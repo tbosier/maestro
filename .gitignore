@@ -1,3 +1,4 @@
 /target
 /.cargo-home
 *.maestro-tmp-*
+/.claude
