@@ -598,7 +598,15 @@ fn draw_box(
 fn draw_picker(ed: &Editor, s: &mut Surface) -> Option<CursorShape> {
     let picker = ed.picker.as_ref()?;
     let ui = &ed.theme.ui;
-    let w = (s.width as u32 * 4 / 5).clamp(20, 120) as u16;
+    let preview = picker
+        .preview
+        .as_ref()
+        .filter(|_| s.width >= maestro_editor::navigation::preview::MIN_WIDTH);
+    let w = if preview.is_some() {
+        (s.width as u32 * 9 / 10).clamp(20, 220) as u16
+    } else {
+        (s.width as u32 * 4 / 5).clamp(20, 120) as u16
+    };
     let w = w.min(s.width);
     let h = (s.height as u32 * 3 / 5).clamp(6, 30) as u16;
     let h = h.min(s.height.saturating_sub(1));
@@ -616,7 +624,31 @@ fn draw_picker(ed: &Editor, s: &mut Surface) -> Option<CursorShape> {
         if picker.loading { "  loading" } else { "" }
     );
     draw_box(s, area, &title, ui.popup, ui.popup_border, ui.popup_title);
-    let inner_r = area.right() - 1;
+    // With a preview, the list takes the left half.
+    let inner_r = match preview {
+        Some(_) => x + 1 + (w - 2) / 2,
+        None => area.right() - 1,
+    };
+    if let Some(pv) = preview {
+        for yy in y + 1..area.bottom() - 1 {
+            s.put(inner_r, yy, "│", ui.popup_border, inner_r + 1);
+        }
+        // Join the top border unless the title runs across the divider.
+        if x + 4 + (title.chars().count() as u16) < inner_r {
+            s.put(inner_r, y, "┬", ui.popup_border, inner_r + 1);
+        }
+        s.put(
+            inner_r,
+            area.bottom() - 1,
+            "┴",
+            ui.popup_border,
+            inner_r + 1,
+        );
+        let r = area.right() - 1;
+        let parea = Rect::new(inner_r + 1, y + 1, r - inner_r - 1, h - 2);
+        crate::preview::draw(ed, s, parea, pv);
+    }
+    let list_w = inner_r - x + 1;
     // Query line.
     let qx = s.print(x + 2, y + 1, "> ", ui.popup_title, inner_r);
     let end = s.print(qx, y + 1, &picker.query, ui.popup, inner_r);
@@ -652,9 +684,9 @@ fn draw_picker(ed: &Editor, s: &mut Surface) -> Option<CursorShape> {
         } else {
             (ui.popup, ui.popup.patch(ui.popup_match))
         };
-        s.fill(Rect::new(x + 1, ry, w - 2, 1), base);
+        s.fill(Rect::new(x + 1, ry, list_w - 2, 1), base);
         let detail_w = item.detail.chars().count() as u16;
-        let label_r = if detail_w > 0 && detail_w + 10 < w {
+        let label_r = if detail_w > 0 && detail_w + 10 < list_w {
             inner_r - detail_w - 2
         } else {
             inner_r

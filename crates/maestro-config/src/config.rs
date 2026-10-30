@@ -61,6 +61,9 @@ pub struct EditorConfig {
     /// recovery directory. 0 disables recovery files.
     pub recovery_interval_secs: u64,
     pub mouse: bool,
+    /// Reopen the files from the last session in this directory when
+    /// started without file arguments.
+    pub restore_session: bool,
 }
 
 impl Default for EditorConfig {
@@ -75,6 +78,7 @@ impl Default for EditorConfig {
             icons: IconMode::Text,
             recovery_interval_secs: 2,
             mouse: true,
+            restore_session: true,
         }
     }
 }

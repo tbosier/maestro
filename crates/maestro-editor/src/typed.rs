@@ -187,6 +187,12 @@ static TYPED: &[TypedCommand] = &[
         fun: swarm,
     },
     TypedCommand {
+        name: "grep",
+        aliases: &[],
+        doc: "Search the workspace for a regex (smart case, skips ignored and binary files)",
+        fun: crate::navigation::grep::typed,
+    },
+    TypedCommand {
         name: "commands",
         aliases: &["help", "h"],
         doc: "Open the command palette",
@@ -361,6 +367,8 @@ fn quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
             modified.join(", ")
         ));
     }
+    // Best effort: a session that cannot be written must not block quitting.
+    let _ = crate::navigation::session::save(ed);
     ed.should_quit = true;
     Ok(())
 }

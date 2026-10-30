@@ -177,6 +177,8 @@ pub struct Editor {
     pub cwd: PathBuf,
     pub clipboard: Box<dyn Clipboard>,
     pub recovery_dir: Option<PathBuf>,
+    /// Sessions, recent files and the state they are stored in.
+    pub navigation: crate::navigation::NavState,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -220,6 +222,7 @@ impl Editor {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             clipboard: Box::new(MemoryClipboard::default()),
             recovery_dir: None,
+            navigation: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -444,6 +447,7 @@ impl Editor {
             }
         };
         self.switch_to(id);
+        crate::navigation::recent::record(self, &path);
         Ok(id)
     }
 

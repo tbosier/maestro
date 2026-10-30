@@ -10,6 +10,7 @@ pub mod key;
 pub mod keymap;
 pub mod layout;
 pub mod motion;
+pub mod navigation;
 pub mod picker;
 pub mod prompt;
 pub mod recovery;

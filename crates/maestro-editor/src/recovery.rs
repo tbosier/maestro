@@ -23,7 +23,7 @@ const HEADER: &str = "maestro-recovery v1\n";
 
 /// FNV-1a: stable across Rust versions, unlike `DefaultHasher`, so recovery
 /// files written by one build are found by the next.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
         h ^= *b as u64;

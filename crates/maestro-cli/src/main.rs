@@ -11,7 +11,7 @@ usage: maestro [options] [file[:line]]...
 
 options:
   -c, --config <path>   use this config file instead of the default
-      --clean           ignore the user config
+      --clean           ignore the user config; do not restore or save the session
   -h, --help            show this help
   -V, --version         show the version
 
@@ -108,6 +108,12 @@ fn main() -> ExitCode {
     let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut editor = Editor::new(config, Rect::new(0, 1, w, h.saturating_sub(2)));
     editor.recovery_dir = maestro_config::config::state_dir().map(|d| d.join("recovery"));
+    let sessions = !args.clean && editor.config.editor.restore_session;
+    maestro_editor::navigation::configure(
+        &mut editor,
+        maestro_config::config::state_dir(),
+        sessions,
+    );
     startup_errors.extend(editor.keymaps.errors.clone());
 
     for (path, line) in &args.files {
@@ -119,6 +125,9 @@ fn main() -> ExitCode {
             }
             Err(e) => startup_errors.push(e),
         }
+    }
+    if sessions && args.files.is_empty() {
+        maestro_editor::navigation::session::restore(&mut editor);
     }
     if !startup_errors.is_empty() {
         editor.set_status(Severity::Error, startup_errors.join("; "));

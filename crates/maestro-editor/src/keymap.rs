@@ -371,6 +371,9 @@ impl Keymaps {
         ] {
             g(&mut normal, k, "space", c);
         }
+        for (k, c) in crate::navigation::DEFAULT_KEYS {
+            g(&mut normal, k, "space", c);
+        }
 
         if profile == Profile::Vim {
             // A small, honest subset of Vim's grammar layered on the
