@@ -36,7 +36,8 @@ title = "Gitignore-aware background file finder, workspace search, session resto
 crates = ["maestro-editor"]
 branch = "feat/navigation"
 owner = "agent"
-status = "not-started"
+status = "done"
+notes = "Finder, workspace search, picker preview, session restore without splits, recent files. See ROADMAP M1."
 
 [[task]]
 id = "m1-lsp"

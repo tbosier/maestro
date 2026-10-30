@@ -7,6 +7,8 @@ Maestro is currently a local editor with no network code, no plugin system and n
 - Files are written atomically through a temp file in the same directory, created with `create_new` so an existing file of that name is never clobbered. Permissions of the original are copied to the new file. Symlinks are followed so the link survives.
 - Binary files and files that are not valid in a supported encoding open read-only, so saving cannot rewrite bytes the user never saw.
 - Recovery files contain file contents. The directory is created with mode 0700 and each file with mode 0600 on Unix. Unnamed buffers are not journaled.
+- Sessions (`sessions/<hash of the directory>.toml`) and the recent-files list (`recent.toml`) in the state directory hold file paths and cursor positions, not contents. They are written atomically with mode 0600 in 0700 directories. `--clean` or `restore-session = false` turns sessions off.
+- The file finder and workspace search only read files; they do not follow symlinked directories, and they skip anything the repository's ignore files exclude.
 - Config is parsed with `deny_unknown_fields`, and key bindings that name unknown commands are rejected at startup.
 - Clipboard: `pbcopy`/`pbpaste`, `wl-copy`/`wl-paste`, `xclip` or `xsel` are run by name from `PATH` with fixed arguments. The text goes over stdin; it is never put on a command line. Without them, copying uses the OSC 52 terminal escape.
 - No `unsafe` code; the workspace forbids it.

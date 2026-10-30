@@ -50,4 +50,5 @@ The terminal front end draws each frame into an off-screen grid (`Surface`) and 
 
 - Files: `maestro_core::io::save` (atomic rename, fsync of file and directory).
 - Recovery journal: `$XDG_STATE_HOME/maestro/recovery`, owner-only permissions.
+- Sessions and recent files: `$XDG_STATE_HOME/maestro/sessions/` and `recent.toml` (`maestro_editor::navigation`).
 - Config: `$XDG_CONFIG_HOME/maestro/config.toml`.
