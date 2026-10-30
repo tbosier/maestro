@@ -170,6 +170,13 @@ impl Server {
         }
     }
 
+    fn wants_save_text(&self) -> bool {
+        self.capabilities
+            .as_ref()
+            .and_then(|c| c["textDocumentSync"]["save"]["includeText"].as_bool())
+            .unwrap_or(false)
+    }
+
     fn supports(&self, capability: &str) -> bool {
         match self.capabilities.as_ref().and_then(|c| c.get(capability)) {
             None | Some(Value::Null) | Some(Value::Bool(false)) => false,
@@ -195,6 +202,40 @@ struct PendingRequest {
     id: RequestId,
     doc: DocumentId,
     version: DocumentVersion,
+    /// Every buffer's version when the request was sent. Locations in the
+    /// reply may point into any of them.
+    versions: HashMap<DocumentId, DocumentVersion>,
+    /// The cursor the request was made at.
+    head: usize,
+}
+
+/// Files read for a reply, keyed by path. Only regular files up to
+/// [`MAX_PRELOAD_BYTES`] each, at most [`MAX_PRELOAD_FILES`] of them.
+type Preloaded = HashMap<PathBuf, Rope>;
+const MAX_PRELOAD_FILES: usize = 500;
+const MAX_PRELOAD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads the files a list of locations points into. Runs on a background
+/// thread. Special files (FIFOs, devices) are never opened.
+fn preload_files(locations: &[(String, Value)]) -> Preloaded {
+    let mut out = Preloaded::new();
+    for (uri, _) in locations {
+        if out.len() >= MAX_PRELOAD_FILES {
+            break;
+        }
+        let Some(path) = uri_to_path(uri) else {
+            continue;
+        };
+        if out.contains_key(&path) {
+            continue;
+        }
+        let regular =
+            std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= MAX_PRELOAD_BYTES);
+        if regular && let Ok(loaded) = maestro_core::io::load(&path) {
+            out.insert(path, loaded.text);
+        }
+    }
+    out
 }
 
 /// Language server state, one per editor.
@@ -328,10 +369,17 @@ pub fn document_changed(ed: &mut Editor, doc: DocumentId, changes: &[ChangeSet])
     let Some(server) = servers.get(&sync.server) else {
         return;
     };
+    // An empty change set leaves the text and the document version alone
+    // (see `Document::apply`), so it is not a change to report.
+    let changes: Vec<&ChangeSet> = changes.iter().filter(|c| !c.is_empty()).collect();
+    let version = buf.doc.version();
+    if changes.is_empty() && version == sync.version {
+        return;
+    }
     let kind = server.sync_kind();
     let mut content = Vec::new();
     let mut lost_track = false;
-    for cs in changes {
+    for cs in &changes {
         if cs.len() != sync.text.len_chars() {
             lost_track = true;
             break;
@@ -345,7 +393,6 @@ pub fn document_changed(ed: &mut Editor, doc: DocumentId, changes: &[ChangeSet])
             break;
         }
     }
-    let version = buf.doc.version();
     let expected = sync.version.0 + changes.len() as u64;
     if lost_track || version.0 != expected || kind == 1 {
         sync.text = buf.doc.text().clone();
@@ -372,10 +419,13 @@ pub fn document_saved(ed: &mut Editor, doc: DocumentId) {
     if let Some(server) = ed.lsp.servers.get(&sync.server)
         && server.wants_save()
     {
-        server.client.notify(
-            "textDocument/didSave",
-            json!({"textDocument": {"uri": sync.uri}}),
-        );
+        let mut params = json!({"textDocument": {"uri": sync.uri}});
+        if server.wants_save_text()
+            && let Some(buf) = ed.buffers.get(&doc)
+        {
+            params["text"] = json!(buf.doc.text().to_string());
+        }
+        server.client.notify("textDocument/didSave", params);
     }
 }
 
@@ -537,7 +587,20 @@ fn start_server(
         .unwrap_or_else(|| config.command.clone());
     let events: JobSender = ed.idle_job_sender();
     let sink = Box::new(move |event: Event| {
-        events.send(move |ed: &mut Editor| on_event(ed, id, event));
+        // Only queue work for what the editor uses, so a chatty server
+        // does not fill the job queue with notifications nobody reads.
+        let wanted = match &event {
+            Event::Exited { .. } => true,
+            Event::Notification { method, .. } => {
+                matches!(
+                    method.as_str(),
+                    "textDocument/publishDiagnostics" | "window/showMessage"
+                )
+            }
+        };
+        if wanted {
+            events.send(move |ed: &mut Editor| on_event(ed, id, event));
+        }
     });
     let opts = StartOptions {
         program,
@@ -744,6 +807,11 @@ pub fn request_at_cursor(ed: &mut Editor, kind: RequestKind) -> bool {
         .client
         .request(kind.method(), params);
     let token = ed.lsp.fresh_id();
+    let versions = ed
+        .buffers
+        .iter()
+        .map(|(id, b)| (*id, b.doc.version()))
+        .collect();
     ed.lsp.pending.insert(
         kind,
         PendingRequest {
@@ -752,12 +820,22 @@ pub fn request_at_cursor(ed: &mut Editor, kind: RequestKind) -> bool {
             id,
             doc,
             version,
+            versions,
+            head,
         },
     );
     let spawned = ed.spawn_background("lsp-request", move |jobs| {
         match rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(reply) => {
-                jobs.send(move |ed: &mut Editor| on_reply(ed, kind, token, reply));
+                // Reading the files that locations point into happens here,
+                // off the editor thread.
+                let files = match (&reply, kind) {
+                    (Ok(v), RequestKind::Definition | RequestKind::References) => {
+                        preload_files(&convert::locations(v))
+                    }
+                    _ => HashMap::new(),
+                };
+                jobs.send(move |ed: &mut Editor| on_reply(ed, kind, token, reply, files));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 jobs.send(move |ed: &mut Editor| on_timeout(ed, kind, token));
@@ -791,10 +869,12 @@ fn on_timeout(ed: &mut Editor, kind: RequestKind, token: u64) {
     }
 }
 
-/// Applies a reply on the main thread. A reply for a document that changed
-/// since the request was sent is dropped: its positions describe text that
-/// no longer exists.
-pub fn on_reply(ed: &mut Editor, kind: RequestKind, token: u64, reply: Reply) {
+/// Applies a reply on the main thread. A reply is dropped if any open
+/// buffer changed since the request was sent: its positions may describe
+/// text that no longer exists, in the requesting buffer or in the one a
+/// location points into. Edits only made between request and reply, so
+/// this rarely costs a real answer.
+fn on_reply(ed: &mut Editor, kind: RequestKind, token: u64, reply: Reply, files: Preloaded) {
     if !ed.lsp.pending.get(&kind).is_some_and(|p| p.token == token) {
         return; // superseded
     }
@@ -807,11 +887,26 @@ pub fn on_reply(ed: &mut Editor, kind: RequestKind, token: u64, reply: Reply) {
         ));
         return;
     }
+    let other_changed = p
+        .versions
+        .iter()
+        .any(|(id, v)| ed.buffers.get(id).is_some_and(|b| b.doc.version() != *v));
+    if other_changed {
+        ed.info(format!(
+            "{} result dropped: another buffer changed while waiting",
+            kind.label()
+        ));
+        return;
+    }
     if ed.view().doc != p.doc {
         ed.info(format!(
             "{} result dropped: another buffer is shown now",
             kind.label()
         ));
+        return;
+    }
+    if kind == RequestKind::Hover && ed.view().selection.primary().head != p.head {
+        ed.info("hover result dropped: the cursor moved");
         return;
     }
     let result = match reply {
@@ -834,40 +929,40 @@ pub fn on_reply(ed: &mut Editor, kind: RequestKind, token: u64, reply: Reply) {
         }
     };
     match kind {
-        RequestKind::Definition => show_definition(ed, &result),
-        RequestKind::References => show_references(ed, &result),
-        RequestKind::Hover => show_hover(ed, &result, p.doc),
+        RequestKind::Definition => show_definition(ed, &result, &files),
+        RequestKind::References => show_references(ed, &result, &files),
+        RequestKind::Hover => show_hover(ed, &result, p.doc, p.head),
     }
 }
 
-fn show_definition(ed: &mut Editor, result: &Value) {
+fn show_definition(ed: &mut Editor, result: &Value, files: &Preloaded) {
     let locations = convert::locations(result);
     match locations.as_slice() {
         [] => ed.info("no definition found"),
-        [(uri, range)] => goto_location(ed, uri, range),
+        [(uri, range)] => goto_location(ed, uri, range, files),
         _ => {
-            let items = location_items(ed, &locations);
+            let items = location_items(ed, &locations, files);
             ed.picker = Some(Picker::new("definitions", items));
         }
     }
 }
 
-fn show_references(ed: &mut Editor, result: &Value) {
+fn show_references(ed: &mut Editor, result: &Value, files: &Preloaded) {
     let locations = convert::locations(result);
     if locations.is_empty() {
         ed.info("no references found");
         return;
     }
-    let items = location_items(ed, &locations);
+    let items = location_items(ed, &locations, files);
     ed.picker = Some(Picker::new("references", items));
 }
 
-fn show_hover(ed: &mut Editor, result: &Value, doc: DocumentId) {
+fn show_hover(ed: &mut Editor, result: &Value, doc: DocumentId, anchor: usize) {
     match convert::hover_text(result) {
         Some(text) => {
             ed.lsp.hover = Some(HoverPopup {
                 doc,
-                anchor: ed.view().selection.primary().head,
+                anchor,
                 lines: text.lines().map(str::to_string).collect(),
             });
         }
@@ -875,19 +970,26 @@ fn show_hover(ed: &mut Editor, result: &Value, doc: DocumentId) {
     }
 }
 
-/// The text of `path`: the open buffer's if there is one, else the file.
-fn text_for(ed: &Editor, path: &Path) -> Option<Rope> {
+/// The text of `path`: the open buffer's if there is one, else the copy
+/// read in the background. Never reads files on the editor thread.
+fn text_for(ed: &Editor, path: &Path, files: &Preloaded) -> Option<Rope> {
     match ed.find_buffer_by_path(path) {
         Some(id) => Some(ed.buffers[&id].doc.text().clone()),
-        None => maestro_core::io::load(path).ok().map(|l| l.text),
+        None => files.get(path).cloned(),
     }
 }
 
-fn goto_location(ed: &mut Editor, uri: &str, range: &Value) {
+fn goto_location(ed: &mut Editor, uri: &str, range: &Value, files: &Preloaded) {
     let Some(path) = uri_to_path(uri) else {
         ed.error(format!("cannot open {uri}"));
         return;
     };
+    // Only open what is already a buffer or was read as a regular file in
+    // the background, so a location cannot make the editor block on a FIFO.
+    if ed.find_buffer_by_path(&path).is_none() && !files.contains_key(&path) {
+        ed.error(format!("cannot open {}", path.display()));
+        return;
+    }
     ed.push_jump();
     if let Err(e) = ed.open(&path) {
         ed.error(e);
@@ -903,7 +1005,11 @@ fn goto_location(ed: &mut Editor, uri: &str, range: &Value) {
 }
 
 /// Picker items for locations, with line text, in the order given.
-fn location_items(ed: &Editor, locations: &[(String, Value)]) -> Vec<PickerItem> {
+fn location_items(
+    ed: &Editor,
+    locations: &[(String, Value)],
+    files: &Preloaded,
+) -> Vec<PickerItem> {
     let mut texts: HashMap<PathBuf, Option<Rope>> = HashMap::new();
     locations
         .iter()
@@ -911,7 +1017,7 @@ fn location_items(ed: &Editor, locations: &[(String, Value)]) -> Vec<PickerItem>
             let path = uri_to_path(uri)?;
             let text = texts
                 .entry(path.clone())
-                .or_insert_with(|| text_for(ed, &path))
+                .or_insert_with(|| text_for(ed, &path, files))
                 .as_ref()?;
             let (from, _) = convert::range_to_chars(text, range)?;
             let line = text.char_to_line(from);

@@ -1,22 +1,27 @@
 //! A language server process and the threads that talk to it.
 //!
-//! Three threads per server, none of which ever touches editor state:
+//! Four threads per server, none of which ever touches editor state:
 //!
 //! * the writer owns the server's stdin and writes framed messages from a
 //!   channel. Until the `initialize` response arrives it holds ordinary
-//!   messages back, then sends `initialized` followed by the backlog;
+//!   messages back, then sends `initialized` followed by the backlog. If a
+//!   write fails it kills the server, which is then reported as exited;
 //! * the reader owns stdout, routes responses to the channel of the request
 //!   that asked, answers the few server-to-client requests itself, and hands
 //!   notifications to the caller's sink. When stdout closes it reports
 //!   [`Event::Exited`];
+//! * a watcher reports the exit when the process ends but a descendant
+//!   keeps stdout open;
 //! * a stderr thread keeps the last [`LOG_LINES`] lines in memory, so server
 //!   noise never reaches the terminal.
 //!
-//! Nothing here blocks the caller: requests return a channel to wait on.
+//! The caller never waits for the server: requests return a channel.
+//! [`Client::start`] does spawn the process on the caller's thread, and
+//! dropping a client waits up to half a second per shutdown step.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -71,6 +76,9 @@ struct Shared {
     next_id: AtomicI64,
     pending: Mutex<HashMap<RequestId, Sender<Reply>>>,
     alive: AtomicBool,
+    /// Set once [`Event::Exited`] has been sent, or on an intended shutdown.
+    exit_reported: AtomicBool,
+    stderr_done: AtomicBool,
     log: Mutex<VecDeque<String>>,
     capabilities: Mutex<Option<Value>>,
 }
@@ -105,7 +113,7 @@ impl Client {
     /// client and a channel that yields the `initialize` result.
     pub fn start(
         opts: StartOptions,
-        mut sink: EventSink,
+        sink: EventSink,
     ) -> std::io::Result<(Client, Receiver<Reply>)> {
         let mut child = Command::new(&opts.program)
             .args(&opts.args)
@@ -121,22 +129,27 @@ impl Client {
             next_id: AtomicI64::new(INITIALIZE_ID + 1),
             pending: Mutex::new(HashMap::new()),
             alive: AtomicBool::new(true),
+            exit_reported: AtomicBool::new(false),
+            stderr_done: AtomicBool::new(false),
             log: Mutex::new(VecDeque::new()),
             capabilities: Mutex::new(None),
         });
         let child = Arc::new(Mutex::new(child));
+        let sink = Arc::new(Mutex::new(sink));
         let (out, out_rx) = mpsc::channel::<Outgoing>();
         let (init_tx, init_rx) = mpsc::channel();
         lock(&shared.pending).insert(INITIALIZE_ID, init_tx);
 
-        std::thread::Builder::new()
-            .name("lsp-writer".into())
-            .spawn(move || writer_loop(stdin, out_rx))?;
-
-        let stderr_done = Arc::new(AtomicBool::new(false));
         {
             let shared = shared.clone();
-            let done = stderr_done.clone();
+            let child = child.clone();
+            std::thread::Builder::new()
+                .name("lsp-writer".into())
+                .spawn(move || writer_loop(stdin, out_rx, &shared, &child))?;
+        }
+
+        {
+            let shared = shared.clone();
             std::thread::Builder::new()
                 .name("lsp-stderr".into())
                 .spawn(move || {
@@ -144,7 +157,9 @@ impl Client {
                     let mut buf = Vec::new();
                     loop {
                         buf.clear();
-                        match r.read_until(b'\n', &mut buf) {
+                        // Bounded: a line without a newline is split.
+                        let limit = (LOG_LINE_CHARS * 4) as u64;
+                        match (&mut r).take(limit).read_until(b'\n', &mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {
                                 let line = String::from_utf8_lossy(&buf);
@@ -152,7 +167,7 @@ impl Client {
                             }
                         }
                     }
-                    done.store(true, Ordering::SeqCst);
+                    shared.stderr_done.store(true, Ordering::SeqCst);
                 })?;
         }
 
@@ -160,6 +175,7 @@ impl Client {
             let shared = shared.clone();
             let out = out.clone();
             let child = child.clone();
+            let sink = sink.clone();
             std::thread::Builder::new()
                 .name("lsp-reader".into())
                 .spawn(move || {
@@ -168,7 +184,7 @@ impl Client {
                         match read_message(&mut r) {
                             Ok(Some(v)) => {
                                 if let Some(msg) = Message::parse(v) {
-                                    route(msg, &shared, &out, &mut sink);
+                                    route(msg, &shared, &out, &sink);
                                 }
                             }
                             Ok(None) => break,
@@ -178,20 +194,35 @@ impl Client {
                             }
                         }
                     }
-                    shared.alive.store(false, Ordering::SeqCst);
-                    // Dropping the senders wakes every waiter with a disconnect.
-                    lock(&shared.pending).clear();
-                    let _ = out.send(Outgoing::Close);
                     let status = wait_for_exit(&child, Duration::from_secs(1))
                         .unwrap_or_else(|| "output closed".to_string());
-                    // Let the last stderr lines (often the reason for the
-                    // exit) reach the log first. A grandchild holding stderr
-                    // open must not delay the report for long.
-                    let deadline = Instant::now() + Duration::from_millis(200);
-                    while !stderr_done.load(Ordering::SeqCst) && Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(5));
+                    report_exit(&shared, &out, &sink, status);
+                })?;
+        }
+
+        // The reader only notices an exit when stdout closes, which a
+        // descendant that inherited stdout can delay forever. This thread
+        // notices the process itself exiting.
+        {
+            let shared = shared.clone();
+            let out = out.clone();
+            let child = child.clone();
+            std::thread::Builder::new()
+                .name("lsp-watcher".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(Duration::from_millis(250));
+                        if shared.exit_reported.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if let Ok(Some(status)) = lock(&child).try_wait() {
+                            // Give the reader a moment to report it with
+                            // the output that preceded the exit.
+                            std::thread::sleep(Duration::from_millis(300));
+                            report_exit(&shared, &out, &sink, describe(status));
+                            return;
+                        }
                     }
-                    sink(Event::Exited { status });
                 })?;
         }
 
@@ -285,6 +316,8 @@ impl Client {
             return;
         }
         self.shut_down = true;
+        // An exit we asked for is not news.
+        self.shared.exit_reported.store(true, Ordering::SeqCst);
         if self.is_alive() && self.capabilities().is_some() {
             let (_, rx) = self.request("shutdown", Value::Null);
             let _ = rx.recv_timeout(timeout);
@@ -304,7 +337,27 @@ impl Drop for Client {
     }
 }
 
-fn writer_loop(stdin: ChildStdin, rx: Receiver<Outgoing>) {
+/// Marks the server dead and sends [`Event::Exited`] once, from whichever
+/// thread noticed first.
+fn report_exit(shared: &Shared, out: &Sender<Outgoing>, sink: &Mutex<EventSink>, status: String) {
+    shared.alive.store(false, Ordering::SeqCst);
+    // Dropping the senders wakes every waiter with a disconnect.
+    lock(&shared.pending).clear();
+    let _ = out.send(Outgoing::Close);
+    if shared.exit_reported.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Let the last stderr lines (often the reason for the exit) reach the
+    // log first. A grandchild holding stderr open must not delay the report
+    // for long.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while !shared.stderr_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (lock(sink))(Event::Exited { status });
+}
+
+fn writer_loop(stdin: ChildStdin, rx: Receiver<Outgoing>, shared: &Shared, child: &Mutex<Child>) {
     let mut w = BufWriter::new(stdin);
     let mut ready = false;
     let mut backlog = Vec::new();
@@ -324,14 +377,19 @@ fn writer_loop(stdin: ChildStdin, rx: Receiver<Outgoing>) {
             }
             Outgoing::Close => break,
         };
-        if result.is_err() {
-            // The reader notices the dead process and reports it.
+        if let Err(e) = result {
+            // A server that stopped reading cannot be kept in sync. Kill it
+            // so the exit is reported like any other crash.
+            if !shared.exit_reported.load(Ordering::SeqCst) {
+                shared.push_log(&format!("[maestro] write to server failed: {e}"));
+                let _ = lock(child).kill();
+            }
             break;
         }
     }
 }
 
-fn route(msg: Message, shared: &Shared, out: &Sender<Outgoing>, sink: &mut EventSink) {
+fn route(msg: Message, shared: &Shared, out: &Sender<Outgoing>, sink: &Mutex<EventSink>) {
     match msg {
         Message::Response { id, result } => {
             let Some(id) = id.as_i64() else {
@@ -382,8 +440,15 @@ fn route(msg: Message, shared: &Shared, out: &Sender<Outgoing>, sink: &mut Event
                 }
             }
             "$/progress" | "$/logTrace" | "telemetry/event" => {}
-            _ => sink(Event::Notification { method, params }),
+            _ => (lock(sink))(Event::Notification { method, params }),
         },
+    }
+}
+
+fn describe(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(c) => format!("exit code {c}"),
+        None => "killed by a signal".to_string(),
     }
 }
 
@@ -393,12 +458,7 @@ fn wait_for_exit(child: &Mutex<Child>, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     loop {
         match lock(child).try_wait() {
-            Ok(Some(status)) => {
-                return Some(match status.code() {
-                    Some(c) => format!("exit code {c}"),
-                    None => "killed by a signal".to_string(),
-                });
-            }
+            Ok(Some(status)) => return Some(describe(status)),
             Ok(None) => {}
             Err(e) => return Some(format!("unknown status ({e})")),
         }
@@ -423,11 +483,17 @@ pub fn find_executable(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> 
     }
     let candidate = Path::new(name);
     if candidate.components().count() > 1 {
-        return is_executable(candidate).then(|| candidate.to_path_buf());
+        // The server runs with the workspace root as its working directory,
+        // so a relative path must be resolved here, against the directory
+        // where it was checked, or a file in the workspace could run
+        // instead.
+        let absolute = std::path::absolute(candidate).ok()?;
+        return is_executable(&absolute).then_some(absolute);
     }
     let path_var = path_var?;
+    // Relative PATH entries are skipped for the same reason.
     std::env::split_paths(path_var)
-        .filter(|dir| !dir.as_os_str().is_empty())
+        .filter(|dir| dir.is_absolute())
         .flat_map(|dir| {
             let plain = dir.join(name);
             let exe = cfg!(windows).then(|| dir.join(format!("{name}.exe")));
@@ -472,6 +538,21 @@ mod tests {
             .is_none()
         );
         assert!(find_executable("", None).is_none());
+        // Relative names come back absolute; relative PATH entries are ignored.
+        if cfg!(unix) {
+            let sh = sh.unwrap();
+            let dir = sh.parent().unwrap();
+            // A relative spelling of `dir`: up to `/`, then down again.
+            let depth = std::env::current_dir().unwrap().components().count() - 1;
+            let up = "../".repeat(depth);
+            let rel = format!(
+                "{up}{}/sh",
+                dir.display().to_string().trim_start_matches('/')
+            );
+            let found = find_executable(&rel, None).unwrap();
+            assert!(found.is_absolute(), "{found:?}");
+            assert!(find_executable("sh", Some(OsStr::new("relative/bin"))).is_none());
+        }
         assert!(find_executable("/nonexistent/dir/tool", None).is_none());
     }
 }

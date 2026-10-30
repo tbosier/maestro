@@ -408,7 +408,7 @@ fn draw_hover(ed: &Editor, s: &mut Surface) {
         .map(|r| unicode_width::UnicodeWidthStr::width(r.as_str()))
         .max()
         .unwrap_or(0);
-    let w = (longest + 4).clamp(16, max_w) as u16;
+    let w = (longest + 4).clamp(16.min(max_w), max_w) as u16;
     let below = s.height.saturating_sub(cursor_y + 2);
     let above = cursor_y;
     let (room, place_below) = if below >= 4 || below >= above {
@@ -934,6 +934,22 @@ mod tests {
         assert!(row(&s, 5).contains("word word"));
         assert!(row(&s, 6).contains("word word"));
         assert!(row(&s, 5).trim_end().ends_with('│'));
+    }
+
+    #[test]
+    fn hover_popup_never_panics_at_small_sizes() {
+        for (w, h) in (1..=40u16).flat_map(|w| (1..=12u16).map(move |h| (w, h))) {
+            let mut ed = Editor::new(Config::default(), Rect::new(0, 1, w, h.saturating_sub(2)));
+            let id = ed.add_document(Document::from_text("fn main() {}\n"));
+            ed.switch_to(id);
+            ed.lsp.hover = Some(HoverPopup {
+                doc: id,
+                anchor: 3,
+                lines: vec!["x".repeat(200), "short".into()],
+            });
+            let mut s = Surface::new(w, h, ed.theme.ui.text);
+            render(&ed, &mut s);
+        }
     }
 
     #[test]

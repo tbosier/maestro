@@ -40,16 +40,26 @@ fn main() {
             incremental_changes_match_random_edits,
         ),
         ("missing_program_is_an_error", missing_program_is_an_error),
+        (
+            "exit_is_seen_while_a_child_holds_stdout",
+            exit_is_seen_while_a_child_holds_stdout,
+        ),
     ]);
 }
 
 const WAIT: Duration = Duration::from_secs(10);
 
 fn start() -> (Client, mpsc::Receiver<Value>, mpsc::Receiver<Event>) {
+    start_with(&[])
+}
+
+fn start_with(extra: &[&str]) -> (Client, mpsc::Receiver<Value>, mpsc::Receiver<Event>) {
     let (tx, events) = mpsc::channel();
+    let mut args = vec![FAKE_ARG.to_string()];
+    args.extend(extra.iter().map(|a| a.to_string()));
     let opts = StartOptions {
         program: std::env::current_exe().unwrap(),
-        args: vec![FAKE_ARG.to_string()],
+        args,
         root: std::env::temp_dir(),
     };
     let (client, init) = Client::start(opts, Box::new(move |e| drop(tx.send(e)))).unwrap();
@@ -106,9 +116,12 @@ fn initialize_and_capture_stderr() {
 }
 
 fn messages_sent_before_initialize_arrive_in_order() {
-    let (client, _init, events) = start();
-    // Sent immediately, before the initialize reply can have arrived.
+    // The server waits 400 ms before answering initialize, so this didOpen
+    // is certainly sent before the reply and must wait in the backlog.
+    let (client, init, events) = start_with(&[fake::SLOW_INIT_ARG]);
     open(&client, "file:///a.rs", "ERROR\n");
+    assert!(client.capabilities().is_none(), "not initialized yet");
+    init.recv_timeout(WAIT).expect("initialize result");
     let d = next_notification(&events, "textDocument/publishDiagnostics");
     assert_eq!(d["uri"], "file:///a.rs");
     let (_, rx) = client.request("fake/stats", Value::Null);
@@ -270,4 +283,26 @@ fn missing_program_is_an_error() {
         root: std::env::temp_dir(),
     };
     assert!(Client::start(opts, Box::new(|_| {})).is_err());
+}
+
+/// The server exits but a child it started keeps stdout open, so the
+/// reader never sees end of file. The exit must still be reported.
+fn exit_is_seen_while_a_child_holds_stdout() {
+    let (client, _init, events) = start();
+    open(&client, "file:///o.rs", "@orphan\n");
+    let t = Instant::now();
+    let status = loop {
+        match events.recv_timeout(WAIT) {
+            Ok(Event::Exited { status }) => break status,
+            Ok(_) => {}
+            Err(_) => panic!("no exit event"),
+        }
+    };
+    assert_eq!(status, "exit code 4");
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        t.elapsed()
+    );
+    assert!(!client.is_alive());
 }

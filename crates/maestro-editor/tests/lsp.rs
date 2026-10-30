@@ -49,6 +49,15 @@ fn main() {
             save_and_close_reach_the_server,
         ),
         ("diagnostics_follow_edits", diagnostics_follow_edits),
+        (
+            "reply_dropped_when_another_buffer_changed",
+            reply_dropped_when_another_buffer_changed,
+        ),
+        (
+            "hover_dropped_when_the_cursor_moved",
+            hover_dropped_when_the_cursor_moved,
+        ),
+        ("save_sends_text_when_asked", save_sends_text_when_asked),
     ]);
 }
 
@@ -76,7 +85,13 @@ fn run(ed: &mut Editor, script: &str) {
 }
 
 fn fake_config() -> Config {
+    fake_config_with(&[])
+}
+
+fn fake_config_with(extra: &[&str]) -> Config {
     let mut config = Config::default();
+    let mut args = vec![FAKE_ARG.to_string()];
+    args.extend(extra.iter().map(|a| a.to_string()));
     config.language_server.insert(
         "rust".into(),
         LanguageServerConfig {
@@ -84,7 +99,7 @@ fn fake_config() -> Config {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            args: vec![FAKE_ARG.into()],
+            args,
             enabled: true,
         },
     );
@@ -122,7 +137,11 @@ fn open(name: &str, text: &str, config: Config) -> Fixture {
 }
 
 fn open_synced(name: &str, text: &str) -> Fixture {
-    let mut f = open(name, text, fake_config());
+    open_synced_with(name, text, fake_config())
+}
+
+fn open_synced_with(name: &str, text: &str, config: Config) -> Fixture {
+    let mut f = open(name, text, config);
     let doc = f.ed.view().doc;
     assert!(
         wait_until(&mut f.ed, |ed| ed.lsp.is_synced(doc)),
@@ -307,6 +326,9 @@ fn incremental_sync_matches_after_edits_and_undo() {
         ("join", "%J"),
         ("undo join", "u"),
         ("repeat", "gg."),
+        // Unindenting an unindented line changes nothing: no didChange may
+        // repeat a version (the fake server records that as an error).
+        ("no-op unindent", "gg<lt>"),
     ] {
         run(ed, script);
         assert_server_matches(ed, step);
@@ -314,6 +336,27 @@ fn incremental_sync_matches_after_edits_and_undo() {
     // A reload replaces the whole text through the same hook.
     run(ed, ":reload!<ret>");
     assert_server_matches(ed, "reload");
+    // Every change went out incrementally: no full-text fallback.
+    let changes: Vec<Value> = stats(ed)
+        .into_iter()
+        .filter(|m| m["method"] == "textDocument/didChange")
+        .flat_map(|m| m["params"]["contentChanges"].as_array().unwrap().clone())
+        .collect();
+    assert!(changes.len() >= 12, "{} changes", changes.len());
+    assert!(
+        changes.iter().all(|c| c.get("range").is_some()),
+        "a full-text change was sent"
+    );
+}
+
+/// The notifications the fake server received, in order.
+fn stats(ed: &Editor) -> Vec<Value> {
+    let rx = ed
+        .lsp
+        .raw_request(ed.view().doc, "fake/stats", json!({}))
+        .expect("synced");
+    let stats = maestro_lsp::client::recv_reply(&rx, WAIT).unwrap().unwrap();
+    stats["received"].as_array().unwrap().clone()
 }
 
 fn server_crash_leaves_editor_usable() {
@@ -472,4 +515,54 @@ fn diagnostics_follow_edits() {
     assert!(wait_until(ed, |ed| {
         ed.lsp.diagnostics(doc).first().map(|d| d.from) == Some(4)
     }));
+}
+
+/// Locations can point into any buffer, so an edit to another buffer
+/// while a definition request is out also drops the reply.
+fn reply_dropped_when_another_buffer_changed() {
+    let mut f = open_synced("cross", "// @slow\nfn helper() {}\nhelper();\n");
+    let other = f.dir.join("other.rs");
+    std::fs::write(&other, "fn other() {}\n").unwrap();
+    let ed = &mut f.ed;
+    let first = ed.view().doc;
+    // Both buffers are open when the request goes out.
+    ed.open(&other).unwrap();
+    run(ed, "ga3Ggd");
+    run(ed, "gaix<esc>ga");
+    assert_eq!(ed.view().doc, first);
+    assert!(
+        wait_until(ed, |ed| status(ed).contains("another buffer changed")),
+        "status {:?}",
+        ed.status
+    );
+    assert_ne!(head(ed), 12, "did not jump");
+}
+
+fn hover_dropped_when_the_cursor_moved() {
+    let mut f = open_synced("hovermove", "// @slow\nfn helper() {}\nhelper();\n");
+    let ed = &mut f.ed;
+    run(ed, "3G<space>kl");
+    assert!(
+        wait_until(ed, |ed| status(ed)
+            .contains("hover result dropped: the cursor moved")),
+        "status {:?}",
+        ed.status
+    );
+    assert!(ed.lsp.hover.is_none());
+}
+
+fn save_sends_text_when_asked() {
+    let mut f = open_synced_with(
+        "savetext",
+        "fn main() {}\n",
+        fake_config_with(&[fake::SAVE_TEXT_ARG]),
+    );
+    let ed = &mut f.ed;
+    run(ed, "ix<esc>:w<ret>");
+    let saved: Vec<Value> = stats(ed)
+        .into_iter()
+        .filter(|m| m["method"] == "textDocument/didSave")
+        .collect();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0]["params"]["text"], "xfn main() {}\n");
 }

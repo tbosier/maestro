@@ -1,13 +1,15 @@
 //! The base protocol's message framing: a `Content-Length` header block,
 //! an empty line, then exactly that many bytes of UTF-8 JSON.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use serde_json::Value;
 
 /// Bodies larger than this are refused, so a broken or hostile server
 /// cannot make the editor allocate without bound.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Header lines are short; a longer one means a broken stream.
+pub const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 
 /// Writes one framed message and flushes.
 pub fn write_message(out: &mut impl Write, msg: &Value) -> io::Result<()> {
@@ -25,7 +27,16 @@ pub fn read_message(input: &mut impl BufRead) -> io::Result<Option<Value>> {
     let mut saw_header = false;
     loop {
         line.clear();
-        if input.read_line(&mut line)? == 0 {
+        let n = input
+            .by_ref()
+            .take(MAX_HEADER_LINE_BYTES as u64)
+            .read_line(&mut line)?;
+        if n == MAX_HEADER_LINE_BYTES && !line.ends_with('\n') {
+            return Err(invalid(format!(
+                "header line longer than {MAX_HEADER_LINE_BYTES} bytes"
+            )));
+        }
+        if n == 0 {
             if saw_header {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -122,5 +133,10 @@ mod tests {
         assert!(read_message(&mut r).is_err());
         let mut r = io::BufReader::new(&b"Content-Length: 2\r\n"[..]);
         assert!(read_message(&mut r).is_err());
+        // A header line that never ends is refused without reading it all.
+        let endless = vec![b'x'; MAX_HEADER_LINE_BYTES * 4];
+        let mut r = io::BufReader::new(&endless[..]);
+        let err = read_message(&mut r).unwrap_err();
+        assert!(err.to_string().contains("header line longer"), "{err}");
     }
 }

@@ -50,7 +50,7 @@ The terminal front end draws each frame into an off-screen grid (`Surface`) and 
 
 ## Language servers
 
-`maestro-lsp` runs each server with three threads (stdin writer, stdout reader, stderr log) and never blocks its caller: a request returns a channel. The editor waits on that channel in a short-lived background thread and applies the reply as a job on the main thread, dropping it if the document's version moved since the request. Notifications such as diagnostics arrive through an idle job sender, so the terminal shows them at its next wake-up (at most a second).
+`maestro-lsp` runs each server with four threads (stdin writer, stdout reader, exit watcher, stderr log) and never waits for a server's answer: a request returns a channel. The editor waits on that channel in a short-lived background thread, which also reads any files the reply points into, and applies the reply as a job on the main thread. The reply is dropped if any open buffer's version moved since the request. Two things still happen on the editor thread: finding a server on `PATH` and spawning it, and, on quit, waiting up to half a second per step for each server to shut down. Notifications such as diagnostics arrive through an idle job sender, so the terminal shows them at its next wake-up (at most a second).
 
 Every text-change path in the editor calls `lsp::document_changed`, which maps stored diagnostics through the change and sends an incremental `didChange` built from the change set in old-document coordinates. `lsp::reconcile` runs after each key, on open and on tick: it opens and closes documents on servers to match the buffers, and resends full text for any document whose version moved without the hook. Positions are UTF-16 through `maestro_core::pos`.
 

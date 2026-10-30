@@ -1,9 +1,9 @@
 //! Language Server Protocol client for Maestro.
 //!
 //! This crate runs language server processes and speaks JSON-RPC to them on
-//! plain threads. It has no terminal or editor dependency and never blocks
-//! its caller: requests hand back a channel, notifications go to a sink the
-//! caller provides. The editor (`maestro-editor`) turns those into jobs that
+//! plain threads. It has no terminal or editor dependency and never waits
+//! for a server's answer: requests hand back a channel, notifications go to
+//! a sink the caller provides. The editor (`maestro-editor`) turns those into jobs that
 //! run on its main thread.
 //!
 //! Positions are UTF-16 code units, the protocol default, converted with

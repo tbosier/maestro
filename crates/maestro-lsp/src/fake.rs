@@ -16,7 +16,8 @@
 //! * hover: a markdown block naming the word;
 //! * a document containing `@slow` delays definition, references and hover
 //!   by [`SLOW_MS`]; one containing `@crash` makes the server exit with
-//!   code 3 as soon as it sees it;
+//!   code 3 as soon as it sees it; `@orphan` makes it start a `sleep`
+//!   child that keeps stdout open and exit with code 4;
 //! * `fake/documentText` returns its copy of a document and any protocol
 //!   errors it noticed; `fake/stats` returns the notifications it received.
 
@@ -30,6 +31,10 @@ use crate::jsonrpc::{self, Message};
 
 pub const FAKE_ARG: &str = "--maestro-fake-lsp";
 pub const SLOW_MS: u64 = 600;
+/// Extra argument: wait 400 ms before answering `initialize`.
+pub const SLOW_INIT_ARG: &str = "--fake-slow-init";
+/// Extra argument: ask for the text in `didSave`.
+pub const SAVE_TEXT_ARG: &str = "--fake-save-text";
 
 /// If this process was started as the fake server, serves stdio and exits.
 pub fn run_if_requested() {
@@ -147,6 +152,12 @@ fn after_change(st: &mut State, uri: &str, out: &mut impl Write) {
         let _ = out.flush();
         std::process::exit(3);
     }
+    if doc.text.contains("@orphan") {
+        // Exit while a child keeps our stdout and stderr open.
+        let _ = std::process::Command::new("sleep").arg("5").spawn();
+        let _ = out.flush();
+        std::process::exit(4);
+    }
     let mut diags = Vec::new();
     for (word, severity) in [("ERROR", 1), ("WARNING", 2), ("INFO", 3), ("HINT", 4)] {
         for start in word_occurrences(&doc.text, word) {
@@ -181,16 +192,26 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
         std::thread::sleep(std::time::Duration::from_millis(SLOW_MS));
     }
     match method {
-        "initialize" => json!({
-            "capabilities": {
-                "positionEncoding": "utf-16",
-                "textDocumentSync": {"openClose": true, "change": 2, "save": {"includeText": false}},
-                "definitionProvider": true,
-                "referencesProvider": true,
-                "hoverProvider": true,
-            },
-            "serverInfo": {"name": "fake-lsp"},
-        }),
+        "initialize" => {
+            if std::env::args().any(|a| a == SLOW_INIT_ARG) {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            let include_text = std::env::args().any(|a| a == SAVE_TEXT_ARG);
+            json!({
+                "capabilities": {
+                    "positionEncoding": "utf-16",
+                    "textDocumentSync": {
+                        "openClose": true,
+                        "change": 2,
+                        "save": {"includeText": include_text},
+                    },
+                    "definitionProvider": true,
+                    "referencesProvider": true,
+                    "hoverProvider": true,
+                },
+                "serverInfo": {"name": "fake-lsp"},
+            })
+        }
         "shutdown" => Value::Null,
         "fake/documentText" => match doc {
             Some(d) => json!({"text": d.text, "version": d.version, "errors": st.errors}),
