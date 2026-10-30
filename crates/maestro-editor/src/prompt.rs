@@ -195,7 +195,10 @@ pub fn insert_text(editor: &mut Editor, text: &str) {
 
 fn cancel(editor: &mut Editor, p: &Prompt) {
     if p.kind != PromptKind::Command {
-        editor.view_mut().selection = p.original.clone();
+        // Saved selections follow edits (see `track_text_change`); clamping
+        // again guards insert mode, where the dispatcher does not clamp.
+        let text = editor.doc().text().clone();
+        editor.view_mut().selection = p.original.clone().normalize(text.slice(..));
         editor.view_mut().top_line = p.original_top;
     }
 }

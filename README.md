@@ -24,7 +24,9 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. Age
 - Git: `+`, `~` and `-` signs in the gutter, the branch in the status line, and `:git-status` and `:worktrees` pickers.
 - An automation API for agents and scripts: `maestro --headless` (JSON-RPC on stdio) or `--listen <socket>` alongside the interactive editor, with version-checked edits. See [docs/automation.md](docs/automation.md).
 
-Not built yet: syntax highlighting, completion, and the agent features (M2). Those are tracked in the roadmap.
+- Tree-sitter syntax highlighting for Rust, Python, TOML, JSON, Markdown, JavaScript, TypeScript and C, and structural selection: `A-o` grows the selection to the enclosing syntax node, `A-i` shrinks it, `A-n`/`A-p` move between siblings.
+
+Not built yet: completion and the agent features (M2). Those are tracked in the roadmap.
 
 ## Build and run
 

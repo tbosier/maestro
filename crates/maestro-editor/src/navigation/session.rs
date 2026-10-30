@@ -264,7 +264,7 @@ pub fn restore(ed: &mut Editor) {
         severity = Severity::Warning;
         msg.push_str(&format!("; could not open: {}", failed.join(", ")));
     }
-    ed.set_status(severity, msg);
+    ed.add_status(severity, msg);
 }
 
 #[cfg(test)]

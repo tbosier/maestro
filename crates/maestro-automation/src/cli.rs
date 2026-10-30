@@ -45,7 +45,10 @@ pub fn start_listener(editor: &mut Editor, spec: &str) -> Result<ListenerGuard, 
     };
     let guard = crate::socket::listen(editor, &path)
         .map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
-    editor.info(format!("automation socket: {}", path.display()));
+    editor.add_status(
+        maestro_editor::Severity::Info,
+        format!("automation socket: {}", path.display()),
+    );
     Ok(guard)
 }
 

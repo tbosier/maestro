@@ -34,6 +34,28 @@ pub struct Preview {
     /// Shown instead of (or after) the lines: binary file, unreadable, too
     /// far into a large file.
     pub message: Option<String>,
+    /// What the preview was built from: a buffer's document version or a
+    /// file's modification time and length. A different stamp means the
+    /// content may have changed, so the preview is rebuilt.
+    pub stamp: u64,
+}
+
+/// The current stamp for `path`: the open buffer's version, else the file's
+/// metadata (no read).
+fn stamp_for(ed: &Editor, path: &Path) -> u64 {
+    if let Some(id) = ed.find_buffer_by_path(path) {
+        return ed.buffers[&id].doc.version().0;
+    }
+    std::fs::metadata(path)
+        .map(|m| {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64);
+            t ^ m.len().rotate_left(32) ^ (1 << 63)
+        })
+        .unwrap_or(0)
 }
 
 /// The file location an action points at.
@@ -57,6 +79,7 @@ fn window(target: Option<usize>) -> (usize, usize) {
 pub fn load_file(path: &Path, target: Option<usize>) -> Preview {
     let (from, to) = window(target);
     let mut preview = Preview {
+        stamp: 0,
         path: path.to_path_buf(),
         target,
         first_line: from,
@@ -170,6 +193,7 @@ fn load_rope(path: &Path, text: &maestro_core::Rope, target: Option<usize>) -> P
         })
         .collect();
     Preview {
+        stamp: 0,
         path: path.to_path_buf(),
         target,
         first_line: from,
@@ -196,17 +220,19 @@ pub fn refresh(ed: &mut Editor) {
         }
         return;
     };
+    let stamp = stamp_for(ed, &path);
     if picker
         .preview
         .as_ref()
-        .is_some_and(|p| p.path == path && p.target == target)
+        .is_some_and(|p| p.path == path && p.target == target && p.stamp == stamp)
     {
         return;
     }
-    let preview = match ed.find_buffer_by_path(&path) {
+    let mut preview = match ed.find_buffer_by_path(&path) {
         Some(id) => load_rope(&path, ed.buffers[&id].doc.text(), target),
         None => load_file(&path, target),
     };
+    preview.stamp = stamp;
     if let Some(p) = ed.picker.as_mut() {
         p.preview = Some(preview);
     }

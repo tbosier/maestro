@@ -151,3 +151,61 @@ fn headless_exits_cleanly_at_end_of_input() {
     let status = c.child.wait().unwrap();
     assert!(status.success(), "{status}");
 }
+
+#[test]
+fn headless_quit_leaves_the_interactive_session_alone() {
+    // A scripted run in a directory must not replace or delete the session
+    // an interactive editor saved there, and must not touch recent files.
+    let dir = std::env::temp_dir().join(format!("maestro-headless-session-{}", std::process::id()));
+    let state = dir.join("state");
+    let sessions = state.join("maestro").join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let saved = sessions.join("some-session.toml");
+    std::fs::write(&saved, "saved by an interactive run\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_maestro"))
+        .arg("--headless")
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("maestro starts");
+    let mut stdin = child.stdin.take().unwrap();
+    for line in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocol_version": "1.0"}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "document.open", "params": {"path": "notes.txt"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "editor.execute", "params": {"line": "q"}}),
+    ] {
+        writeln!(stdin, "{line}").unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "saved by an interactive run\n"
+    );
+    let names = |d: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(&state.join("maestro")),
+        vec!["sessions"],
+        "no recent list written"
+    );
+    assert_eq!(
+        names(&sessions),
+        vec!["some-session.toml"],
+        "no session written"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -905,6 +905,15 @@ fn on_reply(ed: &mut Editor, kind: RequestKind, token: u64, reply: Reply, files:
         ));
         return;
     }
+    // The user moved on to something else (a prompt, a picker, typing):
+    // jumping or opening a picker now would act on input meant for that.
+    if ed.prompt.is_some() || ed.picker.is_some() || ed.mode == crate::editor::Mode::Insert {
+        ed.info(format!(
+            "{} result dropped: arrived while you were typing or in a picker",
+            kind.label()
+        ));
+        return;
+    }
     if kind == RequestKind::Hover && ed.view().selection.primary().head != p.head {
         ed.info("hover result dropped: the cursor moved");
         return;
@@ -988,6 +997,17 @@ fn goto_location(ed: &mut Editor, uri: &str, range: &Value, files: &Preloaded) {
     // the background, so a location cannot make the editor block on a FIFO.
     if ed.find_buffer_by_path(&path).is_none() && !files.contains_key(&path) {
         ed.error(format!("cannot open {}", path.display()));
+        return;
+    }
+    // Re-check right before the synchronous open: the background read saw a
+    // regular file, but it could have been replaced since.
+    if ed.find_buffer_by_path(&path).is_none()
+        && !std::fs::metadata(&path).is_ok_and(|m| m.is_file())
+    {
+        ed.error(format!(
+            "cannot open {}: not a regular file",
+            path.display()
+        ));
         return;
     }
     ed.push_jump();

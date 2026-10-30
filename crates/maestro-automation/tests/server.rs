@@ -706,3 +706,15 @@ fn agent_edits_keep_the_syntax_tree_in_sync() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn language_server_ui_commands_are_refused_through_the_api() {
+    let (mut h, _) = Harness::with_text("fn a() {}\n");
+    for name in ["goto_definition", "goto_references", "hover"] {
+        let (code, msg, _) = h.fails("command.run", json!({"name": name}));
+        assert_eq!(code, ErrorCode::CommandFailed, "{name}");
+        assert!(msg.contains("was not run"), "{name}: {msg}");
+    }
+    // Ordinary commands still run afterwards.
+    h.ok("command.run", json!({"name": "move_char_right"}));
+}

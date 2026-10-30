@@ -6,7 +6,7 @@ Nothing in this document is built yet except where marked. It records the decisi
 
 `Document::apply_at_version(tx, expected_version, selection)` applies a transaction only if the document is still at the version the edit was computed against. Otherwise it returns `EditError::Stale` and changes nothing. Separately, every `ChangeSet` records the length of the document it was built for and refuses to apply to any other length.
 
-Any edit produced away from the keyboard (a language server rename, an agent patch, an automation call) must go through `apply_at_version`.
+Edits produced away from the keyboard and computed against a known version must go through `apply_at_version`. The automation API's `document.apply_edit` does. Its `command.run` and `editor.execute` do not: they run editor commands on the current text, as a key press would, with no version check and no entry in the edit history (see `docs/automation.md`).
 
 ## Planned
 

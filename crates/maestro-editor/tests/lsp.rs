@@ -58,6 +58,10 @@ fn main() {
             hover_dropped_when_the_cursor_moved,
         ),
         ("save_sends_text_when_asked", save_sends_text_when_asked),
+        (
+            "definition_reply_dropped_while_a_prompt_is_open",
+            definition_reply_dropped_while_a_prompt_is_open,
+        ),
     ]);
 }
 
@@ -565,4 +569,24 @@ fn save_sends_text_when_asked() {
         .collect();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0]["params"]["text"], "xfn main() {}\n");
+}
+
+fn definition_reply_dropped_while_a_prompt_is_open() {
+    // A slow reply must not switch files under a half-typed `:` command.
+    let mut f = open_synced("prompt", "// @slow\nfn helper() {}\nhelper();\n");
+    let ed = &mut f.ed;
+    run(ed, "3G");
+    let doc = ed.view().doc;
+    let before = head(ed);
+    run(ed, "gd:%s/helper/other/g");
+    assert!(
+        wait_until(ed, |ed| status(ed)
+            .contains("arrived while you were typing")),
+        "status {:?}",
+        ed.status
+    );
+    assert_eq!(ed.view().doc, doc);
+    assert_eq!(head(ed), before, "did not jump while the prompt was open");
+    assert!(ed.prompt.is_some(), "the user's prompt is still open");
+    run(ed, "<esc>");
 }

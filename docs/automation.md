@@ -12,7 +12,7 @@ Every message is one JSON object on one line (newline-delimited JSON). Responses
 
 ### Headless: `maestro --headless`
 
-Runs an editor with no terminal. Requests arrive on stdin, responses and notifications go to stdout, and diagnostics go to stderr. The process exits with status 0 at end of input or after `editor.quit` (or a `:q` through `editor.execute`). File arguments open as usual, and the user config loads unless `--clean` is given.
+Runs an editor with no terminal. Requests arrive on stdin, responses and notifications go to stdout, and diagnostics go to stderr. The process exits with status 0 at end of input or after `editor.quit` (or a `:q` through `editor.execute`). File arguments open as usual, and the user config loads unless `--clean` is given. Headless runs start no language servers and read or write no session or recent-files state. In the interactive editor, `editor.quit` saves the session as `:q` does.
 
 ```
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":"1.0"}}' | maestro --headless --clean
@@ -187,7 +187,7 @@ No params. Result: `buffers` (`id`, `path`, `name`, `version`, `modified`, `read
 
 ### command.run
 
-Params: `name` (a registry command or a `:` command name), `count` (optional, at least 1). Runs on the focused view with the same bookkeeping a key press gets (the undo group closes outside insert mode). The status line is cleared first. Result: `mode` and `status`. While the user is in the middle of input (a prompt, a picker, a pending typed character, a count or a partial key sequence) the command is not run and the request fails with `-32016`; the user's input is left as it was. Commands are not version-checked and are not recorded in `document.history`. A command that reports an error, or that opens a prompt, a picker or waits for a typed character (`f`, `r`, `/`), fails with `-32016`; the interactive part is canceled with Esc so the editor is not left waiting.
+Params: `name` (a registry command or a `:` command name), `count` (optional, at least 1). Runs on the focused view with the same bookkeeping a key press gets (the undo group closes outside insert mode). The status line is cleared first. Result: `mode` and `status`. While the user is in the middle of input (a prompt, a picker, a pending typed character, a count or a partial key sequence) the command is not run and the request fails with `-32016`; the user's input is left as it was. Commands are not version-checked and are not recorded in `document.history`. A command that reports an error, or that opens a prompt, a picker or waits for a typed character (`f`, `r`, `/`), fails with `-32016`; the interactive part is canceled with Esc so the editor is not left waiting. `goto_definition`, `goto_references` and `hover` are refused up front with `-32016`: their result arrives later from a language server as a jump, picker or popup, after the response, where it would block later requests.
 
 ```
 --> {"jsonrpc":"2.0","id":11,"method":"command.run","params":{"name":"goto_line_end"}}

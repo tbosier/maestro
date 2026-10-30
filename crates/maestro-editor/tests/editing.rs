@@ -562,3 +562,71 @@ fn regex_prompt_survives_a_reload_that_shrinks_the_file() {
     run(&mut ed, "x<ret>");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ----- regressions from the integration review ------------------------------
+
+#[test]
+fn reload_while_an_insert_mode_regex_prompt_is_open_does_not_crash() {
+    let dir = std::env::temp_dir().join(format!("maestro-ins-prompt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.txt");
+    std::fs::write(&path, "a long line of text\n").unwrap();
+    let mut config = Config::default();
+    config
+        .keys
+        .entry("insert".into())
+        .or_default()
+        .insert("C-f".into(), "select_regex".into());
+    let mut ed = Editor::new(config, Rect::new(0, 0, 80, 24));
+    ed.open(&path).unwrap();
+    run(&mut ed, "A<C-f>");
+    assert!(ed.prompt.is_some());
+    std::fs::write(&path, "x\n").unwrap();
+    ed.tick(std::time::Instant::now());
+    assert_eq!(text(&ed), "x\n");
+    run(&mut ed, "<esc>");
+    run(&mut ed, "<ret>");
+    assert!(ed.doc().text().len_chars() >= 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_buffer_shown_again_keeps_its_cursor_on_the_same_char_after_edits() {
+    let mut ed = editor("abcdefghij\n");
+    let a = ed.view().doc;
+    run(&mut ed, "5l"); // on 'f'
+    run(&mut ed, "<C-w>v"); // second view on the same buffer
+    let b = ed.add_document(Document::from_text("other\n"));
+    ed.switch_to(b); // caches A's cursor (offset 5)
+    run(&mut ed, "<C-w>w"); // the other view, still on A
+    run(&mut ed, "ggi\n<esc>"); // insert a line break before 'f'
+    run(&mut ed, "<C-w>w");
+    ed.switch_to(a);
+    let p = ed.primary().head;
+    assert_eq!(ed.doc().text().char(p), 'f');
+}
+
+#[test]
+fn executing_a_command_line_keeps_the_normal_mode_invariant() {
+    let mut ed = editor("abcdef");
+    run(&mut ed, "A");
+    ed.execute_line("normal_mode");
+    assert_eq!(ed.mode, Mode::Normal);
+    assert!(ed.primary().head < 6);
+}
+
+#[test]
+fn external_reload_keeps_the_cursor_on_its_text() {
+    let dir = std::env::temp_dir().join(format!("maestro-reload-keep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.txt");
+    std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").unwrap();
+    let mut ed = editor("");
+    ed.open(&path).unwrap();
+    run(&mut ed, "2jl"); // on the 'a' after 'g' in gamma
+    std::fs::write(&path, "alpha\nbeta\ngamma\nDELTA changed\n").unwrap();
+    ed.tick(std::time::Instant::now());
+    assert_eq!(text(&ed), "alpha\nbeta\ngamma\nDELTA changed\n");
+    assert_eq!(ed.primary().head, 12, "cursor did not move to the top");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

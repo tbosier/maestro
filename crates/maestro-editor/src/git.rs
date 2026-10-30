@@ -189,6 +189,11 @@ pub fn refresh(ed: &mut Editor) {
             Some(ReadOnlyReason::Binary | ReadOnlyReason::InvalidEncoding)
         );
         if unreadable || buf.doc.text().len_bytes() > MAX_DIFF_BYTES {
+            // Signs computed before the buffer crossed the limit would point
+            // at lines that have since moved; show none instead.
+            if let Some(entry) = ed.git.docs.get_mut(&id) {
+                entry.signs = Default::default();
+            }
             continue;
         }
         let entry = ed.git.docs.entry(id).or_default();

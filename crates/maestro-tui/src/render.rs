@@ -177,9 +177,19 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
             );
         }
         draw_gutter(ed, s, area.x, y, gutter, line, primary_line, focused);
+        // One sign cell, three sources. Errors and warnings win; a Git
+        // change wins over an info or hint, which is drawn only when the
+        // line has no Git sign.
+        let diag = signs.get(&line).copied();
+        let urgent = |sev: &DiagnosticSeverity| {
+            matches!(sev, DiagnosticSeverity::Error | DiagnosticSeverity::Warning)
+        };
+        if let Some(sev) = diag.filter(|d| !urgent(d)) {
+            draw_diagnostic_sign(ed, s, area.x, y, gutter, sev);
+        }
         draw_git_sign(ed, s, area.x, y, gutter, view, line, primary_line);
-        if let Some(sev) = signs.get(&line) {
-            draw_diagnostic_sign(ed, s, area.x, y, gutter, *sev);
+        if let Some(sev) = diag.filter(urgent) {
+            draw_diagnostic_sign(ed, s, area.x, y, gutter, sev);
         }
 
         // Text.
@@ -1108,5 +1118,40 @@ mod tests {
         assert_eq!(wrap("aa bb cc", 5), ["aa bb", "cc"]);
         assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
         assert_eq!(wrap("", 3), [""]);
+    }
+
+    #[test]
+    fn errors_win_the_sign_cell_and_git_wins_over_hints() {
+        use maestro_editor::git::SignMap;
+        let mut ed = editor("a\nb\nc\n");
+        let doc = ed.view().doc;
+        // Lines 0 and 1 changed.
+        ed.git
+            .set_signs(doc, SignMap::diff("A\nB\nc\n", "a\nb\nc\n"));
+        let diag = |from, severity| Diagnostic {
+            from,
+            to: from + 1,
+            severity,
+            message: "m".into(),
+            source: None,
+        };
+        ed.lsp.set_diagnostics(
+            doc,
+            vec![
+                diag(0, DiagnosticSeverity::Error),
+                diag(2, DiagnosticSeverity::Hint),
+                diag(4, DiagnosticSeverity::Hint),
+            ],
+        );
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        let top = ed.view().area.y;
+        assert_eq!(s.cell(0, top).unwrap().symbol, "E", "error over a git sign");
+        assert_eq!(
+            s.cell(0, top + 1).unwrap().symbol,
+            "~",
+            "git sign over a hint"
+        );
+        assert_eq!(s.cell(0, top + 2).unwrap().symbol, "H", "hint alone shows");
     }
 }

@@ -561,15 +561,7 @@ impl Server {
         let s = new_text.slice(..);
         let after = before.map(&cs).normalize(s);
         buf.doc.commit(&after);
-        buf.last_selection = buf.last_selection.map(&cs).normalize(s).clamp_normal(s);
         let version = buf.doc.version().0;
-        // An open prompt keeps the selection it started from (restored on
-        // Esc, and the base of regex previews); move it with the text too.
-        if ed.views.get(&focused).is_some_and(|v| v.doc == id)
-            && let Some(prompt) = ed.prompt.as_mut()
-        {
-            prompt.original = prompt.original.map(&cs).normalize(s).clamp_normal(s);
-        }
         for v in ed.views.values_mut().filter(|v| v.doc == id) {
             let mapped = v.selection.map(&cs).normalize(s);
             v.selection = if v.id == focused && insert_mode {
@@ -579,8 +571,9 @@ impl Server {
             };
         }
 
-        // Keep the syntax tree and any language server in step with the text,
-        // exactly as edits from the keyboard do.
+        // Keep the syntax tree, any language server, the buffer's cached
+        // selection, an open prompt's saved selection, marks and jumps in step
+        // with the text, exactly as edits from the keyboard do.
         ed.on_text_changed(id, &old_text, std::slice::from_ref(&cs));
         maestro_editor::lsp::document_changed(ed, id, std::slice::from_ref(&cs));
 
@@ -752,6 +745,10 @@ fn execute(ed: &mut Editor, p: p::ExecuteParams) -> Res<p::CommandResult> {
     run_noninteractive(ed, &format!(":{line}"), |ed| ed.execute_line(&line))
 }
 
+/// Commands whose result arrives asynchronously as UI (a jump, a picker or a
+/// popup). Refused by `command.run`.
+const ASYNC_UI_COMMANDS: &[&str] = &["goto_definition", "goto_references", "hover"];
+
 fn run_command(ed: &mut Editor, p: p::CommandRunParams) -> Res<p::CommandResult> {
     let name = p.name.as_str();
     if maestro_editor::commands::lookup(name).is_none()
@@ -760,6 +757,17 @@ fn run_command(ed: &mut Editor, p: p::CommandRunParams) -> Res<p::CommandResult>
         return Err(err(
             ErrorCode::NotFound,
             format!("no command named {name:?}"),
+        ));
+    }
+    // These answer later, from a language server, by moving the user's
+    // cursor or opening a picker or popup. Through the API that result would
+    // arrive after the response and block later requests behind a picker.
+    if ASYNC_UI_COMMANDS.contains(&name) {
+        return Err(err(
+            ErrorCode::CommandFailed,
+            format!(
+                "{name} shows its result in the editor later, which the automation API cannot wait for; it was not run"
+            ),
         ));
     }
     if p.count == Some(0) {
@@ -795,6 +803,10 @@ fn quit(ed: &mut Editor, p: p::QuitParams) -> Res<p::QuitResult> {
             ),
         )
         .with_data(modified));
+    }
+    // Quitting through the API saves the session the same way :q does.
+    if let Err(e) = maestro_editor::navigation::session::save(ed) {
+        ed.set_status(maestro_editor::Severity::Warning, e);
     }
     ed.should_quit = true;
     Ok(p::QuitResult {})
@@ -863,6 +875,8 @@ fn open(ed: &mut Editor, p: p::DocumentOpenParams) -> Res<p::DocumentOpenResult>
     if p.focus {
         ed.switch_to(id);
     }
+    // Start or notify language servers as opening from the keyboard does.
+    maestro_editor::lsp::reconcile(ed);
     let doc = &ed.buffers[&id].doc;
     Ok(p::DocumentOpenResult {
         doc: id.0,
@@ -915,10 +929,13 @@ fn save(ed: &mut Editor, p: p::DocumentSaveParams) -> Res<p::DocumentSaveResult>
             if let Some(dir) = recovery_dir {
                 maestro_editor::recovery::remove(&dir, &path, &session);
             }
+            let version = buf.doc.version().0;
+            // Same language-server notification as :w.
+            maestro_editor::lsp::document_saved(ed, id);
             Ok(p::DocumentSaveResult {
                 doc: p.doc,
                 path: path.display().to_string(),
-                version: buf.doc.version().0,
+                version,
             })
         }
         Err(SaveError::NoPath) => Err(invalid("document has no path; it is a scratch buffer")),

@@ -405,16 +405,7 @@ impl Document {
             )));
         }
         self.commit(current_selection);
-        let new_text = loaded.text.to_string();
-        let changes = ChangeSet::from_changes(
-            self.text.len_chars(),
-            [crate::change::Change::replace(
-                0,
-                self.text.len_chars(),
-                new_text,
-            )],
-        )
-        .expect("whole-document replacement is always valid");
+        let changes = differing_region(&self.text, &loaded.text);
         let was_read_only = self.read_only.take();
         let tx = Transaction::new(changes.clone());
         let result = self.apply(&tx, current_selection);
@@ -430,6 +421,38 @@ impl Document {
         self.saved_revision = Some(self.history.current());
         Ok(changes)
     }
+}
+
+/// A change set that turns `old` into `new` by replacing only the region
+/// between their common prefix and common suffix. Positions outside that
+/// region (cursors, marks, other views) keep their place across a reload,
+/// and incremental consumers (syntax trees, language servers) see a small
+/// edit instead of a whole-file replacement.
+pub fn differing_region(old: &Rope, new: &Rope) -> ChangeSet {
+    let (old_len, new_len) = (old.len_chars(), new.len_chars());
+    let prefix = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let max_suffix = (old_len - prefix).min(new_len - prefix);
+    let suffix = old
+        .chars_at(old_len)
+        .reversed()
+        .zip(new.chars_at(new_len).reversed())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let replacement = new.slice(prefix..new_len - suffix).to_string();
+    ChangeSet::from_changes(
+        old_len,
+        [crate::change::Change::replace(
+            prefix,
+            old_len - suffix,
+            replacement,
+        )],
+    )
+    .expect("a single in-bounds replacement is always valid")
 }
 
 #[cfg(test)]
@@ -531,6 +554,29 @@ mod tests {
         doc.undo(&Selection::point(0)).unwrap();
         assert_eq!(doc.text().to_string(), "zero one\n");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn differing_region_replaces_only_what_changed() {
+        let old = Rope::from_str("one\ntwo\nthree\n");
+        let new = Rope::from_str("one\nTWO!\nthree\n");
+        let cs = differing_region(&old, &new);
+        assert_eq!(
+            cs.changes(),
+            vec![crate::change::Change::replace(4, 7, "TWO!")]
+        );
+        let mut t = old.clone();
+        cs.apply(&mut t).unwrap();
+        assert_eq!(t, new);
+        // A position after the change keeps its place relative to the text.
+        assert_eq!(cs.map_pos(10, crate::change::Assoc::After), 11);
+        // Overlapping prefix and suffix ("aa" to "aaa") still round-trip.
+        let (o, n) = (Rope::from_str("aa"), Rope::from_str("aaa"));
+        let mut t = o.clone();
+        differing_region(&o, &n).apply(&mut t).unwrap();
+        assert_eq!(t, n);
+        let same = differing_region(&n, &n);
+        assert!(same.is_empty());
     }
 
     #[test]

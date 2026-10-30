@@ -51,7 +51,7 @@ pub enum MouseKind {
     ScrollDown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Info,
     Warning,
@@ -339,6 +339,19 @@ impl Editor {
 
     pub fn set_status(&mut self, severity: Severity, msg: impl Into<String>) {
         self.status = Some((severity, msg.into()));
+    }
+
+    /// Sets a status message without hiding a more important one already
+    /// showing: both are kept, the more severe first. Used at startup, where
+    /// several sources report at once (recovery data, session restore, the
+    /// automation socket, config errors).
+    pub fn add_status(&mut self, severity: Severity, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.status = Some(match self.status.take() {
+            Some((old_sev, old)) if old_sev >= severity => (old_sev, format!("{old}; {msg}")),
+            Some((_, old)) => (severity, format!("{msg}; {old}")),
+            None => (severity, msg),
+        });
     }
 
     pub fn info(&mut self, msg: impl Into<String>) {
@@ -1228,10 +1241,58 @@ impl Editor {
         ran
     }
 
+    /// Bookkeeping every text change needs, whatever caused it: the buffer's
+    /// cached selection, an open prompt's saved selection, marks and jump
+    /// entries follow the edit, and the recovery idle timer restarts. View
+    /// selections are mapped by the caller (it knows which view is acting).
+    /// Called from [`Editor::on_text_changed`], which every path calls.
+    pub fn track_text_change(&mut self, id: DocumentId, changes: &[maestro_core::ChangeSet]) {
+        let focused_doc = self.views.get(&self.focus).map(|v| v.doc);
+        let Some(buf) = self.buffers.get_mut(&id) else {
+            return;
+        };
+        buf.last_edit = Some(Instant::now());
+        let text = buf.doc.text().clone();
+        let s = text.slice(..);
+        let map = |sel: &Selection| {
+            changes
+                .iter()
+                .fold(sel.clone(), |sel, cs| sel.map(cs))
+                .normalize(s)
+        };
+        buf.last_selection = map(&buf.last_selection).clamp_normal(s);
+        if focused_doc == Some(id)
+            && let Some(p) = self.prompt.as_mut()
+        {
+            p.original = map(&p.original);
+        }
+        for (doc, pos) in self.marks.values_mut() {
+            if *doc == id {
+                *pos = changes
+                    .iter()
+                    .fold(*pos, |p, cs| cs.map_pos(p, maestro_core::Assoc::Before))
+                    .min(text.len_chars());
+            }
+        }
+        for view in self.views.values_mut() {
+            for (doc, sel) in &mut view.jumps {
+                if *doc == id {
+                    *sel = map(sel);
+                }
+            }
+        }
+    }
+
     /// Runs a `:` command line, as if typed after `:`.
     pub fn execute_line(&mut self, line: &str) {
         crate::typed::execute_line(self, line);
         self.commit();
+        // Same invariant as after a key: no normal-mode cursor past the text.
+        if self.mode != Mode::Insert {
+            let text = self.doc().text().clone();
+            let sel = self.view().selection.clamp_normal(text.slice(..));
+            self.view_mut().selection = sel;
+        }
         self.ensure_cursor_visible();
     }
 

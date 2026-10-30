@@ -353,6 +353,7 @@ impl Editor {
     /// text before `changes` were applied, in order. Every code path that
     /// changes a document's text must call this.
     pub fn on_text_changed(&mut self, id: DocumentId, old: &Rope, changes: &[ChangeSet]) {
+        self.track_text_change(id, changes);
         let Some(buf) = self.buffers.get_mut(&id) else {
             return;
         };

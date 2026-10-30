@@ -145,12 +145,15 @@ fn main() -> ExitCode {
     };
     let mut editor = Editor::new(config, Rect::new(0, 1, w, h.saturating_sub(2)));
     editor.recovery_dir = maestro_config::config::state_dir().map(|d| d.join("recovery"));
-    // Language servers start for opened files, except when only measuring
-    // startup.
-    editor.lsp.enabled = !args.first_frame_only;
-    let sessions = !args.clean && editor.config.editor.restore_session;
-    // --clean keeps nothing: no session and no recent-files history on disk.
-    let nav_state = if args.clean {
+    // Language servers start for opened files in the interactive editor
+    // only: not when measuring startup, and not headless, where unattended
+    // runs must not start programs that can execute repository code.
+    editor.lsp.enabled = !args.first_frame_only && !args.headless;
+    // Sessions and recent files belong to interactive use. Headless runs
+    // neither read nor write them, so a scripted quit cannot replace the
+    // directory's saved session. --clean keeps nothing on disk either.
+    let sessions = !args.clean && !args.headless && editor.config.editor.restore_session;
+    let nav_state = if args.clean || args.headless {
         None
     } else {
         maestro_config::config::state_dir()
@@ -186,7 +189,7 @@ fn main() -> ExitCode {
         maestro_editor::navigation::session::restore(&mut editor);
     }
     if !startup_errors.is_empty() {
-        editor.set_status(Severity::Error, startup_errors.join("; "));
+        editor.add_status(Severity::Error, startup_errors.join("; "));
     }
 
     let opts = maestro_tui::RunOptions {

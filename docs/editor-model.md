@@ -66,7 +66,13 @@ There is no separate Helix profile yet. The Maestro profile already follows Heli
 - A self-invoking macro stops after 16 levels of nesting with an error.
 - Text pasted while a prompt or picker is open goes into the prompt or picker, never into the document.
 
+## The sign column
+
+The first gutter cell holds one sign. An error or warning diagnostic letter (`E`, `W`) takes it first; otherwise a Git change (`+`, `~`, `-`); otherwise an info or hint letter (`I`, `H`). The diagnostic message for the cursor line is in the status line either way.
+
 ## Known limitations
+
+- A reload (automatic or `:reload`) replaces only the region between the old and new text's common prefix and suffix. Cursors, marks and jump entries outside that region keep their place; ones inside it move to its start.
 
 - Bracketed paste is applied directly and is not recorded by macros or `.`.
 - `:open` and `:w` take one path; it may contain spaces.
