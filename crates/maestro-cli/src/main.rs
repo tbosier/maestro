@@ -108,6 +108,9 @@ fn main() -> ExitCode {
     let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut editor = Editor::new(config, Rect::new(0, 1, w, h.saturating_sub(2)));
     editor.recovery_dir = maestro_config::config::state_dir().map(|d| d.join("recovery"));
+    // Language servers start for opened files, except when only measuring
+    // startup.
+    editor.lsp.enabled = !args.first_frame_only;
     startup_errors.extend(editor.keymaps.errors.clone());
 
     for (path, line) in &args.files {
