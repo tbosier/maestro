@@ -2,6 +2,7 @@
 //! events and draws frames; all editing logic lives in `maestro-editor`.
 
 pub mod clipboard;
+mod preview;
 pub mod render;
 pub mod surface;
 pub mod terminal;

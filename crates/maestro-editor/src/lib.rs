@@ -15,6 +15,7 @@ pub mod layout;
 pub mod lsp;
 pub mod lsp_commands;
 pub mod motion;
+pub mod navigation;
 pub mod picker;
 pub mod prompt;
 pub mod recovery;

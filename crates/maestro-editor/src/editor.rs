@@ -185,6 +185,8 @@ pub struct Editor {
     pub git: crate::git::GitState,
     /// Language servers, synced documents and diagnostics.
     pub lsp: crate::lsp::Lsp,
+    /// Sessions, recent files and the state they are stored in.
+    pub navigation: crate::navigation::NavState,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -232,6 +234,7 @@ impl Editor {
             macro_depth: 0,
             git: crate::git::GitState::default(),
             lsp: Default::default(),
+            navigation: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -458,6 +461,7 @@ impl Editor {
         };
         self.switch_to(id);
         crate::lsp::reconcile(self);
+        crate::navigation::recent::record(self, &path);
         Ok(id)
     }
 

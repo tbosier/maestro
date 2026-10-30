@@ -43,6 +43,7 @@ pub static TABLES: &[&[Command]] = &[
     COMMANDS,
     crate::git::COMMANDS,
     crate::lsp_commands::COMMANDS,
+    crate::navigation::COMMANDS,
 ];
 
 /// Iterates every registered command.
@@ -174,10 +175,8 @@ commands! {
     jump_view_down => "Focus the view below",
     buffer_next => "Show the next buffer",
     buffer_prev => "Show the previous buffer",
-    file_picker => "Find a file in the working directory",
     buffer_picker => "Pick an open buffer",
     command_palette => "Search every command",
-    global_search => "Search the workspace (not built yet)",
     toggle_focus_mode => "Toggle focus mode (text only)",
 }
 
@@ -1815,74 +1814,6 @@ fn buffer_prev(ed: &mut Editor) {
     cycle_buffer(ed, -1);
 }
 
-/// Directories never descended into by the simple file finder.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    ".hg",
-    ".svn",
-    ".cargo-home",
-];
-const FILE_LIMIT: usize = 50_000;
-
-/// Lists files under `root`, skipping hidden and build directories. A
-/// stand-in until the gitignore-aware background finder lands; it stops at
-/// [`FILE_LIMIT`] files and says so.
-pub fn list_files(root: &std::path::Path) -> (Vec<std::path::PathBuf>, bool) {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-        entries.sort_by_key(|e| e.file_name());
-        for e in entries {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
-                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref()) {
-                    stack.push(e.path());
-                }
-            } else if ft.is_file() || ft.is_symlink() {
-                out.push(e.path());
-                if out.len() >= FILE_LIMIT {
-                    return (out, true);
-                }
-            }
-        }
-    }
-    (out, false)
-}
-
-fn file_picker(ed: &mut Editor) {
-    let root = ed.cwd.clone();
-    let (files, truncated) = list_files(&root);
-    let items = files
-        .into_iter()
-        .map(|p| {
-            let label = p
-                .strip_prefix(&root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .into_owned();
-            PickerItem {
-                label,
-                detail: String::new(),
-                action: PickerAction::OpenFile(p),
-            }
-        })
-        .collect();
-    let title = if truncated {
-        format!("files (first {FILE_LIMIT})")
-    } else {
-        "files".to_string()
-    };
-    ed.picker = Some(Picker::new(title, items));
-}
-
 fn buffer_picker(ed: &mut Editor) {
     let current = ed.view().doc;
     let items = ed
@@ -1927,13 +1858,6 @@ fn command_palette(ed: &mut Editor) {
         });
     }
     ed.picker = Some(Picker::new("commands", items));
-}
-
-fn global_search(ed: &mut Editor) {
-    ed.set_status(
-        Severity::Warning,
-        "workspace search is not built yet (ROADMAP M1); use :e and / for now",
-    );
 }
 
 fn toggle_focus_mode(ed: &mut Editor) {

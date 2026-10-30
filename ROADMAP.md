@@ -19,15 +19,15 @@ Verified two ways on October 30, 2026:
 | Multiple selections | done |
 | Multiple buffers | done |
 | Splits | done |
-| Fuzzy file finder | partial: a synchronous walker capped at 50,000 files that skips hidden and build directories; not gitignore-aware |
-| Search and replace | done in the buffer; workspace search not started |
+| Fuzzy file finder | done: background walk that respects `.gitignore`, `.ignore`, `.git/info/exclude` and Git's global excludes and skips hidden files; results stream into the picker; file preview |
+| Search and replace | done in the buffer; workspace search done (`space /`, `:grep`): regex with smart case, binary and ignored files skipped, 10,000-result cap, preview of the match line; it reads files from disk, so unsaved edits in open buffers are not searched |
 | Tree-sitter highlighting | not started |
 | LSP diagnostics and navigation | partial: diagnostics (sign column, range underline, cursor-line message, `]d`/`[d`, `space d`/`space D` pickers), goto definition (`gd`), references (`gr`), hover (`space k`), incremental sync, crash reporting with `:lsp-restart`. Checked against the fake test server and, by hand in tmux, against rust-analyzer on this repo. Not started: completion, code actions, rename, formatting, signature help |
 | Configuration | done |
-| Session restoration | not started |
+| Session restoration | partial: open files, each one's cursor and the focused file are saved on quit and restored per directory; splits, scroll positions and multiple selections are not restored. Recent files across sessions (`space r`) |
 | Crash-safe editing | done: atomic saves, external-change detection, recovery journal |
 
-Acceptance (use Maestro to navigate and modify its own source without another editor) has not been attempted. It needs highlighting and workspace search first.
+Acceptance (use Maestro to navigate and modify its own source without another editor) has not been attempted. It needs syntax highlighting first.
 
 ## M2: agent development environment (partial)
 

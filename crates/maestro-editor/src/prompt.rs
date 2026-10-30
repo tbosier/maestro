@@ -10,10 +10,16 @@ use crate::key::{KeyCode, KeyEvent};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Command,
-    Search { backward: bool },
+    Search {
+        backward: bool,
+    },
     SelectRegex,
     SplitRegex,
-    Keep { remove: bool },
+    Keep {
+        remove: bool,
+    },
+    /// Workspace search; Enter starts it.
+    GlobalSearch,
 }
 
 impl PromptKind {
@@ -26,6 +32,7 @@ impl PromptKind {
             PromptKind::SplitRegex => "split: ",
             PromptKind::Keep { remove: false } => "keep: ",
             PromptKind::Keep { remove: true } => "remove: ",
+            PromptKind::GlobalSearch => "search workspace: ",
         }
     }
 
@@ -217,6 +224,12 @@ fn finish(editor: &mut Editor, p: Prompt) {
             editor.push_jump();
             crate::commands::search_next_impl(editor, backward);
         }
+        PromptKind::GlobalSearch => {
+            editor.view_mut().selection = p.original;
+            if let Err(e) = crate::navigation::grep::start(editor, &p.input) {
+                editor.set_status(Severity::Error, e);
+            }
+        }
         PromptKind::SelectRegex | PromptKind::SplitRegex | PromptKind::Keep { .. } => {
             if let Some(f) = p.feedback {
                 editor.set_status(Severity::Error, f);
@@ -238,6 +251,13 @@ fn preview(editor: &mut Editor, p: &mut Prompt) {
     p.original = p.original.clone().normalize(text.slice(..));
     editor.view_mut().selection = p.original.clone();
     if p.input.is_empty() {
+        return;
+    }
+    if p.kind == PromptKind::GlobalSearch {
+        // Only validate here; the search itself starts on Enter.
+        if let Err(e) = crate::navigation::grep::compile(&p.input) {
+            p.feedback = Some(e);
+        }
         return;
     }
     let re = match crate::search::compile(&p.input) {
@@ -298,7 +318,7 @@ fn preview(editor: &mut Editor, p: &mut Prompt) {
                 None => p.feedback = Some("no selections would remain".into()),
             }
         }
-        PromptKind::Command => {}
+        PromptKind::Command | PromptKind::GlobalSearch => {}
     }
 }
 

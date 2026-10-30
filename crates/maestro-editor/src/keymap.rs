@@ -376,6 +376,9 @@ impl Keymaps {
         for (k, group, c) in crate::lsp_commands::DEFAULT_KEYS {
             g(&mut normal, k, group, c);
         }
+        for (k, c) in crate::navigation::DEFAULT_KEYS {
+            g(&mut normal, k, "space", c);
+        }
 
         if profile == Profile::Vim {
             // A small, honest subset of Vim's grammar layered on the

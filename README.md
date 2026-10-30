@@ -12,13 +12,19 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. Age
 - Registers (one value per selection), the system clipboard, macros (`Q` records, `q` replays), dot repeat, counts, marks and a jump list.
 - Search with live preview, `n`/`N`, and `:s/pat/rep/g` or `:%s` substitution with capture groups.
 - Text objects and surround: `mi(`, `ma"`, `ms[`, `mr([`, `md{`, `mm` for the matching bracket.
-- Splits (`C-w v`, `C-w s`), multiple buffers, a buffer picker, a simple file finder, and a command palette listing every command with its key.
+- Splits (`C-w v`, `C-w s`), multiple buffers, a buffer picker and a command palette listing every command with its key.
+- A file finder (`space f`) that respects `.gitignore`, `.ignore` and Git's global excludes and fills in on a background thread, so you can type while a large tree is still being listed. Workspace search (`space /` or `:grep <regex>`) streams `path:line:col` results; accepting one opens the file there. Both pickers preview the file on the right when the terminal is at least 100 columns wide.
+- Session restore: quitting saves the open files and cursors for the directory; starting `maestro` there with no file arguments reopens them. `space r` lists recently opened files.
 - Detects files changed on disk (metadata, file identity, and a content hash at save time). A clean buffer reloads; a modified one warns and refuses to overwrite until you choose.
 - Crash recovery: unsaved changes are journaled after two idle seconds, one journal per editor session, and `:recover` in a later session brings them back.
 - UTF-8, UTF-8 with BOM, and UTF-16 files with a BOM. LF and CRLF are preserved. Binary files and invalid UTF-8 open read-only.
 - The Duskfox theme from nightfox.nvim, with every interface text pair checked for WCAG AA contrast by a test.
 
-Not built yet: syntax highlighting, language servers, workspace search, Git, agents. Those are tracked in the roadmap.
+- Language servers (rust-analyzer, pyright or pylsp, typescript-language-server, clangd when installed): diagnostics in the gutter and status line, `]d`/`[d`, `gd`, `gr` and hover on `space k`. No completion yet.
+- Git: `+`, `~` and `-` signs in the gutter, the branch in the status line, and `:git-status` and `:worktrees` pickers.
+- An automation API for agents and scripts: `maestro --headless` (JSON-RPC on stdio) or `--listen <socket>` alongside the interactive editor, with version-checked edits. See [docs/automation.md](docs/automation.md).
+
+Not built yet: syntax highlighting, completion, and the agent features (M2). Those are tracked in the roadmap.
 
 ## Build and run
 
@@ -51,6 +57,7 @@ cargo build --release
 | `/ ? n N *` | search |
 | `.` | repeat the last change |
 | `gg G` / `3G` / `:42` | go to the start, end, or a line |
+| `space f` / `space /` / `space r` | find a file / search the workspace / recent files |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
 
@@ -68,12 +75,13 @@ line-numbers = "absolute"  # relative, off
 scrolloff = 5
 recovery-interval-secs = 2 # 0 turns crash recovery off
 mouse = true
+restore-session = true     # reopen the last session's files in this directory
 
 [keys.normal]
 "space w" = "write"
 ```
 
-Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config.
+Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config, and reads and writes neither the session nor the recent-files list.
 
 ## Documentation
 

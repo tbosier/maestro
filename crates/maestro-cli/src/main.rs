@@ -11,7 +11,8 @@ usage: maestro [options] [file[:line]]...
 
 options:
   -c, --config <path>   use this config file instead of the default
-      --clean           ignore the user config
+      --clean           ignore the user config; do not read or write the
+                        session or the recent-files list
   -h, --help            show this help
       --headless        no terminal: serve the automation API on stdin/stdout
       --listen <path>   also serve the automation API on a Unix socket
@@ -147,6 +148,14 @@ fn main() -> ExitCode {
     // Language servers start for opened files, except when only measuring
     // startup.
     editor.lsp.enabled = !args.first_frame_only;
+    let sessions = !args.clean && editor.config.editor.restore_session;
+    // --clean keeps nothing: no session and no recent-files history on disk.
+    let nav_state = if args.clean {
+        None
+    } else {
+        maestro_config::config::state_dir()
+    };
+    maestro_editor::navigation::configure(&mut editor, nav_state, sessions);
     startup_errors.extend(editor.keymaps.errors.clone());
 
     for (path, line) in &args.files {
@@ -173,6 +182,9 @@ fn main() -> ExitCode {
         },
         None => None,
     };
+    if sessions && args.files.is_empty() {
+        maestro_editor::navigation::session::restore(&mut editor);
+    }
     if !startup_errors.is_empty() {
         editor.set_status(Severity::Error, startup_errors.join("; "));
     }
