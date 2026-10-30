@@ -112,6 +112,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if args.headless && args.listen.is_some() {
+        eprintln!("maestro: --headless and --listen cannot be combined\n\n{USAGE}");
+        return ExitCode::from(2);
+    }
     if let Some((socket, request)) = &args.remote {
         return maestro_automation::cli::remote_main(socket, request);
     }

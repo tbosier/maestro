@@ -16,14 +16,16 @@ Maestro is currently a local editor with no network code, no plugin system and n
 `maestro --headless` talks only over its own stdin and stdout, so whoever started the process is the only client. `maestro --listen` serves a Unix socket while the editor runs. The trust model for the socket:
 
 - It is local only. There is no TCP listener.
-- The socket file has mode 0600 and the default location is `$XDG_RUNTIME_DIR/maestro/<pid>.sock`, a per-user directory. A missing parent directory is created with mode 0700. The socket is bound inside a fresh 0700 directory, set to 0600 and then renamed into place, so it never exists with the umask's looser permissions. There is no fallback to `/tmp`.
+- The socket file has mode 0600 and the default location is `$XDG_RUNTIME_DIR/maestro/<pid>.sock`, a per-user directory. A missing parent directory is created with mode 0700. The socket is bound inside a fresh 0700 directory, set to 0600 and then hard-linked into place, so it never exists with the umask's looser permissions. Linking fails if anything appeared at the path in the meantime, so a file or another editor's socket there is never replaced. There is no fallback to `/tmp`.
 - File permissions are the only access control. There is no token or other authentication, so any process running as the same user can connect and do anything the API allows, including editing and saving any open file. This is the same trust a process running as the user already has over the user's files.
 - Peer credentials are not checked. On Linux only the owner (and root) can connect to a 0600 socket anyway.
-- Agent edits change text only through `document.apply_edit`, which checks the document version and refuses a stale edit without changing anything. The edit is applied immediately; there is no review step yet.
+- `document.apply_edit` checks the document version and refuses a stale edit without changing anything. It is the only version-checked way to change text. A client can also change text with `command.run` (for example `delete_selection`) or `editor.execute` (for example `:%s`); those act on the editor's current state with no version check and are not recorded in `document.history`. Every change applies immediately; there is no review step yet.
 - `document.open` and `document.save` accept any path the user can read or write, including paths outside the workspace root. A client can therefore read and overwrite files outside the project. A workspace boundary is planned with the permission system.
 - The edit log (`document.history`) records the actor string the client sent. The server does not verify it; any client can claim any actor name.
-- A client that stops reading is disconnected after a 2-second write timeout, so it cannot hang the editor.
-- The socket is removed when the editor exits normally. After a crash it stays behind; the next `--listen` on that path detects that nobody is listening and replaces it.
+- Writes to a client happen on the editor's thread. Each message has a 2-second deadline in total; a client that misses it is disconnected. A client that stops reading can therefore freeze the editor for up to 2 seconds per message, and several such clients add up.
+- A request line longer than 64 MiB gets an error and the connection is closed. Each connection may have at most 32 requests queued for the editor; past that its reader stops reading until the editor catches up.
+- `document.open` refuses paths that exist and are not regular files (FIFOs, sockets, devices), because reading one could block the editor thread with no way to cancel.
+- The socket is removed when the editor exits normally. After a crash it stays behind; the next `--listen` on that path replaces it only if connecting is refused (nobody listening). Any other connection error is reported and the file is left alone. Between that check and the removal there is a small window in which another process could put a new socket there and have it removed.
 - Windows has no socket transport yet; `--listen` is refused there.
 
 ## Trust boundaries for what comes next

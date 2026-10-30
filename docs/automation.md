@@ -24,7 +24,7 @@ The headless editor has an 80 by 24 screen for scrolling purposes, does not writ
 
 ### Live: `maestro --listen <path|auto>`
 
-Serves the API on a Unix socket while the interactive editor runs. `auto` means `$XDG_RUNTIME_DIR/maestro/<pid>.sock`; there is no fallback to `/tmp` when `XDG_RUNTIME_DIR` is unset. The status line shows the socket path at startup. The socket is created with mode 0600 (a missing parent directory is created 0700) and removed when the editor exits. A stale socket left by a crash is replaced; a live one or a non-socket file at the path is refused. There is no TCP listener.
+Serves the API on a Unix socket while the interactive editor runs. `auto` means `$XDG_RUNTIME_DIR/maestro/<pid>.sock`; there is no fallback to `/tmp` when `XDG_RUNTIME_DIR` is unset. The status line shows the socket path at startup. The socket is created with mode 0600 (a missing parent directory is created 0700) and removed when the editor exits. A stale socket left by a crash (connecting is refused) is replaced; a live one, a non-socket file, or anything that appears at the path while the socket is being set up is refused. There is no TCP listener.
 
 Each request runs on the editor's thread as a background job, the same path other background work uses, so requests and keystrokes never run at the same time. The terminal loop checks for jobs once a second when idle and every 16 ms while a client is connected, so the first request on a new connection can wait up to a second. Later requests on that connection, and new connections made within about 100 ms of the last one closing, are answered in milliseconds (18 ms for a `--remote` round trip in the run below, process start included).
 
@@ -76,7 +76,7 @@ Selections use the editor's model: a range covers every grapheme from `min(ancho
 | -32700 | parse error | the line is not JSON or not UTF-8 |
 | -32600 | invalid request | not a request object, `jsonrpc` is not `"2.0"`, or a second `initialize` |
 | -32601 | method not found | unknown method |
-| -32602 | invalid params | missing or malformed params, positions out of bounds or in the wrong encoding, overlapping or reversed edits, empty edits or actor |
+| -32602 | invalid params | missing or malformed params, positions out of bounds or in the wrong encoding, overlapping or reversed edits, empty edits or actor, edits that change nothing, a path that is not a regular file |
 | -32603 | internal | a bug in the server |
 | -32002 | not initialized | a method before `initialize` |
 | -32003 | unsupported protocol version | `initialize` with another major version; `data` is `{"requested", "supported"}` |
@@ -86,7 +86,7 @@ Selections use the editor's model: a range covers every grapheme from `min(ancho
 | -32013 | permission denied | the operating system refused a file operation |
 | -32014 | conflict | the file changed on disk since it was read; save again with `force` |
 | -32015 | unsaved changes | `editor.quit` with modified buffers; `data` lists them |
-| -32016 | command failed | a command reported an error in the status line, or needed a prompt, picker or typed character |
+| -32016 | command failed | a command reported an error in the status line, needed a prompt, picker or typed character, or the user was in the middle of input |
 | -32017 | I/O | any other file error |
 
 ## Methods
@@ -106,7 +106,7 @@ Params: `protocol_version` (string), `client_name` (optional). Result: `protocol
 
 ### document.open
 
-Params: `path` (absolute, or relative to the editor's working directory; `~` expands), `focus` (default false). Without `focus` the user's view does not move. A path that does not exist opens as an empty document that creates the file on first save, as `:e` does. Result: `doc`, `path`, `version`, `read_only`, `already_open`.
+Params: `path` (absolute, or relative to the editor's working directory; `~` expands), `focus` (default false). Without `focus` the user's view does not move. A path that does not exist opens as an empty document that creates the file on first save, as `:e` does. A path that exists but is not a regular file (a FIFO, socket or device) is refused with `-32602`. Result: `doc`, `path`, `version`, `read_only`, `already_open`.
 
 ```
 --> {"jsonrpc":"2.0","id":3,"method":"document.open","params":{"path":"greet.txt","focus":true}}
@@ -128,7 +128,7 @@ Params: `doc`, optional `range` (requires `encoding`). Result: `doc`, `version`,
 
 Params: `doc`, `base_version`, `encoding`, `edits` (a list of `{range, text}` against the document at `base_version`, in any order, touching allowed, overlapping refused), `actor` (non-empty string), `description` (optional). Result: `doc`, `base_version`, `version`.
 
-The edits apply as one transaction through `Document::apply_at_version`, so a stale `base_version` changes nothing. Any undo group the user had open is closed first, then the edit is committed as its own group, so one undo (`u`, or `command.run` `undo` while that document is focused) reverts exactly this edit. Selections in every view of the document move with the text. Text is inserted as given; line endings are not converted.
+The edits apply as one transaction through `Document::apply_at_version`, so a stale `base_version` changes nothing. Any undo group the user had open is closed first, then the edit is committed as its own group, so one undo (`u`, or `command.run` `undo` while that document is focused) reverts exactly this edit. Selections in every view of the document move with the text. Text is inserted as given; line endings are not converted. A batch that would change nothing (for example replacing an empty range with empty text) is refused with `-32602`, since it would create no version and no undo step.
 
 ```
 --> {"jsonrpc":"2.0","id":6,"method":"document.apply_edit","params":{"doc":3,"base_version":0,"encoding":"char","edits":[{"range":{"start":6,"end":11},"text":"there"}],"actor":"agent:docs","description":"greet someone closer"}}
@@ -187,7 +187,7 @@ No params. Result: `buffers` (`id`, `path`, `name`, `version`, `modified`, `read
 
 ### command.run
 
-Params: `name` (a registry command or a `:` command name), `count` (optional, at least 1). Runs on the focused view with the same bookkeeping a key press gets (the undo group closes outside insert mode). The status line is cleared first. Result: `mode` and `status`. A command that reports an error, or that opens a prompt, a picker or waits for a typed character (`f`, `r`, `/`), fails with `-32016`; the interactive part is canceled with Esc so the editor is not left waiting.
+Params: `name` (a registry command or a `:` command name), `count` (optional, at least 1). Runs on the focused view with the same bookkeeping a key press gets (the undo group closes outside insert mode). The status line is cleared first. Result: `mode` and `status`. While the user is in the middle of input (a prompt, a picker, a pending typed character, a count or a partial key sequence) the command is not run and the request fails with `-32016`; the user's input is left as it was. Commands are not version-checked and are not recorded in `document.history`. A command that reports an error, or that opens a prompt, a picker or waits for a typed character (`f`, `r`, `/`), fails with `-32016`; the interactive part is canceled with Esc so the editor is not left waiting.
 
 ```
 --> {"jsonrpc":"2.0","id":11,"method":"command.run","params":{"name":"goto_line_end"}}
