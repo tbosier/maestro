@@ -109,6 +109,37 @@ impl View {
 
 type CharCallback = Box<dyn FnOnce(&mut Editor, char)>;
 
+/// Work finished on another thread, applied to the editor on the main
+/// thread by [`Editor::poll_background`].
+pub type Job = Box<dyn FnOnce(&mut Editor) + Send>;
+
+/// Handle a background thread uses to send results back to the editor.
+/// While any `JobSender` from [`Editor::spawn_background`] is alive, the
+/// front end polls quickly so results appear promptly.
+#[derive(Clone)]
+pub struct JobSender {
+    tx: std::sync::mpsc::Sender<Job>,
+    _active: std::sync::Arc<ActiveGuard>,
+}
+
+/// Counts a live background task; `None` for long-lived idle senders.
+struct ActiveGuard(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if let Some(c) = &self.0 {
+            c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl JobSender {
+    /// Queues `job` to run on the editor. Returns false if the editor is gone.
+    pub fn send(&self, job: impl FnOnce(&mut Editor) + Send + 'static) -> bool {
+        self.tx.send(Box::new(job)).is_ok()
+    }
+}
+
 pub struct Editor {
     pub buffers: BTreeMap<DocumentId, Buffer>,
     pub views: BTreeMap<ViewId, View>,
@@ -146,6 +177,9 @@ pub struct Editor {
     pub cwd: PathBuf,
     pub clipboard: Box<dyn Clipboard>,
     pub recovery_dir: Option<PathBuf>,
+    jobs_tx: std::sync::mpsc::Sender<Job>,
+    jobs_rx: std::sync::mpsc::Receiver<Job>,
+    active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     next_id: u64,
 }
 
@@ -153,6 +187,7 @@ impl Editor {
     pub fn new(config: Config, area: Rect) -> Self {
         let keymaps = Keymaps::for_config(&config);
         let theme = Theme::duskfox();
+        let (jobs_tx, jobs_rx) = std::sync::mpsc::channel();
         let mut editor = Self {
             buffers: BTreeMap::new(),
             views: BTreeMap::new(),
@@ -185,6 +220,9 @@ impl Editor {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             clipboard: Box::new(MemoryClipboard::default()),
             recovery_dir: None,
+            jobs_tx,
+            jobs_rx,
+            active_jobs: Default::default(),
             next_id: 1,
         };
         let doc = editor.add_document(Document::default());
@@ -1095,6 +1133,53 @@ impl Editor {
             self.commit();
         }
         self.ensure_cursor_visible();
+    }
+
+    /// Runs `work` on a new thread. The thread reports back through the
+    /// [`JobSender`] it is given; results are applied in
+    /// [`Editor::poll_background`] on the main thread.
+    pub fn spawn_background(
+        &self,
+        name: &str,
+        work: impl FnOnce(JobSender) + Send + 'static,
+    ) -> std::io::Result<()> {
+        self.active_jobs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sender = JobSender {
+            tx: self.jobs_tx.clone(),
+            _active: std::sync::Arc::new(ActiveGuard(Some(self.active_jobs.clone()))),
+        };
+        std::thread::Builder::new()
+            .name(format!("maestro-{name}"))
+            .spawn(move || work(sender))
+            .map(|_| ())
+    }
+
+    /// A sender for long-lived producers (servers, sockets) that should not
+    /// keep the front end in fast-poll mode. Prefer [`Editor::spawn_background`].
+    pub fn idle_job_sender(&self) -> JobSender {
+        JobSender {
+            tx: self.jobs_tx.clone(),
+            _active: std::sync::Arc::new(ActiveGuard(None)),
+        }
+    }
+
+    /// True while background work started with `spawn_background` runs.
+    pub fn has_background_work(&self) -> bool {
+        self.active_jobs.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Applies results sent by background threads. Returns true if any ran.
+    pub fn poll_background(&mut self) -> bool {
+        let mut ran = false;
+        while let Ok(job) = self.jobs_rx.try_recv() {
+            job(self);
+            ran = true;
+        }
+        if ran {
+            self.ensure_cursor_visible();
+        }
+        ran
     }
 
     /// Runs a `:` command line, as if typed after `:`.

@@ -435,3 +435,22 @@ fn ranges_stay_valid_after_random_edits() {
     }
     let _ = Range::point(0);
 }
+
+#[test]
+fn background_jobs_apply_on_poll() {
+    let mut ed = editor("x\n");
+    ed.spawn_background("test", |tx| {
+        tx.send(|ed| ed.info("from background"));
+    })
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ed.poll_background() {
+        assert!(std::time::Instant::now() < deadline, "job never arrived");
+        std::thread::yield_now();
+    }
+    assert_eq!(ed.status.as_ref().unwrap().1, "from background");
+    while ed.has_background_work() {
+        assert!(std::time::Instant::now() < deadline, "job counter stuck");
+        std::thread::yield_now();
+    }
+}

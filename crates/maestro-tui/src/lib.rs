@@ -130,7 +130,15 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
             return Ok(());
         }
 
-        let timeout = tick_every.saturating_sub(last_tick.elapsed());
+        if editor.poll_background() {
+            dirty = true;
+            continue;
+        }
+        // Poll quickly while background work may deliver results.
+        let mut timeout = tick_every.saturating_sub(last_tick.elapsed());
+        if editor.has_background_work() {
+            timeout = timeout.min(Duration::from_millis(16));
+        }
         if event::poll(timeout)? {
             let start = Instant::now();
             // Drain everything already queued before drawing, so a burst of

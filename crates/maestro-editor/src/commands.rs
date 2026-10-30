@@ -26,12 +26,24 @@ pub struct Command {
     pub fun: CommandFn,
 }
 
+/// Declares a `COMMANDS` table in the calling module. Workstreams put their
+/// commands in their own module with their own table and add it to
+/// [`TABLES`], so the registry grows without everyone editing one list.
+#[macro_export]
 macro_rules! commands {
     ($($name:ident => $doc:literal,)*) => {
-        pub static COMMANDS: &[Command] = &[
-            $(Command { name: stringify!($name), doc: $doc, fun: $name },)*
+        pub static COMMANDS: &[$crate::commands::Command] = &[
+            $($crate::commands::Command { name: stringify!($name), doc: $doc, fun: $name },)*
         ];
     };
+}
+
+/// Every command table. Add new modules' tables here.
+pub static TABLES: &[&[Command]] = &[COMMANDS];
+
+/// Iterates every registered command.
+pub fn all() -> impl Iterator<Item = &'static Command> {
+    TABLES.iter().flat_map(|t| t.iter())
 }
 
 commands! {
@@ -164,7 +176,7 @@ commands! {
 }
 
 pub fn lookup(name: &str) -> Option<&'static Command> {
-    COMMANDS.iter().find(|c| c.name == name)
+    all().find(|c| c.name == name)
 }
 
 // ----- helpers -------------------------------------------------------------
@@ -1807,8 +1819,7 @@ fn command_palette(ed: &mut Editor) {
     } else {
         ed.mode
     };
-    let mut items: Vec<PickerItem> = COMMANDS
-        .iter()
+    let mut items: Vec<PickerItem> = all()
         .map(|c| {
             let key = ed.keymaps.key_for(mode, c.name).unwrap_or_default();
             PickerItem {
