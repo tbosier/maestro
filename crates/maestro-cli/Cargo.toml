@@ -14,7 +14,12 @@ path = "src/main.rs"
 maestro-config.workspace = true
 maestro-editor.workspace = true
 maestro-tui.workspace = true
+maestro-automation.workspace = true
 crossterm.workspace = true
+
+[dev-dependencies]
+maestro-protocol.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

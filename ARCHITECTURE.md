@@ -14,9 +14,11 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 | `maestro-config` | TOML config, theme tokens, the Duskfox palette | serde, toml |
 | `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery | core, config, regex |
 | `maestro-tui` | Terminal lifecycle, input conversion, rendering, clipboard providers | editor, crossterm |
-| `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui |
+| `maestro-protocol` | Automation API wire types: JSON-RPC messages, params, results, error codes | serde, serde_json |
+| `maestro-automation` | Runs protocol requests against an `Editor`; headless (stdio) and Unix socket transports | core, config, editor, protocol |
+| `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui, automation |
 
-Planned crates (`maestro-syntax`, `maestro-lsp`, `maestro-git`, `maestro-protocol`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
+Planned crates (`maestro-syntax`, `maestro-lsp`, `maestro-git`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 
 ## Rules
 
@@ -40,7 +42,7 @@ Selections follow Kakoune: a range covers whole graphemes from `min(anchor, head
 
 ## Commands
 
-Every action is a named command in `maestro_editor::commands::COMMANDS` or a typed command in `maestro_editor::typed`. Keymaps bind key sequences to names, the palette lists names, and user config binds names. The automation API (M3) will call the same names. Adding a command means adding one function and one line in the `commands!` table; a test fails if a default binding names a command that does not exist.
+Every action is a named command in `maestro_editor::commands::COMMANDS` or a typed command in `maestro_editor::typed`. Keymaps bind key sequences to names, the palette lists names, and user config binds names. The automation API (`command.run`, see `docs/automation.md`) calls the same names. Adding a command means adding one function and one line in the `commands!` table; a test fails if a default binding names a command that does not exist.
 
 ## Rendering
 
