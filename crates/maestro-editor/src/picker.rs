@@ -16,6 +16,8 @@ pub enum PickerAction {
     Buffer(DocumentId),
     /// A registry or typed command name.
     Command(String),
+    /// Make a directory the working directory (`:cd`).
+    ChangeDir(PathBuf),
     /// Open a file at a zero-based line and char column.
     Goto {
         path: PathBuf,
@@ -214,6 +216,15 @@ pub fn resolve(editor: &mut Editor, outcome: Outcome) {
                     }
                 }
                 PickerAction::Command(name) => editor.run_command(&name),
+                PickerAction::ChangeDir(path) => match std::fs::canonicalize(&path) {
+                    Ok(dir) if dir.is_dir() => {
+                        let msg = format!("cwd: {}", dir.display());
+                        editor.cwd = dir;
+                        editor.info(msg);
+                    }
+                    Ok(dir) => editor.error(format!("{} is not a directory", dir.display())),
+                    Err(e) => editor.error(format!("{}: {e}", path.display())),
+                },
                 PickerAction::Goto { path, line, column } => {
                     if let Err(e) = editor.open(&path) {
                         editor.error(e);

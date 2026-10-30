@@ -306,7 +306,8 @@ impl Theme {
             change_bg: blend(p::BLUE.base, 0.2),
             text_bg: blend(p::BLUE.base, 0.4),
             git_add: Style::fg(p::GREEN.base),
-            git_removed: Style::fg(p::RED.base),
+            // Bright: base red is 4.1:1 on the current-line gutter.
+            git_removed: Style::fg(p::RED.bright),
             git_changed: Style::fg(p::YELLOW.base),
             git_conflict: Style::fg(p::ORANGE.base),
             git_ignored: Style::fg(p::COMMENT),
@@ -497,6 +498,31 @@ mod tests {
         ];
         let failing: Vec<_> = pairs.iter().filter(|(_, r)| *r < 4.5).collect();
         assert!(failing.is_empty(), "pairs under 4.5:1: {failing:?}");
+    }
+
+    /// Git signs (`+`, `~`, `-`) are text in the gutter, on both the plain
+    /// and the current-line gutter background.
+    #[test]
+    fn git_signs_meet_contrast_on_the_gutter() {
+        let t = Theme::duskfox();
+        let d = &t.diff;
+        let mut failing = Vec::new();
+        for (name, sign) in [
+            ("git_add", d.git_add),
+            ("git_changed", d.git_changed),
+            ("git_removed", d.git_removed),
+        ] {
+            for (surface, gutter) in [
+                ("gutter", t.ui.gutter),
+                ("gutter_current", t.ui.gutter_current),
+            ] {
+                let r = sign.fg.unwrap().contrast(gutter.bg.unwrap());
+                if r < 4.5 {
+                    failing.push((name, surface, r));
+                }
+            }
+        }
+        assert!(failing.is_empty(), "under 4.5:1: {failing:?}");
     }
 
     /// Borders identify panes, so they need 3:1 (WCAG 1.4.11) when active.

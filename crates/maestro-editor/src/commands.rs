@@ -39,7 +39,7 @@ macro_rules! commands {
 }
 
 /// Every command table. Add new modules' tables here.
-pub static TABLES: &[&[Command]] = &[COMMANDS];
+pub static TABLES: &[&[Command]] = &[COMMANDS, crate::git::COMMANDS];
 
 /// Iterates every registered command.
 pub fn all() -> impl Iterator<Item = &'static Command> {

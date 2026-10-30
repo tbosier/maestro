@@ -177,6 +177,8 @@ pub struct Editor {
     pub cwd: PathBuf,
     pub clipboard: Box<dyn Clipboard>,
     pub recovery_dir: Option<PathBuf>,
+    /// Gutter signs and branch names; see [`crate::git`].
+    pub git: crate::git::GitState,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -220,6 +222,7 @@ impl Editor {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             clipboard: Box::new(MemoryClipboard::default()),
             recovery_dir: None,
+            git: crate::git::GitState::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -1170,7 +1173,9 @@ impl Editor {
     }
 
     /// Applies results sent by background threads. Returns true if any ran.
+    /// Also starts Git sign updates for buffers that changed.
     pub fn poll_background(&mut self) -> bool {
+        crate::git::refresh(self);
         let mut ran = false;
         while let Ok(job) = self.jobs_rx.try_recv() {
             job(self);
@@ -1190,10 +1195,12 @@ impl Editor {
     }
 
     /// Called periodically by the front end (roughly once a second) for
-    /// background duties: recovery files and external-change detection.
+    /// background duties: recovery files, external-change detection and
+    /// noticing Git index or branch changes.
     pub fn tick(&mut self, now: Instant) {
         crate::recovery::tick(self, now);
         self.check_disk_changes();
+        crate::git::tick(self);
     }
 
     fn check_disk_changes(&mut self) {

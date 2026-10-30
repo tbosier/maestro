@@ -1,11 +1,13 @@
 //! Editor state, modal commands and keymaps for Maestro.
 //!
-//! This crate depends on `maestro-core` and `maestro-config` only. It has no
-//! terminal, network or Git dependency: a front end feeds it [`KeyEvent`]s
-//! and draws what it holds.
+//! This crate depends on `maestro-core`, `maestro-config` and `maestro-git`.
+//! It has no terminal or network dependency: a front end feeds it
+//! [`KeyEvent`]s and draws what it holds. Git runs only on background
+//! threads (see [`git`]).
 
 pub mod commands;
 pub mod editor;
+pub mod git;
 pub mod key;
 pub mod keymap;
 pub mod layout;
