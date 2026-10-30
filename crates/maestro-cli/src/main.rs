@@ -13,6 +13,11 @@ options:
   -c, --config <path>   use this config file instead of the default
       --clean           ignore the user config
   -h, --help            show this help
+      --headless        no terminal: serve the automation API on stdin/stdout
+      --listen <path>   also serve the automation API on a Unix socket
+                        (auto: $XDG_RUNTIME_DIR/maestro/<pid>.sock)
+      --remote <socket> <json>
+                        send one automation request to a running editor
   -V, --version         show the version
 
 environment:
@@ -25,6 +30,10 @@ struct Args {
     config: Option<PathBuf>,
     clean: bool,
     first_frame_only: bool,
+    // Automation API (docs/automation.md).
+    headless: bool,
+    listen: Option<String>,
+    remote: Option<(PathBuf, String)>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -33,6 +42,9 @@ fn parse_args() -> Result<Option<Args>, String> {
         config: None,
         clean: false,
         first_frame_only: false,
+        headless: false,
+        listen: None,
+        remote: None,
     };
     let mut it = std::env::args_os().skip(1);
     while let Some(a) = it.next() {
@@ -51,6 +63,20 @@ fn parse_args() -> Result<Option<Args>, String> {
                 args.config = Some(PathBuf::from(p));
             }
             "--clean" => args.clean = true,
+            // Automation API flags.
+            "--headless" => args.headless = true,
+            "--listen" => {
+                let p = it
+                    .next()
+                    .ok_or("--listen needs a socket path or \"auto\"")?;
+                args.listen = Some(p.to_string_lossy().into_owned());
+            }
+            "--remote" => {
+                let (Some(sock), Some(json)) = (it.next(), it.next()) else {
+                    return Err("--remote needs a socket path and a JSON request".into());
+                };
+                args.remote = Some((PathBuf::from(sock), json.to_string_lossy().into_owned()));
+            }
             // Undocumented: draw one frame and exit, for startup benchmarks.
             "--first-frame-only" => args.first_frame_only = true,
             "--" => {
@@ -86,6 +112,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some((socket, request)) = &args.remote {
+        return maestro_automation::cli::remote_main(socket, request);
+    }
 
     let mut startup_errors = Vec::new();
     let config = if args.clean {
@@ -105,7 +134,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (w, h) = match args.headless {
+        true => (80, 24),
+        false => crossterm::terminal::size().unwrap_or((80, 24)),
+    };
     let mut editor = Editor::new(config, Rect::new(0, 1, w, h.saturating_sub(2)));
     editor.recovery_dir = maestro_config::config::state_dir().map(|d| d.join("recovery"));
     startup_errors.extend(editor.keymaps.errors.clone());
@@ -120,6 +152,20 @@ fn main() -> ExitCode {
             Err(e) => startup_errors.push(e),
         }
     }
+    if args.headless {
+        return maestro_automation::cli::headless_main(editor, &startup_errors);
+    }
+    // Removes the socket file when dropped, after the editor quits.
+    let _listener = match &args.listen {
+        Some(spec) => match maestro_automation::cli::start_listener(&mut editor, spec) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("maestro: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
     if !startup_errors.is_empty() {
         editor.set_status(Severity::Error, startup_errors.join("; "));
     }
