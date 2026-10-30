@@ -88,6 +88,52 @@ impl EditorConfig {
     }
 }
 
+/// A language server for one language: `[language-server.rust]`.
+///
+/// Servers are run by name from this config or the built-in defaults, never
+/// from files inside a repository (see docs/security.md).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct LanguageServerConfig {
+    /// Program name looked up on `PATH`, or a path.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// `false` turns the language's server off.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl LanguageServerConfig {
+    pub fn new(command: &str, args: &[&str]) -> Self {
+        Self {
+            command: command.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            enabled: true,
+        }
+    }
+}
+
+/// Built-in servers per language, in order of preference. The first one
+/// found on `PATH` is used.
+pub fn default_language_servers(language: &str) -> Vec<LanguageServerConfig> {
+    let ts = || LanguageServerConfig::new("typescript-language-server", &["--stdio"]);
+    match language {
+        "rust" => vec![LanguageServerConfig::new("rust-analyzer", &[])],
+        "python" => vec![
+            LanguageServerConfig::new("pyright-langserver", &["--stdio"]),
+            LanguageServerConfig::new("pylsp", &[]),
+        ],
+        "typescript" | "javascript" => vec![ts()],
+        "c" | "cpp" => vec![LanguageServerConfig::new("clangd", &[])],
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
@@ -96,6 +142,8 @@ pub struct Config {
     pub editor: EditorConfig,
     /// Extra key bindings per mode: `[keys.normal] "space w" = "write"`.
     pub keys: BTreeMap<String, BTreeMap<String, String>>,
+    /// Language servers that replace the built-in choice for a language.
+    pub language_server: BTreeMap<String, LanguageServerConfig>,
 }
 
 impl Default for Config {
@@ -105,6 +153,19 @@ impl Default for Config {
             profile: Profile::default(),
             editor: EditorConfig::default(),
             keys: BTreeMap::new(),
+            language_server: BTreeMap::new(),
+        }
+    }
+}
+
+impl Config {
+    /// Server candidates for `language`: the user's entry if there is one
+    /// (none if it is disabled), else the built-in defaults.
+    pub fn language_servers(&self, language: &str) -> Vec<LanguageServerConfig> {
+        match self.language_server.get(language) {
+            Some(c) if c.enabled => vec![c.clone()],
+            Some(_) => Vec::new(),
+            None => default_language_servers(language),
         }
     }
 }
@@ -205,5 +266,34 @@ line-numbers = "relative"
         assert_eq!(c.editor.indent_unit(), "\t");
         assert_eq!(c.keys["normal"]["space w"], "write");
         assert!(Config::parse("[editor]\ntab-widht = 2\n", Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn language_servers_override_defaults_per_language() {
+        let c = Config::parse(
+            r#"
+[language-server.rust]
+command = "/opt/ra/rust-analyzer"
+args = ["--log", "x"]
+[language-server.python]
+command = "pylsp"
+enabled = false
+"#,
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.language_servers("rust"),
+            vec![LanguageServerConfig::new("/opt/ra/rust-analyzer", &["--log", "x"])]
+        );
+        assert!(c.language_servers("python").is_empty());
+        // Untouched languages keep the defaults.
+        assert_eq!(c.language_servers("c")[0].command, "clangd");
+        assert_eq!(
+            Config::default().language_servers("python")[1].command,
+            "pylsp"
+        );
+        assert!(c.language_servers("cobol").is_empty());
+        assert!(Config::parse("[language-server.rust]\ncmd = \"x\"\n", Path::new("x")).is_err());
     }
 }
