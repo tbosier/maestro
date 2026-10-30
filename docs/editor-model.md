@@ -44,6 +44,10 @@ Ranges that overlap after an edit merge. The merged range stays primary if eithe
 
 There is no separate Helix profile yet. The Maestro profile already follows Helix for most keys; the differences are documented in `crates/maestro-editor/src/keymap.rs`.
 
+## Undo history
+
+`u` and `U` walk the current branch of the revision tree. Editing after an undo starts a new branch; the old one stays in memory. `g-` and `g+` (also `earlier` and `later` in the palette) step through every state in the order it was created, across branches, so an abandoned branch is always reachable.
+
 ## Repeat, macros, registers
 
 - `.` replays the keys of the last change. A change is any command that modified the document, or an insert session from the key that entered insert mode through Escape.
@@ -58,4 +62,11 @@ There is no separate Helix profile yet. The Maestro profile already follows Heli
 - Mapped positions stay inside the new document (property test).
 - Selections stay inside the document after arbitrary key sequences (`ranges_stay_valid_after_random_edits`).
 - Saving never leaves a partial file: the new text is written and synced to a temp file, then renamed over the target.
-- A buffer whose file changed on disk refuses `:w` until the user chooses `:w!` or `:reload`.
+- A buffer whose file changed on disk refuses `:w` until the user chooses `:w!` or `:reload`. The check covers metadata, file identity and a hash of the bytes, so a same-size rewrite with a restored timestamp is caught.
+- A self-invoking macro stops after 16 levels of nesting with an error.
+- Text pasted while a prompt or picker is open goes into the prompt or picker, never into the document.
+
+## Known limitations
+
+- Bracketed paste is applied directly and is not recorded by macros or `.`.
+- `:open` and `:w` take one path; it may contain spaces.

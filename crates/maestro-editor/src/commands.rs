@@ -153,6 +153,8 @@ commands! {
     switch_to_uppercase => "Uppercase the selections",
     join_selections => "Join lines",
     repeat_last_change => "Repeat the last change",
+    earlier => "Go to the previous state, across undo branches",
+    later => "Go to the next state, across undo branches",
     record_macro => "Start or stop recording a macro",
     replay_macro => "Replay a recorded macro",
     set_mark => "Set a mark at the cursor",
@@ -224,14 +226,27 @@ fn changes_from(text: &Rope, changes: Vec<Change>) -> ChangeSet {
 /// there (`select_inserted`) or puts a cursor after it.
 fn apply_changes(ed: &mut Editor, changes: Vec<Change>, after: AfterEdit) {
     let text = text_of(ed);
-    let anchors: Vec<(usize, usize)> = changes.iter().map(|c| (c.from, c.to)).collect();
+    // Where each change lands after the same clipping `changes_from` does,
+    // and how many chars it inserts.
+    let mut last = 0;
+    let anchors: Vec<(usize, usize)> = changes
+        .iter()
+        .map(|c| {
+            let to = c.to.min(text.len_chars());
+            let from = c.from.min(to).max(last);
+            last = to.max(from);
+            (from, c.text.as_deref().map_or(0, |t| t.chars().count()))
+        })
+        .collect();
     let cs = changes_from(&text, changes);
     let primary = ed.view().selection.primary_index();
     let ranges: Vec<Range> = anchors
         .iter()
-        .map(|&(from, _to)| {
+        .map(|&(from, inserted)| {
+            // Mapping `from` lands before a replacement's inserted text;
+            // the inserted length gives the other end.
             let start = cs.map_pos(from, maestro_core::Assoc::Before);
-            let end = cs.map_pos(from, maestro_core::Assoc::After);
+            let end = start + inserted;
             match after {
                 // Head at the start, so a Vim-style follow-up acts there.
                 AfterEdit::SelectInserted if end > start => {
@@ -1224,15 +1239,18 @@ fn delete_word_backward(ed: &mut Editor) {
         .selection
         .iter()
         .map(|r| {
+            // Walk whole graphemes so CRLF and combining sequences are never
+            // split; a grapheme's class is the class of its first char.
             let p = r.head;
+            let class_before = |i: usize| char_class(s.char(prev_grapheme_boundary(s, i)));
             let mut i = p;
-            while i > 0 && matches!(char_class(s.char(i - 1)), CharClass::Whitespace) {
-                i -= 1;
+            while i > 0 && class_before(i) == CharClass::Whitespace {
+                i = prev_grapheme_boundary(s, i);
             }
             if i > 0 {
-                let cls = char_class(s.char(i - 1));
-                while i > 0 && char_class(s.char(i - 1)) == cls {
-                    i -= 1;
+                let cls = class_before(i);
+                while i > 0 && class_before(i) == cls {
+                    i = prev_grapheme_boundary(s, i);
                     if cls == CharClass::Eol {
                         break;
                     }
@@ -1363,8 +1381,13 @@ fn paste_impl(ed: &mut Editor, name: char, before: bool) {
             } else if line + 1 < s.len_lines() {
                 changes.push(Change::insert(s.line_to_char(line + 1), value));
             } else {
-                // Last line without a terminator: add one first.
-                let value = value.trim_end_matches(['\r', '\n']).to_string();
+                // Last line without a terminator: add one first and drop
+                // exactly one from the end, so blank lines in the block survive.
+                let value = value
+                    .strip_suffix("\r\n")
+                    .or_else(|| value.strip_suffix('\n'))
+                    .unwrap_or(&value)
+                    .to_string();
                 changes.push(Change::insert(s.len_chars(), format!("{le}{value}")));
             }
         } else {
@@ -1648,12 +1671,74 @@ fn replay_macro(ed: &mut Editor) {
         Ok(k) => k,
         Err(e) => return ed.error(format!("register {reg}: {e}")),
     };
+    // A macro may replay itself or another macro; cap the nesting so a
+    // self-invoking macro stops with an error instead of overflowing the stack.
+    const MAX_DEPTH: usize = 16;
+    if ed.macro_depth >= MAX_DEPTH {
+        ed.error(format!("macro nesting deeper than {MAX_DEPTH}; stopped"));
+        return;
+    }
     let count = ed.count_or(1);
     ed.count = None;
     ed.selected_register = None;
+    ed.macro_depth += 1;
     for _ in 0..count {
         ed.feed_keys(&keys);
+        if ed
+            .status
+            .as_ref()
+            .is_some_and(|(_, m)| m.starts_with("macro nesting"))
+        {
+            break;
+        }
     }
+    ed.macro_depth -= 1;
+}
+
+fn earlier(ed: &mut Editor) {
+    goto_revision_step(ed, false);
+}
+
+fn later(ed: &mut Editor) {
+    goto_revision_step(ed, true);
+}
+
+/// Moves to the chronologically previous or next state of the document,
+/// across undo branches (Vim's g- and g+).
+fn goto_revision_step(ed: &mut Editor, forward: bool) {
+    let count = ed.count_or(1);
+    let doc_id = ed.view().doc;
+    let focus = ed.focus;
+    let (current, len) = {
+        let h = ed.doc().history();
+        (h.current(), h.len())
+    };
+    let target = if forward {
+        (current + count).min(len - 1)
+    } else {
+        current.saturating_sub(count)
+    };
+    let sel = ed.view().selection.clone();
+    let Some(step) = ed.buffer_mut().doc.goto_revision(target, &sel) else {
+        ed.info(if forward {
+            "already at the newest state"
+        } else {
+            "already at the oldest state"
+        });
+        return;
+    };
+    let text = text_of(ed);
+    for v in ed.views.values_mut().filter(|v| v.doc == doc_id) {
+        v.selection = if v.id == focus {
+            step.selection.clone()
+        } else {
+            step.applied
+                .iter()
+                .fold(v.selection.clone(), |sel, cs| sel.map(cs))
+        }
+        .clamp_normal(text.slice(..));
+    }
+    ed.info(format!("state {target} of {}", len - 1));
 }
 
 fn set_mark(ed: &mut Editor) {

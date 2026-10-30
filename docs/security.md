@@ -4,9 +4,10 @@
 
 Maestro is currently a local editor with no network code, no plugin system and no subprocesses except the clipboard helpers below.
 
-- Files are written atomically through a temp file in the same directory, created with `create_new` so an existing file of that name is never clobbered. Permissions of the original are copied to the new file. Symlinks are followed so the link survives.
+- Files are written atomically through a temp file in the same directory, created with `create_new` so an existing file of that name is never clobbered, and removed on failure only if this save created it. When an existing file is replaced, the temp file is created owner-only (0600) and gets the original's permissions just before the rename, so private contents are never briefly readable by others. Symlinks, including dangling ones, are followed so the link survives.
+- Before overwriting, a save compares the file's metadata, identity (device and inode on Unix) and a hash of its bytes with what was last read or written. Any difference refuses the save until the user picks `:w!` or `:reload`.
 - Binary files and files that are not valid in a supported encoding open read-only, so saving cannot rewrite bytes the user never saw.
-- Recovery files contain file contents. The directory is created with mode 0700 and each file with mode 0600 on Unix. Unnamed buffers are not journaled.
+- Recovery files contain file contents. The directory is created with mode 0700 and each file with mode 0600 on Unix. Unnamed buffers are not journaled. Each editor session writes and deletes only its own recovery files; another session's files are removed only by `:recover` (after copying the text into this session's journal) or `:recover-discard`.
 - Config is parsed with `deny_unknown_fields`, and key bindings that name unknown commands are rejected at startup.
 - Clipboard: `pbcopy`/`pbpaste`, `wl-copy`/`wl-paste`, `xclip` or `xsel` are run by name from `PATH` with fixed arguments. The text goes over stdin; it is never put on a command line. Without them, copying uses the OSC 52 terminal escape.
 - No `unsafe` code; the workspace forbids it.

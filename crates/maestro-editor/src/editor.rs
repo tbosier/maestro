@@ -177,6 +177,10 @@ pub struct Editor {
     pub cwd: PathBuf,
     pub clipboard: Box<dyn Clipboard>,
     pub recovery_dir: Option<PathBuf>,
+    /// Identifies this editor's recovery files (see `recovery`).
+    pub session_id: String,
+    /// Nesting depth of macro replays, to stop self-invoking macros.
+    pub macro_depth: usize,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -220,6 +224,8 @@ impl Editor {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             clipboard: Box::new(MemoryClipboard::default()),
             recovery_dir: None,
+            session_id: crate::recovery::new_session_id(),
+            macro_depth: 0,
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -616,7 +622,7 @@ impl Editor {
         self.marks.retain(|_, (d, _)| *d != id);
         self.buffers.remove(&id);
         if force && let (Some(dir), Some(path)) = (&self.recovery_dir, path) {
-            crate::recovery::remove(dir, &path);
+            crate::recovery::remove(dir, &path, &self.session_id);
         }
         let sel = self.buffers[&replacement].last_selection.clone();
         let text = self.buffers[&replacement].doc.text().clone();
@@ -1094,6 +1100,24 @@ impl Editor {
     /// each cursor; otherwise it replaces nothing and lands before each
     /// selection, selected. One paste is one undo step.
     pub fn paste_text(&mut self, text: &str) {
+        // Overlays own the input: a paste while one is open goes into it,
+        // never into the document underneath.
+        if let Some(p) = &mut self.picker {
+            p.push_query(text);
+            return;
+        }
+        if self.prompt.is_some() {
+            crate::prompt::insert_text(self, text);
+            return;
+        }
+        if self.pending_char.is_some() || self.awaiting_register || !self.pending.is_empty() {
+            // A paste in the middle of a key sequence cancels it.
+            self.pending_char = None;
+            self.awaiting_register = false;
+            self.pending.clear();
+            self.count = None;
+            return;
+        }
         let text = if self.doc().line_ending() == maestro_core::LineEnding::Crlf {
             text.replace("\r\n", "\n").replace('\n', "\r\n")
         } else {

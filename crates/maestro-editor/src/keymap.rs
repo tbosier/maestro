@@ -249,6 +249,8 @@ impl Keymaps {
             ("g n", "buffer_next"),
             ("g p", "buffer_prev"),
             ("g a", "goto_alternate_file"),
+            ("g -", "earlier"),
+            ("g +", "later"),
             ("g t", "goto_window_top"),
             ("g c", "goto_window_center"),
             ("g b", "goto_window_bottom"),

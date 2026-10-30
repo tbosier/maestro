@@ -379,7 +379,7 @@ fn recovery_files_follow_modifications() {
     let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
     ed.tick(later);
     assert_eq!(
-        maestro_editor::recovery::read(&rec, &path).as_deref(),
+        maestro_editor::recovery::read(&rec, &path, &ed.session_id).as_deref(),
         Some("edit base\n")
     );
     // A new session announces it and :recover restores it.
@@ -390,7 +390,8 @@ fn recovery_files_follow_modifications() {
     run(&mut ed2, ":recover<ret>");
     assert_eq!(text(&ed2), "edit base\n");
     run(&mut ed2, ":w<ret>");
-    assert!(maestro_editor::recovery::read(&rec, &path).is_none());
+    // The crashed session's file was adopted and the new session saved.
+    assert!(maestro_editor::recovery::all_for(&rec, &path).is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -453,4 +454,111 @@ fn background_jobs_apply_on_poll() {
         assert!(std::time::Instant::now() < deadline, "job counter stuck");
         std::thread::yield_now();
     }
+}
+
+// ----- regressions from the M0 hostile review -------------------------------
+
+#[test]
+fn self_invoking_macro_stops_with_an_error() {
+    let mut ed = editor("abc\n");
+    // `q` while recording into @ is refused but recorded; replaying the
+    // macro then calls itself.
+    run(&mut ed, "QqQ");
+    run(&mut ed, "q");
+    assert!(ed.status.as_ref().unwrap().1.contains("macro nesting"));
+    assert_eq!(text(&ed), "abc\n");
+}
+
+#[test]
+fn prompt_ctrl_w_after_multibyte_space_does_not_panic() {
+    let mut ed = editor("abc\n");
+    run(&mut ed, ":\u{3000}x<C-w>");
+    assert_eq!(ed.prompt.as_ref().unwrap().input, "\u{3000}");
+    run(&mut ed, "<esc>");
+}
+
+#[test]
+fn paste_into_prompt_and_picker_never_edits_the_document() {
+    let mut ed = editor("hello world\n");
+    run(&mut ed, "/");
+    ed.paste_text("wor");
+    assert_eq!(ed.prompt.as_ref().unwrap().input, "wor");
+    run(&mut ed, "<ret>");
+    assert_eq!(text(&ed), "hello world\n");
+    assert_eq!(ranges(&ed), vec![(6, 8)]);
+    run(&mut ed, "<space>?");
+    ed.paste_text("undo");
+    assert_eq!(ed.picker.as_ref().unwrap().query, "undo");
+    run(&mut ed, "<esc>");
+    assert_eq!(text(&ed), "hello world\n");
+}
+
+#[test]
+fn ctrl_w_in_insert_never_splits_crlf_or_graphemes() {
+    let mut ed = editor("a\r\nb\r\n");
+    run(&mut ed, "ji<C-w><esc>");
+    assert_eq!(text(&ed), "ab\r\n");
+    let mut ed = editor("xe\u{301}\n");
+    run(&mut ed, "A<C-w><esc>");
+    assert_eq!(text(&ed), "\n");
+}
+
+#[test]
+fn replacement_selects_the_whole_result() {
+    let mut ed = editor("foo bar\n");
+    run(&mut ed, "erX");
+    assert_eq!(text(&ed), "XXX bar\n");
+    run(&mut ed, "rY");
+    assert_eq!(text(&ed), "YYY bar\n");
+}
+
+#[test]
+fn linewise_paste_at_unterminated_eof_keeps_blank_lines() {
+    let mut ed = editor("one\n\nx");
+    run(&mut ed, "xxyGp");
+    assert_eq!(text(&ed), "one\n\nx\none\n");
+}
+
+#[test]
+fn earlier_reaches_an_abandoned_undo_branch() {
+    let mut ed = editor("");
+    run(&mut ed, "iA<esc>uiB<esc>");
+    assert_eq!(text(&ed), "B");
+    run(&mut ed, "uU");
+    assert_eq!(text(&ed), "B");
+    run(&mut ed, "g-");
+    assert_eq!(text(&ed), "A");
+    run(&mut ed, "g+");
+    assert_eq!(text(&ed), "B");
+}
+
+#[test]
+fn write_path_with_spaces_names_one_file() {
+    let dir = std::env::temp_dir().join(format!("maestro-space-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ed = editor("");
+    ed.cwd = dir.clone();
+    run(&mut ed, "ihi<esc>:w my file.rs<ret>");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("my file.rs")).unwrap(),
+        "hi"
+    );
+    assert!(!dir.join("my").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn regex_prompt_survives_a_reload_that_shrinks_the_file() {
+    let dir = std::env::temp_dir().join(format!("maestro-shrink-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f.txt");
+    std::fs::write(&path, "abcdef").unwrap();
+    let mut ed = editor("");
+    ed.open(&path).unwrap();
+    run(&mut ed, "5ls");
+    std::fs::write(&path, "x").unwrap();
+    ed.tick(std::time::Instant::now());
+    assert_eq!(text(&ed), "x");
+    run(&mut ed, "x<ret>");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

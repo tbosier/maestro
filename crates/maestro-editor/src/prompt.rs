@@ -121,8 +121,9 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) {
             let before = &p.input[..p.cursor];
             let trimmed = before.trim_end();
             let start = trimmed
-                .rfind(|c: char| c.is_whitespace() || c == '/')
-                .map(|i| i + 1)
+                .char_indices()
+                .rfind(|&(_, c)| c.is_whitespace() || c == '/')
+                .map(|(i, c)| i + c.len_utf8())
                 .unwrap_or(0);
             p.input.replace_range(start..p.cursor, "");
             p.cursor = start;
@@ -161,6 +162,24 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) {
             }
         }
     }
+    p.completions.clear();
+    p.completion_idx = None;
+    preview(editor, &mut p);
+    editor.prompt = Some(p);
+}
+
+/// Inserts pasted text at the prompt cursor. Line breaks become spaces,
+/// since a prompt is one line.
+pub fn insert_text(editor: &mut Editor, text: &str) {
+    let Some(mut p) = editor.prompt.take() else {
+        return;
+    };
+    let clean: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    p.input.insert_str(p.cursor, &clean);
+    p.cursor += clean.len();
     p.completions.clear();
     p.completion_idx = None;
     preview(editor, &mut p);
@@ -213,6 +232,10 @@ fn preview(editor: &mut Editor, p: &mut Prompt) {
     if p.kind == PromptKind::Command {
         return;
     }
+    // The document may have changed since the prompt opened (an automatic
+    // reload, a background edit), so bring the saved selection into range.
+    let text = editor.doc().text().clone();
+    p.original = p.original.clone().normalize(text.slice(..));
     editor.view_mut().selection = p.original.clone();
     if p.input.is_empty() {
         return;
@@ -224,7 +247,6 @@ fn preview(editor: &mut Editor, p: &mut Prompt) {
             return;
         }
     };
-    let text = editor.doc().text().clone();
     let slice = text.slice(..);
     match p.kind {
         PromptKind::Search { backward } => {

@@ -41,19 +41,146 @@ impl Encoding {
 }
 
 /// What the file looked like on disk when we last read or wrote it.
+///
+/// Metadata (modification time, length, and on Unix the device and inode)
+/// is cheap to poll and catches ordinary edits and atomic replacements by
+/// other programs. `hash` covers what metadata cannot: a rewrite that keeps
+/// the size and restores the timestamp. It is checked when saving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskState {
     pub modified: Option<SystemTime>,
     pub len: u64,
+    pub dev: u64,
+    pub ino: u64,
+    /// [`content_hash`] of the file's bytes, when known.
+    pub hash: Option<u64>,
 }
 
 impl DiskState {
-    pub fn read(path: &Path) -> Option<Self> {
-        let meta = fs::metadata(path).ok()?;
-        Some(Self {
+    fn from_meta(meta: &fs::Metadata, hash: Option<u64>) -> Self {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Self {
             modified: meta.modified().ok(),
             len: meta.len(),
-        })
+            dev,
+            ino,
+            hash,
+        }
+    }
+
+    /// Reads metadata only (no hash).
+    pub fn read(path: &Path) -> Option<Self> {
+        fs::metadata(path).ok().map(|m| Self::from_meta(&m, None))
+    }
+
+    /// True if the metadata differs (ignores the hash).
+    pub fn metadata_differs(&self, other: &DiskState) -> bool {
+        (self.modified, self.len, self.dev, self.ino)
+            != (other.modified, other.len, other.dev, other.ino)
+    }
+}
+
+/// A fast, streaming, non-cryptographic 64-bit hash for detecting that a
+/// file's bytes changed. Processes eight bytes per step.
+#[derive(Debug, Clone)]
+pub struct ContentHasher {
+    state: u64,
+    buf: [u8; 8],
+    buf_len: usize,
+    total: u64,
+}
+
+impl Default for ContentHasher {
+    fn default() -> Self {
+        Self {
+            state: 0x243f_6a88_85a3_08d3,
+            buf: [0; 8],
+            buf_len: 0,
+            total: 0,
+        }
+    }
+}
+
+impl ContentHasher {
+    fn mix(&mut self, word: u64) {
+        self.state = (self.state.rotate_left(5) ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    pub fn update(&mut self, mut bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        if self.buf_len > 0 {
+            let take = (8 - self.buf_len).min(bytes.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&bytes[..take]);
+            self.buf_len += take;
+            bytes = &bytes[take..];
+            if self.buf_len < 8 {
+                return;
+            }
+            self.mix(u64::from_le_bytes(self.buf));
+            self.buf_len = 0;
+        }
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.mix(u64::from_le_bytes(c.try_into().expect("8 bytes")));
+        }
+        let rest = chunks.remainder();
+        self.buf[..rest.len()].copy_from_slice(rest);
+        self.buf_len = rest.len();
+    }
+
+    pub fn finish(mut self) -> u64 {
+        if self.buf_len > 0 {
+            let mut last = [0u8; 8];
+            last[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
+            self.mix(u64::from_le_bytes(last));
+        }
+        let total = self.total;
+        self.mix(total);
+        self.state ^ (self.state >> 29)
+    }
+}
+
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    let mut h = ContentHasher::default();
+    h.update(bytes);
+    h.finish()
+}
+
+/// Hashes the file currently at `path`.
+pub fn hash_file(path: &Path) -> io::Result<u64> {
+    let mut f = File::open(path)?;
+    let mut h = ContentHasher::default();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(h.finish());
+        }
+        h.update(&buf[..n]);
+    }
+}
+
+/// A writer that hashes everything passing through it.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: ContentHasher,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -87,10 +214,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
         text,
         encoding,
         read_only,
-        disk: Some(DiskState {
-            modified: meta.modified().ok(),
-            len: meta.len(),
-        }),
+        disk: Some(DiskState::from_meta(&meta, Some(content_hash(&bytes)))),
     })
 }
 
@@ -172,20 +296,39 @@ fn write_encoded(out: &mut impl Write, text: &Rope, encoding: Encoding) -> io::R
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Resolves the path that should actually be written: a symlink is followed
-/// so the link survives and its target gets the new contents.
-fn write_target(path: &Path) -> PathBuf {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// Resolves the path that should actually be written. Symlinks are followed
+/// (including dangling ones, whose target is created) so the link survives
+/// and its target gets the new contents.
+fn write_target(path: &Path) -> io::Result<PathBuf> {
+    let mut p = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&p) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let t = fs::read_link(&p)?;
+                p = if t.is_absolute() {
+                    t
+                } else {
+                    p.parent().unwrap_or(Path::new(".")).join(t)
+                };
+            }
+            _ => return Ok(p),
         }
-        _ => path.to_path_buf(),
     }
+    Err(io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
 }
 
 /// Atomically writes `text` to `path` and returns the new disk state.
+///
+/// The temp file is created with `create_new` (never clobbering anything)
+/// and, when replacing an existing file, owner-only, so private contents are
+/// not briefly readable by others. The returned state comes from the temp
+/// file's own handle before the rename, so a writer racing us afterwards is
+/// detected rather than adopted as our baseline.
 pub fn save(path: &Path, text: &Rope, encoding: Encoding) -> io::Result<DiskState> {
-    let target = write_target(path);
+    let target = write_target(path)?;
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -195,46 +338,84 @@ pub fn save(path: &Path, text: &Rope, encoding: Encoding) -> io::Result<DiskStat
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?
         .to_string_lossy()
         .into_owned();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
     let tmp = dir.join(format!(
-        ".{name}.maestro-tmp-{}-{}",
+        ".{name}.maestro-tmp-{}-{}-{nonce:x}",
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let existing = fs::metadata(&target).ok();
 
-    let result: io::Result<()> = (|| {
-        let file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        let mut w = BufWriter::with_capacity(256 * 1024, file);
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if existing.is_some() {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    // Only a file we created may be cleaned up on failure.
+    let file = opts.open(&tmp)?;
+
+    let result: io::Result<DiskState> = (|| {
+        let mut w = HashingWriter {
+            inner: BufWriter::with_capacity(256 * 1024, file),
+            hasher: ContentHasher::default(),
+        };
         write_encoded(&mut w, text, encoding)?;
-        let file = w.into_inner().map_err(|e| e.into_error())?;
+        let hash = w.hasher.finish();
+        let file = w.inner.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         if let Some(meta) = &existing {
             fs::set_permissions(&tmp, meta.permissions())?;
         }
+        let state = DiskState::from_meta(&file.metadata()?, Some(hash));
         drop(file);
         fs::rename(&tmp, &target)?;
-        sync_dir(&dir);
-        Ok(())
+        Ok(state)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    match result {
+        Ok(state) => {
+            sync_dir(&dir).map_err(|e| {
+                io::Error::other(format!(
+                    "{} was replaced, but syncing its directory failed ({e}); save again before relying on it",
+                    target.display()
+                ))
+            })?;
+            Ok(state)
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    result?;
-    DiskState::read(&target)
-        .ok_or_else(|| io::Error::other("file vanished immediately after saving"))
 }
 
+/// Makes the rename durable. Filesystems that cannot sync a directory
+/// (`EINVAL`, unsupported) are accepted; other failures are reported.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) {
-    // Best effort: the data is already safe in the renamed file; this makes
-    // the rename itself survive a power loss.
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    let d = File::open(dir)?;
+    match d.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) {}
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -314,6 +495,50 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_through_dangling_symlink_creates_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tmpdir("dangling");
+        let link = dir.join("link.rs");
+        symlink("real.rs", &link).unwrap();
+        save(&link, &Rope::from_str("x"), Encoding::Utf8).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(dir.join("real.rs")).unwrap(), "x");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temp_name_collision_never_deletes_the_other_file() {
+        // A pre-existing file at a would-be temp name is untouched even if
+        // a save fails for another reason.
+        let dir = tmpdir("collide");
+        let bystander = dir.join(".f.maestro-tmp-bystander");
+        fs::write(&bystander, "keep me").unwrap();
+        save(&dir.join("f"), &Rope::from_str("ok"), Encoding::Utf8).unwrap();
+        assert_eq!(fs::read_to_string(&bystander).unwrap(), "keep me");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn content_hash_is_chunking_independent() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let whole = content_hash(&data);
+        for split in [1, 3, 7, 8, 9, 500, 999] {
+            let mut h = ContentHasher::default();
+            h.update(&data[..split]);
+            h.update(&data[split..]);
+            assert_eq!(h.finish(), whole, "split at {split}");
+        }
+        assert_ne!(content_hash(b"ab"), content_hash(b"ba"));
+        assert_ne!(content_hash(b""), content_hash(b"\0"));
     }
 
     #[test]

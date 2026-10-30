@@ -547,7 +547,7 @@ fn draw_which_key(ed: &Editor, s: &mut Surface, cmdline: Rect) {
         .unwrap_or(1);
     let w = (key_w + desc_w + 5).min(s.width as usize) as u16;
     let h = (rows.len() as u16 + 2).min(cmdline.y);
-    if h < 3 {
+    if h < 3 || w < 8 {
         return;
     }
     let x = s.width.saturating_sub(w + 1);
@@ -576,6 +576,10 @@ fn draw_box(
     border: Style,
     title_style: Style,
 ) {
+    // Too small to frame anything; skip rather than underflow.
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
     s.fill(area, fill);
     let (l, r, t, b) = (area.x, area.right() - 1, area.y, area.bottom() - 1);
     for x in l + 1..r {

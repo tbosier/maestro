@@ -2,18 +2,23 @@
 //!
 //! While a named buffer has unsaved changes, its full text is written to the
 //! recovery directory after a short idle period. A crash or a killed
-//! terminal therefore loses at most a couple of seconds of typing. Saving or
-//! discarding the buffer deletes its recovery file. On open, a recovery file
-//! whose contents differ from the file on disk is announced; `:recover`
-//! loads it as an undoable change and `:recover-discard` deletes it.
+//! terminal therefore loses at most a couple of seconds of typing.
+//!
+//! Each editor session writes its own file (`<path hash>-<name>.<session>.recover`),
+//! so one session saving or discarding a buffer never deletes another
+//! session's journal, and a session started after a crash never overwrites
+//! the crashed session's file. A session only ever deletes its own files,
+//! except through `:recover` (after copying the content into its own
+//! journal) and `:recover-discard` (an explicit user choice).
 //!
 //! Recovery files contain file contents, so the directory is created
-//! owner-only (0700) on Unix. Unnamed scratch buffers are not recovered.
+//! owner-only (0700) on Unix and files are 0600. Unnamed scratch buffers are
+//! not recovered.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use maestro_core::Rope;
 
@@ -32,14 +37,52 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-pub fn recovery_path(dir: &Path, file: &Path) -> PathBuf {
+fn prefix(file: &Path) -> String {
     let canonical = crate::editor::normalize_path(file);
-    let hash = fnv1a(canonical.to_string_lossy().as_bytes());
+    format!("{:016x}-", fnv1a(canonical.to_string_lossy().as_bytes()))
+}
+
+/// A fresh session id: process id plus time, unique per editor instance.
+pub fn new_session_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{:x}", std::process::id(), nanos & 0xffff_ffff_ffff)
+}
+
+/// This session's recovery file for `file`.
+pub fn recovery_path(dir: &Path, file: &Path, session: &str) -> PathBuf {
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into());
-    dir.join(format!("{hash:016x}-{name}.recover"))
+    dir.join(format!("{}{name}.{session}.recover", prefix(file)))
+}
+
+/// Every recovery file for `file`, from any session, newest first.
+pub fn all_for(dir: &Path, file: &Path) -> Vec<(PathBuf, SystemTime)> {
+    let prefix = prefix(file);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, SystemTime)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with(&prefix) && n.ends_with(".recover")
+        })
+        .map(|e| {
+            let t = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (e.path(), t)
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
+    out
 }
 
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
@@ -53,9 +96,9 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     b.create(dir)
 }
 
-pub fn write(dir: &Path, file: &Path, text: &Rope) -> std::io::Result<()> {
+pub fn write(dir: &Path, file: &Path, session: &str, text: &Rope) -> std::io::Result<()> {
     ensure_dir(dir)?;
-    let target = recovery_path(dir, file);
+    let target = recovery_path(dir, file, session);
     let tmp = target.with_extension("recover.tmp");
     {
         let mut f = fs::File::create(&tmp)?;
@@ -74,20 +117,43 @@ pub fn write(dir: &Path, file: &Path, text: &Rope) -> std::io::Result<()> {
     fs::rename(&tmp, &target)
 }
 
-/// Reads the recovered text for `file`, if any.
-pub fn read(dir: &Path, file: &Path) -> Option<String> {
-    let raw = fs::read_to_string(recovery_path(dir, file)).ok()?;
+fn read_body(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
     let rest = raw.strip_prefix(HEADER)?;
     let (_path, body) = rest.split_once('\n')?;
     Some(body.to_string())
 }
 
-pub fn remove(dir: &Path, file: &Path) {
-    let _ = fs::remove_file(recovery_path(dir, file));
+/// The newest recovery file for `file` written by another session.
+pub fn newest_foreign(dir: &Path, file: &Path, session: &str) -> Option<(PathBuf, String)> {
+    let own = recovery_path(dir, file, session);
+    all_for(dir, file)
+        .into_iter()
+        .filter(|(p, _)| *p != own)
+        .find_map(|(p, _)| read_body(&p).map(|b| (p, b)))
 }
 
-/// Announces a recovery file for a freshly opened buffer when its contents
-/// differ from what was loaded.
+/// Reads this session's recovery text for `file`, if any.
+pub fn read(dir: &Path, file: &Path, session: &str) -> Option<String> {
+    read_body(&recovery_path(dir, file, session))
+}
+
+/// Deletes this session's recovery file for `file`.
+pub fn remove(dir: &Path, file: &Path, session: &str) {
+    let _ = fs::remove_file(recovery_path(dir, file, session));
+}
+
+/// Deletes every session's recovery files for `file`. Only on an explicit
+/// user request.
+pub fn remove_all(dir: &Path, file: &Path) -> usize {
+    all_for(dir, file)
+        .into_iter()
+        .filter(|(p, _)| fs::remove_file(p).is_ok())
+        .count()
+}
+
+/// Announces recovery data from another session for a freshly opened
+/// buffer when its contents differ from what was loaded.
 pub fn notify_if_recoverable(editor: &mut Editor, id: DocumentId) {
     let Some(dir) = editor.recovery_dir.clone() else {
         return;
@@ -95,17 +161,16 @@ pub fn notify_if_recoverable(editor: &mut Editor, id: DocumentId) {
     let Some(path) = editor.buffers[&id].doc.path().map(Path::to_path_buf) else {
         return;
     };
-    let Some(body) = read(&dir, &path) else {
+    let Some((_, body)) = newest_foreign(&dir, &path, &editor.session_id) else {
         return;
     };
     if *editor.buffers[&id].doc.text() == body.as_str() {
-        remove(&dir, &path);
         return;
     }
     editor.set_status(
         Severity::Warning,
         format!(
-            "unsaved changes from an earlier session exist for {}; :recover loads them, :recover-discard deletes them",
+            "unsaved changes from another session exist for {}; :recover loads them, :recover-discard deletes them",
             path.display()
         ),
     );
@@ -118,6 +183,7 @@ pub fn tick(editor: &mut Editor, now: Instant) {
     else {
         return;
     };
+    let session = editor.session_id.clone();
     let mut failure = None;
     for buf in editor.buffers.values_mut() {
         let Some(path) = buf.doc.path().map(Path::to_path_buf) else {
@@ -125,7 +191,7 @@ pub fn tick(editor: &mut Editor, now: Instant) {
         };
         if !buf.doc.is_modified() {
             if buf.recovery_version.take().is_some() {
-                remove(&dir, &path);
+                remove(&dir, &path, &session);
             }
             continue;
         }
@@ -134,7 +200,7 @@ pub fn tick(editor: &mut Editor, now: Instant) {
             .last_edit
             .is_none_or(|t| now.saturating_duration_since(t) >= interval);
         if buf.recovery_version != Some(version) && idle {
-            match write(&dir, &path, buf.doc.text()) {
+            match write(&dir, &path, &session, buf.doc.text()) {
                 Ok(()) => buf.recovery_version = Some(version),
                 Err(e) => {
                     failure = Some(format!("recovery write failed for {}: {e}", path.display()))
@@ -152,23 +218,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_read_remove() {
+    fn sessions_do_not_touch_each_other() {
         let dir =
             std::env::temp_dir().join(format!("maestro-recovery-test-{}", std::process::id()));
         let file = dir.join("some file.rs");
-        write(&dir, &file, &Rope::from_str("fn main() {}\nsecond\n")).unwrap();
-        assert_eq!(read(&dir, &file).as_deref(), Some("fn main() {}\nsecond\n"));
+        write(&dir, &file, "a", &Rope::from_str("from a\n")).unwrap();
+        write(&dir, &file, "b", &Rope::from_str("from b\n")).unwrap();
+        assert_eq!(read(&dir, &file, "a").as_deref(), Some("from a\n"));
+        // Session b saving removes only its own journal.
+        remove(&dir, &file, "b");
+        assert_eq!(read(&dir, &file, "a").as_deref(), Some("from a\n"));
+        let (_, body) = newest_foreign(&dir, &file, "c").unwrap();
+        assert_eq!(body, "from a\n");
+        assert!(newest_foreign(&dir, &file, "a").is_none());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(recovery_path(&dir, &file))
+            let mode = fs::metadata(recovery_path(&dir, &file, "a"))
                 .unwrap()
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        remove(&dir, &file);
-        assert!(read(&dir, &file).is_none());
+        assert_eq!(remove_all(&dir, &file), 1);
+        assert!(all_for(&dir, &file).is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

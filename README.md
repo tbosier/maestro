@@ -8,13 +8,13 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. Age
 
 - Open, edit and save files. Saves are atomic (write to a temp file, fsync, rename) and keep permissions and symlinks.
 - Selection-first modal editing in the Kakoune and Helix style, with Vim-familiar motions. Multiple selections everywhere: select by regex, split on regex, add cursors on the lines below, and edit them all at once.
-- Undo and redo as a revision tree, so undoing and then editing never throws away history. A whole insert session is one undo step.
+- Undo and redo as a revision tree: editing after an undo starts a branch instead of discarding the old one, and `g-`/`g+` step through every state across branches. A whole insert session is one undo step.
 - Registers (one value per selection), the system clipboard, macros (`Q` records, `q` replays), dot repeat, counts, marks and a jump list.
 - Search with live preview, `n`/`N`, and `:s/pat/rep/g` or `:%s` substitution with capture groups.
 - Text objects and surround: `mi(`, `ma"`, `ms[`, `mr([`, `md{`, `mm` for the matching bracket.
 - Splits (`C-w v`, `C-w s`), multiple buffers, a buffer picker, a simple file finder, and a command palette listing every command with its key.
-- Detects files changed on disk. A clean buffer reloads; a modified one warns and refuses to overwrite until you choose.
-- Crash recovery: unsaved changes are journaled after two idle seconds, and `:recover` brings them back after a crash.
+- Detects files changed on disk (metadata, file identity, and a content hash at save time). A clean buffer reloads; a modified one warns and refuses to overwrite until you choose.
+- Crash recovery: unsaved changes are journaled after two idle seconds, one journal per editor session, and `:recover` in a later session brings them back.
 - UTF-8, UTF-8 with BOM, and UTF-16 files with a BOM. LF and CRLF are preserved. Binary files and invalid UTF-8 open read-only.
 - The Duskfox theme from nightfox.nvim, with every interface text pair checked for WCAG AA contrast by a test.
 
@@ -46,6 +46,7 @@ cargo build --release
 | `d c y p` | delete, change, yank, paste |
 | `i a o O I A` | insert modes |
 | `u U` | undo, redo |
+| `g- g+` | step through every state, across undo branches |
 | `v` | select mode (motions extend) |
 | `/ ? n N *` | search |
 | `.` | repeat the last change |

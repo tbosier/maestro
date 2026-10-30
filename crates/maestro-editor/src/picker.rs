@@ -90,6 +90,13 @@ impl Picker {
         self.refilter();
     }
 
+    /// Appends pasted text to the query (line breaks dropped).
+    pub fn push_query(&mut self, text: &str) {
+        self.query
+            .extend(text.chars().filter(|c| *c != '\n' && *c != '\r'));
+        self.refilter();
+    }
+
     pub fn selected_item(&self) -> Option<&PickerItem> {
         self.matches
             .get(self.selected)

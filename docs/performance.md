@@ -17,13 +17,15 @@ Method: `scripts/bench_startup.py` runs `maestro --clean --first-frame-only <fil
 
 | File | Runs | Median ms | p95 ms | Max ms |
 |---|---|---|---|---|
-| none | 30 | 1.1 | 1.6 | 1.6 |
-| 60 KB source file | 30 | 1.8 | 2.0 | 2.3 |
-| 1 MB | 30 | 3.6 | 3.9 | 4.1 |
-| 10 MB | 30 | 15.0 | 17.3 | 17.3 |
-| 100 MB | 5 | 144.4 | 151.8 | 151.8 |
+| none | 30 | 1.6 | 2.3 | 2.4 |
+| 60 KB source file | 30 | 1.4 | 1.7 | 2.0 |
+| 1 MB | 30 | 3.4 | 4.4 | 4.5 |
+| 10 MB | 30 | 17.9 | 21.2 | 21.4 |
+| 100 MB | 5 | 170.1 | 180.1 | 180.1 |
 
-The 100 MB time is dominated by reading the file, validating UTF-8 and building the rope. Nothing is lazy yet.
+The 100 MB time is dominated by reading the file, validating UTF-8, hashing the bytes and building the rope. Nothing is lazy yet.
+
+The content hash (used to detect files rewritten with the same size and timestamp) was added after the first measurement. Before it, the medians were 15.0 ms at 10 MB and 144.4 ms at 100 MB, so it costs roughly 3 ms and 26 ms at those sizes. Saving now also re-reads and hashes the file on disk before overwriting it; that cost has not been measured separately.
 
 ## Input processing
 

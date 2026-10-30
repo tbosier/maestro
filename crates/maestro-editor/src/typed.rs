@@ -194,6 +194,9 @@ static TYPED: &[TypedCommand] = &[
     },
 ];
 
+/// Commands whose argument is a single path that may contain spaces.
+const PATH_COMMANDS: &[&str] = &["write", "write-quit", "open", "split", "vsplit", "cd"];
+
 pub fn all() -> &'static [TypedCommand] {
     TYPED
 }
@@ -242,9 +245,14 @@ pub fn execute_line(editor: &mut Editor, line: &str) {
         Some(n) => (n, true),
         None => (head, false),
     };
-    let args: Vec<&str> = parts.collect();
+    let mut args: Vec<&str> = parts.collect();
     match lookup(name) {
         Some(cmd) => {
+            // Path arguments keep their spaces: `:w my file.rs` names one file.
+            if PATH_COMMANDS.contains(&cmd.name) {
+                let rest = line[head.len()..].trim();
+                args = if rest.is_empty() { vec![] } else { vec![rest] };
+            }
             if let Err(e) = (cmd.fun)(editor, &args, force) {
                 editor.error(e);
             }
@@ -283,7 +291,7 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
             let lines = crate::motion::last_line(buf.doc.text().slice(..)) + 1;
             let bytes = buf.doc.text().len_bytes();
             if let (Some(dir), Some(p)) = (editor.recovery_dir.clone(), old_path) {
-                crate::recovery::remove(&dir, &p);
+                crate::recovery::remove(&dir, &p, &editor.session_id);
             }
             editor.info(format!("wrote {name}: {lines} lines, {bytes} bytes"));
             Ok(())
@@ -318,12 +326,13 @@ fn write_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
             .map(|v| v.selection.clone())
             .unwrap_or_else(|| ed.buffers[id].last_selection.clone());
         let dir = ed.recovery_dir.clone();
+        let session = ed.session_id.clone();
         let buf = ed.buffers.get_mut(id).expect("buffer exists");
         match buf.doc.save(&sel, force) {
             Ok(()) => {
                 buf.recovery_version = None;
                 if let (Some(dir), Some(p)) = (dir, buf.doc.path()) {
-                    crate::recovery::remove(&dir, p);
+                    crate::recovery::remove(&dir, p, &session);
                 }
             }
             Err(e) => errors.push(format!("{}: {e}", buf.doc.display_name())),
@@ -377,9 +386,7 @@ fn open(ed: &mut Editor, args: &[&str], force: bool) -> Result<(), String> {
         }
         return Err("usage: :open <path>".into());
     }
-    for a in args {
-        ed.open(Path::new(a))?;
-    }
+    ed.open(Path::new(args[0]))?;
     Ok(())
 }
 
@@ -692,11 +699,20 @@ fn cd(ed: &mut Editor, args: &[&str], _: bool) -> Result<(), String> {
 fn recover(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     let dir = ed.recovery_dir.clone().ok_or("recovery is disabled")?;
     let path = ed.doc().path().ok_or("buffer has no file")?.to_path_buf();
-    let content = crate::recovery::read(&dir, &path).ok_or("no recovery file for this buffer")?;
+    let (foreign, content) = crate::recovery::newest_foreign(&dir, &path, &ed.session_id)
+        .ok_or("no recovery file from another session for this buffer")?;
     let len = ed.doc().text().len_chars();
     let cs = ChangeSet::from_changes(len, [Change::replace(0, len, content)])
         .map_err(|e| e.to_string())?;
     if ed.apply_or_report(Transaction::new(cs)) {
+        // Journal the recovered text under this session before deleting the
+        // other session's file, so a crash in between loses nothing.
+        let session = ed.session_id.clone();
+        let text = ed.doc().text().clone();
+        crate::recovery::write(&dir, &path, &session, &text)
+            .map_err(|e| format!("recovered, but could not journal it: {e}"))?;
+        ed.buffer_mut().recovery_version = Some(ed.doc().version());
+        let _ = std::fs::remove_file(foreign);
         ed.set_status(
             Severity::Info,
             "recovered unsaved changes; review, then :w (u undoes the recovery)",
@@ -708,8 +724,8 @@ fn recover(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
 fn recover_discard(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     let dir = ed.recovery_dir.clone().ok_or("recovery is disabled")?;
     let path = ed.doc().path().ok_or("buffer has no file")?.to_path_buf();
-    crate::recovery::remove(&dir, &path);
-    ed.info("recovery file deleted");
+    let n = crate::recovery::remove_all(&dir, &path);
+    ed.info(format!("deleted {n} recovery file(s) for this buffer"));
     Ok(())
 }
 

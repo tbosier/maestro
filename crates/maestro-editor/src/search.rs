@@ -22,6 +22,8 @@ pub fn compile(pattern: &str) -> Result<Regex, String> {
 /// All matches in `text[from..to]` (char indices), as char ranges
 /// `(start, end_exclusive)`. Empty matches are skipped.
 pub fn matches_in(text: &Rope, re: &Regex, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let to = to.min(text.len_chars());
+    let from = from.min(to);
     let slice = text.slice(from..to);
     let s = slice.to_string();
     let base_byte = text.char_to_byte(from);

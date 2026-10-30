@@ -4,8 +4,8 @@
 //! inverses, and the selections before and after. Undo walks to the parent;
 //! redo walks to the most recently created child. Making a new edit after
 //! undoing starts a new branch instead of discarding the old one, so no
-//! committed state is ever lost. Navigating between branches by time is a
-//! later feature; the data model already supports it.
+//! committed state is ever lost. [`History::path_to`] reaches any revision,
+//! which is how `earlier`/`later` (g- / g+) visit abandoned branches.
 
 use std::time::SystemTime;
 
@@ -103,6 +103,48 @@ impl History {
         let child = self.revisions[self.current].last_child?;
         self.current = child;
         Some(&self.revisions[child])
+    }
+
+    /// The revisions to undo (in order) and then redo (in order) to move
+    /// from the current revision to `target`. `None` if `target` is unknown.
+    pub fn path_to(&self, target: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+        if target >= self.revisions.len() {
+            return None;
+        }
+        let ancestors = |mut id: usize| {
+            let mut v = vec![id];
+            while id != 0 {
+                id = self.revisions[id].parent;
+                v.push(id);
+            }
+            v
+        };
+        let from_chain = ancestors(self.current);
+        let to_chain = ancestors(target);
+        let common = *from_chain
+            .iter()
+            .find(|id| to_chain.contains(id))
+            .expect("the root is a common ancestor");
+        let up: Vec<usize> = from_chain
+            .into_iter()
+            .take_while(|id| *id != common)
+            .collect();
+        let mut down: Vec<usize> = to_chain
+            .into_iter()
+            .take_while(|id| *id != common)
+            .collect();
+        down.reverse();
+        Some((up, down))
+    }
+
+    /// Marks `target` current after walking `down`, pointing each parent's
+    /// redo at the branch just taken.
+    pub fn arrive(&mut self, target: usize, down: &[usize]) {
+        for &id in down {
+            let parent = self.revisions[id].parent;
+            self.revisions[parent].last_child = Some(id);
+        }
+        self.current = target;
     }
 
     pub fn can_undo(&self) -> bool {

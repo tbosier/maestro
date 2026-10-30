@@ -204,6 +204,13 @@ impl Document {
         if let Some(r) = self.read_only {
             return Err(EditError::ReadOnly(r));
         }
+        if tx.changes.len() != self.text.len_chars() {
+            return Err(ChangeError::LengthMismatch {
+                expected: tx.changes.len(),
+                actual: self.text.len_chars(),
+            }
+            .into());
+        }
         if tx.changes.is_empty() {
             return Ok(());
         }
@@ -292,13 +299,55 @@ impl Document {
         })
     }
 
-    /// True if the file on disk no longer matches what we last read or wrote.
+    /// Moves to any revision in the undo tree, chronologically numbered.
+    /// Used by `earlier`/`later` to reach branches that plain redo cannot.
+    pub fn goto_revision(
+        &mut self,
+        target: usize,
+        current_selection: &Selection,
+    ) -> Option<HistoryStep> {
+        if self.read_only.is_some() {
+            return None;
+        }
+        self.commit(current_selection);
+        let (up, down) = self.history.path_to(target)?;
+        if up.is_empty() && down.is_empty() {
+            return None;
+        }
+        let mut applied = Vec::new();
+        let mut selection = current_selection.clone();
+        for id in &up {
+            let rev = self.history.revision(*id).expect("path ids exist").clone();
+            for cs in rev.inverses.iter().rev() {
+                cs.apply(&mut self.text)
+                    .expect("history inverse must match the document it was recorded against");
+                self.version += 1;
+                applied.push(cs.clone());
+            }
+            selection = rev.selection_before;
+        }
+        for id in &down {
+            let rev = self.history.revision(*id).expect("path ids exist").clone();
+            for cs in &rev.changes {
+                cs.apply(&mut self.text)
+                    .expect("history change must match the document it was recorded against");
+                self.version += 1;
+                applied.push(cs.clone());
+            }
+            selection = rev.selection_after;
+        }
+        self.history.arrive(target, &down);
+        Some(HistoryStep { applied, selection })
+    }
+
+    /// True if the file on disk no longer matches what we last read or wrote,
+    /// judged by metadata and file identity (cheap enough to poll).
     pub fn changed_on_disk(&self) -> bool {
         let Some(path) = &self.path else {
             return false;
         };
         match (self.disk, DiskState::read(path)) {
-            (Some(then), Some(now)) => then != now,
+            (Some(then), Some(now)) => then.metadata_differs(&now),
             (Some(_), None) => true, // deleted or moved away
             // Never read from disk: a file appearing is handled by `save`.
             (None, _) => false,
@@ -313,6 +362,15 @@ impl Document {
             return Err(SaveError::ReadOnly(r));
         }
         if !force && self.disk.is_some() && self.changed_on_disk() {
+            return Err(SaveError::ExternallyModified(path));
+        }
+        // Metadata can be preserved by a rewrite (same size, timestamp put
+        // back). Before overwriting, compare the actual bytes.
+        if !force
+            && let Some(expected) = self.disk.and_then(|d| d.hash)
+            && path.exists()
+            && crate::io::hash_file(&path)? != expected
+        {
             return Err(SaveError::ExternallyModified(path));
         }
         if !force && self.disk.is_none() && path.exists() && self.saved_revision.is_some() {
@@ -334,6 +392,18 @@ impl Document {
             .clone()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "document has no path"))?;
         let loaded = crate::io::load(&path)?;
+        // Replacing editable text with a binary or undecodable file would
+        // make the buffer read-only, and read-only buffers cannot undo, so
+        // the previous text would be unreachable. Refuse instead.
+        if let Some(reason @ (ReadOnlyReason::Binary | ReadOnlyReason::InvalidEncoding)) =
+            loaded.read_only
+            && self.read_only.is_none()
+        {
+            return Err(io::Error::other(format!(
+                "not reloaded: the file on disk is now a {}",
+                reason.describe()
+            )));
+        }
         self.commit(current_selection);
         let new_text = loaded.text.to_string();
         let changes = ChangeSet::from_changes(
@@ -460,6 +530,78 @@ mod tests {
         assert!(!doc.is_modified());
         doc.undo(&Selection::point(0)).unwrap();
         assert_eq!(doc.text().to_string(), "zero one\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_rejects_mismatched_length_without_panicking() {
+        let mut doc = Document::from_text("abc");
+        let cs = ChangeSet::from_changes(10, [Change::delete(0, 10)]).unwrap();
+        assert!(matches!(
+            doc.apply(&Transaction::new(cs), &Selection::point(0)),
+            Err(EditError::Change(ChangeError::LengthMismatch { .. }))
+        ));
+        assert_eq!(doc.text().to_string(), "abc");
+    }
+
+    #[test]
+    fn earlier_and_later_reach_abandoned_branches() {
+        let mut doc = Document::from_text("");
+        let sel = Selection::point(0);
+        insert(&mut doc, 0, "A");
+        doc.commit(&sel); // revision 1
+        doc.undo(&sel).unwrap();
+        insert(&mut doc, 0, "B");
+        doc.commit(&sel); // revision 2, a sibling of 1
+        assert_eq!(doc.text().to_string(), "B");
+        // Plain redo cannot reach "A"; revision navigation can.
+        doc.goto_revision(1, &sel).unwrap();
+        assert_eq!(doc.text().to_string(), "A");
+        doc.goto_revision(2, &sel).unwrap();
+        assert_eq!(doc.text().to_string(), "B");
+        doc.goto_revision(0, &sel).unwrap();
+        assert_eq!(doc.text().to_string(), "");
+        // After arriving at 1 through navigation, redo follows that branch.
+        doc.goto_revision(1, &sel).unwrap();
+        doc.undo(&sel).unwrap();
+        doc.redo(&sel).unwrap();
+        assert_eq!(doc.text().to_string(), "A");
+    }
+
+    #[test]
+    fn save_detects_same_size_rewrite_with_restored_mtime() {
+        let dir = std::env::temp_dir().join(format!("maestro-doc-mtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "aaaa\n").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        insert(&mut doc, 0, "mine ");
+        // Same length, different bytes, timestamp restored.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        use std::io::Write;
+        (&f).write_all(b"bbbb\n").unwrap();
+        f.set_modified(mtime).unwrap();
+        drop(f);
+        assert!(matches!(
+            doc.save(&Selection::point(0), false),
+            Err(SaveError::ExternallyModified(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bbbb\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reload_refuses_binary_replacement() {
+        let dir = std::env::temp_dir().join(format!("maestro-doc-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        std::fs::write(&path, b"\x00\x01binary").unwrap();
+        assert!(doc.reload(&Selection::point(0)).is_err());
+        assert_eq!(doc.text().to_string(), "fn main() {}\n");
+        assert!(doc.read_only().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
