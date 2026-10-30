@@ -528,6 +528,7 @@ impl Server {
         let before = reference_selection(ed, id);
         let focused = ed.focus;
         let insert_mode = ed.mode == maestro_editor::Mode::Insert;
+        let old_text = ed.buffers[&id].doc.text().clone();
         let buf = ed.buffers.get_mut(&id).expect("checked above");
         // Close whatever the user had open so this edit is its own undo step.
         buf.doc.commit(&before);
@@ -577,6 +578,11 @@ impl Server {
                 mapped.clamp_normal(s)
             };
         }
+
+        // Keep the syntax tree and any language server in step with the text,
+        // exactly as edits from the keyboard do.
+        ed.on_text_changed(id, &old_text, std::slice::from_ref(&cs));
+        maestro_editor::lsp::document_changed(ed, id, std::slice::from_ref(&cs));
 
         let log = self.log.entry(id).or_default();
         log.push(p::EditRecord {

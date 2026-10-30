@@ -152,6 +152,8 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
         let last = text.line_to_char((view.top_line + text_h).min(text.len_lines()));
         lsp::spans_in(ed, view.doc, first, last.max(first + 1))
     };
+    let syntax = syntax_styles(ed, buf, view, text_h);
+    let mut next_syntax = 0;
 
     s.fill(
         Rect::new(area.x, area.y, area.width, text_h as u16),
@@ -219,6 +221,14 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
             let w = if eol { 1 } else { grapheme_width(g, col, tab) };
             if col + w > view.left_col && x < right {
                 let mut style = base;
+                while syntax.get(next_syntax).is_some_and(|&(_, to, _)| to <= pos) {
+                    next_syntax += 1;
+                }
+                if let Some(&(from, _, st)) = syntax.get(next_syntax)
+                    && from <= pos
+                {
+                    style = style.patch(st);
+                }
                 if let Some(&(_, _, sev)) = diag_spans
                     .iter()
                     .filter(|(a, b, _)| pos >= *a && pos < *b)
@@ -507,6 +517,30 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     }
     out.push(cur);
     out
+}
+
+/// Syntax styles for the visible lines, as sorted, non-overlapping
+/// `(from, to, style)` char spans.
+fn syntax_styles(
+    ed: &Editor,
+    buf: &Buffer,
+    view: &View,
+    height: usize,
+) -> Vec<(usize, usize, Style)> {
+    let text = buf.doc.text();
+    let first = view.top_line.min(text.len_lines().saturating_sub(1));
+    let last = (view.top_line + height).min(text.len_lines());
+    let (from, to) = (text.line_to_char(first), text.line_to_char(last));
+    // Very long lines go uncolored: highlighting costs time and two bytes
+    // of scratch memory per byte of the visible lines.
+    if to - from > 256 * 1024 {
+        return Vec::new();
+    }
+    buf.syntax
+        .highlights(text, from..to)
+        .into_iter()
+        .filter_map(|(a, b, scope)| ed.theme.syntax(scope).map(|st| (a, b, st)))
+        .collect()
 }
 
 fn search_matches(ed: &Editor, view: &View, height: usize) -> Option<Vec<(usize, usize)>> {

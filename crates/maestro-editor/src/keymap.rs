@@ -398,6 +398,8 @@ impl Keymaps {
             }
         }
 
+        bind_syntax(&mut normal);
+
         let mut select = normal.clone();
         b(&mut select, "v", "normal_mode");
         b(&mut select, "esc", "normal_mode");
@@ -430,6 +432,17 @@ impl Keymaps {
             insert,
             errors: Vec::new(),
         }
+    }
+}
+
+/// Structural selection keys (`crate::syntax_commands`).
+fn bind_syntax(trie: &mut KeyTrie) {
+    for (keys, command) in crate::syntax_commands::DEFAULT_KEYS {
+        trie.bind(
+            &parse_sequence(keys).expect("default keymap parses"),
+            command,
+            None,
+        );
     }
 }
 

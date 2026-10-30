@@ -317,6 +317,7 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
                 return Err(format!("{} is open in another buffer", target.display()));
             }
             editor.buffer_mut().doc.set_path(target);
+            editor.refresh_syntax(editor.view().doc);
         }
     }
     let (view, buf) = editor.current();
@@ -443,9 +444,11 @@ fn reload(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
     let doc_id = ed.view().doc;
     let (view, buf) = ed.current();
     let sel = view.selection.clone();
+    let old = buf.doc.text().clone();
     let changes = buf.doc.reload(&sel).map_err(|e| e.to_string())?;
     buf.disk_change_reported = false;
     let text = buf.doc.text().clone();
+    ed.on_text_changed(doc_id, &old, std::slice::from_ref(&changes));
     for v in ed.views.values_mut().filter(|v| v.doc == doc_id) {
         v.selection = v.selection.map(&changes).clamp_normal(text.slice(..));
     }

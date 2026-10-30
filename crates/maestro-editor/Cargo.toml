@@ -11,6 +11,7 @@ maestro-core.workspace = true
 maestro-config.workspace = true
 maestro-git.workspace = true
 maestro-lsp.workspace = true
+maestro-syntax.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 ignore.workspace = true

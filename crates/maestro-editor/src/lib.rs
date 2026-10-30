@@ -1,10 +1,11 @@
 //! Editor state, modal commands and keymaps for Maestro.
 //!
-//! This crate depends on `maestro-core`, `maestro-config`, `maestro-git`
-//! and `maestro-lsp`. It has no terminal or network dependency: a front end
-//! feeds it [`KeyEvent`]s and draws what it holds. Git runs only on
-//! background threads (see [`git`]); language servers run on their own
-//! threads (see [`lsp`]).
+//! This crate depends on `maestro-core`, `maestro-config`, `maestro-git`,
+//! `maestro-lsp` and `maestro-syntax`. It has no terminal or network
+//! dependency: a front end feeds it [`KeyEvent`]s and draws what it holds.
+//! Git runs only on background threads (see [`git`]); language servers run
+//! on their own threads (see [`lsp`]); large parses run in the background
+//! (see [`syntax`]).
 
 pub mod commands;
 pub mod editor;
@@ -21,6 +22,8 @@ pub mod prompt;
 pub mod recovery;
 pub mod registers;
 pub mod search;
+pub mod syntax;
+pub mod syntax_commands;
 pub mod typed;
 
 pub use editor::{DocumentId, Editor, Mode, MouseKind, Presentation, Severity, View, ViewId};

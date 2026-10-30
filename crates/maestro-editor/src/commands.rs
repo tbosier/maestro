@@ -44,6 +44,7 @@ pub static TABLES: &[&[Command]] = &[
     crate::git::COMMANDS,
     crate::lsp_commands::COMMANDS,
     crate::navigation::COMMANDS,
+    crate::syntax_commands::COMMANDS,
 ];
 
 /// Iterates every registered command.
@@ -1480,6 +1481,7 @@ fn history_step(ed: &mut Editor, redo: bool) {
         let sel = ed.view().selection.clone();
         let doc_id = ed.view().doc;
         let focus = ed.focus;
+        let old = text_of(ed);
         let step = {
             let buf = ed.buffer_mut();
             if redo {
@@ -1500,6 +1502,7 @@ fn history_step(ed: &mut Editor, redo: bool) {
             }
             return;
         };
+        ed.on_text_changed(doc_id, &old, &step.applied);
         let text = text_of(ed);
         for v in ed.views.values_mut().filter(|v| v.doc == doc_id) {
             v.selection = if v.id == focus {
@@ -1723,6 +1726,7 @@ fn goto_revision_step(ed: &mut Editor, forward: bool) {
         current.saturating_sub(count)
     };
     let sel = ed.view().selection.clone();
+    let old = text_of(ed);
     let Some(step) = ed.buffer_mut().doc.goto_revision(target, &sel) else {
         ed.info(if forward {
             "already at the newest state"
@@ -1742,6 +1746,8 @@ fn goto_revision_step(ed: &mut Editor, forward: bool) {
         }
         .clamp_normal(text.slice(..));
     }
+    ed.on_text_changed(doc_id, &old, &step.applied);
+    crate::lsp::document_changed(ed, doc_id, &step.applied);
     ed.info(format!("state {target} of {}", len - 1));
 }
 

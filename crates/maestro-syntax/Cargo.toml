@@ -1,0 +1,22 @@
+[package]
+name = "maestro-syntax"
+description = "Tree-sitter parsing, highlighting and structural selection for Maestro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+maestro-core.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-md.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-c.workspace = true
+
+[lints]
+workspace = true

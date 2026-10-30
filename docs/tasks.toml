@@ -28,7 +28,7 @@ title = "Tree-sitter highlighting and structural selection"
 crates = ["maestro-syntax"]
 branch = "feat/syntax"
 owner = "agent"
-status = "not-started"
+status = "done"
 
 [[task]]
 id = "m1-navigation"

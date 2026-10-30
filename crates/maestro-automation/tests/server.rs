@@ -676,3 +676,33 @@ fn opening_something_other_than_a_regular_file_is_refused() {
     assert_eq!(code, ErrorCode::InvalidParams);
     assert!(msg.contains("not a regular file"), "{msg}");
 }
+
+#[test]
+fn agent_edits_keep_the_syntax_tree_in_sync() {
+    let dir = temp_dir("syntax-sync");
+    let path = dir.join("lib.rs");
+    std::fs::write(&path, "fn a() {}\n").unwrap();
+    let mut h = Harness::new();
+    let opened = h.ok("document.open", json!({"path": path.to_str().unwrap()}));
+    let doc = opened["doc"].as_u64().unwrap();
+    h.ok(
+        "document.apply_edit",
+        json!({"doc": doc, "base_version": 0, "encoding": "char",
+               "edits": [{"range": {"start": 3, "end": 4}, "text": "renamed"}],
+               "actor": "test"}),
+    );
+    let buf = &h.ed.buffers[&DocumentId(doc)];
+    let text = buf.doc.text();
+    assert_eq!(text.to_string(), "fn renamed() {}\n");
+    let fresh = maestro_syntax::Syntax::parse(buf.syntax.language().unwrap(), text).unwrap();
+    assert_eq!(
+        buf.syntax.syntax().unwrap().tree().root_node().to_sexp(),
+        fresh.tree().root_node().to_sexp()
+    );
+    let all = 0..text.len_chars();
+    assert_eq!(
+        buf.syntax.highlights(text, all.clone()),
+        fresh.highlights(text, all)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -82,6 +82,8 @@ pub struct Buffer {
     pub last_edit: Option<Instant>,
     /// Set once the user has been told the file changed on disk.
     pub disk_change_reported: bool,
+    /// Language, syntax tree and structural-selection state.
+    pub syntax: crate::syntax::BufferSyntax,
 }
 
 #[derive(Debug, Clone)]
@@ -265,8 +267,10 @@ impl Editor {
                 recovery_version: None,
                 last_edit: None,
                 disk_change_reported: false,
+                syntax: Default::default(),
             },
         );
+        self.refresh_syntax(id);
         id
     }
 
@@ -379,9 +383,11 @@ impl Editor {
         let doc_id = self.views[&view_id].doc;
         let before = self.views[&view_id].selection.clone();
         let buf = self.buffers.get_mut(&doc_id).expect("buffer exists");
+        let old = buf.doc.text().clone();
         buf.doc.apply(&tx, &before)?;
         buf.last_edit = Some(Instant::now());
         let text = buf.doc.text().clone();
+        self.on_text_changed(doc_id, &old, std::slice::from_ref(&tx.changes));
         for view in self.views.values_mut().filter(|v| v.doc == doc_id) {
             let mapped = if view.id == view_id {
                 tx.selection
@@ -1256,9 +1262,11 @@ impl Editor {
                     .map(|v| v.selection.clone())
                     .unwrap_or_else(|| Selection::point(0));
                 let buf = self.buffers.get_mut(&id).expect("exists");
+                let old = buf.doc.text().clone();
                 match buf.doc.reload(&sel) {
                     Ok(changes) => {
                         let text = buf.doc.text().clone();
+                        self.on_text_changed(id, &old, std::slice::from_ref(&changes));
                         for v in self.views.values_mut().filter(|v| v.doc == id) {
                             v.selection = v.selection.map(&changes).clamp_normal(text.slice(..));
                         }
