@@ -167,6 +167,7 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
             );
         }
         draw_gutter(ed, s, area.x, y, gutter, line, primary_line, focused);
+        draw_git_sign(ed, s, area.x, y, gutter, view, line, primary_line);
 
         // Text.
         let line_start = text.line_to_char(line);
@@ -308,6 +309,42 @@ fn draw_gutter(
     s.print(x + 1, y, &label, style, x + width);
 }
 
+// ----- git sign column (maestro-git) -----------------------------------
+// Draws `+`, `~` or `-` in the gutter's first cell, colored by the theme's
+// diff roles. The symbol carries the meaning; color only reinforces it.
+#[allow(clippy::too_many_arguments)]
+fn draw_git_sign(
+    ed: &Editor,
+    s: &mut Surface,
+    x: u16,
+    y: u16,
+    width: u16,
+    view: &View,
+    line: usize,
+    primary_line: usize,
+) {
+    if width == 0 {
+        return;
+    }
+    let Some(sign) = ed.git.sign_at(view.doc, line) else {
+        return;
+    };
+    let diff = &ed.theme.diff;
+    let color = match sign {
+        maestro_editor::git::Sign::Added => diff.git_add,
+        maestro_editor::git::Sign::Changed => diff.git_changed,
+        maestro_editor::git::Sign::Removed => diff.git_removed,
+    };
+    let ui = &ed.theme.ui;
+    let gutter = if line == primary_line && view.id == ed.focus {
+        ui.gutter_current
+    } else {
+        ui.gutter
+    };
+    s.put(x, y, sign.symbol(), gutter.patch(color), x + 1);
+}
+// ----- end git sign column ---------------------------------------------
+
 fn search_matches(ed: &Editor, view: &View, height: usize) -> Option<Vec<(usize, usize)>> {
     let pattern = ed.last_search.as_ref()?;
     let re = maestro_editor::search::compile(pattern).ok()?;
@@ -350,6 +387,16 @@ fn draw_statusline(ed: &Editor, view: &View, s: &mut Surface, area: Rect) {
                 view.selection.primary_index() + 1,
                 sels
             ));
+        }
+        // Git branch (maestro-git), shortened so it never crowds out the rest.
+        if let Some(branch) = ed.git.branch_label(view.doc) {
+            let chars: Vec<char> = branch.chars().collect();
+            let shown: String = if chars.len() > 24 {
+                chars[..23].iter().chain(['…'].iter()).collect()
+            } else {
+                branch
+            };
+            right.push_str(&format!("{shown}  "));
         }
         right.push_str(&format!(
             "{}  {}  ",
@@ -678,4 +725,44 @@ fn draw_picker(ed: &Editor, s: &mut Surface) -> Option<CursorShape> {
         }
     }
     Some(CursorShape::Bar(end.min(inner_r - 1), y + 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maestro_config::Config;
+    use maestro_core::Document;
+    use maestro_editor::git::{Sign, SignMap};
+
+    /// Signs draw as symbols in the gutter's first cell, colored by role.
+    #[test]
+    fn git_signs_draw_symbols_in_the_sign_column() {
+        let mut ed = Editor::new(Config::default(), Rect::new(0, 0, 40, 10));
+        let id = ed.add_document(Document::from_text("a\nb\nc\nd\n\n"));
+        ed.switch_to(id);
+        let (_, views, _) = split_screen(40, 10, &ed);
+        ed.resize(views);
+        ed.git
+            .set_signs(id, SignMap::diff("a\nB\nc\nx\nd\n", "a\nb\nc\nd\n\n"));
+        // Line 1 changed, "x" removed below line 2, line 4 added.
+        assert_eq!(
+            ed.git.signs(id).unwrap().iter().collect::<Vec<_>>(),
+            vec![(1, Sign::Changed), (2, Sign::Removed), (4, Sign::Added)]
+        );
+        let mut s = Surface::new(40, 10, ed.theme.ui.text);
+        render(&ed, &mut s);
+        let top = ed.view().area.y;
+        let cell = |line: u16| s.cell(0, top + line).unwrap().clone();
+        assert_eq!(cell(0).symbol, " ");
+        assert_eq!(cell(1).symbol, "~");
+        assert_eq!(cell(1).style.fg, ed.theme.diff.git_changed.fg);
+        assert_eq!(cell(1).style.bg, ed.theme.ui.gutter.bg);
+        assert_eq!(cell(2).symbol, "-");
+        assert_eq!(cell(2).style.fg, ed.theme.diff.git_removed.fg);
+        assert_eq!(cell(3).symbol, " ");
+        assert_eq!(cell(4).symbol, "+");
+        assert_eq!(cell(4).style.fg, ed.theme.diff.git_add.fg);
+        // Line numbers still follow the sign column.
+        assert_eq!(s.cell(3, top + 1).unwrap().symbol, "2");
+    }
 }

@@ -257,7 +257,11 @@ pub fn execute_line(editor: &mut Editor, line: &str) {
                 editor.error(e);
             }
         }
-        None => match crate::commands::lookup(name) {
+        // Registry commands also answer to their name with dashes
+        // (`:git-status` runs `git_status`).
+        None => match crate::commands::lookup(name)
+            .or_else(|| crate::commands::lookup(&name.replace('-', "_")))
+        {
             Some(cmd) => (cmd.fun)(editor),
             None => editor.error(format!("unknown command: {name}")),
         },

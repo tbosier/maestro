@@ -2,7 +2,7 @@
 
 ## What exists today
 
-Maestro is currently a local editor with no network code, no plugin system and no subprocesses except the clipboard helpers below. The automation API (below) listens only on a Unix socket, and only when started with `--listen`.
+Maestro is currently a local editor with no network code and no plugin system. It runs subprocesses only for the clipboard helpers and `git`, both described below. The automation API (below) listens only on a Unix socket, and only when started with `--listen`.
 
 - Files are written atomically through a temp file in the same directory, created with `create_new` so an existing file of that name is never clobbered, and removed on failure only if this save created it. When an existing file is replaced, the temp file is created owner-only (0600) and gets the original's permissions just before the rename, so private contents are never briefly readable by others. Symlinks, including dangling ones, are followed so the link survives.
 - Before overwriting, a save compares the file's metadata, identity (device and inode on Unix) and a hash of its bytes with what was last read or written. Any difference refuses the save until the user picks `:w!` or `:reload`.
@@ -10,6 +10,8 @@ Maestro is currently a local editor with no network code, no plugin system and n
 - Recovery files contain file contents. The directory is created with mode 0700 and each file with mode 0600 on Unix. Unnamed buffers are not journaled. Each editor session writes and deletes only its own recovery files; another session's files are removed only by `:recover` (after copying the text into this session's journal) or `:recover-discard`.
 - Config is parsed with `deny_unknown_fields`, and key bindings that name unknown commands are rejected at startup.
 - Clipboard: `pbcopy`/`pbpaste`, `wl-copy`/`wl-paste`, `xclip` or `xsel` are run by name from `PATH` with fixed arguments. The text goes over stdin; it is never put on a command line. Without them, copying uses the OSC 52 terminal escape.
+- Git: `maestro-git` runs `git` from `PATH` with argument vectors, never a shell. Paths are separate arguments with `GIT_LITERAL_PATHSPECS=1`; revisions starting with `-` are refused and new branch names are checked with `git check-ref-format`. Read-only calls (status, diffs, base texts) set `GIT_OPTIONAL_LOCKS=0` and `GIT_NO_LAZY_FETCH=1`. `GIT_TERMINAL_PROMPT=0` stops terminal password prompts; a configured askpass or credential helper can still run, and calls have no timeout.
+- Removing a worktree refuses, unless the caller passes `force`, when `git status` reports uncommitted changes or untracked files, or when its `HEAD` has commits that are ahead of its upstream or (without one) on no other branch or remote-tracking branch. That last check also runs for a worktree whose directory is gone. The main and locked worktrees are never removed, even with `force`. Not detected: edits to files marked `assume-unchanged` or `skip-worktree`, and ignored files, which are deleted with the directory as `git worktree remove` does.
 - No `unsafe` code; the workspace forbids it.
 
 ## Automation API
@@ -38,6 +40,8 @@ Maestro is currently a local editor with no network code, no plugin system and n
 - No project contents go to a model provider unless the user configured that provider and authorized it for the workspace.
 
 ## Known gaps
+
+- `git` runs with the user's configuration, including the repository's own `.git/config`. A repository unpacked from an archive with a hostile `.git/config` could name a command in `core.fsmonitor`, which `git status` (run for gutter signs and the status picker) would execute. `git worktree add` runs the repository's `post-checkout` hook. This is the same exposure as a shell prompt that runs `git status`; Maestro does not yet ask before running Git in a newly opened repository.
 
 - Saving a file owned by another user keeps the permission bits but not the owner.
 - A file with several hard links loses its link to the others when saved, because the save replaces the directory entry.
