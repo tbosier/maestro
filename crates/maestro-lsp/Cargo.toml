@@ -1,0 +1,28 @@
+[package]
+name = "maestro-lsp"
+description = "Language Server Protocol client for Maestro: process, framing, JSON-RPC and position conversions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# A scriptable fake language server used by tests in this crate and in
+# maestro-editor. Not part of the editor.
+fake-server = []
+
+[dependencies]
+maestro-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# Turns on the fake server for this crate's own tests.
+maestro-lsp = { path = ".", features = ["fake-server"] }
+
+[[test]]
+name = "client"
+harness = false
+
+[lints]
+workspace = true
