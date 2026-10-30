@@ -12,11 +12,12 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 |---|---|---|
 | `maestro-core` | Rope text, position types, selections, change sets, transactions, undo tree, documents, file IO | ropey, unicode-segmentation, unicode-width, thiserror |
 | `maestro-config` | TOML config, theme tokens, the Duskfox palette | serde, toml |
-| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery | core, config, regex |
+| `maestro-syntax` | Tree-sitter grammars, incremental parsing from change sets, highlight spans, syntax node ranges | core, tree-sitter and grammar crates |
+| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, per-buffer syntax state | core, config, syntax, regex |
 | `maestro-tui` | Terminal lifecycle, input conversion, rendering, clipboard providers | editor, crossterm |
 | `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui |
 
-Planned crates (`maestro-syntax`, `maestro-lsp`, `maestro-git`, `maestro-protocol`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
+Planned crates (`maestro-lsp`, `maestro-git`, `maestro-protocol`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 
 ## Rules
 
