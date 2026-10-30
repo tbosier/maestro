@@ -1,0 +1,71 @@
+# Workstreams. status: done | in-progress | not-started
+# owner: "lead" or the agent branch working on it.
+
+[[task]]
+id = "m0-core"
+title = "Text engine, selections, transactions, undo tree, atomic IO"
+crates = ["maestro-core"]
+owner = "lead"
+status = "done"
+
+[[task]]
+id = "m0-tui"
+title = "Terminal renderer, Duskfox theme, input, clipboard"
+crates = ["maestro-tui", "maestro-config"]
+owner = "lead"
+status = "done"
+
+[[task]]
+id = "m0-modal"
+title = "Modal editing, keymaps, command registry, prompts, pickers"
+crates = ["maestro-editor"]
+owner = "lead"
+status = "done"
+
+[[task]]
+id = "m1-syntax"
+title = "Tree-sitter highlighting and structural selection"
+crates = ["maestro-syntax"]
+branch = "feat/syntax"
+owner = "agent"
+status = "not-started"
+
+[[task]]
+id = "m1-navigation"
+title = "Gitignore-aware background file finder, workspace search, session restore"
+crates = ["maestro-editor"]
+branch = "feat/navigation"
+owner = "agent"
+status = "not-started"
+
+[[task]]
+id = "m1-lsp"
+title = "Async LSP client: diagnostics, goto definition, hover, completion"
+crates = ["maestro-lsp"]
+branch = "feat/lsp"
+owner = "agent"
+status = "not-started"
+
+[[task]]
+id = "m2-git"
+title = "Git status, diffs and worktree lifecycle"
+crates = ["maestro-git"]
+branch = "feat/git-worktrees"
+owner = "agent"
+status = "not-started"
+
+[[task]]
+id = "m3-protocol"
+title = "Versioned automation API with headless mode"
+crates = ["maestro-protocol"]
+branch = "feat/automation-api"
+owner = "agent"
+status = "not-started"
+
+[[task]]
+id = "m1-vim"
+title = "Vim operator-pending grammar"
+crates = ["maestro-editor"]
+branch = "feat/vim-profile"
+owner = "unassigned"
+status = "not-started"

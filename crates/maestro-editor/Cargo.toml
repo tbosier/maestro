@@ -1,0 +1,19 @@
+[package]
+name = "maestro-editor"
+description = "Editor state, modal commands, keymaps and the command registry for Maestro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+maestro-core.workspace = true
+maestro-config.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

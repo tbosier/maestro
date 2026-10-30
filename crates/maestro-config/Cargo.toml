@@ -1,0 +1,15 @@
+[package]
+name = "maestro-config"
+description = "Configuration, theme tokens and the Duskfox palette for Maestro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

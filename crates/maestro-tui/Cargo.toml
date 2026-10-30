@@ -1,0 +1,19 @@
+[package]
+name = "maestro-tui"
+description = "Terminal front end for Maestro: rendering, input and terminal lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+maestro-core.workspace = true
+maestro-config.workspace = true
+maestro-editor.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+regex.workspace = true
+
+[lints]
+workspace = true
