@@ -122,7 +122,7 @@ pub fn listen(editor: &Editor, path: &Path) -> io::Result<Listener> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let private = parent.join(format!(".maestro-{}-{nonce:x}", std::process::id()));
+    let private = parent.join(format!(".m{:x}.{nonce:x}", std::process::id()));
     std::fs::DirBuilder::new().mode(0o700).create(&private)?;
     let staged = private.join("s");
     let bound = (|| {

@@ -26,6 +26,9 @@ pub fn serve<R: BufRead, W: Write>(
         if input.read_until(b'\n', &mut buf)? == 0 {
             return Ok(());
         }
+        // Results of background work started by earlier requests land
+        // before this one reads state.
+        editor.poll_background();
         let response = match std::str::from_utf8(&buf) {
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => server.handle_line(editor, &mut session, line.trim_end()),

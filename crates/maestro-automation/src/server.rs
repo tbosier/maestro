@@ -301,9 +301,9 @@ impl Server {
         session: &mut Session,
         req: Request,
     ) -> Option<Response> {
-        // Results of background work (file listings and the like) land
-        // before the request reads state.
-        ed.poll_background();
+        // No `ed.poll_background()` here: on the socket transport this runs
+        // inside `poll_background` already, and draining other jobs from
+        // here would re-enter the connection hub's lock.
         let outcome = self.dispatch(ed, session, &req.method, req.params);
         let id = req.id?;
         Some(match outcome {
