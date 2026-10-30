@@ -654,7 +654,7 @@ fn interactive_state(ed: &Editor) -> (bool, bool, bool) {
 }
 
 /// Runs `f`, then refuses if it opened a prompt, picker or character
-/// request (the API cannot type into them; they are cancelled with Esc so
+/// request (the API cannot type into them; they are canceled with Esc so
 /// the editor is not left waiting), or if it reported an error.
 fn run_noninteractive(
     ed: &mut Editor,
@@ -678,7 +678,7 @@ fn run_noninteractive(
         return Err(err(
             ErrorCode::CommandFailed,
             format!(
-                "{what} needs interactive input ({input}), which the automation API cannot supply; it was cancelled"
+                "{what} needs interactive input ({input}), which the automation API cannot supply; it was canceled"
             ),
         ));
     }

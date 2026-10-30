@@ -57,10 +57,15 @@ status = "not-started"
 [[task]]
 id = "m3-protocol"
 title = "Versioned automation API with headless mode"
-crates = ["maestro-protocol"]
+crates = ["maestro-protocol", "maestro-automation", "maestro-cli"]
 branch = "feat/automation-api"
 owner = "agent"
-status = "not-started"
+status = "in-progress"
+# Done: protocol 1.0 types, server (snapshot, open, text, save, apply_edit
+# with version check, history, selections, command.run/list, execute, quit,
+# events), --headless, --listen (Unix socket), --remote. See docs/automation.md.
+# Open: edit proposals with review, persistent provenance, Windows named
+# pipe, a wake-up for the interactive loop.
 
 [[task]]
 id = "m1-vim"

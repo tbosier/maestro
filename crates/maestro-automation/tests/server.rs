@@ -400,7 +400,7 @@ fn command_run_moves_selections() {
 
     let (code, _, _) = h.fails("command.run", json!({"name": "no_such_command"}));
     assert_eq!(code, ErrorCode::NotFound);
-    // A command that waits for a typed character is refused and cancelled.
+    // A command that waits for a typed character is refused and canceled.
     let (code, msg, _) = h.fails("command.run", json!({"name": "find_next_char"}));
     assert_eq!(code, ErrorCode::CommandFailed);
     assert!(msg.contains("typed character"), "{msg}");

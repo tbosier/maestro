@@ -33,9 +33,17 @@ Acceptance (use Maestro to navigate and modify its own source without another ed
 
 Worktree management, agent terminals, one working agent integration, sessions, worktree-aware editing, diff review, approval, test execution, safe merge or cherry-pick.
 
-## M3: differentiating capabilities (not started)
+## M3: differentiating capabilities (partial)
 
-The foundation exists: version-checked transactions in `maestro-core` refuse stale edits. Not started: task contracts, the automation API, provenance, conflict detection, structural pipelines.
+| Item | Status |
+|---|---|
+| Automation API | partial: protocol 1.0 over `--headless` (stdin/stdout) and `--listen` (Unix socket); version-checked `document.apply_edit` as one undo step; commands by name; change events. Not built: edit proposals with review, buffer and view management, Windows transport. See `docs/automation.md` |
+| Provenance | partial: an in-memory per-buffer log of API edits (actor, description, versions, time). Not persisted; typing is not attributed |
+| Task contracts | not started |
+| Conflict detection | partial: stale edits are refused by version; no merge or rebase of a stale edit |
+| Structural pipelines | not started |
+
+Verified October 30, 2026: `headless_acceptance_open_edit_stale_save_history` in `crates/maestro-cli/tests/headless.rs` spawns `maestro --headless`, opens a file, applies a change against its version, has a second change against the old version refused as stale, saves, checks the file on disk and reads the actor from the history. The live socket was driven with `maestro --remote` against the interactive editor running in tmux.
 
 ## M4: advanced (not started)
 
