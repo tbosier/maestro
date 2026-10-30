@@ -15,6 +15,7 @@
 //! are replayed onto its result when it arrives.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -30,8 +31,10 @@ pub const SYNC_PARSE_BYTES: usize = 256 * 1024;
 /// Longest the main thread spends on a parse when a file is opened.
 pub const OPEN_BUDGET: Duration = Duration::from_millis(50);
 
-/// Longest the main thread spends reparsing after an edit.
-pub const REPARSE_BUDGET: Duration = Duration::from_millis(8);
+/// Longest the main thread spends reparsing after an edit. Tree-sitter
+/// checks the clock only every so often, so the real cost can overshoot a
+/// little; the 16 ms frame target leaves room for that.
+pub const REPARSE_BUDGET: Duration = Duration::from_millis(4);
 
 /// Files above this size get no syntax tree at all.
 pub const MAX_PARSE_BYTES: usize = 64 << 20;
@@ -54,10 +57,21 @@ pub struct BufferSyntax {
     /// as missing color rather than wrong color or a panic.
     synced_len: usize,
     note: Option<&'static str>,
+    /// Bumped whenever the tree changes; keys the highlight cache.
+    generation: u64,
+    /// The last highlights computed, so frames that do not change the tree
+    /// or the visible range (cursor motion, most commands) reuse them.
+    cache: Mutex<Option<HighlightCache>>,
     /// Per view: the selections before each `expand_selection`, and the
     /// selection the last expansion produced. `shrink_selection` walks back
     /// only while the view still has that selection.
     pub(crate) expansions: HashMap<ViewId, (Vec<Selection>, Selection)>,
+}
+
+struct HighlightCache {
+    generation: u64,
+    range: std::ops::Range<usize>,
+    spans: Vec<Highlight>,
 }
 
 /// A background parse in flight and the edits made since it started.
@@ -96,12 +110,26 @@ impl BufferSyntax {
     /// no tree, while the language's highlight query is still compiling, or
     /// if the tree does not match the text.
     pub fn highlights(&self, text: &Rope, range: std::ops::Range<usize>) -> Vec<Highlight> {
-        match &self.syntax {
-            Some(s) if self.synced_len == text.len_bytes() && s.language().is_prepared() => {
-                s.highlights(text, range)
-            }
-            _ => Vec::new(),
+        let Some(s) = &self.syntax else {
+            return Vec::new();
+        };
+        if self.synced_len != text.len_bytes() || !s.language().is_prepared() {
+            return Vec::new();
         }
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = &*cache
+            && c.generation == self.generation
+            && c.range == range
+        {
+            return c.spans.clone();
+        }
+        let spans = s.highlights(text, range.clone());
+        *cache = Some(HighlightCache {
+            generation: self.generation,
+            range,
+            spans: spans.clone(),
+        });
+        spans
     }
 
     /// A status line message for when a command needs a tree and there is
@@ -113,6 +141,19 @@ impl BufferSyntax {
             (Some(_), false, Some(note)) => note.into(),
             (Some(l), false, None) => format!("no {} syntax tree", l.name()),
         }
+    }
+}
+
+/// Frees a replaced tree. Releasing a big tree visits every node it does
+/// not share with its successor, which takes milliseconds on multi-megabyte
+/// files, so big ones are freed on a short-lived thread.
+fn drop_elsewhere<T: Send + 'static>(old: T, big: bool) {
+    if big {
+        // If the thread cannot start, the closure (and the tree) is dropped
+        // here instead.
+        let _ = std::thread::Builder::new()
+            .name("maestro-syntax-free".into())
+            .spawn(move || drop(old));
     }
 }
 
@@ -147,9 +188,10 @@ impl Editor {
             return;
         };
         if !lang.is_prepared() {
-            // Compiling a highlight query takes tens of milliseconds; do it
-            // once per language off the main thread. The empty job makes the
-            // front end redraw when it is done.
+            // Compiling a highlight query takes up to ~15 ms (Rust, TSX);
+            // start it once per language on another thread, in parallel
+            // with the parse below. The empty job makes the front end redraw
+            // when it is done.
             let _ = self.spawn_background("syntax-query", move |tx| {
                 lang.prepare();
                 tx.send(|_| {});
@@ -167,6 +209,10 @@ impl Editor {
         {
             buf.syntax.syntax = Some(s);
             buf.syntax.synced_len = bytes;
+            // Wait for the query too, so the first frame is colored. This
+            // costs at most the compile time left over after the parse, once
+            // per language.
+            lang.prepare();
             return;
         }
         self.spawn_parse(id, ParseJob::Fresh(lang));
@@ -212,6 +258,7 @@ impl Editor {
         };
         let st = &mut buf.syntax;
         if st.pending.as_ref().map(|p| p.id) != Some(parse) {
+            drop_elsewhere(result, true);
             return;
         }
         let pending = st.pending.take().expect("checked above");
@@ -222,7 +269,9 @@ impl Editor {
         st.slow = took > REPARSE_BUDGET;
         let replay = !pending.edits.is_empty();
         syntax.apply_edits(&pending.edits);
-        st.syntax = Some(syntax);
+        let old = st.syntax.replace(syntax);
+        drop_elsewhere(old, buf.doc.text().len_bytes() > SYNC_PARSE_BYTES);
+        st.generation += 1;
         st.synced_len = buf.doc.text().len_bytes();
         if replay {
             self.reparse(id);
@@ -239,8 +288,13 @@ impl Editor {
         let Some(s) = &mut st.syntax else {
             return;
         };
-        if !st.slow && s.reparse_within(buf.doc.text(), REPARSE_BUDGET) {
-            return;
+        st.generation += 1;
+        if !st.slow {
+            let big = buf.doc.text().len_bytes() > SYNC_PARSE_BYTES;
+            if let Some(old) = s.reparse_within(buf.doc.text(), REPARSE_BUDGET) {
+                drop_elsewhere(old, big);
+                return;
+            }
         }
         st.slow = true;
         let fork = s.fork();
@@ -263,6 +317,7 @@ impl Editor {
         if let Some(s) = &mut st.syntax {
             s.apply_edits(&edits);
             st.synced_len = buf.doc.text().len_bytes();
+            st.generation += 1;
         }
         if let Some(p) = &mut st.pending {
             p.edits.extend(edits);

@@ -356,7 +356,7 @@ fn budgets_stop_parsing_and_a_fork_finishes_the_job() {
     cs.apply(&mut text).unwrap();
     syntax.apply_edits(&input_edits(&old, &[cs]));
     // Out of time: the tree stays the edited old tree.
-    assert!(!syntax.reparse_within(&text, Duration::ZERO));
+    assert!(syntax.reparse_within(&text, Duration::ZERO).is_none());
     assert_eq!(
         syntax.tree().root_node().end_byte(),
         text.len_bytes(),
@@ -374,7 +374,11 @@ fn budgets_stop_parsing_and_a_fork_finishes_the_job() {
     };
     let fork = worker.join().unwrap();
     assert_same_as_fresh(&fork, &text, "forked reparse");
-    assert!(syntax.reparse_within(&text, Duration::from_secs(60)));
+    assert!(
+        syntax
+            .reparse_within(&text, Duration::from_secs(60))
+            .is_some()
+    );
     assert_same_as_fresh(&syntax, &text, "reparse after a stopped one");
 }
 

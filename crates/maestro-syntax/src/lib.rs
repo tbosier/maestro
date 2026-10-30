@@ -120,16 +120,16 @@ impl Syntax {
     }
 
     /// Like [`Syntax::reparse`], but gives up once it has taken longer than
-    /// `budget` and returns false. The tree is then still the edited old
+    /// `budget` and returns `None`. The tree is then still the edited old
     /// tree: positions are right, the new text is not parsed yet.
-    pub fn reparse_within(&mut self, text: &Rope, budget: Duration) -> bool {
-        match parse_bounded(&mut self.parser, text, Some(&self.tree), Some(budget)) {
-            Some(tree) => {
-                self.tree = tree;
-                true
-            }
-            None => false,
-        }
+    ///
+    /// On success it returns the replaced tree. Freeing a big tree takes
+    /// milliseconds (one node per top-level item and more), so a caller on a
+    /// latency-sensitive thread can drop it elsewhere.
+    #[must_use = "the replaced tree is returned so the caller decides where to free it"]
+    pub fn reparse_within(&mut self, text: &Rope, budget: Duration) -> Option<Tree> {
+        let tree = parse_bounded(&mut self.parser, text, Some(&self.tree), Some(budget))?;
+        Some(std::mem::replace(&mut self.tree, tree))
     }
 
     /// Updates the tree after `changes` (applied in order) turned `old` into
