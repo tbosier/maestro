@@ -275,6 +275,7 @@ version = "0.1.0"
 dependencies = [
  "maestro-config",
  "maestro-core",
+ "maestro-syntax",
  "proptest",
  "regex",
  "thiserror",

@@ -1,6 +1,7 @@
 //! Editor state, modal commands and keymaps for Maestro.
 //!
-//! This crate depends on `maestro-core` and `maestro-config` only. It has no
+//! This crate depends on `maestro-core`, `maestro-config` and
+//! `maestro-syntax` only. It has no
 //! terminal, network or Git dependency: a front end feeds it [`KeyEvent`]s
 //! and draws what it holds.
 
@@ -15,6 +16,8 @@ pub mod prompt;
 pub mod recovery;
 pub mod registers;
 pub mod search;
+pub mod syntax;
+pub mod syntax_commands;
 pub mod typed;
 
 pub use editor::{DocumentId, Editor, Mode, MouseKind, Presentation, Severity, View, ViewId};

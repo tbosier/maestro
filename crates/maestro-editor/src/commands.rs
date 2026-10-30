@@ -39,7 +39,7 @@ macro_rules! commands {
 }
 
 /// Every command table. Add new modules' tables here.
-pub static TABLES: &[&[Command]] = &[COMMANDS];
+pub static TABLES: &[&[Command]] = &[COMMANDS, crate::syntax_commands::COMMANDS];
 
 /// Iterates every registered command.
 pub fn all() -> impl Iterator<Item = &'static Command> {
@@ -1454,6 +1454,7 @@ fn history_step(ed: &mut Editor, redo: bool) {
         let sel = ed.view().selection.clone();
         let doc_id = ed.view().doc;
         let focus = ed.focus;
+        let old = text_of(ed);
         let step = {
             let buf = ed.buffer_mut();
             if redo {
@@ -1474,6 +1475,7 @@ fn history_step(ed: &mut Editor, redo: bool) {
             }
             return;
         };
+        ed.on_text_changed(doc_id, &old, &step.applied);
         let text = text_of(ed);
         for v in ed.views.values_mut().filter(|v| v.doc == doc_id) {
             v.selection = if v.id == focus {

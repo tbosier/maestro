@@ -9,14 +9,22 @@
 //! the document changes, pass the old text and the applied change sets to
 //! [`Syntax::update`] (or [`input_edits`] then [`Syntax::apply_edits`] and
 //! [`Syntax::reparse`]), which reparses incrementally.
+//!
+//! Parsing cost grows with file size, so callers on a latency-sensitive
+//! thread use [`Syntax::parse_within`] and [`Syntax::reparse_within`], which
+//! give up after a time budget, and finish the work elsewhere with
+//! [`Syntax::fork`] (a [`Syntax`] is `Send`).
 
 mod language;
 
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
+use std::time::{Duration, Instant};
 
 use maestro_core::change::Op;
 use maestro_core::{ChangeSet, Rope};
-use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{
+    InputEdit, Node, ParseOptions, ParseState, Parser, Point, QueryCursor, StreamingIterator, Tree,
+};
 
 pub use language::Language;
 pub use tree_sitter::InputEdit as Edit;
@@ -55,14 +63,38 @@ impl Syntax {
     /// Parses `text` from scratch. Returns `None` only if the grammar cannot
     /// be loaded (an ABI mismatch), which the tests rule out per language.
     pub fn parse(language: Language, text: &Rope) -> Option<Syntax> {
+        Self::parse_inner(language, text, None)
+    }
+
+    /// Like [`Syntax::parse`], but gives up and returns `None` once parsing
+    /// has taken longer than `budget`.
+    pub fn parse_within(language: Language, text: &Rope, budget: Duration) -> Option<Syntax> {
+        Self::parse_inner(language, text, Some(budget))
+    }
+
+    fn parse_inner(language: Language, text: &Rope, budget: Option<Duration>) -> Option<Syntax> {
         let mut parser = Parser::new();
         parser.set_language(&language.grammar()).ok()?;
-        let tree = parser.parse_with_options(&mut read_rope(text), None, None)?;
+        let tree = parse_bounded(&mut parser, text, None, budget)?;
         Some(Syntax {
             language,
             parser,
             tree,
         })
+    }
+
+    /// A copy with its own parser, to reparse on another thread while this
+    /// one keeps serving highlights.
+    pub fn fork(&self) -> Syntax {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&self.language.grammar())
+            .expect("the grammar loaded once already");
+        Syntax {
+            language: self.language,
+            parser,
+            tree: self.tree.clone(),
+        }
     }
 
     pub fn language(&self) -> Language {
@@ -82,22 +114,21 @@ impl Syntax {
 
     /// Reparses `text`, reusing the unchanged parts of the edited tree.
     pub fn reparse(&mut self, text: &Rope) {
-        let new = self
-            .parser
-            .parse_with_options(&mut read_rope(text), Some(&self.tree), None);
-        match new {
-            Some(tree) => self.tree = tree,
-            None => {
-                // Only happens if parsing was cancelled; fall back to a fresh
-                // parse so the tree never stays out of date.
-                self.parser.reset();
-                if let Some(tree) = self
-                    .parser
-                    .parse_with_options(&mut read_rope(text), None, None)
-                {
-                    self.tree = tree;
-                }
+        if let Some(tree) = parse_bounded(&mut self.parser, text, Some(&self.tree), None) {
+            self.tree = tree;
+        }
+    }
+
+    /// Like [`Syntax::reparse`], but gives up once it has taken longer than
+    /// `budget` and returns false. The tree is then still the edited old
+    /// tree: positions are right, the new text is not parsed yet.
+    pub fn reparse_within(&mut self, text: &Rope, budget: Duration) -> bool {
+        match parse_bounded(&mut self.parser, text, Some(&self.tree), Some(budget)) {
+            Some(tree) => {
+                self.tree = tree;
+                true
             }
+            None => false,
         }
     }
 
@@ -270,6 +301,30 @@ impl Syntax {
         let len = text.len_bytes();
         text.byte_to_char(r.start.min(len))..text.byte_to_char(r.end.min(len))
     }
+}
+
+/// Runs the parser, optionally stopping after `budget`. A stopped parse is
+/// discarded (the parser is reset), so the next parse starts clean.
+fn parse_bounded(
+    parser: &mut Parser,
+    text: &Rope,
+    old: Option<&Tree>,
+    budget: Option<Duration>,
+) -> Option<Tree> {
+    let start = Instant::now();
+    let mut check = |_: &ParseState| {
+        if budget.is_some_and(|b| start.elapsed() > b) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let options = budget.map(|_| ParseOptions::new().progress_callback(&mut check));
+    let tree = parser.parse_with_options(&mut read_rope(text), old, options);
+    if tree.is_none() {
+        parser.reset();
+    }
+    tree
 }
 
 /// The tree-sitter edits for `changes`, applied in order to `old`. Each

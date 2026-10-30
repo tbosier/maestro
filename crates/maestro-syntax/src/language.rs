@@ -133,12 +133,29 @@ impl Language {
 
     /// The compiled highlight query, built on first use and shared after.
     pub(crate) fn highlights(self) -> &'static HighlightQuery {
+        self.query_cell().get_or_init(|| HighlightQuery::new(self))
+    }
+
+    /// Compiles the highlight query now. Compiling takes tens of
+    /// milliseconds for the larger queries, so editors call this on a
+    /// background thread and check [`Language::is_prepared`] before drawing.
+    pub fn prepare(self) {
+        self.highlights();
+    }
+
+    /// True once the highlight query is compiled, so
+    /// [`crate::Syntax::highlights`] will not block on compiling it.
+    pub fn is_prepared(self) -> bool {
+        self.query_cell().get().is_some()
+    }
+
+    fn query_cell(self) -> &'static OnceLock<HighlightQuery> {
         static CELLS: [OnceLock<HighlightQuery>; 9] = [const { OnceLock::new() }; 9];
         let idx = Language::ALL
             .iter()
             .position(|l| *l == self)
             .expect("every language is in ALL");
-        CELLS[idx].get_or_init(|| HighlightQuery::new(self))
+        &CELLS[idx]
     }
 }
 

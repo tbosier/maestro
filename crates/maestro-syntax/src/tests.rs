@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use maestro_core::{Change, ChangeSet, Rope};
 
@@ -335,4 +336,50 @@ fn expand_shrink_and_siblings_follow_the_tree() {
 
     // The whole document cannot grow.
     assert_eq!(syntax.expand(&text, 0, text.len_chars()), None);
+}
+
+fn many_items(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("fn item_{i}(x: u32) -> u32 {{ let y = x + {i}; y * 2 }}\n"))
+        .collect()
+}
+
+#[test]
+fn budgets_stop_parsing_and_a_fork_finishes_the_job() {
+    let mut text = Rope::from_str(&many_items(5000));
+    assert!(Syntax::parse_within(Language::Rust, &text, Duration::ZERO).is_none());
+    let mut syntax =
+        Syntax::parse_within(Language::Rust, &text, Duration::from_secs(60)).expect("parses");
+
+    let old = text.clone();
+    let cs = ChangeSet::from_changes(text.len_chars(), [Change::insert(10, "é漢 ")]).unwrap();
+    cs.apply(&mut text).unwrap();
+    syntax.apply_edits(&input_edits(&old, &[cs]));
+    // Out of time: the tree stays the edited old tree.
+    assert!(!syntax.reparse_within(&text, Duration::ZERO));
+    assert_eq!(
+        syntax.tree().root_node().end_byte(),
+        text.len_bytes(),
+        "the edited tree spans the new text"
+    );
+    // A fork reparses elsewhere and matches a fresh parse; the original
+    // can also finish on its own.
+    let mut fork = syntax.fork();
+    let worker = {
+        let text = text.clone();
+        std::thread::spawn(move || {
+            fork.reparse(&text);
+            fork
+        })
+    };
+    let fork = worker.join().unwrap();
+    assert_same_as_fresh(&fork, &text, "forked reparse");
+    assert!(syntax.reparse_within(&text, Duration::from_secs(60)));
+    assert_same_as_fresh(&syntax, &text, "reparse after a stopped one");
+}
+
+#[test]
+fn queries_compile_on_demand_or_ahead() {
+    Language::Json.prepare();
+    assert!(Language::Json.is_prepared());
 }
