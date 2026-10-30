@@ -38,21 +38,24 @@ Rendering is most of it (p50 430 µs on the small file). Key handling itself has
 
 ## File finder on a large tree
 
-Method: the ignored test `large_tree_streams_without_blocking_input` in `crates/maestro-editor/tests/navigation.rs` (`cargo test --release -p maestro-editor --test navigation -- --ignored --nocapture`). It generates 200,000 empty files in 20,000 directories, opens the finder, and imitates the terminal loop: apply queued results if any, otherwise handle one key (a query typed and erased again), sleeping 1 ms per turn for the frame. The machine was shared with other builds during these runs (load average 5 to 8 on 24 threads), so the spread is wide.
+Method: the ignored test `large_tree_streams_without_blocking_input` in `crates/maestro-editor/tests/navigation.rs` (`cargo test --release -p maestro-editor --test navigation -- --ignored --nocapture`). It generates 200,000 empty files in 20,000 directories, opens the finder, and imitates the terminal loop: apply queued results if any, otherwise handle one key (a query typed and erased again), sleeping 1 ms per turn in place of a frame. Nothing is rendered, so "first results" means applied to the picker, not drawn. Load average was about 2.4 on 24 threads during these runs; other builds were running on the machine.
 
 | Measure | Result over 5 runs |
 |---|---|
-| First results on screen | 1.2 to 2.4 ms after the key |
-| Whole tree listed | 490 to 750 ms, in 11 to 14 batches |
-| Batches applied back to back (input not read in between) | never; at most 1 batch per loop turn |
-| Key handling while loading, p50 / p95 / max | 1.1 to 1.5 / 7.9 to 24 / 12 to 43 ms |
-| Typing `file_199999` into the full 200,000-file list, slowest key | 13 to 33 ms (31 to 38 ms with matching on one thread) |
+| First results applied | 1.2 to 1.3 ms after the key |
+| Whole tree listed | 520 to 545 ms, over 12 to 13 polls that applied results |
+| Polls that applied results back to back (no input read in between) | never more than 1 in a row |
+| Slowest poll that applied results | 7.6 to 11.8 ms |
+| Key handling while loading, p50 / p95 / max | 1.4 to 1.5 / 10.3 to 11.6 / 14.6 to 17.6 ms |
+| Typing `file_199999` into the full 200,000-file list, slowest key | 13.5 to 17.0 ms |
 
-How it stays responsive: the walker sends at most one batch at a time and waits 40 ms after each batch is applied before sending the next, so the front end always gets a turn to read input. Matching only checks new items when a batch arrives and only current matches when a character is typed, splits large lists across threads, and computes highlight positions only for rows near the top and the selection.
+How it keeps input moving: the walker has at most one batch queued at a time, including the last one, and waits 40 ms after a batch is applied before sending the next, so the terminal loop reads input between batches. Matching checks only new items when a batch arrives (merged into the sorted list) and only current matches when a character is typed. Lists over 16,384 items are matched on up to 16 threads, spawned per key, and highlight positions are computed only for rows near the top and the selection. A broad query over a list this size still costs 10 to 17 ms per key; the work is not moved off the main thread.
 
-The real binary in tmux with `MAESTRO_LATENCY_LOG`, same tree: keys typed 250 ms apart took 2 to 17 ms each. Keys typed 30 ms apart while the machine was loaded (load average 7 to 10) queued behind broad-query refilters of the full list and were handled in single batches of 60 to 700 ms. Typing fast into a list of hundreds of thousands of files on a busy machine can therefore lag; it does not lag on ordinary projects (the Maestro repository lists 68 files).
+The real binary in tmux with `MAESTRO_LATENCY_LOG`, same tree, load average 4.3 to 4.7: with keys sent 30 ms apart, the slowest input batch was 19 and 38 ms in two runs; with keys 250 ms apart, each key took 0.2 to 15 ms. During an earlier version's runs on a more heavily loaded machine (load average 7 to 10), fast typing queued behind refilters for up to 700 ms. That version computed highlight positions for every match and re-sorted the whole list per batch; it was not re-measured under that load after the fix.
 
-Workspace search over the Cargo registry sources (9,240 files, 249 MB) in tmux: `unsafe fn` found 4,498 lines while the query `write` was typed into the open picker; `fn` stopped at the 10,000-result cap. Key handling stayed under 2.2 ms.
+Workspace search over the Cargo registry sources (9,240 files, 249 MB) in tmux: `unsafe fn` found 4,498 lines while the query `write` was typed into the open picker, and `fn` stopped at the 10,000-result cap with the title saying so. The slowest input batch was 5.3 ms.
+
+The picker preview reads files on the main thread when the selection moves: at most 4 MB per file, regular files only. It is fast on local disks; a slow network filesystem would stall the editor for as long as the read takes.
 
 ## Known costs not yet measured or fixed
 

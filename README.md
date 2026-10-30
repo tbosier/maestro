@@ -76,7 +76,7 @@ restore-session = true     # reopen the last session's files in this directory
 "space w" = "write"
 ```
 
-Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config and without restoring or saving the session.
+Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config, and reads and writes neither the session nor the recent-files list.
 
 ## Documentation
 
