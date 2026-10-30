@@ -22,12 +22,12 @@ Verified two ways on October 30, 2026:
 | Fuzzy file finder | partial: a synchronous walker capped at 50,000 files that skips hidden and build directories; not gitignore-aware |
 | Search and replace | done in the buffer; workspace search not started |
 | Tree-sitter highlighting | not started |
-| LSP diagnostics and navigation | not started |
+| LSP diagnostics and navigation | partial: diagnostics (sign column, range underline, cursor-line message, `]d`/`[d`, `space d`/`space D` pickers), goto definition (`gd`), references (`gr`), hover (`space k`), incremental sync, crash reporting with `:lsp-restart`. Checked against the fake test server and, by hand in tmux, against rust-analyzer on this repo. Not started: completion, code actions, rename, formatting, signature help |
 | Configuration | done |
 | Session restoration | not started |
 | Crash-safe editing | done: atomic saves, external-change detection, recovery journal |
 
-Acceptance (use Maestro to navigate and modify its own source without another editor) has not been attempted. It needs highlighting, workspace search and goto-definition first.
+Acceptance (use Maestro to navigate and modify its own source without another editor) has not been attempted. It needs highlighting and workspace search first.
 
 ## M2: agent development environment (partial)
 

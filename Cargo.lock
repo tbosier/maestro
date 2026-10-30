@@ -269,6 +269,7 @@ dependencies = [
  "maestro-config",
  "maestro-core",
  "maestro-git",
+ "maestro-lsp",
  "proptest",
  "regex",
  "thiserror",
@@ -280,6 +281,16 @@ version = "0.1.0"
 dependencies = [
  "similar",
  "thiserror",
+]
+
+[[package]]
+name = "maestro-lsp"
+version = "0.1.0"
+dependencies = [
+ "maestro-core",
+ "maestro-lsp",
+ "proptest",
+ "serde_json",
 ]
 
 [[package]]

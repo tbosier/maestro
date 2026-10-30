@@ -3,6 +3,7 @@
 use maestro_config::{LineNumbers, Style, Theme};
 use maestro_core::text::{grapheme_width, is_line_ending_str, next_grapheme_boundary};
 use maestro_editor::editor::Buffer;
+use maestro_editor::lsp::{self, DiagnosticSeverity};
 use maestro_editor::{Editor, Mode, Presentation, Rect, Severity, View};
 
 use crate::surface::Surface;
@@ -37,6 +38,7 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
         }
     }
     draw_dividers(ed, surface, &placements);
+    draw_hover(ed, surface);
     let mut cursor = CursorShape::Hidden;
     if ed.mode == Mode::Insert && ed.prompt.is_none() && ed.picker.is_none() {
         cursor = insert_cursor(ed, ed.view());
@@ -144,6 +146,12 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
     let cursorline =
         ed.config.editor.cursorline && focused && ed.presentation != Presentation::Focus;
     let matches = search_matches(ed, view, text_h);
+    let signs = lsp::line_signs(ed, view.doc, view.top_line..view.top_line + text_h);
+    let diag_spans = {
+        let first = text.line_to_char(view.top_line.min(text.len_lines()));
+        let last = text.line_to_char((view.top_line + text_h).min(text.len_lines()));
+        lsp::spans_in(ed, view.doc, first, last.max(first + 1))
+    };
 
     s.fill(
         Rect::new(area.x, area.y, area.width, text_h as u16),
@@ -168,6 +176,9 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
         }
         draw_gutter(ed, s, area.x, y, gutter, line, primary_line, focused);
         draw_git_sign(ed, s, area.x, y, gutter, view, line, primary_line);
+        if let Some(sev) = signs.get(&line) {
+            draw_diagnostic_sign(ed, s, area.x, y, gutter, *sev);
+        }
 
         // Text.
         let line_start = text.line_to_char(line);
@@ -208,6 +219,13 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
             let w = if eol { 1 } else { grapheme_width(g, col, tab) };
             if col + w > view.left_col && x < right {
                 let mut style = base;
+                if let Some(&(_, _, sev)) = diag_spans
+                    .iter()
+                    .filter(|(a, b, _)| pos >= *a && pos < *b)
+                    .min_by_key(|(_, _, sev)| *sev)
+                {
+                    style = style.patch(diagnostic_range_style(theme, sev));
+                }
                 if let Some(m) = &matches
                     && m.iter().any(|&(a, b)| pos >= a && pos < b)
                 {
@@ -344,6 +362,152 @@ fn draw_git_sign(
     s.put(x, y, sign.symbol(), gutter.patch(color), x + 1);
 }
 // ----- end git sign column ---------------------------------------------
+
+fn diagnostic_fg(theme: &Theme, sev: DiagnosticSeverity) -> Style {
+    let d = &theme.diagnostic;
+    match sev {
+        DiagnosticSeverity::Error => d.error,
+        DiagnosticSeverity::Warning => d.warning,
+        DiagnosticSeverity::Info => d.info,
+        DiagnosticSeverity::Hint => d.hint,
+    }
+}
+
+/// Text inside a diagnostic range: a severity tint plus an underline, so
+/// the range shows without relying on hue alone.
+fn diagnostic_range_style(theme: &Theme, sev: DiagnosticSeverity) -> Style {
+    let d = &theme.diagnostic;
+    let tint = match sev {
+        DiagnosticSeverity::Error => d.error_bg,
+        DiagnosticSeverity::Warning => d.warning_bg,
+        DiagnosticSeverity::Info => d.info_bg,
+        DiagnosticSeverity::Hint => d.hint_bg,
+    };
+    Style::bg(tint).underline()
+}
+
+/// The severity letter in the gutter's sign column (its first cell). It
+/// keeps the plain gutter background even on the cursor line, where the
+/// severity colors are checked for contrast.
+fn draw_diagnostic_sign(
+    ed: &Editor,
+    s: &mut Surface,
+    x: u16,
+    y: u16,
+    gutter: u16,
+    sev: DiagnosticSeverity,
+) {
+    if gutter == 0 {
+        return;
+    }
+    let style = ed
+        .theme
+        .ui
+        .gutter
+        .patch(diagnostic_fg(&ed.theme, sev))
+        .bold();
+    s.put(x, y, &sev.letter().to_string(), style, x + 1);
+}
+
+/// Hover text in a box below the cursor (above it when there is no room),
+/// wrapped to the box width.
+fn draw_hover(ed: &Editor, s: &mut Surface) {
+    let Some(hover) = &ed.lsp.hover else {
+        return;
+    };
+    let view = ed.view();
+    if hover.doc != view.doc {
+        return;
+    }
+    let ui = &ed.theme.ui;
+    let text = ed.doc().text().slice(..);
+    let anchor = hover.anchor.min(text.len_chars());
+    let line = text.char_to_line(anchor);
+    if line < view.top_line || line >= view.top_line + view.text_height() {
+        return;
+    }
+    let cursor_y = view.area.y + (line - view.top_line) as u16;
+    let col = maestro_editor::motion::display_col(text, anchor, ed.tab_width());
+    let cursor_x = (view.area.x + ed.gutter_width(view) + col.saturating_sub(view.left_col) as u16)
+        .min(s.width.saturating_sub(1));
+
+    let max_w = (s.width as usize).saturating_sub(2).min(80);
+    if max_w < 12 {
+        return;
+    }
+    let inner = max_w - 4;
+    let mut rows: Vec<String> = Vec::new();
+    for l in &hover.lines {
+        rows.extend(wrap(l, inner));
+    }
+    let longest = rows
+        .iter()
+        .map(|r| unicode_width::UnicodeWidthStr::width(r.as_str()))
+        .max()
+        .unwrap_or(0);
+    let w = (longest + 4).clamp(16.min(max_w), max_w) as u16;
+    let below = s.height.saturating_sub(cursor_y + 2);
+    let above = cursor_y;
+    let (room, place_below) = if below >= 4 || below >= above {
+        (below, true)
+    } else {
+        (above, false)
+    };
+    let h = (rows.len() as u16 + 2).min(room).min(20);
+    if h < 3 {
+        return;
+    }
+    let y = if place_below {
+        cursor_y + 1
+    } else {
+        cursor_y - h
+    };
+    let x = cursor_x.min(s.width - w);
+    let area = Rect::new(x, y, w, h);
+    draw_box(s, area, "hover", ui.popup, ui.popup_border, ui.popup_title);
+    let visible = (h - 2) as usize;
+    for (i, row) in rows.iter().take(visible).enumerate() {
+        let truncated = i + 1 == visible && rows.len() > visible;
+        let shown = if truncated { "…" } else { row.as_str() };
+        s.print(x + 2, y + 1 + i as u16, shown, ui.popup, area.right() - 1);
+    }
+}
+
+/// Splits `line` into pieces at most `width` columns wide, preferring
+/// spaces as break points.
+fn wrap(line: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0;
+    for ch in line.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if cur_w + cw > width && !cur.is_empty() {
+            if ch == ' ' {
+                // Break here and drop the space.
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+                continue;
+            }
+            match cur.rfind(' ').filter(|&i| i > 0) {
+                Some(i) => {
+                    let rest = cur.split_off(i + 1);
+                    out.push(cur.trim_end().to_string());
+                    cur = rest;
+                }
+                None => out.push(std::mem::take(&mut cur)),
+            }
+            cur_w = unicode_width::UnicodeWidthStr::width(cur.as_str());
+        }
+        cur.push(ch);
+        cur_w += cw;
+    }
+    out.push(cur);
+    out
+}
 
 fn search_matches(ed: &Editor, view: &View, height: usize) -> Option<Vec<(usize, usize)>> {
     let pattern = ed.last_search.as_ref()?;
@@ -532,6 +696,15 @@ fn draw_cmdline(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
             style,
             area.right(),
         );
+    } else if ed.mode != Mode::Insert
+        && ed.picker.is_none()
+        && let Some(d) = lsp::cursor_diagnostic(ed)
+    {
+        // When nothing else is said, the cursor line's diagnostic is.
+        let style = ui.text.patch(diagnostic_fg(&ed.theme, d.severity));
+        let line = d.message.lines().next().unwrap_or_default();
+        let text = format!("{}: {line}", d.severity.label());
+        s.print(area.x, area.y, &text, style, area.right());
     }
     // Pending state on the right: count, register, keys.
     let mut pending = String::new();
@@ -764,5 +937,110 @@ mod tests {
         assert_eq!(cell(4).style.fg, ed.theme.diff.git_add.fg);
         // Line numbers still follow the sign column.
         assert_eq!(s.cell(3, top + 1).unwrap().symbol, "2");
+    }
+
+    use maestro_editor::KeyEvent;
+    use maestro_editor::lsp::{Diagnostic, HoverPopup};
+
+    fn editor(text: &str) -> Editor {
+        let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 60, 18));
+        let id = ed.add_document(Document::from_text(text));
+        ed.switch_to(id);
+        ed
+    }
+
+    fn row(s: &Surface, y: u16) -> String {
+        s.row(y).iter().map(|c| c.symbol.as_str()).collect()
+    }
+
+    #[test]
+    fn diagnostics_draw_a_sign_a_range_and_a_message() {
+        let mut ed = editor("fn main() {}\nlet x = bad;\n");
+        let doc = ed.view().doc;
+        ed.lsp.set_diagnostics(
+            doc,
+            vec![Diagnostic {
+                from: 21,
+                to: 24,
+                severity: DiagnosticSeverity::Error,
+                message: "cannot find value `bad`\nsecond line".into(),
+                source: None,
+            }],
+        );
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        // Row 2 is the second text line (row 0 is the tab line).
+        let sign = s.cell(0, 2).unwrap();
+        assert_eq!(sign.symbol, "E");
+        assert_eq!(sign.style.fg, ed.theme.diagnostic.error.fg);
+        assert_eq!(sign.style.bg, ed.theme.ui.gutter.bg);
+        assert_eq!(s.cell(0, 1).unwrap().symbol, " ", "no sign on line 1");
+        // The range is tinted and underlined; its neighbors are not.
+        let gutter = ed.gutter_width(ed.view());
+        let b = s.cell(gutter + 8, 2).unwrap();
+        assert_eq!(b.symbol, "b");
+        assert!(b.style.underline);
+        assert_eq!(b.style.bg, Some(ed.theme.diagnostic.error_bg));
+        assert!(!s.cell(gutter + 7, 2).unwrap().style.underline);
+        // The message shows in the command line only on the cursor's line.
+        assert!(!row(&s, 19).contains("cannot find"));
+        ed.handle_key(KeyEvent::char('j'));
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        assert!(
+            row(&s, 19).starts_with("error: cannot find value `bad`"),
+            "{:?}",
+            row(&s, 19)
+        );
+        assert_eq!(
+            s.cell(0, 19).unwrap().style.fg,
+            ed.theme.diagnostic.error.fg
+        );
+    }
+
+    #[test]
+    fn hover_popup_wraps_below_the_cursor() {
+        let mut ed = editor("fn main() {}\n");
+        let doc = ed.view().doc;
+        ed.lsp.hover = Some(HoverPopup {
+            doc,
+            anchor: 3,
+            lines: vec![
+                "fn main()".into(),
+                String::new(),
+                "word ".repeat(30).trim_end().to_string(),
+            ],
+        });
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        assert!(row(&s, 2).contains("hover"), "{:?}", row(&s, 2));
+        assert!(row(&s, 3).contains("fn main()"));
+        // 150 columns of text wrapped inside a 56-column box.
+        assert!(row(&s, 5).contains("word word"));
+        assert!(row(&s, 6).contains("word word"));
+        assert!(row(&s, 5).trim_end().ends_with('│'));
+    }
+
+    #[test]
+    fn hover_popup_never_panics_at_small_sizes() {
+        for (w, h) in (1..=40u16).flat_map(|w| (1..=12u16).map(move |h| (w, h))) {
+            let mut ed = Editor::new(Config::default(), Rect::new(0, 1, w, h.saturating_sub(2)));
+            let id = ed.add_document(Document::from_text("fn main() {}\n"));
+            ed.switch_to(id);
+            ed.lsp.hover = Some(HoverPopup {
+                doc: id,
+                anchor: 3,
+                lines: vec!["x".repeat(200), "short".into()],
+            });
+            let mut s = Surface::new(w, h, ed.theme.ui.text);
+            render(&ed, &mut s);
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_inside_long_words() {
+        assert_eq!(wrap("aa bb cc", 5), ["aa bb", "cc"]);
+        assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap("", 3), [""]);
     }
 }

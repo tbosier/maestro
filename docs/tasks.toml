@@ -41,10 +41,12 @@ status = "not-started"
 [[task]]
 id = "m1-lsp"
 title = "Async LSP client: diagnostics, goto definition, hover, completion"
-crates = ["maestro-lsp"]
+crates = ["maestro-lsp", "maestro-editor", "maestro-tui", "maestro-config"]
 branch = "feat/lsp"
 owner = "agent"
-status = "not-started"
+status = "in-progress"
+# Done: diagnostics, goto definition, references, hover, incremental sync,
+# crash handling. Not started: completion.
 
 [[task]]
 id = "m2-git"

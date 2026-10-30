@@ -17,6 +17,7 @@ maestro-tui = { path = "crates/maestro-tui" }
 maestro-protocol = { path = "crates/maestro-protocol" }
 maestro-automation = { path = "crates/maestro-automation" }
 maestro-git = { path = "crates/maestro-git" }
+maestro-lsp = { path = "crates/maestro-lsp" }
 
 ropey = "1.6"
 unicode-segmentation = "1.12"

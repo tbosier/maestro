@@ -4,23 +4,25 @@
 
 ```
 maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-core
-                     │                │     │
-                     │                │     └──► maestro-git
-                     └──────► maestro-config ◄────┘
+     │               │                │  │  └──► maestro-git
+     │               │                │  └─────► maestro-lsp ──► maestro-core
+     │               └──────► maestro-config ◄───┘
+     └──► maestro-automation ──► maestro-editor, maestro-protocol
 ```
 
 | Crate | Owns | Depends on |
 |---|---|---|
 | `maestro-core` | Rope text, position types, selections, change sets, transactions, undo tree, documents, file IO | ropey, unicode-segmentation, unicode-width, thiserror |
 | `maestro-config` | TOML config, theme tokens, the Duskfox palette | serde, toml |
-| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, Git gutter signs and pickers | core, config, git, regex |
+| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, Git gutter signs and pickers, language server integration (`lsp.rs`, `lsp_commands.rs`) | core, config, git, lsp, regex |
 | `maestro-git` | Repository discovery, status, line diffs for gutter signs, a unified diff model, worktree lifecycle with safety checks, merge dry runs; all through the `git` CLI (ADR 0005) | similar, thiserror |
+| `maestro-lsp` | Language server processes on plain threads: framing, JSON-RPC, initialize and shutdown, cancellation, exit detection, a bounded stderr log, and position and change conversions. A fake server for tests behind the `fake-server` feature | core, serde_json |
 | `maestro-tui` | Terminal lifecycle, input conversion, rendering, clipboard providers | editor, crossterm |
 | `maestro-protocol` | Automation API wire types: JSON-RPC messages, params, results, error codes | serde, serde_json |
 | `maestro-automation` | Runs protocol requests against an `Editor`; headless (stdio) and Unix socket transports | core, config, editor, protocol |
 | `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui, automation |
 
-Planned crates (`maestro-syntax`, `maestro-lsp`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
+Planned crates (`maestro-syntax`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 
 ## Rules
 
@@ -50,6 +52,12 @@ Every action is a named command in `maestro_editor::commands::COMMANDS` or a typ
 ## Rendering
 
 The terminal front end draws each frame into an off-screen grid (`Surface`) and writes only the cells that differ from the previous frame, inside a synchronized update. Truecolor is used when the terminal reports it, with a 256-color fallback. ADR 0004 covers why this is a small custom layer and not ratatui.
+
+## Language servers
+
+`maestro-lsp` runs each server with four threads (stdin writer, stdout reader, exit watcher, stderr log) and never waits for a server's answer: a request returns a channel. The editor waits on that channel in a short-lived background thread, which also reads any files the reply points into, and applies the reply as a job on the main thread. The reply is dropped if any open buffer's version moved since the request. Two things still happen on the editor thread: finding a server on `PATH` and spawning it, and, on quit, waiting up to half a second per step for each server to shut down. Notifications such as diagnostics arrive through an idle job sender, so the terminal shows them at its next wake-up (at most a second).
+
+Every text-change path in the editor calls `lsp::document_changed`, which maps stored diagnostics through the change and sends an incremental `didChange` built from the change set in old-document coordinates. `lsp::reconcile` runs after each key, on open and on tick: it opens and closes documents on servers to match the buffers, and resends full text for any document whose version moved without the hook. Positions are UTF-16 through `maestro_core::pos`.
 
 ## Persistence
 

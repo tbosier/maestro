@@ -8,5 +8,8 @@ pub mod config;
 pub mod duskfox;
 pub mod theme;
 
-pub use config::{Config, ConfigError, EditorConfig, IconMode, IndentStyle, LineNumbers, Profile};
+pub use config::{
+    Config, ConfigError, EditorConfig, IconMode, IndentStyle, LanguageServerConfig, LineNumbers,
+    Profile,
+};
 pub use theme::{Rgb, Style, Theme};

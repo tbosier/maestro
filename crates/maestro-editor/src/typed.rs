@@ -192,10 +192,32 @@ static TYPED: &[TypedCommand] = &[
         doc: "Open the command palette",
         fun: commands,
     },
+    TypedCommand {
+        name: "lsp-restart",
+        aliases: &[],
+        doc: "Restart language servers (also after a crash)",
+        fun: lsp_restart,
+    },
+    TypedCommand {
+        name: "lsp-log",
+        aliases: &[],
+        doc: "Show language server logs in a scratch buffer",
+        fun: lsp_log,
+    },
 ];
 
 /// Commands whose argument is a single path that may contain spaces.
 const PATH_COMMANDS: &[&str] = &["write", "write-quit", "open", "split", "vsplit", "cd"];
+
+fn lsp_restart(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::lsp::restart(ed);
+    Ok(())
+}
+
+fn lsp_log(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::lsp::show_log(ed);
+    Ok(())
+}
 
 pub fn all() -> &'static [TypedCommand] {
     TYPED
@@ -297,6 +319,10 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
             if let (Some(dir), Some(p)) = (editor.recovery_dir.clone(), old_path) {
                 crate::recovery::remove(&dir, &p, &editor.session_id);
             }
+            let id = editor.view().doc;
+            // A new name means a new document for the server.
+            crate::lsp::reconcile(editor);
+            crate::lsp::document_saved(editor, id);
             editor.info(format!("wrote {name}: {lines} lines, {bytes} bytes"));
             Ok(())
         }
@@ -338,6 +364,7 @@ fn write_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
                 if let (Some(dir), Some(p)) = (dir, buf.doc.path()) {
                     crate::recovery::remove(&dir, p, &session);
                 }
+                crate::lsp::document_saved(ed, *id);
             }
             Err(e) => errors.push(format!("{}: {e}", buf.doc.display_name())),
         }
@@ -407,6 +434,7 @@ fn reload(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
     for v in ed.views.values_mut().filter(|v| v.doc == doc_id) {
         v.selection = v.selection.map(&changes).clamp_normal(text.slice(..));
     }
+    crate::lsp::document_changed(ed, doc_id, &[changes]);
     ed.info("reloaded from disk (u undoes the reload)");
     Ok(())
 }

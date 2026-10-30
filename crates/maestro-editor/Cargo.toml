@@ -10,11 +10,18 @@ rust-version.workspace = true
 maestro-core.workspace = true
 maestro-config.workspace = true
 maestro-git.workspace = true
+maestro-lsp.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+maestro-lsp = { workspace = true, features = ["fake-server"] }
+
+# Runs its own main so the test binary can double as the fake server.
+[[test]]
+name = "lsp"
+harness = false
 
 [lints]
 workspace = true

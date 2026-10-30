@@ -525,6 +525,36 @@ mod tests {
         assert!(failing.is_empty(), "under 4.5:1: {failing:?}");
     }
 
+    /// Diagnostic letters in the sign column and messages in the command
+    /// line sit on the gutter and text backgrounds; text inside a
+    /// diagnostic range sits on the severity tint.
+    #[test]
+    fn diagnostic_colors_meet_contrast() {
+        let t = Theme::duskfox();
+        let d = &t.diagnostic;
+        let surfaces = [t.ui.gutter.bg.unwrap(), t.ui.text.bg.unwrap()];
+        for (name, s) in [
+            ("error", d.error),
+            ("warning", d.warning),
+            ("info", d.info),
+            ("hint", d.hint),
+        ] {
+            for bg in surfaces {
+                let r = s.fg.unwrap().contrast(bg);
+                assert!(r >= 4.5, "{name} on {bg:?}: {r:.2}");
+            }
+        }
+        for (name, bg) in [
+            ("error_bg", d.error_bg),
+            ("warning_bg", d.warning_bg),
+            ("info_bg", d.info_bg),
+            ("hint_bg", d.hint_bg),
+        ] {
+            let r = t.ui.text.fg.unwrap().contrast(bg);
+            assert!(r >= 4.5, "text on {name}: {r:.2}");
+        }
+    }
+
     /// Borders identify panes, so they need 3:1 (WCAG 1.4.11) when active.
     #[test]
     fn active_border_meets_non_text_contrast() {
