@@ -228,6 +228,39 @@ fn saving_under_a_new_name_detects_the_language() {
 }
 
 #[test]
+fn typing_or_removing_a_shebang_switches_the_language() {
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 0, 80, 24));
+    run(
+        &mut ed,
+        "i#!/usr/bin/env python3<ret>def f(x):<ret>return x<esc>",
+    );
+    assert_eq!(ed.buffer().syntax.language(), Some(Language::Python));
+    assert_in_sync(&mut ed, "shebang typed");
+    assert_eq!(scope_of(&ed, "def"), Some("keyword"));
+    // Delete the first line: no shebang, no language.
+    run(&mut ed, "ggxd");
+    assert_eq!(ed.doc().text().line(0).to_string(), "def f(x):\n");
+    assert_eq!(ed.buffer().syntax.language(), None);
+    assert_eq!(scope_of(&ed, "def"), None);
+}
+
+#[test]
+fn a_huge_paste_reparses_from_scratch_and_stays_in_sync() {
+    let dir = temp_dir("paste");
+    let mut ed = open(&dir.join("main.rs"), SRC);
+    let big: String = (0..8000)
+        .map(|i| format!("fn pasted_{i}() -> &'static str {{ \"é漢 {i}\" }}\n"))
+        .collect();
+    assert!(big.len() > maestro_editor::syntax::BIG_EDIT_BYTES);
+    ed.paste_text(&big);
+    assert_in_sync(&mut ed, "huge paste");
+    run(&mut ed, "u");
+    assert_eq!(ed.doc().text().to_string(), SRC);
+    assert_in_sync(&mut ed, "undo huge paste");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn large_files_parse_in_the_background_and_replay_edits() {
     let dir = temp_dir("large");
     let path = dir.join("big.rs");

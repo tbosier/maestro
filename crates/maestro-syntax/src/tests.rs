@@ -133,6 +133,62 @@ fn rust_keywords_functions_and_strings_land_on_the_right_chars() {
     }
 }
 
+/// Later patterns win for the same node, so the generic patterns at the top
+/// of the bundled queries do not swallow the specific ones below them.
+#[test]
+fn later_patterns_override_generic_ones() {
+    let cases: [(Language, &str, &str, &str); 6] = [
+        (
+            Language::Python,
+            "def greet(n):\n    return greet(n)\n",
+            "greet(n):",
+            "function",
+        ),
+        (
+            Language::Python,
+            "def greet(n):\n    return greet(n)\n",
+            "greet(n)\n",
+            "function",
+        ),
+        (Language::Python, "x = len(y)\n", "len", "function.builtin"),
+        (
+            Language::Rust,
+            "fn f(v: Vec<u8>) { v.len(); }\n",
+            "len",
+            "function.method",
+        ),
+        (
+            Language::JavaScript,
+            "function go() {}\ngo();\n",
+            "go();",
+            "function",
+        ),
+        (
+            Language::C,
+            "int main(void) { return puts(\"x\"); }\n",
+            "puts",
+            "function",
+        ),
+    ];
+    for (lang, src, needle, want) in cases {
+        let text = Rope::from_str(src);
+        let syntax = Syntax::parse(lang, &text).unwrap();
+        let hl = whole(&syntax, &text);
+        let (a, _) = span_of(src, needle);
+        assert_eq!(scope_at(&hl, a), Some(want), "{lang:?} {needle:?}: {hl:?}");
+    }
+}
+
+#[test]
+fn columns_count_bytes_since_the_last_line_feed() {
+    // Ropey breaks lines at a lone CR; tree-sitter does not, so the column
+    // of `b` is 2, not 0.
+    let text = Rope::from_str("a\rb");
+    let cs = ChangeSet::from_changes(text.len_chars(), [Change::insert(2, "x")]).unwrap();
+    let e = input_edits(&text, &[cs])[0];
+    assert_eq!(e.start_position.column, 2);
+}
+
 #[test]
 fn highlights_are_clipped_to_the_requested_range() {
     let src = "fn one() {}\nfn two() {}\n";

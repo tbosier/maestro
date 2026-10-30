@@ -39,6 +39,17 @@ pub const REPARSE_BUDGET: Duration = Duration::from_millis(4);
 /// Files above this size get no syntax tree at all.
 pub const MAX_PARSE_BYTES: usize = 64 << 20;
 
+/// An edit that deletes plus inserts more than this many bytes (a reload,
+/// select-all-and-delete, a huge paste) is not applied to the tree: walking
+/// the old tree for it can take as long as a parse, and a single long token
+/// (a pasted string) cannot be interrupted by the budget. The buffer is
+/// parsed again from scratch instead, off the main thread if it is big.
+pub const BIG_EDIT_BYTES: usize = 256 * 1024;
+
+/// Highlight results kept per buffer, one per visible range, so split
+/// views on one buffer do not evict each other.
+const CACHE_ENTRIES: usize = 4;
+
 static NEXT_PARSE: AtomicU64 = AtomicU64::new(1);
 
 /// Syntax state for one buffer.
@@ -59,9 +70,9 @@ pub struct BufferSyntax {
     note: Option<&'static str>,
     /// Bumped whenever the tree changes; keys the highlight cache.
     generation: u64,
-    /// The last highlights computed, so frames that do not change the tree
-    /// or the visible range (cursor motion, most commands) reuse them.
-    cache: Mutex<Option<HighlightCache>>,
+    /// Recent highlights by visible range, so frames that change neither
+    /// the tree nor the range (cursor motion, most commands) reuse them.
+    cache: Mutex<Vec<HighlightCache>>,
     /// Per view: the selections before each `expand_selection`, and the
     /// selection the last expansion produced. `shrink_selection` walks back
     /// only while the view still has that selection.
@@ -117,14 +128,15 @@ impl BufferSyntax {
             return Vec::new();
         }
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = &*cache
-            && c.generation == self.generation
-            && c.range == range
-        {
+        cache.retain(|c| c.generation == self.generation);
+        if let Some(c) = cache.iter().find(|c| c.range == range) {
             return c.spans.clone();
         }
         let spans = s.highlights(text, range.clone());
-        *cache = Some(HighlightCache {
+        if cache.len() >= CACHE_ENTRIES {
+            cache.remove(0);
+        }
+        cache.push(HighlightCache {
             generation: self.generation,
             range,
             spans: spans.clone(),
@@ -144,11 +156,25 @@ impl BufferSyntax {
     }
 }
 
+/// Bytes a tree covers, to decide where to free it.
+fn tree_bytes(s: &Syntax) -> usize {
+    s.tree().root_node().end_byte()
+}
+
+/// Bytes deleted plus inserted by `edits`.
+fn edit_bytes(edits: &[Edit]) -> usize {
+    edits
+        .iter()
+        .map(|e| (e.old_end_byte - e.start_byte) + (e.new_end_byte - e.start_byte))
+        .sum()
+}
+
 /// Frees a replaced tree. Releasing a big tree visits every node it does
 /// not share with its successor, which takes milliseconds on multi-megabyte
-/// files, so big ones are freed on a short-lived thread.
-fn drop_elsewhere<T: Send + 'static>(old: T, big: bool) {
-    if big {
+/// files, so trees over [`SYNC_PARSE_BYTES`] are freed on a short-lived
+/// thread.
+fn drop_elsewhere<T: Send + 'static>(old: T, bytes: usize) {
+    if bytes > SYNC_PARSE_BYTES {
         // If the thread cannot start, the closure (and the tree) is dropped
         // here instead.
         let _ = std::thread::Builder::new()
@@ -180,10 +206,15 @@ impl Editor {
         let Some(buf) = self.buffers.get_mut(&id) else {
             return;
         };
-        buf.syntax = BufferSyntax {
-            language: lang,
-            ..BufferSyntax::default()
-        };
+        let old = std::mem::replace(
+            &mut buf.syntax,
+            BufferSyntax {
+                language: lang,
+                ..BufferSyntax::default()
+            },
+        );
+        let old_bytes = old.syntax.as_ref().map_or(0, tree_bytes);
+        drop_elsewhere(old, old_bytes);
         let Some(lang) = lang else {
             return;
         };
@@ -244,7 +275,10 @@ impl Editor {
         if spawned.is_err()
             && let Some(buf) = self.buffers.get_mut(&id)
         {
+            // Without the worker the kept tree is stale; drop it rather than
+            // let commands treat it as exact.
             buf.syntax.pending = None;
+            buf.syntax.syntax = None;
             buf.syntax.note = Some("could not start the syntax thread");
         }
     }
@@ -253,24 +287,38 @@ impl Editor {
     /// made while it was being built. A result for a parse that has since
     /// been superseded is dropped.
     fn finish_parse(&mut self, id: DocumentId, parse: u64, result: Option<Syntax>, took: Duration) {
+        let result_bytes = result.as_ref().map_or(0, tree_bytes);
         let Some(buf) = self.buffers.get_mut(&id) else {
+            drop_elsewhere(result, result_bytes);
             return;
         };
         let st = &mut buf.syntax;
         if st.pending.as_ref().map(|p| p.id) != Some(parse) {
-            drop_elsewhere(result, true);
+            drop_elsewhere(result, result_bytes);
             return;
         }
         let pending = st.pending.take().expect("checked above");
         let Some(mut syntax) = result else {
+            // Keep no stale tree around that would pass for an exact one.
+            let old = st.syntax.take();
+            let bytes = old.as_ref().map_or(0, tree_bytes);
+            drop_elsewhere(old, bytes);
             st.note = Some("the syntax parser failed on this file");
             return;
         };
         st.slow = took > REPARSE_BUDGET;
+        if edit_bytes(&pending.edits) > BIG_EDIT_BYTES {
+            // Replaying would cost as much as parsing again.
+            drop_elsewhere(syntax, result_bytes);
+            let lang = st.language;
+            self.start_parse(id, lang);
+            return;
+        }
         let replay = !pending.edits.is_empty();
         syntax.apply_edits(&pending.edits);
         let old = st.syntax.replace(syntax);
-        drop_elsewhere(old, buf.doc.text().len_bytes() > SYNC_PARSE_BYTES);
+        let old_bytes = old.as_ref().map_or(0, tree_bytes);
+        drop_elsewhere(old, old_bytes);
         st.generation += 1;
         st.synced_len = buf.doc.text().len_bytes();
         if replay {
@@ -289,12 +337,12 @@ impl Editor {
             return;
         };
         st.generation += 1;
-        if !st.slow {
-            let big = buf.doc.text().len_bytes() > SYNC_PARSE_BYTES;
-            if let Some(old) = s.reparse_within(buf.doc.text(), REPARSE_BUDGET) {
-                drop_elsewhere(old, big);
-                return;
-            }
+        if !st.slow
+            && let Some(old) = s.reparse_within(buf.doc.text(), REPARSE_BUDGET)
+        {
+            let bytes = old.root_node().end_byte();
+            drop_elsewhere(old, bytes);
+            return;
         }
         st.slow = true;
         let fork = s.fork();
@@ -310,10 +358,32 @@ impl Editor {
         };
         let st = &mut buf.syntax;
         st.expansions.clear();
+        let edits = input_edits(old, changes);
+        // Without a language from the file name, the first line (a shebang)
+        // decides, so editing it can switch languages.
+        let shebang_decides = buf.doc.path().and_then(Language::from_path).is_none();
+        if shebang_decides && edits.iter().any(|e| e.start_position.row == 0) {
+            let first_line: String = buf.doc.text().line(0).chars().take(256).collect();
+            let lang = Language::detect(None, &first_line);
+            if lang != st.language {
+                self.start_parse(id, lang);
+                return;
+            }
+        }
         let Some(lang) = st.language else {
             return;
         };
-        let edits = input_edits(old, changes);
+        let too_big = buf.doc.text().len_bytes() > MAX_PARSE_BYTES;
+        if too_big
+            || edit_bytes(&edits) > BIG_EDIT_BYTES
+            || st.syntax.is_none() && st.pending.is_none()
+        {
+            // Parse from scratch: the edit is too big to apply to the tree,
+            // the file crossed the size limit, or there was no tree (too
+            // large before, or the parser failed). This re-checks the size.
+            self.start_parse(id, Some(lang));
+            return;
+        }
         if let Some(s) = &mut st.syntax {
             s.apply_edits(&edits);
             st.synced_len = buf.doc.text().len_bytes();
@@ -321,12 +391,6 @@ impl Editor {
         }
         if let Some(p) = &mut st.pending {
             p.edits.extend(edits);
-            return;
-        }
-        if st.syntax.is_none() {
-            // No tree (too large, or the parser failed): try again from
-            // scratch, which re-checks the size.
-            self.start_parse(id, Some(lang));
             return;
         }
         self.reparse(id);

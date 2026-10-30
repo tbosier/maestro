@@ -141,9 +141,13 @@ impl Syntax {
 
     /// Highlights inside the char range `range`: sorted, non-overlapping
     /// spans clipped to the range. Where captures nest, the innermost wins;
-    /// where two patterns capture the same node, the earlier pattern in the
-    /// query wins (tree-sitter-highlight's rule, which the bundled queries
-    /// are written for).
+    /// where two patterns capture the same range, the later pattern in the
+    /// query wins, as in tree-sitter-highlight. The bundled queries rely on
+    /// that: Python's starts with `(identifier) @variable` and refines it
+    /// with function and constant patterns further down.
+    ///
+    /// Memory is two bytes per byte of the range, so callers should bound
+    /// the range (the editor asks for the visible lines only).
     pub fn highlights(&self, text: &Rope, range: Range<usize>) -> Vec<Highlight> {
         let hq = self.language.highlights();
         let Some(query) = &hq.query else {
@@ -157,8 +161,9 @@ impl Syntax {
         }
         let len_bytes = text.len_bytes();
 
-        // (start byte, end byte, pattern, scope) for every capture.
-        let mut caps: Vec<(usize, usize, usize, &'static str)> = Vec::new();
+        // (start byte, end byte, pattern, capture index) for every capture
+        // that maps to a theme scope.
+        let mut caps: Vec<(usize, usize, usize, u16)> = Vec::new();
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(start_byte..end_byte);
         let provider = |node: Node| {
@@ -170,41 +175,44 @@ impl Syntax {
         let mut matches = cursor.matches(query, self.tree.root_node(), provider);
         while let Some(m) = matches.next() {
             for c in m.captures {
-                let Some(Some(scope)) = hq.scopes.get(c.index as usize) else {
+                if !matches!(hq.scopes.get(c.index as usize), Some(Some(_))) {
+                    continue;
+                }
+                let Ok(index) = u16::try_from(c.index) else {
                     continue;
                 };
                 let r = c.node.byte_range();
                 let (a, b) = (r.start.max(start_byte), r.end.min(end_byte));
                 if a < b {
-                    caps.push((r.start, r.end, m.pattern_index, scope));
+                    caps.push((r.start, r.end, m.pattern_index, index));
                 }
             }
         }
 
         // Paint outer captures first and inner ones over them; for the same
-        // node paint later patterns first so the earliest pattern ends on top.
-        caps.sort_by(|x, y| (y.1 - y.0).cmp(&(x.1 - x.0)).then_with(|| y.2.cmp(&x.2)));
-        let mut owner: Vec<Option<&'static str>> = vec![None; end_byte - start_byte];
-        for &(a, b, _, scope) in &caps {
+        // range paint earlier patterns first so the latest one ends on top.
+        caps.sort_by(|x, y| (y.1 - y.0).cmp(&(x.1 - x.0)).then_with(|| x.2.cmp(&y.2)));
+        const NONE: u16 = u16::MAX;
+        let mut owner: Vec<u16> = vec![NONE; end_byte - start_byte];
+        for &(a, b, _, index) in &caps {
             let (a, b) = (a.max(start_byte), b.min(end_byte));
-            owner[a - start_byte..b - start_byte].fill(Some(scope));
+            owner[a - start_byte..b - start_byte].fill(index);
         }
 
         let mut out = Vec::new();
         let mut i = 0;
         while i < owner.len() {
-            let Some(scope) = owner[i] else {
-                i += 1;
-                continue;
-            };
+            let index = owner[i];
             let mut j = i + 1;
-            while j < owner.len() && owner[j] == Some(scope) {
+            while j < owner.len() && owner[j] == index {
                 j += 1;
             }
-            let from = text.byte_to_char(start_byte + i);
-            let to = text.byte_to_char(start_byte + j);
-            if from < to {
-                out.push((from, to, scope));
+            if let Some(Some(scope)) = hq.scopes.get(usize::from(index)) {
+                let from = text.byte_to_char(start_byte + i);
+                let to = text.byte_to_char(start_byte + j);
+                if from < to {
+                    out.push((from, to, *scope));
+                }
             }
             i = j;
         }
@@ -376,15 +384,20 @@ fn edit(text: &mut Rope, pos: usize, delete: usize, insert: &str) -> InputEdit {
 /// The tree-sitter point (row, byte column) of `byte`.
 ///
 /// Tree-sitter counts rows at `\n` only, while Ropey also breaks lines at
-/// lone CR and Unicode separators. The column matters (external scanners for
-/// indentation read it), so it is measured from the last `\n`. The row can
-/// over-count in files with those rare separators; nothing here reads rows.
+/// lone CR and Unicode separators (VT, FF, NEL, U+2028, U+2029). The column
+/// matters, because external scanners that track indentation read it, so it
+/// is measured from the last `\n`, looking back at most 4096 Ropey lines.
+///
+/// The row is Ropey's line index, so in a file containing those separators
+/// it over-counts. Tree-sitter stores rows in node positions; this crate
+/// never reads them (highlights and selections use byte offsets), but a
+/// caller reading `Node::start_position` on such a file would see them.
 fn point(text: &Rope, byte: usize) -> Point {
     let row = text.byte_to_line(byte);
     let mut line = row;
     let mut start = text.line_to_byte(line);
     let mut steps = 0;
-    while line > 0 && text.byte(start - 1) != b'\n' && steps < 64 {
+    while line > 0 && text.byte(start - 1) != b'\n' && steps < 4096 {
         line -= 1;
         start = text.line_to_byte(line);
         steps += 1;

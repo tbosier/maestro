@@ -330,8 +330,9 @@ fn syntax_styles(
     let first = view.top_line.min(text.len_lines().saturating_sub(1));
     let last = (view.top_line + height).min(text.len_lines());
     let (from, to) = (text.line_to_char(first), text.line_to_char(last));
-    // Bound the work for pathological lines, like search highlighting.
-    if to - from > 1_000_000 {
+    // Very long lines go uncolored: highlighting costs time and two bytes
+    // of scratch memory per byte of the visible lines.
+    if to - from > 256 * 1024 {
         return Vec::new();
     }
     buf.syntax
