@@ -590,3 +590,89 @@ fn headless_transport_streams_responses_and_events() {
     // The loop stopped at quit; request 6 was never read.
     assert!(ed.should_quit);
 }
+
+#[test]
+fn an_edit_while_a_regex_prompt_is_open_does_not_break_the_prompt() {
+    let (mut h, doc) = Harness::with_text("0123456789\n");
+    // The cursor is on the 8, and the user opens the select-regex prompt,
+    // which remembers that selection.
+    for _ in 0..8 {
+        h.ed.handle_key(KeyEvent::char('l'));
+    }
+    h.ed.handle_key(KeyEvent::char('s'));
+    assert!(h.ed.prompt.is_some());
+    // An agent deletes everything meanwhile.
+    h.ok(
+        "document.apply_edit",
+        json!({"doc": doc, "base_version": 0, "encoding": "char", "actor": "agent",
+               "edits": [{"range": {"start": 0, "end": 11}, "text": ""}]}),
+    );
+    // Typing into the prompt previews against the moved selection instead
+    // of slicing past the end of the text.
+    h.ed.handle_key(KeyEvent::char('1'));
+    h.ed.handle_key(KeyEvent::plain(KeyCode::Esc));
+    assert!(h.ed.prompt.is_none());
+    assert_eq!(h.text(doc).0, "");
+}
+
+#[test]
+fn edits_that_change_nothing_are_refused_and_not_recorded() {
+    let (mut h, doc) = Harness::with_text("abc");
+    let (code, msg, _) = h.fails(
+        "document.apply_edit",
+        json!({"doc": doc, "base_version": 0, "encoding": "char", "actor": "a",
+               "edits": [{"range": {"start": 1, "end": 1}, "text": ""}]}),
+    );
+    assert_eq!(code, ErrorCode::InvalidParams);
+    assert!(msg.contains("change nothing"), "{msg}");
+    assert_eq!(h.text(doc), ("abc".to_string(), 0));
+    let hist = h.ok("document.history", json!({"doc": doc}));
+    assert!(hist["edits"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn commands_are_refused_while_the_user_is_mid_input() {
+    let (mut h, doc) = Harness::with_text("abc abc\n");
+    // The user has typed "/ab" into the search prompt.
+    for k in ['/', 'a', 'b'] {
+        h.ed.handle_key(KeyEvent::char(k));
+    }
+    let (code, msg, _) = h.fails("command.run", json!({"name": "find_next_char"}));
+    assert_eq!(code, ErrorCode::CommandFailed);
+    assert!(msg.contains("waiting for the user's input"), "{msg}");
+    let (code, _, _) = h.fails("editor.execute", json!({"line": "%s/abc/x/g"}));
+    assert_eq!(code, ErrorCode::CommandFailed);
+    // The user's prompt is untouched and nothing is armed behind it.
+    assert_eq!(h.ed.prompt.as_ref().unwrap().input, "ab");
+    assert!(h.ed.pending_char_label().is_none());
+    assert_eq!(h.text(doc).0, "abc abc\n");
+    // Version-checked edits still apply.
+    h.ok(
+        "document.apply_edit",
+        json!({"doc": doc, "base_version": 0, "encoding": "char", "actor": "a",
+               "edits": [{"range": {"start": 7, "end": 7}, "text": "!"}]}),
+    );
+    assert_eq!(h.text(doc).0, "abc abc!\n");
+}
+
+#[test]
+fn lsp_columns_past_the_line_end_clamp_even_when_huge() {
+    let (mut h, doc) = Harness::with_text("a\nb");
+    h.ok(
+        "document.apply_edit",
+        json!({"doc": doc, "base_version": 0, "encoding": "lsp", "actor": "a",
+               "edits": [{"range": {"start": {"line": 0, "character": 4294967295u32},
+                                    "end": {"line": 0, "character": 4294967295u32}},
+                          "text": "!"}]}),
+    );
+    assert_eq!(h.text(doc).0, "a!\nb");
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_something_other_than_a_regular_file_is_refused() {
+    let mut h = Harness::new();
+    let (code, msg, _) = h.fails("document.open", json!({"path": "/dev/null"}));
+    assert_eq!(code, ErrorCode::InvalidParams);
+    assert!(msg.contains("not a regular file"), "{msg}");
+}

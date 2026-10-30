@@ -17,6 +17,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use maestro_core::Transaction;
 use maestro_core::document::{EditError, SaveError};
 use maestro_core::pos::{LspPosition as CoreLsp, char_to_lsp, lsp_to_char};
+use maestro_core::text::line_end_excluding_terminator;
 use maestro_core::{Change, ChangeSet, Document, DocumentVersion, Range, Rope, Selection};
 use maestro_editor::{DocumentId, Editor, KeyCode, KeyEvent, ViewId};
 use maestro_protocol::{self as p, ErrorCode, Request, RequestId, Response, RpcError, methods};
@@ -161,20 +162,31 @@ fn to_char(text: &Rope, enc: p::Encoding, pos: p::Position, what: &str) -> Res<u
                 ))),
             }
         }
-        (p::Encoding::Lsp, p::Position::Lsp(l)) => lsp_to_char(
-            text,
-            CoreLsp {
-                line: l.line,
-                character: l.character,
-            },
-        )
-        .ok_or_else(|| {
-            invalid(format!(
-                "{what} line {} is out of bounds for a document of {} lines",
-                l.line,
-                text.len_lines()
-            ))
-        }),
+        (p::Encoding::Lsp, p::Position::Lsp(l)) => {
+            let line = l.line as usize;
+            if line >= text.len_lines() {
+                return Err(invalid(format!(
+                    "{what} line {} is out of bounds for a document of {} lines",
+                    l.line,
+                    text.len_lines()
+                )));
+            }
+            // Clamp the column to the line first, so a huge `character`
+            // cannot overflow the addition inside `lsp_to_char` where usize
+            // is 32 bits.
+            let start = text.line_to_char(line);
+            let end = line_end_excluding_terminator(text.slice(..), line);
+            let width = text.char_to_utf16_cu(end) - text.char_to_utf16_cu(start);
+            let character = (l.character as usize).min(width) as u32;
+            lsp_to_char(
+                text,
+                CoreLsp {
+                    line: l.line,
+                    character,
+                },
+            )
+            .ok_or_else(|| invalid(format!("{what} is out of bounds")))
+        }
         (enc, _) => Err(invalid(format!(
             "{what} does not match encoding {:?}: char positions are numbers, lsp positions are {{\"line\", \"character\"}} objects",
             encoding_name(enc)
@@ -266,6 +278,19 @@ impl Server {
         serde_json::to_string(&Response::err(
             None,
             err(ErrorCode::ParseError, "line is not valid UTF-8"),
+        ))
+        .expect("static response encodes")
+    }
+
+    /// The response to a line longer than `max` bytes; the transport closes
+    /// the connection after sending it.
+    pub fn line_too_long_response(max: usize) -> String {
+        serde_json::to_string(&Response::err(
+            None,
+            err(
+                ErrorCode::InvalidRequest,
+                format!("request line is longer than {max} bytes; closing the connection"),
+            ),
         ))
         .expect("static response encodes")
     }
@@ -494,6 +519,11 @@ impl Server {
                 .map(|&(from, to, _, t)| Change::replace(from, to, t)),
         )
         .map_err(|e| invalid(e.to_string()))?;
+        if cs.is_empty() {
+            // The version would not move, so there would be no undo step and
+            // nothing to attribute.
+            return Err(invalid("the edits change nothing"));
+        }
 
         let before = reference_selection(ed, id);
         let focused = ed.focus;
@@ -532,6 +562,13 @@ impl Server {
         buf.doc.commit(&after);
         buf.last_selection = buf.last_selection.map(&cs).normalize(s).clamp_normal(s);
         let version = buf.doc.version().0;
+        // An open prompt keeps the selection it started from (restored on
+        // Esc, and the base of regex previews); move it with the text too.
+        if ed.views.get(&focused).is_some_and(|v| v.doc == id)
+            && let Some(prompt) = ed.prompt.as_mut()
+        {
+            prompt.original = prompt.original.map(&cs).normalize(s).clamp_normal(s);
+        }
         for v in ed.views.values_mut().filter(|v| v.doc == id) {
             let mapped = v.selection.map(&cs).normalize(s);
             v.selection = if v.id == focused && insert_mode {
@@ -662,6 +699,16 @@ fn run_noninteractive(
     f: impl FnOnce(&mut Editor),
 ) -> Res<p::CommandResult> {
     let before = interactive_state(ed);
+    // Running a command while the user is mid-input would mix the two: an
+    // Esc meant to cancel this command would close the user's prompt.
+    if before.0 || before.1 || before.2 || !ed.pending.is_empty() || ed.count.is_some() {
+        return Err(err(
+            ErrorCode::CommandFailed,
+            format!(
+                "{what} was not run: the editor is waiting for the user's input (a prompt, picker, typed character, count or partial key sequence)"
+            ),
+        ));
+    }
     ed.status = None;
     f(ed);
     let after = interactive_state(ed);
@@ -789,6 +836,13 @@ fn open(ed: &mut Editor, p: p::DocumentOpenParams) -> Res<p::DocumentOpenResult>
     let path = ed.resolve_path(Path::new(&p.path));
     if path.is_dir() {
         return Err(invalid(format!("{} is a directory", path.display())));
+    }
+    // Reading a FIFO, socket or device could block the editor thread with
+    // no way to cancel. A missing file is fine: it is created on save.
+    if let Ok(m) = std::fs::metadata(&path)
+        && !m.is_file()
+    {
+        return Err(invalid(format!("{} is not a regular file", path.display())));
     }
     let (id, already_open) = match ed.find_buffer_by_path(&path) {
         Some(id) => (id, true),

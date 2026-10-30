@@ -15,13 +15,14 @@
 //! permissions. It is removed when the [`Listener`] is dropped.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use maestro_editor::Editor;
 use maestro_editor::editor::JobSender;
@@ -35,6 +36,34 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often subscribed connections check for changes made outside the API
 /// (typing, commands).
 pub const EVENT_POLL: Duration = Duration::from_millis(100);
+/// Longest request line accepted; a longer one closes the connection.
+pub const MAX_LINE: usize = 64 << 20;
+/// Requests a connection may have queued for the editor before its reader
+/// stops reading, so one client cannot flood the editor thread.
+pub const MAX_IN_FLIGHT: usize = 32;
+
+/// Counts a connection's requests queued for the editor.
+#[derive(Default)]
+struct InFlight {
+    count: Mutex<usize>,
+    done: Condvar,
+}
+
+impl InFlight {
+    fn acquire(&self) {
+        let mut n = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= MAX_IN_FLIGHT {
+            n = self.done.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+    }
+
+    fn release(&self) {
+        let mut n = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.done.notify_one();
+    }
+}
 
 struct Conn {
     session: Session,
@@ -106,18 +135,30 @@ pub fn listen(editor: &Editor, path: &Path) -> io::Result<Listener> {
                 format!("{} exists and is not a socket", path.display()),
             ));
         }
-        if UnixStream::connect(path).is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("another process is listening on {}", path.display()),
-            ));
+        match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("another process is listening on {}", path.display()),
+                ));
+            }
+            // Refused means nobody listens: a socket left behind by a crash.
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path)?;
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("{} exists and could not be checked: {e}", path.display()),
+                ));
+            }
         }
-        // A socket nobody listens on: left behind by a crash.
-        std::fs::remove_file(path)?;
     }
 
-    // Bind inside a private directory, tighten the mode, then rename into
+    // Bind inside a private directory, tighten the mode, then link it into
     // place, so the socket is never reachable with the umask's permissions.
+    // A hard link (unlike a rename) fails if anything appeared at `path`
+    // meanwhile, so a file or another listener there is never replaced.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -128,7 +169,7 @@ pub fn listen(editor: &Editor, path: &Path) -> io::Result<Listener> {
     let bound = (|| {
         let l = UnixListener::bind(&staged)?;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&staged, path)?;
+        std::fs::hard_link(&staged, path)?;
         Ok::<_, io::Error>(l)
     })();
     let _ = std::fs::remove_file(&staged);
@@ -166,9 +207,6 @@ fn accept_loop(listener: UnixListener, idle: JobSender, hub: SharedHub) {
 /// reader with a fast-poll [`JobSender`].
 fn start_connection(ed: &mut Editor, hub: SharedHub, id: u64, stream: UnixStream) {
     let Ok(out) = stream.try_clone() else { return };
-    if out.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
-        return;
-    }
     let subscribed = Arc::new(AtomicBool::new(false));
     lock(&hub).conns.insert(
         id,
@@ -212,22 +250,36 @@ fn serve_connection(
                 }
             });
     }
+    let in_flight = Arc::new(InFlight::default());
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        match reader
+            .by_ref()
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+        {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let line = match String::from_utf8(std::mem::take(&mut buf)) {
-            Ok(l) if l.trim().is_empty() => continue,
-            Ok(l) => Ok(l),
-            Err(_) => Err(()),
+        let too_long = buf.len() > MAX_LINE && buf.last() != Some(&b'\n');
+        let line = if too_long {
+            Line::TooLong
+        } else {
+            match String::from_utf8(std::mem::take(&mut buf)) {
+                Ok(l) if l.trim().is_empty() => continue,
+                Ok(l) => Line::Text(l),
+                Err(_) => Line::NotUtf8,
+            }
         };
-        let hub = hub.clone();
-        let job = move |ed: &mut Editor| handle_on_editor(ed, &hub, id, line);
-        if !sender.send(job) {
+        in_flight.acquire();
+        let (hub, done) = (hub.clone(), in_flight.clone());
+        let job = move |ed: &mut Editor| {
+            handle_on_editor(ed, &hub, id, line);
+            done.release();
+        };
+        if !sender.send(job) || too_long {
             break;
         }
     }
@@ -237,21 +289,50 @@ fn serve_connection(
     });
 }
 
-fn write_line(out: &mut UnixStream, line: &str) -> io::Result<()> {
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
-    out.flush()
+enum Line {
+    Text(String),
+    NotUtf8,
+    TooLong,
 }
 
-fn handle_on_editor(ed: &mut Editor, hub: &SharedHub, id: u64, line: Result<String, ()>) {
+/// Writes `text` and a newline, giving up once [`WRITE_TIMEOUT`] has passed
+/// in total, so a client that reads a byte at a time cannot hold the
+/// editor thread for longer than that.
+fn write_line(out: &mut UnixStream, text: &str) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(text.len() + 1);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.push(b'\n');
+    let deadline = Instant::now() + WRITE_TIMEOUT;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "client is not reading",
+            ));
+        }
+        out.set_write_timeout(Some(left))?;
+        match out.write(&bytes[pos..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => pos += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn handle_on_editor(ed: &mut Editor, hub: &SharedHub, id: u64, line: Line) {
     let mut guard = lock(hub);
     let Hub { server, conns } = &mut *guard;
     let Some(conn) = conns.get_mut(&id) else {
         return;
     };
     let response = match line {
-        Ok(l) => server.handle_line(ed, &mut conn.session, l.trim_end()),
-        Err(()) => Some(Server::invalid_utf8_response()),
+        Line::Text(l) => server.handle_line(ed, &mut conn.session, l.trim_end()),
+        Line::NotUtf8 => Some(Server::invalid_utf8_response()),
+        Line::TooLong => Some(Server::line_too_long_response(MAX_LINE)),
     };
     conn.subscribed
         .store(conn.session.is_subscribed(), Ordering::SeqCst);
@@ -275,16 +356,18 @@ fn pump(ed: &mut Editor, hub: &mut Hub) {
     if events.is_empty() {
         return;
     }
-    let lines: Vec<String> = events
+    // One write per client, so the write deadline covers the whole batch.
+    let batch = events
         .iter()
         .filter_map(|n| serde_json::to_string(n).ok())
-        .collect();
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut dead = Vec::new();
     for (id, c) in hub.conns.iter_mut() {
         if !c.session.is_subscribed() {
             continue;
         }
-        if lines.iter().any(|l| write_line(&mut c.out, l).is_err()) {
+        if write_line(&mut c.out, &batch).is_err() {
             dead.push(*id);
         }
     }

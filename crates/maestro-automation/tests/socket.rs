@@ -197,3 +197,49 @@ fn live_socket_serves_requests_and_events() {
     assert!(!path.exists(), "socket file removed on drop");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+#[ignore = "needs AF_UNIX sockets; run with --ignored outside sandboxes that block them"]
+fn listen_never_replaces_files_and_bounds_request_lines() {
+    let dir = std::env::temp_dir().join(format!("maestro-sock2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 80, 22));
+
+    // A regular file at the path is refused and left alone.
+    let file = dir.join("not-a-socket");
+    std::fs::write(&file, "keep me").unwrap();
+    assert!(socket::listen(&ed, &file).is_err());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+
+    // A stale socket (bound, then its listener closed) is replaced.
+    let path = dir.join("ed.sock");
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    let listener = socket::listen(&ed, &path).unwrap();
+
+    // A request line over the limit gets an error and the connection closes.
+    let stream = UnixStream::connect(&path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut w = stream.try_clone().unwrap();
+        let mut r = BufReader::new(stream);
+        let big = vec![b' '; socket::MAX_LINE + 10];
+        // The server may close before reading all of it.
+        let _ = w.write_all(&big);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let mut rest = String::new();
+        let eof = r.read_line(&mut rest).unwrap() == 0;
+        tx.send((line, eof)).unwrap();
+    });
+    let (line, eof) = drive(&mut ed, &rx);
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["error"]["code"], -32600, "{line}");
+    assert!(eof, "connection closed after the oversized line");
+
+    drop(listener);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -243,8 +243,9 @@ pub enum ErrorCode {
     Conflict,
     /// Quitting would discard unsaved changes; pass `force`.
     UnsavedChanges,
-    /// The command ran and reported an error in the status line, or needs
-    /// interactive input the API cannot supply. The message is that text.
+    /// The command ran and reported an error in the status line (the
+    /// message is that text), needs interactive input the API cannot
+    /// supply, or was not run because the user is in the middle of input.
     CommandFailed,
     /// Another I/O failure.
     Io,
