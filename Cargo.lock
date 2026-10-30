@@ -253,6 +253,7 @@ version = "0.1.0"
 dependencies = [
  "maestro-config",
  "maestro-core",
+ "maestro-lsp",
  "proptest",
  "regex",
  "thiserror",

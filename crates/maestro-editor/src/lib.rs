@@ -1,6 +1,7 @@
 //! Editor state, modal commands and keymaps for Maestro.
 //!
-//! This crate depends on `maestro-core` and `maestro-config` only. It has no
+//! This crate depends on `maestro-core`, `maestro-config` and `maestro-lsp`
+//! (which runs language servers on its own threads). It has no
 //! terminal, network or Git dependency: a front end feeds it [`KeyEvent`]s
 //! and draws what it holds.
 
@@ -9,6 +10,8 @@ pub mod editor;
 pub mod key;
 pub mod keymap;
 pub mod layout;
+pub mod lsp;
+pub mod lsp_commands;
 pub mod motion;
 pub mod picker;
 pub mod prompt;

@@ -177,6 +177,8 @@ pub struct Editor {
     pub cwd: PathBuf,
     pub clipboard: Box<dyn Clipboard>,
     pub recovery_dir: Option<PathBuf>,
+    /// Language servers, synced documents and diagnostics.
+    pub lsp: crate::lsp::Lsp,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -220,6 +222,7 @@ impl Editor {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             clipboard: Box::new(MemoryClipboard::default()),
             recovery_dir: None,
+            lsp: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -377,6 +380,7 @@ impl Editor {
             };
             view.selection = mapped.normalize(text.slice(..));
         }
+        crate::lsp::document_changed(self, doc_id, std::slice::from_ref(&tx.changes));
         Ok(())
     }
 
@@ -444,6 +448,7 @@ impl Editor {
             }
         };
         self.switch_to(id);
+        crate::lsp::reconcile(self);
         Ok(id)
     }
 
@@ -822,6 +827,7 @@ impl Editor {
         }
 
         self.status_clear_on_key(key);
+        crate::lsp::on_key(self);
         self.dispatch(key);
 
         // Mode-transition bookkeeping.
@@ -832,6 +838,7 @@ impl Editor {
             self.view_mut().selection = sel;
         }
         self.track_change(version_before, doc_before, mode_before);
+        crate::lsp::reconcile(self);
         self.ensure_cursor_visible();
     }
 
@@ -1194,6 +1201,7 @@ impl Editor {
     pub fn tick(&mut self, now: Instant) {
         crate::recovery::tick(self, now);
         self.check_disk_changes();
+        crate::lsp::reconcile(self);
     }
 
     fn check_disk_changes(&mut self) {
@@ -1219,6 +1227,7 @@ impl Editor {
                         for v in self.views.values_mut().filter(|v| v.doc == id) {
                             v.selection = v.selection.map(&changes).clamp_normal(text.slice(..));
                         }
+                        crate::lsp::document_changed(self, id, &[changes]);
                         self.info(format!("reloaded {name}: it changed on disk"));
                     }
                     Err(e) => self.error(format!("could not reload {name}: {e}")),

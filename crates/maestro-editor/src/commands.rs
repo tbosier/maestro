@@ -39,7 +39,7 @@ macro_rules! commands {
 }
 
 /// Every command table. Add new modules' tables here.
-pub static TABLES: &[&[Command]] = &[COMMANDS];
+pub static TABLES: &[&[Command]] = &[COMMANDS, crate::lsp_commands::COMMANDS];
 
 /// Iterates every registered command.
 pub fn all() -> impl Iterator<Item = &'static Command> {
@@ -1485,6 +1485,7 @@ fn history_step(ed: &mut Editor, redo: bool) {
             }
             .clamp_normal(text.slice(..));
         }
+        crate::lsp::document_changed(ed, doc_id, &step.applied);
     }
 }
 

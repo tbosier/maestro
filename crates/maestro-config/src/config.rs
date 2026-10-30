@@ -284,7 +284,10 @@ enabled = false
         .unwrap();
         assert_eq!(
             c.language_servers("rust"),
-            vec![LanguageServerConfig::new("/opt/ra/rust-analyzer", &["--log", "x"])]
+            vec![LanguageServerConfig::new(
+                "/opt/ra/rust-analyzer",
+                &["--log", "x"]
+            )]
         );
         assert!(c.language_servers("python").is_empty());
         // Untouched languages keep the defaults.
