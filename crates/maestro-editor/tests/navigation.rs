@@ -65,10 +65,11 @@ fn wait_loaded(ed: &mut Editor) {
     }
 }
 
-/// Waits until no background job is running, then applies what they sent.
+/// Applies background results until no background job is running.
 fn wait_idle(ed: &mut Editor) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while ed.has_background_work() {
+        ed.poll_background();
         assert!(Instant::now() < deadline, "background work still running");
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -340,13 +341,56 @@ fn recent_files_are_most_recent_first_across_sessions() {
     assert_eq!(labels(&ed), vec!["c.txt", "a.txt"]);
 }
 
+#[test]
+fn a_result_from_disk_never_lands_on_another_line_of_an_edited_buffer() {
+    let dir = temp_dir("goto-edited");
+    write(&dir, "a.txt", "prefix needle\nsecond\n");
+    let mut ed = editor_in(&dir);
+    // Open the file and shorten the first line without saving.
+    run(&mut ed, ":e a.txt\nxcx\n<esc>");
+    assert_eq!(ed.doc().text().to_string(), "x\nsecond\n");
+    run(&mut ed, ":grep needle\n");
+    wait_loaded(&mut ed);
+    run(&mut ed, "\n");
+    let text = ed.doc().text().clone();
+    let head = ed.view().selection.primary().head;
+    assert_eq!(text.char_to_line(head), 0, "cursor stayed on line 1");
+}
+
+#[test]
+fn grep_keeps_the_spaces_in_its_pattern() {
+    let dir = temp_dir("grep-spaces");
+    write(&dir, "a.txt", "a b\na  b\n");
+    let mut ed = editor_in(&dir);
+    run(&mut ed, ":grep a  b\n");
+    wait_loaded(&mut ed);
+    assert_eq!(ed.picker.as_ref().unwrap().title, "search /a  b/");
+    assert_eq!(labels(&ed), vec!["a.txt:2:1  a  b"]);
+}
+
+#[test]
+fn restoring_a_session_does_not_reorder_recent_files() {
+    let dir = temp_dir("restore-recent");
+    let state = dir.join("state");
+    write(&dir, "a.txt", "a\n");
+    write(&dir, "b.txt", "b\n");
+    let mut ed = configured(&dir, &state);
+    run(&mut ed, ":e a.txt\n:e b.txt\n:e a.txt\n:qa\n");
+    let mut ed = configured(&dir, &state);
+    session::restore(&mut ed);
+    assert_eq!(doc_path(&ed), dir.join("a.txt"));
+    run(&mut ed, "<space>r");
+    assert_eq!(labels(&ed), vec!["a.txt", "b.txt"]);
+}
+
 /// Measures the finder on a generated tree (200,000 files by default, or
 /// `MAESTRO_NAV_BENCH_FILES`). Run with
 /// `cargo test --release -p maestro-editor --test navigation -- --ignored --nocapture`.
 ///
 /// It imitates the terminal loop: apply background results, then handle a
-/// key, then sleep for about one frame. It reports the slowest result batch,
-/// the slowest key, and the longest run of back-to-back batches, which is
+/// key, then sleep for about one frame (nothing is rendered). It reports the
+/// slowest poll that applied results,
+/// the slowest key, and the longest run of back-to-back result polls, which is
 /// what would keep the real loop from reading input.
 #[test]
 #[ignore]
@@ -432,9 +476,9 @@ fn large_tree_streams_without_blocking_input() {
     }
     assert_eq!(labels(&ed)[0], "d499/s39/file_199999.rs");
     eprintln!(
-        "files={n} open_ms={open_ms:.2} first_items_ms={:.1} all_ms={:.0} batches={batches} \
-         max_batch_apply_ms={:.2} keys={} key_p50_ms={:.2} key_p95_ms={:.2} max_key_while_loading_ms={:.2} max_ms_between_keys={:.2} \
-         max_back_to_back_batches={max_streak} max_key_filtering_full_list_ms={:.2}",
+        "files={n} open_ms={open_ms:.2} first_results_applied_ms={:.1} all_ms={:.0} polls_applying_results={batches} \
+         max_result_poll_ms={:.2} keys={} key_p50_ms={:.2} key_p95_ms={:.2} max_key_while_loading_ms={:.2} max_ms_between_keys={:.2} \
+         max_back_to_back_result_polls={max_streak} max_key_filtering_full_list_ms={:.2}",
         first_items.unwrap_or_default().as_secs_f64() * 1e3,
         total.as_secs_f64() * 1e3,
         max_poll.as_secs_f64() * 1e3,

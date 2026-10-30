@@ -1,6 +1,8 @@
 //! Recently opened files, across sessions: `<state>/recent.toml`, most
 //! recent first, capped at [`LIMIT`]. Every open rereads the file before
-//! writing it, so two editors running at once both contribute.
+//! writing it, so editors running at once see each other's opens. The
+//! read and write are not locked: two opens in different editors at the
+//! same instant can lose one entry.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +44,9 @@ pub fn push_front(list: &mut Vec<PathBuf>, file: PathBuf) {
 /// Records that `file` was opened. Writes the list when a state directory
 /// is configured; failures to write are ignored (the list is a convenience).
 pub fn record(ed: &mut Editor, file: &Path) {
+    if ed.navigation.restoring {
+        return;
+    }
     let file = crate::editor::normalize_path(file);
     if file.to_str().is_none() {
         return;
@@ -62,7 +67,7 @@ pub fn record(ed: &mut Editor, file: &Path) {
             files: list.clone(),
         };
         if let Ok(text) = toml::to_string(&body) {
-            let _ = super::session::write_private(&path(dir), text.as_bytes());
+            let _ = super::session::write_private(&path(dir), text.as_bytes(), false);
         }
     }
     ed.navigation.recent = list;

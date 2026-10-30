@@ -634,7 +634,7 @@ fn draw_picker(ed: &Editor, s: &mut Surface) -> Option<CursorShape> {
             s.put(inner_r, yy, "│", ui.popup_border, inner_r + 1);
         }
         // Join the top border unless the title runs across the divider.
-        if x + 4 + (title.chars().count() as u16) < inner_r {
+        if x as usize + 4 + title.chars().count() < inner_r as usize {
             s.put(inner_r, y, "┬", ui.popup_border, inner_r + 1);
         }
         s.put(

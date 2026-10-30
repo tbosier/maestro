@@ -81,6 +81,13 @@ impl Surface {
     /// Puts one grapheme at (x, y). Returns the number of columns used, or 0
     /// if it did not fit before `max_x`.
     pub fn put(&mut self, x: u16, y: u16, grapheme: &str, style: Style, max_x: u16) -> u16 {
+        // Control characters (ESC, BEL, ...) in file names or file text
+        // would reach the terminal as commands. Show them as `?`.
+        let grapheme = if grapheme.chars().any(char::is_control) {
+            "?"
+        } else {
+            grapheme
+        };
         let w = grapheme.width().max(1) as u16;
         if x + w > max_x.min(self.width) || y >= self.height {
             return 0;
@@ -135,5 +142,13 @@ mod tests {
         assert_eq!(s.cell(4, 0).unwrap().symbol, "");
         let end = s.print(0, 0, "abcd漢", Style::default(), 5);
         assert_eq!(end, 4);
+    }
+
+    #[test]
+    fn control_characters_never_reach_a_cell() {
+        let mut s = Surface::new(8, 1, Style::default());
+        s.print(0, 0, "a\x1b]0;x\x07b", Style::default(), 8);
+        let row: String = s.row(0).iter().map(|c| c.symbol.as_str()).collect();
+        assert_eq!(row, "a?]0;x?b");
     }
 }

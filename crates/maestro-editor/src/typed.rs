@@ -242,6 +242,13 @@ pub fn execute_line(editor: &mut Editor, line: &str) {
         }
         return;
     }
+    // :grep takes the rest of the line as its pattern, spaces included.
+    if let Some(pattern) = line.strip_prefix("grep ") {
+        if let Err(e) = crate::navigation::grep::start(editor, pattern.trim_start()) {
+            editor.error(e);
+        }
+        return;
+    }
     let mut parts = line.split_whitespace();
     let head = parts.next().unwrap_or_default();
     let (name, force) = match head.strip_suffix('!') {

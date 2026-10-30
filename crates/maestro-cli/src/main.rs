@@ -11,7 +11,8 @@ usage: maestro [options] [file[:line]]...
 
 options:
   -c, --config <path>   use this config file instead of the default
-      --clean           ignore the user config; do not restore or save the session
+      --clean           ignore the user config; do not read or write the
+                        session or the recent-files list
   -h, --help            show this help
   -V, --version         show the version
 
@@ -109,11 +110,13 @@ fn main() -> ExitCode {
     let mut editor = Editor::new(config, Rect::new(0, 1, w, h.saturating_sub(2)));
     editor.recovery_dir = maestro_config::config::state_dir().map(|d| d.join("recovery"));
     let sessions = !args.clean && editor.config.editor.restore_session;
-    maestro_editor::navigation::configure(
-        &mut editor,
-        maestro_config::config::state_dir(),
-        sessions,
-    );
+    // --clean keeps nothing: no session and no recent-files history on disk.
+    let nav_state = if args.clean {
+        None
+    } else {
+        maestro_config::config::state_dir()
+    };
+    maestro_editor::navigation::configure(&mut editor, nav_state, sessions);
     startup_errors.extend(editor.keymaps.errors.clone());
 
     for (path, line) in &args.files {

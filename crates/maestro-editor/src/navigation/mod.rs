@@ -2,13 +2,16 @@
 //! preview, session restore and recent files.
 //!
 //! Walking and searching run on background threads and stream results into
-//! the open picker through [`stream::Stream`], so a large tree never blocks
-//! input. Sessions and the recent-files list live in the state directory
+//! the open picker through [`stream::Stream`], so typing keeps working while
+//! a large tree is listed (results never queue up behind each other; see
+//! [`stream`]). Filtering a very large list still costs time per key.
+//! Sessions and the recent-files list live in the state directory
 //! (`$XDG_STATE_HOME/maestro`); with no state directory configured (tests,
-//! `--clean`) nothing is written to disk.
+//! `--clean`) nothing is read from or written to disk.
 
 pub mod finder;
 pub mod grep;
+pub mod lines;
 pub mod preview;
 pub mod recent;
 pub mod session;
@@ -42,6 +45,9 @@ pub struct NavState {
     pub session_cwd: Option<PathBuf>,
     /// Recently opened files, most recent first.
     pub recent: Vec<PathBuf>,
+    /// Set while a session is restored, so reopening its files does not
+    /// count as opening them.
+    pub(crate) restoring: bool,
 }
 
 /// Sets where navigation state is stored and whether sessions are saved.
@@ -66,17 +72,25 @@ fn recent_files(ed: &mut Editor) {
 }
 
 /// Path shown in pickers: relative to `root` when inside it, otherwise with
-/// the home directory abbreviated to `~`.
+/// the home directory abbreviated to `~`. Control characters in file names
+/// are shown as `?` so they cannot reach the terminal.
 pub fn display_path(path: &Path, root: &Path) -> String {
-    if let Ok(rel) = path.strip_prefix(root) {
-        return rel.to_string_lossy().into_owned();
-    }
-    if let Some(home) = std::env::var_os("HOME")
+    let shown = if let Ok(rel) = path.strip_prefix(root) {
+        rel.to_string_lossy().into_owned()
+    } else if let Some(home) = std::env::var_os("HOME")
         && let Ok(rel) = path.strip_prefix(&home)
     {
-        return format!("~/{}", rel.to_string_lossy());
+        format!("~/{}", rel.to_string_lossy())
+    } else {
+        path.to_string_lossy().into_owned()
+    };
+    if shown.chars().any(char::is_control) {
+        return shown
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
     }
-    path.to_string_lossy().into_owned()
+    shown
 }
 
 /// Opens a picker that background work will fill, and returns its id.
@@ -110,6 +124,10 @@ mod tests {
         assert_eq!(
             display_path(Path::new("/elsewhere/b.rs"), root),
             "/elsewhere/b.rs"
+        );
+        assert_eq!(
+            display_path(Path::new("/work/proj/a\x1b[2Jb\n.rs"), root),
+            "a?[2Jb?.rs"
         );
     }
 }

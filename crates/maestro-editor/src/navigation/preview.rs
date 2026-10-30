@@ -7,7 +7,7 @@
 //! a file than that shows a message instead of text. Files already open in
 //! a buffer are previewed from the buffer, unsaved edits included.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::editor::Editor;
@@ -63,45 +63,75 @@ pub fn load_file(path: &Path, target: Option<usize>) -> Preview {
         lines: Vec::new(),
         message: None,
     };
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
+    // Opening a FIFO or a device would block the editor, so only regular
+    // files are read.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            preview.message = Some("not a regular file".into());
+            return preview;
+        }
+        Err(e) => {
+            preview.message = Some(format!("cannot read: {e}"));
+            return preview;
+        }
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f.take(MAX_SCAN_BYTES),
         Err(e) => {
             preview.message = Some(format!("cannot read: {e}"));
             return preview;
         }
     };
-    let mut reader = BufReader::new(file.take(MAX_SCAN_BYTES));
-    let mut buf = Vec::new();
-    let mut line = 0;
+    // Read in chunks until the window's last line is complete.
+    let mut data = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut cur = super::lines::Cursor::default();
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {}
+        let n = match file.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 preview.message = Some(format!("cannot read: {e}"));
                 break;
             }
+        };
+        if n == 0 {
+            break;
         }
-        if buf.contains(&0) {
-            preview.lines.clear();
+        if chunk[..n].contains(&0) {
             preview.message = Some("binary file".into());
             return preview;
         }
-        if line >= from {
-            preview.lines.push(clean_line(&buf));
+        data.extend_from_slice(&chunk[..n]);
+        // Leave the last bytes for the next round: a CRLF or a multi-byte
+        // separator may continue in the next chunk.
+        let safe = data.len().saturating_sub(2);
+        if safe > cur.scanned {
+            cur = super::lines::advance(&data, cur, safe);
         }
-        line += 1;
-        if line >= to {
-            return preview;
+        if cur.line >= to {
+            break;
         }
     }
-    if line == 0 && preview.message.is_none() {
+    let capped = data.len() as u64 >= MAX_SCAN_BYTES;
+    // The editor hides a UTF-8 byte order mark; so does the preview.
+    let text = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data);
+    if text.is_empty() && preview.message.is_none() {
         preview.message = Some("empty file".into());
         return preview;
     }
-    let read_all = reader.into_inner().limit() > 0;
-    if !read_all && target.is_some_and(|t| t >= line) {
+    let mut total = 0;
+    for (i, (a, b)) in super::lines::lines(text).enumerate() {
+        if i >= to {
+            break;
+        }
+        total = i + 1;
+        if i >= from {
+            preview.lines.push(clean_line(&text[a..b]));
+        }
+    }
+    if capped && target.is_some_and(|t| t + 1 >= total) {
         preview.message = Some(format!(
             "line {} is past the first {} MB this preview reads",
             target.unwrap_or(0) + 1,
@@ -111,9 +141,8 @@ pub fn load_file(path: &Path, target: Option<usize>) -> Preview {
     preview
 }
 
+/// Cuts a line (without its terminator) to [`MAX_LINE_BYTES`].
 fn clean_line(raw: &[u8]) -> String {
-    let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
-    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
     let cut = &raw[..raw.len().min(MAX_LINE_BYTES)];
     String::from_utf8_lossy(cut).into_owned()
 }
@@ -132,11 +161,12 @@ fn load_rope(path: &Path, text: &maestro_core::Rope, target: Option<usize>) -> P
                     break;
                 }
             }
+            let s = s.trim_end_matches(maestro_core::text::is_line_ending_char);
             let mut cut = s.len().min(MAX_LINE_BYTES);
             while !s.is_char_boundary(cut) {
                 cut -= 1;
             }
-            clean_line(&s.as_bytes()[..cut])
+            s[..cut].to_string()
         })
         .collect();
     Preview {
@@ -207,7 +237,34 @@ mod tests {
         assert_eq!(pv.first_line, 0);
         assert_eq!(pv.lines[0], "line 0");
         let pv = load_file(&p, Some(199));
-        assert_eq!(pv.lines.last().unwrap(), "line 199");
+        // Like the rope, a final line break is followed by an empty line.
+        assert_eq!(pv.lines[pv.lines.len() - 2], "line 199");
+        assert_eq!(pv.lines.last().unwrap(), "");
+    }
+
+    #[test]
+    fn lines_split_like_the_editor_and_bom_is_hidden() {
+        let p = temp_file("cr.txt", "\u{feff}one\rtwo\u{2028}three\r\nfour".as_bytes());
+        let pv = load_file(&p, Some(2));
+        assert_eq!(pv.lines, vec!["one", "two", "three", "four"]);
+        assert_eq!(pv.message, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_not_opened() {
+        let dir = std::env::temp_dir().join(format!("maestro-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let _ = std::fs::remove_file(&fifo);
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("mkfifo is not available; skipping");
+            return;
+        }
+        // Without the check this would block until a writer appeared.
+        let pv = load_file(&fifo, None);
+        assert_eq!(pv.message.as_deref(), Some("not a regular file"));
     }
 
     #[test]

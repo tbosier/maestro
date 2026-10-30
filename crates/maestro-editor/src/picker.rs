@@ -96,8 +96,9 @@ impl Picker {
         self.items.len()
     }
 
-    /// Appends items. Only the new items are matched against the query, so
-    /// streaming many batches into a large picker stays linear.
+    /// Appends items. Only the new items are matched against the query;
+    /// their matches are sorted and merged into the sorted list, so a batch
+    /// costs its own matching plus one linear merge.
     pub fn extend(&mut self, items: impl IntoIterator<Item = PickerItem>) {
         let start = self.items.len();
         self.items.extend(items);
@@ -113,9 +114,29 @@ impl Picker {
                     positions: Vec::new(),
                 }));
         } else {
-            let new = self.match_range(start..self.items.len());
-            self.matches.extend(new);
-            self.sort_matches();
+            let mut new = self.match_range(start..self.items.len());
+            let items = &self.items;
+            let key = |m: &Match| {
+                (
+                    std::cmp::Reverse(m.score),
+                    items[m.index].label.len(),
+                    m.index,
+                )
+            };
+            new.sort_by_cached_key(key);
+            let old = std::mem::take(&mut self.matches);
+            let mut merged = Vec::with_capacity(old.len() + new.len());
+            let (mut a, mut b) = (old.into_iter().peekable(), new.into_iter().peekable());
+            loop {
+                let take_old = match (a.peek(), b.peek()) {
+                    (Some(x), Some(y)) => key(x) <= key(y),
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                merged.extend(if take_old { a.next() } else { b.next() });
+            }
+            self.matches = merged;
         }
         self.restore_selection(prev);
     }
@@ -300,7 +321,11 @@ pub fn resolve(editor: &mut Editor, outcome: Outcome) {
                     }
                     let text = editor.doc().text().clone();
                     let line = line.min(text.len_lines().saturating_sub(1));
-                    let pos = (text.line_to_char(line) + column).min(text.len_chars());
+                    // The location may come from the file on disk while the
+                    // buffer has unsaved edits; never spill onto the next line.
+                    let line_end =
+                        maestro_core::text::line_end_excluding_terminator(text.slice(..), line);
+                    let pos = (text.line_to_char(line) + column).min(line_end);
                     editor.push_jump();
                     editor.set_selection(maestro_core::Selection::point(pos));
                     editor.commit();

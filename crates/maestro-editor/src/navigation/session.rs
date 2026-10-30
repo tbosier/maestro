@@ -44,18 +44,25 @@ pub fn session_path(state_dir: &Path, cwd: &Path) -> PathBuf {
 }
 
 /// Writes `bytes` to `path` atomically: a 0600 temp file in the same
-/// directory, synced, then renamed over the target, then the directory is
-/// synced so the rename is durable. Creates the parent directory (0700) if
-/// needed.
-pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// directory, then a rename over the target. With `durable`, the file and
+/// the directory are synced so the result survives a power cut; the recent
+/// list skips that, since it is written on every open.
+///
+/// The parent directory is created, or tightened, to 0700. The temp file is
+/// created exclusively, so an existing file or symlink at its name is never
+/// written through.
+pub fn write_private(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         b.mode(0o700);
+        b.create(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
     b.create(dir)?;
     let name = path
         .file_name()
@@ -64,24 +71,28 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let result = (|| {
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp)?;
-        #[cfg(unix)]
-        {
-            // `mode` only applies when the file is created.
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
+        let mut f = match opts.open(&tmp) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Left by a crash, or planted. Remove the entry itself (not
+                // what a symlink points at) and create it fresh.
+                fs::remove_file(&tmp)?;
+                opts.open(&tmp)?
+            }
+            other => other?,
+        };
         f.write_all(bytes)?;
-        f.sync_all()?;
+        if durable {
+            f.sync_all()?;
+        }
         fs::rename(&tmp, path)?;
         #[cfg(unix)]
-        if let Ok(d) = fs::File::open(dir) {
+        if durable && let Ok(d) = fs::File::open(dir) {
             let _ = d.sync_all();
         }
         Ok(())
@@ -153,7 +164,7 @@ pub fn save(ed: &Editor) -> Result<(), String> {
         };
     }
     let text = toml::to_string(&session).map_err(|e| e.to_string())?;
-    write_private(&path, text.as_bytes())
+    write_private(&path, text.as_bytes(), true)
         .map_err(|e| format!("could not save the session to {}: {e}", path.display()))
 }
 
@@ -194,6 +205,7 @@ pub fn restore(ed: &mut Editor) {
     let mut opened: Vec<(DocumentId, &SessionBuffer)> = Vec::new();
     let mut missing = Vec::new();
     let mut failed = Vec::new();
+    ed.navigation.restoring = true;
     for entry in &session.buffers {
         let path = Path::new(&entry.path);
         if !path.is_file() {
@@ -205,6 +217,7 @@ pub fn restore(ed: &mut Editor) {
             Err(e) => failed.push(e),
         }
     }
+    ed.navigation.restoring = false;
     // Put each cursor back, clamped to the file as it is now.
     for (id, entry) in &opened {
         let text = ed.buffers[id].doc.text().clone();
@@ -294,8 +307,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("maestro-session-w-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let p = dir.join("sub").join("s.toml");
-        write_private(&p, b"one").unwrap();
-        write_private(&p, b"two").unwrap();
+        write_private(&p, b"one", true).unwrap();
+        write_private(&p, b"two", false).unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap(), "two");
         let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -307,5 +320,27 @@ mod tests {
         assert_eq!(dmode, 0o700);
         // No temp files left behind.
         assert_eq!(fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_symlink_is_not_followed_and_loose_dirs_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("maestro-session-l-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "keep me").unwrap();
+        let target = state.join("recent.toml");
+        let tmp = state.join(format!(".recent.toml.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        write_private(&target, b"files = []", false).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "files = []");
+        assert!(fs::symlink_metadata(&target).unwrap().file_type().is_file());
+        let mode = fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

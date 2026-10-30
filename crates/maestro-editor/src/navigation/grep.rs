@@ -48,49 +48,42 @@ pub struct LineMatch {
 }
 
 /// Every line of `data` with a non-empty match, first match per line.
+/// Lines are counted as the editor counts them (see [`super::lines`]).
 /// Returns `None` for binary data (a NUL byte anywhere). Stops after `limit`
 /// lines.
 pub fn search_bytes(data: &[u8], re: &Regex, limit: usize) -> Option<Vec<LineMatch>> {
     if data.contains(&0) {
         return None;
     }
-    // A UTF-8 byte order mark is not part of the text the editor shows.
-    let bom = if data.starts_with(b"\xEF\xBB\xBF") {
-        3
-    } else {
-        0
-    };
+    // A UTF-8 byte order mark is not part of the text the editor shows, so
+    // it is not searched either (`^` must match right after it).
+    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
     let mut out = Vec::new();
-    let mut line = 0;
-    let mut line_start = bom;
-    let mut scanned = bom;
+    let mut cur = super::lines::Cursor::default();
     for m in re.find_iter(data) {
-        if m.start() == m.end() || m.start() < bom {
+        if m.start() == m.end() {
             continue;
         }
-        // Advance the line count to the match start.
-        for (i, b) in data[scanned..m.start()].iter().enumerate() {
-            if *b == b'\n' {
-                line += 1;
-                line_start = scanned + i + 1;
-            }
+        if m.start() > cur.scanned {
+            cur = super::lines::advance(data, cur, m.start());
         }
-        scanned = m.start();
+        // A match that starts on the LF of a CRLF pair belongs to the line
+        // that pair ends, which the scan has already stepped past.
+        let (line, line_start) = if m.start() < cur.start {
+            (cur.line - 1, cur.prev_start)
+        } else {
+            (cur.line, cur.start)
+        };
         if out.last().is_some_and(|l: &LineMatch| l.line == line) {
             continue;
         }
-        let line_end = data[m.start()..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(data.len(), |p| m.start() + p);
-        let raw = &data[line_start..line_end];
-        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let end = super::lines::content_end(data, line_start);
         out.push(LineMatch {
             line,
             column: String::from_utf8_lossy(&data[line_start..m.start()])
                 .chars()
                 .count(),
-            text: String::from_utf8_lossy(raw).into_owned(),
+            text: String::from_utf8_lossy(&data[line_start..end]).into_owned(),
         });
         if out.len() >= limit {
             break;
@@ -142,7 +135,8 @@ pub fn start(ed: &mut Editor, pattern: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `:grep <pattern>`. Arguments are joined with single spaces.
+/// `:grep` with no pattern (with one, `typed::execute_line` passes the
+/// rest of the line to [`start`] verbatim).
 pub fn typed(ed: &mut Editor, args: &[&str], _force: bool) -> Result<(), String> {
     start(ed, &args.join(" "))
 }
@@ -263,6 +257,42 @@ mod tests {
         // Empty matches are not results.
         let re = compile("^").unwrap();
         assert!(search_bytes(b"a\nb", &re, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lines_are_counted_like_the_editor_counts_them() {
+        let re = compile("needle").unwrap();
+        // A lone CR, NEL and LINE SEPARATOR each end a line in the rope.
+        let text = "alpha\rbravo\nnee\u{85}x\u{2028}é needle\r\nneedle";
+        let m = search_bytes(text.as_bytes(), &re, 100).unwrap();
+        let rope = maestro_core::Rope::from_str(text);
+        assert_eq!(m.len(), 2);
+        for lm in &m {
+            let at = rope.line_to_char(lm.line) + lm.column;
+            assert_eq!(rope.slice(at..at + 6).to_string(), "needle", "{lm:?}");
+        }
+        assert_eq!(
+            (m[0].line, m[0].column, m[0].text.as_str()),
+            (4, 2, "é needle")
+        );
+        // A match starting on the LF of a CRLF pair is reported on the line
+        // that pair ends, once.
+        let re = compile(r"\n").unwrap();
+        let m = search_bytes(b"a\r\nb\nc", &re, 100).unwrap();
+        assert_eq!(
+            m.iter().map(|l| (l.line, l.column)).collect::<Vec<_>>(),
+            vec![(0, 2), (1, 1)]
+        );
+        let re = compile(r"\nneedle").unwrap();
+        let m = search_bytes(b"a\r\nneedle", &re, 100).unwrap();
+        assert_eq!((m[0].line, m[0].column, m[0].text.as_str()), (0, 2, "a"));
+    }
+
+    #[test]
+    fn anchors_work_after_a_byte_order_mark() {
+        let re = compile("^needle").unwrap();
+        let m = search_bytes("\u{feff}needle\n".as_bytes(), &re, 100).unwrap();
+        assert_eq!((m[0].line, m[0].column), (0, 0));
     }
 
     #[test]
