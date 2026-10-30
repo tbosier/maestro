@@ -29,9 +29,18 @@ Verified two ways on October 30, 2026:
 
 Acceptance (use Maestro to navigate and modify its own source without another editor) has not been attempted. It needs highlighting, workspace search and goto-definition first.
 
-## M2: agent development environment (not started)
+## M2: agent development environment (partial)
 
-Worktree management, agent terminals, one working agent integration, sessions, worktree-aware editing, diff review, approval, test execution, safe merge or cherry-pick.
+| Item | Status |
+|---|---|
+| Worktree management | partial: crate and gutter, no agent UI. `maestro-git` lists, adds, removes (refusing, unless forced, on uncommitted or untracked files and on commits that are ahead of the upstream or, without one, on no other branch) and prunes worktrees, and checks fast-forwards and merge conflicts without touching the working tree. The editor shows `+`/`~`/`-` gutter signs, the branch in the status line, and `:git-status` and `:worktrees` pickers. |
+| Agent terminals | not started |
+| One working agent integration | not started |
+| Sessions | not started |
+| Worktree-aware editing | not started |
+| Diff review and approval | not started; the unified diff model it needs exists in `maestro-git` |
+| Test execution | not started |
+| Safe merge or cherry-pick | not started; `can_fast_forward` and the `merge-tree` dry run exist in `maestro-git` |
 
 ## M3: differentiating capabilities (not started)
 

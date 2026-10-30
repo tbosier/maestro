@@ -49,10 +49,14 @@ status = "not-started"
 [[task]]
 id = "m2-git"
 title = "Git status, diffs and worktree lifecycle"
-crates = ["maestro-git"]
+crates = ["maestro-git", "maestro-editor"]
 branch = "feat/git-worktrees"
 owner = "agent"
-status = "not-started"
+status = "in-progress"
+# Done: maestro-git crate (status, line and unified diffs, worktree
+# add/list/remove/prune with safety checks, fast-forward and merge-tree
+# checks), gutter signs, branch in the status line, :git-status and
+# :worktrees pickers. Not started: agent orchestration, review and merge UI.
 
 [[task]]
 id = "m3-protocol"

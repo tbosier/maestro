@@ -4,7 +4,8 @@
 
 ```
 maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-core
-                     │                │
+                     │                │     │
+                     │                │     └──► maestro-git
                      └──────► maestro-config ◄────┘
 ```
 
@@ -12,15 +13,17 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 |---|---|---|
 | `maestro-core` | Rope text, position types, selections, change sets, transactions, undo tree, documents, file IO | ropey, unicode-segmentation, unicode-width, thiserror |
 | `maestro-config` | TOML config, theme tokens, the Duskfox palette | serde, toml |
-| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery | core, config, regex |
+| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, Git gutter signs and pickers | core, config, git, regex |
+| `maestro-git` | Repository discovery, status, line diffs for gutter signs, a unified diff model, worktree lifecycle with safety checks, merge dry runs; all through the `git` CLI (ADR 0005) | similar, thiserror |
 | `maestro-tui` | Terminal lifecycle, input conversion, rendering, clipboard providers | editor, crossterm |
 | `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui |
 
-Planned crates (`maestro-syntax`, `maestro-lsp`, `maestro-git`, `maestro-protocol`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
+Planned crates (`maestro-syntax`, `maestro-lsp`, `maestro-protocol`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 
 ## Rules
 
 - `maestro-core` has no terminal, async runtime, network, Git or language-server dependency. Its tests run as plain data.
+- `maestro-git` has no editor or terminal dependency. It blocks while `git` runs; the editor calls it only from background threads.
 - `maestro-editor` never touches a terminal. Tests drive it with key sequences (`crates/maestro-editor/tests/editing.rs`), the same path the terminal uses.
 - The terminal crate reads editor state and draws it. It does not implement editing.
 - Colors appear in one file, `crates/maestro-config/src/duskfox.rs`. Everything else asks the theme for a role.
