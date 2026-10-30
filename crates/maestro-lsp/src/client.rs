@@ -133,8 +133,10 @@ impl Client {
             .name("lsp-writer".into())
             .spawn(move || writer_loop(stdin, out_rx))?;
 
+        let stderr_done = Arc::new(AtomicBool::new(false));
         {
             let shared = shared.clone();
+            let done = stderr_done.clone();
             std::thread::Builder::new()
                 .name("lsp-stderr".into())
                 .spawn(move || {
@@ -150,6 +152,7 @@ impl Client {
                             }
                         }
                     }
+                    done.store(true, Ordering::SeqCst);
                 })?;
         }
 
@@ -181,6 +184,13 @@ impl Client {
                     let _ = out.send(Outgoing::Close);
                     let status = wait_for_exit(&child, Duration::from_secs(1))
                         .unwrap_or_else(|| "output closed".to_string());
+                    // Let the last stderr lines (often the reason for the
+                    // exit) reach the log first. A grandchild holding stderr
+                    // open must not delay the report for long.
+                    let deadline = Instant::now() + Duration::from_millis(200);
+                    while !stderr_done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     sink(Event::Exited { status });
                 })?;
         }

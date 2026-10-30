@@ -4,7 +4,8 @@
 
 ```
 maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-core
-                     │                │
+                     │                │    │             ▲
+                     │                │    └──► maestro-lsp
                      └──────► maestro-config ◄────┘
 ```
 
@@ -12,11 +13,12 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 |---|---|---|
 | `maestro-core` | Rope text, position types, selections, change sets, transactions, undo tree, documents, file IO | ropey, unicode-segmentation, unicode-width, thiserror |
 | `maestro-config` | TOML config, theme tokens, the Duskfox palette | serde, toml |
-| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery | core, config, regex |
+| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, language server integration (`lsp.rs`, `lsp_commands.rs`) | core, config, lsp, regex |
+| `maestro-lsp` | Language server processes on plain threads: framing, JSON-RPC, initialize and shutdown, cancellation, exit detection, a bounded stderr log, and position and change conversions. A fake server for tests behind the `fake-server` feature | core, serde_json |
 | `maestro-tui` | Terminal lifecycle, input conversion, rendering, clipboard providers | editor, crossterm |
 | `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui |
 
-Planned crates (`maestro-syntax`, `maestro-lsp`, `maestro-git`, `maestro-protocol`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
+Planned crates (`maestro-syntax`, `maestro-git`, `maestro-protocol`, `maestro-agent`, `maestro-tasks`) are added when their work starts, not before. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 
 ## Rules
 
@@ -45,6 +47,12 @@ Every action is a named command in `maestro_editor::commands::COMMANDS` or a typ
 ## Rendering
 
 The terminal front end draws each frame into an off-screen grid (`Surface`) and writes only the cells that differ from the previous frame, inside a synchronized update. Truecolor is used when the terminal reports it, with a 256-color fallback. ADR 0004 covers why this is a small custom layer and not ratatui.
+
+## Language servers
+
+`maestro-lsp` runs each server with three threads (stdin writer, stdout reader, stderr log) and never blocks its caller: a request returns a channel. The editor waits on that channel in a short-lived background thread and applies the reply as a job on the main thread, dropping it if the document's version moved since the request. Notifications such as diagnostics arrive through an idle job sender, so the terminal shows them at its next wake-up (at most a second).
+
+Every text-change path in the editor calls `lsp::document_changed`, which maps stored diagnostics through the change and sends an incremental `didChange` built from the change set in old-document coordinates. `lsp::reconcile` runs after each key, on open and on tick: it opens and closes documents on servers to match the buffers, and resends full text for any document whose version moved without the hook. Positions are UTF-16 through `maestro_core::pos`.
 
 ## Persistence
 

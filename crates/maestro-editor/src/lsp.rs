@@ -214,6 +214,9 @@ pub struct Lsp {
     /// stopped until `:lsp-restart`, so a broken server cannot loop.
     stopped: HashSet<(String, PathBuf)>,
     pub hover: Option<HoverPopup>,
+    /// The log of each server that stopped, kept so `:lsp-log` can show
+    /// why. One entry per server name, the latest stop.
+    stopped_logs: BTreeMap<String, Vec<String>>,
     next_id: u64,
 }
 
@@ -617,6 +620,9 @@ fn stop_server(ed: &mut Editor, id: ServerId, why: &str) {
             server.name
         ),
     );
+    ed.lsp
+        .stopped_logs
+        .insert(server.name.clone(), server.client.log());
     shut_down_in_background(server);
 }
 
@@ -1095,16 +1101,26 @@ pub fn restart(ed: &mut Editor) {
 }
 
 /// Opens a scratch buffer with each server's captured stderr and log
-/// messages.
+/// messages, including servers that stopped.
 pub fn show_log(ed: &mut Editor) {
-    if ed.lsp.servers.is_empty() {
-        ed.info("no language servers are running");
+    if ed.lsp.servers.is_empty() && ed.lsp.stopped_logs.is_empty() {
+        ed.info("no language servers have run in this session");
         return;
     }
     let mut text = String::new();
-    for s in ed.lsp.servers.values() {
-        text.push_str(&format!("== {} ({}) ==\n", s.name, s.root.display()));
-        for line in s.client.log() {
+    let running = ed
+        .lsp
+        .servers
+        .values()
+        .map(|s| (format!("{} ({})", s.name, s.root.display()), s.client.log()));
+    let stopped = ed
+        .lsp
+        .stopped_logs
+        .iter()
+        .map(|(name, log)| (format!("{name} (stopped)"), log.clone()));
+    for (title, log) in running.chain(stopped) {
+        text.push_str(&format!("== {title} ==\n"));
+        for line in log {
             text.push_str(&line);
             text.push('\n');
         }

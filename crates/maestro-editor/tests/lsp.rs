@@ -329,6 +329,14 @@ fn server_crash_leaves_editor_usable() {
     assert!(status(ed).contains(":lsp-restart"));
     let doc = ed.view().doc;
     assert!(!ed.lsp.is_synced(doc));
+    // The server's stderr went to the log, which outlives the server.
+    run(ed, ":lsp-log<ret>");
+    let log = ed.doc().text().to_string();
+    assert!(log.contains("(stopped) =="), "{log}");
+    assert!(log.contains("fake-lsp: started"), "{log}");
+    assert!(log.contains("fake-lsp: crashing on request"), "{log}");
+    run(ed, "ga");
+    assert_eq!(ed.view().doc, doc);
     // Editing goes on, and the crashed server is not restarted on its own.
     run(ed, "Aok<esc>");
     assert_eq!(ed.doc().text().to_string(), "@crash fn main() {}ok\n");
