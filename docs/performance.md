@@ -38,31 +38,37 @@ Rendering is most of it (p50 430 µs on the small file). Key handling itself has
 
 ## Syntax
 
-Measured October 30, 2026 on the same machine, release build of `feat/syntax`, against a release build of `main` at 28ec419 run the same way in the same session. The machine was shared with other build jobs (load average 1 to 5), so the baseline was rerun next to each measurement rather than taken from the tables above.
+Measured October 30, 2026 on the same machine, release build of `feat/syntax` at 54c0356, against a release build of `main` at 28ec419 run the same way in the same session. Other build jobs shared the machine (load average 3 to 4), so the baseline was rerun next to each measurement rather than taken from the tables above.
 
 Files: the 60 KB file is `crates/maestro-editor/src/commands.rs` from 28ec419 (60,586 bytes). The 1 MB and 10 MB files are generated lines of valid Rust, 83 bytes each, of the form `fn item_0000001(x: u64, name: &str) -> u64 { let y = x * 1 + name.len() as u64; y }`.
 
 ### Input processing with highlighting
 
-Method: the input-processing method above (`MAESTRO_LATENCY_LOG`, the same 267 inputs, each sent by tmux 30 ms apart), started 1 s (60 KB), 2 s (1 MB) or 5 s (10 MB) after launch. The value is the sum of the first three columns (handle, render, flush) per logged frame, in microseconds. Frames redrawn because a background parse finished are logged too, so there are more rows than inputs.
+Method: the input-processing method above (`MAESTRO_LATENCY_LOG`, the same 267 inputs, each sent by tmux 30 ms apart), started 1 s (60 KB), 2 s (1 MB) or 5 s (10 MB) after launch, when the first parse had finished. The value is the sum of the first three columns (handle, render, flush) per logged frame, in microseconds.
+
+Frames redrawn because a background parse finished are logged too, so there are more rows than inputs. The logger in `maestro-tui` keeps the last input's handle time until the next input, so those extra rows repeat it. The "corrected" rows come from a temporary build (not committed) that resets the handle time after each logged frame and also times `poll_background`.
 
 | File | Build | Rows | p50 µs | p95 µs | p99 µs | Max µs |
 |---|---|---|---|---|---|---|
-| 60 KB | main | 269 | 560 | 747 | 777 | 787 |
-| 60 KB | feat/syntax | 270 | 937 | 1201 | 1858 | 2535 |
-| 1 MB | main | 269 | 926 | 1054 | 1232 | 1310 |
-| 1 MB | feat/syntax | 423 | 1520 | 6002 | 6565 | 6887 |
-| 10 MB | main | 269 | 966 | 1095 | 1146 | 1558 |
-| 10 MB | feat/syntax | 327 | 1506 | 1860 | 2134 | 5075 |
+| 60 KB | main | 269 | 562 | 770 | 840 | 995 |
+| 60 KB | feat/syntax | 270 | 924 | 1498 | 1970 | 2564 |
+| 60 KB | corrected | 270 | 922 | 1271 | 1914 | 2572 |
+| 1 MB | main | 269 | 912 | 1060 | 1191 | 1328 |
+| 1 MB | feat/syntax | 424 | 1551 | 6222 | 6902 | 8031 |
+| 1 MB | corrected | 420 | 2200 | 5727 | 7048 | 9575 |
+| 10 MB | main | 269 | 941 | 1050 | 1179 | 1468 |
+| 10 MB | feat/syntax | 321 | 1639 | 2408 | 4137 | 7353 |
+| 10 MB | corrected | 328 | 1582 | 2676 | 5427 | 7880 |
 
-Starting the keys 0.3 s after opening the 10 MB file, while its first parse was still running on a background thread, gave p50 1508, p95 1983, max 3709 µs.
+Starting the keys 0.3 s after opening the 10 MB file, while its first parse was still running on a background thread, gave (corrected build) p50 1514, p95 1926, max 2604 µs.
 
 Where the time goes:
 
-- Highlighting adds about 0.5 ms to a frame whose visible range or tree changed (render p50 655 µs against 484 on the 60 KB file). Frames where neither changed, such as cursor motion within the screen, reuse cached highlights.
+- Highlighting adds about 0.2 to 1.0 ms to a frame whose visible range or tree changed (render p50 654 µs against 490 on the 60 KB file, 1.4 to 1.8 ms against 0.85 on the dense generated files). Frames where neither changed, such as cursor motion within the screen, reuse cached highlights.
 - On the 1 MB file most typed characters reparse on the main thread in 3 to 5 ms, which is the p95. Tree-sitter's incremental reparse grows with file size on these flat files: a one-character edit in the middle costs about 0.3 ms at 60 KB, 4 ms at 1 MB and 70 to 200 ms at 10 MB, measured with tree-sitter alone on a contiguous string as well as through the rope.
 - So the main thread gives a reparse 4 ms (`REPARSE_BUDGET` in `crates/maestro-editor/src/syntax.rs`). Past that, or when the previous reparse was over budget, the reparse runs on a background thread. Until it returns, the screen draws the old tree with the edits applied to it, so colors shift with the text but new text is not parsed yet. Edits made meanwhile are replayed onto the result.
-- Applying a background result runs inside `poll_background`, outside the logged handle time. A temporary build that timed `poll_background` measured p50 46 µs, max 83 µs on the 1 MB file and p50 90 µs, max 423 µs on the 10 MB file. Before replaced trees were freed on a separate thread, the 10 MB file spent p50 14 ms, max 37 ms there, freeing the old tree.
+- Tree-sitter checks the budget between tokens, so one long token (a block comment opened at the top of a 1 MB file) can overrun it. Edits over 256 KB, such as a reload or a huge paste, skip the old tree and parse from scratch, off the main thread when the file is over 256 KB.
+- Applying a background result runs inside `poll_background`, outside the logged handle time. The corrected build measured p50 117 µs, max 632 µs there on the 1 MB file and p50 97 µs, max 382 µs on the 10 MB file. Before replaced trees were freed on a separate thread, the 10 MB file spent p50 14 ms, max 37 ms there, freeing the old tree.
 
 ### Startup
 
@@ -70,9 +76,9 @@ Method: `scripts/bench_startup.py`, 30 runs per file, inside a tmux pane.
 
 | File | main median ms | feat/syntax median ms | feat/syntax p95 ms | feat/syntax max ms |
 |---|---|---|---|---|
-| 60 KB | 1.9 | 19.0 | 20.1 | 20.7 |
-| 1 MB | 4.0 | 5.4 | 5.8 | 6.1 |
-| 10 MB | 20.5 | 21.7 | 24.8 | 25.0 |
+| 60 KB | 1.5 | 18.8 | 20.5 | 22.5 |
+| 1 MB | 4.1 | 5.3 | 6.3 | 6.4 |
+| 10 MB | 21.0 | 21.8 | 24.1 | 24.9 |
 
 Files up to 256 KB are parsed on the main thread before the first frame (within a 50 ms budget, after which the parse moves to a background thread), and the first frame waits for the language's highlight query. Compiling the Rust query takes about 15 ms (TSX 15, TypeScript 14, JavaScript 6, Python 4, C 2.6, the rest under 1). It starts on another thread in parallel with the parse and runs once per language per process. Bigger files open without color and gain it when the background parse finishes: about 0.2 s for 1 MB and 1.5 to 2.7 s for 10 MB.
 
@@ -82,6 +88,7 @@ Files up to 256 KB are parsed on the main thread before the first frame (within 
 - Search highlighting runs the regex over the visible lines every frame.
 - Very long lines are rendered by walking graphemes from the line start, so a single 10 MB line will be slow to draw.
 - No benchmark yet for thousands of selections, project search, or many agent sessions; those features do not exist yet.
+- Visible lines totaling more than 256K chars (minified files) are drawn without syntax colors.
 - An edit that changes everything after it in a big file (an unclosed quote at the top of 10 MB) makes tree-sitter re-lex everything after it. That runs on a background thread (0.16 to 0.28 s at 10 MB in two runs), and colors below the edit are stale until it lands.
 
 ## Targets
