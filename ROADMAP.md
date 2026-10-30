@@ -21,13 +21,13 @@ Verified two ways on October 30, 2026:
 | Splits | done |
 | Fuzzy file finder | done: background walk that respects `.gitignore`, `.ignore`, `.git/info/exclude` and Git's global excludes and skips hidden files; results stream into the picker; file preview |
 | Search and replace | done in the buffer; workspace search done (`space /`, `:grep`): regex with smart case, binary and ignored files skipped, 10,000-result cap, preview of the match line; it reads files from disk, so unsaved edits in open buffers are not searched |
-| Tree-sitter highlighting | not started |
+| Tree-sitter highlighting | done: Rust, Python, TOML, JSON, Markdown (block level), JavaScript, TypeScript, TSX and C; incremental, with large or slow parses on background threads; structural selection with `A-o`/`A-i`/`A-n`/`A-p`. Markdown inline syntax and injected code blocks are not highlighted |
 | LSP diagnostics and navigation | partial: diagnostics (sign column, range underline, cursor-line message, `]d`/`[d`, `space d`/`space D` pickers), goto definition (`gd`), references (`gr`), hover (`space k`), incremental sync, crash reporting with `:lsp-restart`. Checked against the fake test server and, by hand in tmux, against rust-analyzer on this repo. Not started: completion, code actions, rename, formatting, signature help |
 | Configuration | done |
 | Session restoration | partial: open files, each one's cursor and the focused file are saved on quit and restored per directory; splits, scroll positions and multiple selections are not restored. Recent files across sessions (`space r`) |
 | Crash-safe editing | done: atomic saves, external-change detection, recovery journal |
 
-Acceptance (use Maestro to navigate and modify its own source without another editor) has not been attempted. It needs syntax highlighting first.
+Acceptance (use Maestro to navigate and modify its own source without another editor): exercised once on October 30, 2026, for one real change. In the release binary in tmux, workspace search (`space /`) found the latency logger's `log.record` call in `crates/maestro-tui/src/lib.rs` and opened it at the match; `o` added `handle_time = Duration::ZERO;` with the right indentation; rust-analyzer flagged a missing semicolon in the gutter and status line, which was fixed in place; `:w` saved (the Git sign showed `+`); `gd` on `Duration` jumped into the standard library and `C-o` came back. The fix was then built and tested outside the editor. That is one session, not daily use, so M1 stays partial until the remaining partial rows are closed and Maestro has been used for real work over days.
 
 ## M2: agent development environment (partial)
 

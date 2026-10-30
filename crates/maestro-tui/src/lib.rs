@@ -121,6 +121,7 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
             let cells = terminal::flush(&mut out, prev.as_ref(), &surface, color, cursor)?;
             let t2 = Instant::now();
             log.record(handle_time, t1 - t0, t2 - t1, cells);
+            handle_time = Duration::ZERO;
             prev = Some(surface);
             dirty = false;
             if opts.exit_after_first_frame {
