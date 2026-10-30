@@ -1,0 +1,18 @@
+[package]
+name = "maestro-automation"
+description = "The Maestro automation server: runs protocol requests against an Editor, over stdio (headless) or a Unix socket (live)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+maestro-core.workspace = true
+maestro-editor.workspace = true
+maestro-protocol.workspace = true
+maestro-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
