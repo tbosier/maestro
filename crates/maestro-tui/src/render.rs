@@ -39,6 +39,7 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     }
     draw_dividers(ed, surface, &placements);
     draw_hover(ed, surface);
+    draw_completion(ed, surface);
     let mut cursor = CursorShape::Hidden;
     if ed.mode == Mode::Insert && ed.prompt.is_none() && ed.picker.is_none() {
         cursor = insert_cursor(ed, ed.view());
@@ -490,6 +491,111 @@ fn draw_hover(ed: &Editor, s: &mut Surface) {
         let truncated = i + 1 == visible && rows.len() > visible;
         let shown = if truncated { "…" } else { row.as_str() };
         s.print(x + 2, y + 1 + i as u16, shown, ui.popup, area.right() - 1);
+    }
+}
+
+/// The completion popup: one row per matching item with its label, kind
+/// and detail, under the identifier being completed (above it when there
+/// is not room below). The title shows the selected row's number.
+fn draw_completion(ed: &Editor, s: &mut Surface) {
+    use maestro_editor::lsp::completion::{self, MAX_VISIBLE};
+    use unicode_width::UnicodeWidthStr;
+    let Some(menu) = completion::visible(ed) else {
+        return;
+    };
+    let view = ed.view();
+    let ui = &ed.theme.ui;
+    let text = ed.doc().text().slice(..);
+    let start = menu.start.min(text.len_chars());
+    let line = text.char_to_line(start);
+    if line < view.top_line || line >= view.top_line + view.text_height() {
+        return;
+    }
+    let row_y = view.area.y + (line - view.top_line) as u16;
+    let col = maestro_editor::motion::display_col(text, start, ed.tab_width());
+    let word_x = view.area.x as usize + ed.gutter_width(view) as usize;
+    let word_x = (word_x + col.saturating_sub(view.left_col)) as u16;
+
+    let shown = menu.matches.len().min(MAX_VISIBLE);
+    let items = || menu.matches.iter().map(|m| &menu.items[m.index]);
+    let label_w = items().map(|i| i.label.width()).max().unwrap_or(0).min(40);
+    let kind_w = items().map(|i| i.kind.width()).max().unwrap_or(0);
+    let detail_w = items().map(|i| i.detail.width()).max().unwrap_or(0).min(40);
+    let gap = |w: usize| if w > 0 { w + 2 } else { 0 };
+    let inner = 1 + label_w + gap(kind_w) + gap(detail_w) + 1;
+    let w = ((inner + 2) as u16).min(s.width);
+    if w < 8 {
+        return;
+    }
+    let below = s.height.saturating_sub(row_y + 2);
+    let above = row_y;
+    let want = shown as u16 + 2;
+    let (room, place_below) = if below >= want || below >= above {
+        (below, true)
+    } else {
+        (above, false)
+    };
+    let h = want.min(room);
+    if h < 3 {
+        return;
+    }
+    let y = if place_below { row_y + 1 } else { row_y - h };
+    // The label column lines up with the identifier being completed.
+    let x = word_x.saturating_sub(2).min(s.width - w);
+    let area = Rect::new(x, y, w, h);
+    let title = format!("{}/{}", menu.selected + 1, menu.matches.len());
+    draw_box(s, area, &title, ui.popup, ui.popup_border, ui.popup_title);
+    let rows = (h - 2) as usize;
+    let scroll = (menu.selected + 1).saturating_sub(rows);
+    let right = area.right() - 1;
+    for (row, m) in menu.matches.iter().skip(scroll).take(rows).enumerate() {
+        let item = &menu.items[m.index];
+        let ry = y + 1 + row as u16;
+        let selected = scroll + row == menu.selected;
+        let (base, hl, muted) = if selected {
+            (
+                ui.popup_selected,
+                ui.popup_selected.patch(ui.popup_match_selected),
+                ui.popup_selected,
+            )
+        } else {
+            (ui.popup, ui.popup.patch(ui.popup_match), ui.popup_muted)
+        };
+        s.fill(Rect::new(x + 1, ry, w - 2, 1), base);
+        let label_r = (x + 2 + label_w as u16).min(right);
+        let mut cx = x + 2;
+        for (i, ch) in item.label.chars().enumerate() {
+            let st = if m.positions.contains(&i) { hl } else { base };
+            let used = s.put(cx, ry, &ch.to_string(), st, label_r);
+            if used == 0 {
+                break;
+            }
+            cx += used;
+        }
+        let mut cx = label_r;
+        if kind_w > 0 {
+            cx += 2;
+            s.print(cx, ry, item.kind, muted, right);
+            cx += kind_w as u16;
+        }
+        if detail_w > 0 && cx + 2 < right {
+            cx += 2;
+            let room = (right - cx) as usize;
+            let detail = if item.detail.width() > room {
+                let mut d: String = String::new();
+                for ch in item.detail.chars() {
+                    if d.width() + ch.to_string().width() + 1 > room {
+                        break;
+                    }
+                    d.push(ch);
+                }
+                d.push('…');
+                d
+            } else {
+                item.detail.clone()
+            };
+            s.print(cx, ry, &detail, muted, right);
+        }
     }
 }
 
@@ -1108,6 +1214,80 @@ mod tests {
                 anchor: 3,
                 lines: vec!["x".repeat(200), "short".into()],
             });
+            let mut s = Surface::new(w, h, ed.theme.ui.text);
+            render(&ed, &mut s);
+        }
+    }
+
+    fn completion_items() -> maestro_editor::lsp::completion::Value {
+        maestro_editor::lsp::completion::json!([
+            {"label": "collections", "kind": 9, "detail": "std::collections", "sortText": "1"},
+            {"label": "Color", "kind": 22, "sortText": "2"},
+        ])
+    }
+
+    /// Label, kind as a word and detail on each row, under the word being
+    /// completed, with the selected row's number in the title.
+    #[test]
+    fn completion_popup_lists_label_kind_and_detail_below_the_word() {
+        use maestro_editor::lsp::completion;
+        let mut ed = editor("let x = co\n");
+        ed.mode = Mode::Insert;
+        ed.set_selection(maestro_core::Selection::point(10));
+        assert!(completion::show(&mut ed, &completion_items()));
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        // Line 0 is screen row 1; the box starts on the row below.
+        assert!(row(&s, 2).contains("1/2"), "{:?}", row(&s, 2));
+        let first = row(&s, 3);
+        assert!(first.contains("collections"), "{first:?}");
+        assert!(first.contains("module"), "{first:?}");
+        assert!(first.contains("std::collections"), "{first:?}");
+        assert!(row(&s, 4).contains("Color") && row(&s, 4).contains("struct"));
+        // The label column starts where `co` starts (gutter 5 + col 8).
+        assert_eq!(s.cell(13, 3).unwrap().symbol, "c", "{first:?}");
+        assert_eq!(s.cell(14, 3).unwrap().symbol, "o", "{first:?}");
+        // The selected row uses the selected style, the other does not.
+        let selected_bg = ed.theme.ui.popup_selected.bg;
+        assert_eq!(s.cell(15, 3).unwrap().style.bg, selected_bg);
+        assert_ne!(s.cell(15, 4).unwrap().style.bg, selected_bg);
+    }
+
+    #[test]
+    fn completion_popup_flips_above_near_the_bottom() {
+        use maestro_editor::lsp::completion;
+        let text = "x\n".repeat(16) + "co\n";
+        let mut ed = editor(&text);
+        // No margin, so the last line stays on the screen's last text row.
+        ed.config.editor.scrolloff = 0;
+        ed.mode = Mode::Insert;
+        let at = ed.doc().text().line_to_char(16) + 2;
+        ed.set_selection(maestro_core::Selection::point(at));
+        ed.ensure_cursor_visible();
+        assert!(completion::show(&mut ed, &completion_items()));
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        let line_y = (1 + 16 - ed.view().top_line) as u16;
+        assert!(row(&s, line_y).contains("co"));
+        assert!(
+            row(&s, line_y - 1).trim_end().ends_with('╯'),
+            "{:?}",
+            (line_y, row(&s, line_y - 1), row(&s, line_y))
+        );
+        assert!(row(&s, line_y - 3).contains("collections"));
+        assert!(!row(&s, line_y + 1).contains("collections"));
+    }
+
+    #[test]
+    fn completion_popup_never_panics_at_small_sizes() {
+        use maestro_editor::lsp::completion;
+        for (w, h) in (1..=40u16).flat_map(|w| (1..=12u16).map(move |h| (w, h))) {
+            let mut ed = Editor::new(Config::default(), Rect::new(0, 1, w, h.saturating_sub(2)));
+            let id = ed.add_document(Document::from_text("let 日本 = co\n"));
+            ed.switch_to(id);
+            ed.mode = Mode::Insert;
+            ed.set_selection(maestro_core::Selection::point(11));
+            completion::show(&mut ed, &completion_items());
             let mut s = Surface::new(w, h, ed.theme.ui.text);
             render(&ed, &mut s);
         }

@@ -1,6 +1,6 @@
 //! Language server commands and their default keys.
 
-use crate::editor::Editor;
+use crate::editor::{Editor, Mode};
 use crate::lsp::{self, RequestKind};
 
 crate::commands! {
@@ -13,6 +13,7 @@ crate::commands! {
     workspace_diagnostics_picker => "Pick a diagnostic in any open buffer",
     lsp_restart => "Restart language servers",
     lsp_log => "Show language server logs in a scratch buffer",
+    completion => "Ask the language server for completions at the cursor (insert mode)",
 }
 
 /// Default normal-mode keys: (keys, which-key group, command). Bound by
@@ -26,6 +27,12 @@ pub static DEFAULT_KEYS: &[(&str, &str, &str)] = &[
     ("] d", "next", "goto_next_diag"),
     ("[ d", "previous", "goto_prev_diag"),
 ];
+
+/// Default insert-mode keys: (keys, command). `C-x` is free in insert mode
+/// (`C-w`, `C-u` and `C-s` are taken). While the completion popup is open
+/// it also takes `C-n`, `C-p`, Up, Down, Tab, Enter and Escape; those are
+/// handled by the popup, not bound here.
+pub static INSERT_KEYS: &[(&str, &str)] = &[("C-x", "completion")];
 
 fn goto_definition(ed: &mut Editor) {
     lsp::request_at_cursor(ed, RequestKind::Definition);
@@ -61,4 +68,12 @@ fn lsp_restart(ed: &mut Editor) {
 
 fn lsp_log(ed: &mut Editor) {
     lsp::show_log(ed);
+}
+
+fn completion(ed: &mut Editor) {
+    if ed.mode != Mode::Insert {
+        ed.info("completion works in insert mode (C-x)");
+        return;
+    }
+    lsp::completion::request(ed, lsp::completion::Trigger::Manual);
 }

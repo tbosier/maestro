@@ -66,6 +66,43 @@ There is no separate Helix profile yet. The Maestro profile already follows Heli
 - A self-invoking macro stops after 16 levels of nesting with an error.
 - Text pasted while a prompt or picker is open goes into the prompt or picker, never into the document.
 
+## Completion
+
+Completion needs a language server that offers it. It works in insert mode only.
+
+A request goes out at the primary cursor in three cases:
+
+- at once, when the typed character is one of the server's trigger characters (rust-analyzer uses `:`, `.`, `'` and `(`);
+- 150 ms after a letter, digit or `_`, if no other key came in between. A fast typist's keys arrive 80 to 120 ms apart, so a burst sends one request when it ends;
+- at once on `C-x`.
+
+The popup opens under the word being completed, or above it when there is no room below. Each row shows the label, the kind as a word (`function`, `module`, `struct`) and the server's detail. Rows are filtered and ranked by the identifier typed before the cursor (letters, digits and `_`): the same fuzzy match as the pickers, case-insensitive unless the prefix has an uppercase letter, then the server's `sortText`. Typing more narrows the list. If the server marked the list incomplete, typing also sends a new request after the same 150 ms.
+
+| Key | In the popup |
+|---|---|
+| `C-n`, Down / `C-p`, Up | next / previous item, wrapping |
+| Tab, Enter | accept |
+| Escape | close the popup and stay in insert mode |
+| `C-x` | ask again |
+
+Escape closes only the popup, the way it closes a picker or a prompt and does nothing else; a second Escape leaves insert mode. Any key that moves the cursor without editing closes the popup, and so does typing a character that ends the identifier.
+
+Accepting applies the item as one transaction:
+
+- the item's `textEdit` (for an `InsertReplaceEdit`, its insert range), or else its `insertText`, or else its label, replacing the identifier before the cursor. Ranges come from the server in UTF-16 and are converted against the text the request was made for, then follow every edit typed since, so the replaced range grows with the prefix;
+- its `additionalTextEdits` (an import, say), once;
+- line breaks in the new text become the document's line ending.
+
+Snippets (`insertTextFormat` 2) are inserted as plain text. Tab stops disappear, placeholders keep their default text, a choice keeps its first option, and variables become their default or nothing. The cursor goes to `$0`, or to the end when there is no `$0`. There is no jumping between tab stops.
+
+With several cursors, the item's edit goes in at the primary cursor. Every other cursor gets the same edit only if the text around it is the same as the text the edit replaces at the primary (the same characters from the edit's start up to the cursor, and from the cursor to the edit's end). The others are left alone and the status line says "completed at N of M cursors". An item whose additional edits overlap its main edit is refused and nothing changes.
+
+A reply is dropped, and nothing is shown, if since the request the document version or any cursor changed, another view or buffer was focused, insert mode was left, or a prompt or picker opened. Leaving insert mode or closing the popup also cancels the request.
+
+`completionItem/resolve` is never sent. The editor does not tell servers it can resolve properties later, so servers send `additionalTextEdits` with the list. Item documentation is not shown.
+
+Repeat and macros: the popup's own keys are not recorded. An accepted item is recorded as the keys that type the same edit (backspaces over the replaced text, the new text, Left to the cursor stop), so `.` and macros repeat it without a server. When typing cannot reproduce the edit (it has additional edits, its new text has line breaks or tabs, or it replaces text after the cursor or text with whitespace in it), `.` repeats nothing for that insert session and a macro being recorded stops with a warning.
+
 ## The sign column
 
 The first gutter cell holds one sign. An error or warning diagnostic letter (`E`, `W`) takes it first; otherwise a Git change (`+`, `~`, `-`); otherwise an info or hint letter (`I`, `H`). The diagnostic message for the cursor line is in the status line either way.

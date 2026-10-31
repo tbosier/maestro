@@ -45,9 +45,11 @@ title = "Async LSP client: diagnostics, goto definition, hover, completion"
 crates = ["maestro-lsp", "maestro-editor", "maestro-tui", "maestro-config"]
 branch = "feat/lsp"
 owner = "agent"
-status = "in-progress"
+status = "done"
 # Done: diagnostics, goto definition, references, hover, incremental sync,
-# crash handling. Not started: completion.
+# crash handling, completion (branch feat/completion; see
+# docs/editor-model.md). Not in this task: resolve, documentation pane,
+# snippet tab stops, signature help, code actions, rename, formatting.
 
 [[task]]
 id = "m2-git"

@@ -246,6 +246,16 @@ impl Client {
                     "hover": {"contentFormat": ["plaintext", "markdown"]},
                     "definition": {"linkSupport": true},
                     "references": {},
+                    // Snippets are accepted as plain text (placeholders
+                    // stripped); no property is resolved lazily, so
+                    // servers send `additionalTextEdits` up front.
+                    "completion": {
+                        "completionItem": {
+                            "snippetSupport": true,
+                            "insertReplaceSupport": true,
+                        },
+                        "contextSupport": true,
+                    },
                 },
                 "workspace": {"workspaceFolders": true, "configuration": true},
                 "window": {"workDoneProgress": false},
