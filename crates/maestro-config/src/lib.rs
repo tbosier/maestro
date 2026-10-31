@@ -9,7 +9,7 @@ pub mod duskfox;
 pub mod theme;
 
 pub use config::{
-    Config, ConfigError, EditorConfig, IconMode, IndentStyle, LanguageServerConfig, LineNumbers,
-    Profile,
+    AgentProviderConfig, AgentProviderKind, AgentsConfig, Config, ConfigError, EditorConfig,
+    IconMode, IndentStyle, LanguageServerConfig, LineNumbers, Profile,
 };
 pub use theme::{Rgb, Style, Theme};

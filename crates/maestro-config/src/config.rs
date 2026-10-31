@@ -138,6 +138,56 @@ pub fn default_language_servers(language: &str) -> Vec<LanguageServerConfig> {
     }
 }
 
+/// How Maestro talks to an agent program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProviderKind {
+    /// Agent Client Protocol on stdin and stdout: structured messages,
+    /// tool calls, permission requests and file access through the editor.
+    Acp,
+    /// Any command-line agent, run in a terminal. Maestro sees only the
+    /// terminal screen and the files it changes.
+    Terminal,
+}
+
+/// An agent program: `[agents.provider.gemini]`.
+///
+/// Like language servers, providers come from this config or the built-in
+/// list, never from files inside a repository (see docs/security.md).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentProviderConfig {
+    pub kind: AgentProviderKind,
+    /// Program name looked up on `PATH`, or a path.
+    pub command: String,
+    /// Arguments. For a terminal agent, an argument containing `{task}` has
+    /// it replaced by the task text; with none, the task is typed into the
+    /// terminal once it starts.
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// `false` hides a built-in provider of the same name.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+/// `[agents]`: where agent worktrees go and how their work is checked.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentsConfig {
+    /// Directory for agent worktrees. Unset means a sibling of the
+    /// repository named `<repository>-worktrees`. `~` expands to the home
+    /// directory.
+    pub worktree_dir: Option<String>,
+    /// The verification command run in an agent's worktree, as program and
+    /// arguments. Empty means `cargo test` when the worktree has a
+    /// `Cargo.toml`, else no command.
+    pub test_command: Vec<String>,
+    /// Providers that add to or replace the built-in ones, by name.
+    pub provider: BTreeMap<String, AgentProviderConfig>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
@@ -148,6 +198,7 @@ pub struct Config {
     pub keys: BTreeMap<String, BTreeMap<String, String>>,
     /// Language servers that replace the built-in choice for a language.
     pub language_server: BTreeMap<String, LanguageServerConfig>,
+    pub agents: AgentsConfig,
 }
 
 impl Default for Config {
@@ -158,6 +209,7 @@ impl Default for Config {
             editor: EditorConfig::default(),
             keys: BTreeMap::new(),
             language_server: BTreeMap::new(),
+            agents: AgentsConfig::default(),
         }
     }
 }
@@ -247,6 +299,53 @@ mod tests {
         assert_eq!(
             Config::parse("", Path::new("x")).unwrap(),
             Config::default()
+        );
+    }
+
+    #[test]
+    fn parses_agent_settings() {
+        let c = Config::parse(
+            r#"
+[agents]
+worktree-dir = "~/worktrees"
+test-command = ["cargo", "test", "--workspace"]
+[agents.provider.local]
+kind = "terminal"
+command = "my-agent"
+args = ["--task", "{task}"]
+env = { MODE = "fast" }
+[agents.provider.gemini]
+kind = "acp"
+command = "gemini"
+enabled = false
+"#,
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(c.agents.worktree_dir.as_deref(), Some("~/worktrees"));
+        assert_eq!(c.agents.test_command, ["cargo", "test", "--workspace"]);
+        let local = &c.agents.provider["local"];
+        assert_eq!(local.kind, AgentProviderKind::Terminal);
+        assert_eq!(local.args, ["--task", "{task}"]);
+        assert_eq!(local.env["MODE"], "fast");
+        assert!(local.enabled);
+        assert!(!c.agents.provider["gemini"].enabled);
+        assert!(
+            Config::parse(
+                "[agents]
+test-cmd = []
+",
+                Path::new("x")
+            )
+            .is_err()
+        );
+        assert!(
+            Config::parse(
+                "[agents.provider.x]
+kind = \"pty\"\ncommand = \"x\"\n",
+                Path::new("x")
+            )
+            .is_err()
         );
     }
 
