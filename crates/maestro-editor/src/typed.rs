@@ -55,6 +55,12 @@ static TYPED: &[TypedCommand] = &[
         fun: write_quit_all,
     },
     TypedCommand {
+        name: "agents",
+        aliases: &[],
+        doc: "Show or hide the agent panel",
+        fun: agents,
+    },
+    TypedCommand {
         name: "open",
         aliases: &["e", "edit"],
         doc: "Open a file (e! reloads the current one)",
@@ -415,9 +421,44 @@ fn quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
             modified.join(", ")
         ));
     }
+    // Git work for an agent (a worktree being made, an integration, an
+    // archive) must not be cut off half done, even with `!`.
+    let busy = ed.agents.git_busy();
+    if !busy.is_empty() {
+        return Err(format!(
+            "wait: Git work is running for {}; quitting now could leave it half done",
+            busy.join(", ")
+        ));
+    }
+    // Running agents are asked about even with `!`, which only discards
+    // unsaved buffers.
+    let running = ed.agents.running().len();
+    if running > 0 {
+        ed.on_next_char(
+            &format!("{running} agent(s) running; stop them and quit? y/n"),
+            |ed, c| {
+                if c == 'y' {
+                    crate::agents::stop_all(ed);
+                    finish_quit(ed);
+                } else {
+                    ed.info("not quitting; the agents keep running");
+                }
+            },
+        );
+        return Ok(());
+    }
+    finish_quit(ed);
+    Ok(())
+}
+
+fn finish_quit(ed: &mut Editor) {
     // Best effort: a session that cannot be written must not block quitting.
     let _ = crate::navigation::session::save(ed);
     ed.should_quit = true;
+}
+
+fn agents(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    ed.run_command("agent_panel");
     Ok(())
 }
 
@@ -797,7 +838,7 @@ fn swarm(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     set_presentation(ed, Presentation::Swarm)?;
     ed.set_status(
         Severity::Warning,
-        "swarm mode: agent and worktree panels are not built yet (ROADMAP M2)",
+        "swarm mode looks like engineering mode for now; the agent panel is space a or :agents",
     );
     Ok(())
 }

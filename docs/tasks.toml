@@ -119,6 +119,12 @@ status = "done"
 [[task]]
 id = "m2-panel"
 title = "Agent panel and review screen in the editor"
-crates = ["maestro-editor", "maestro-tui"]
-owner = "lead"
-status = "not-started"
+crates = ["maestro-editor", "maestro-tui", "maestro-config"]
+branch = "feat/panel"
+owner = "agent"
+status = "in-progress"
+# Done: agent records, worktree per task, ACP and terminal launch, panel
+# (space a, :agents) with C-\ terminal keys, review screen, tests,
+# feedback, permissions, reject, archive, integrate, quit confirmation,
+# M2 acceptance test and a tmux run with shell-script providers.
+# Open: agent sessions across restarts, a real agent run through the panel.

@@ -33,14 +33,16 @@ Acceptance (use Maestro to navigate and modify its own source without another ed
 
 | Item | Status |
 |---|---|
-| Worktree management | partial: crate and gutter, no agent UI. `maestro-git` lists, adds, removes (refusing, unless forced, on uncommitted or untracked files and on commits that are ahead of the upstream or, without one, on no other branch) and prunes worktrees, and checks fast-forwards and merge conflicts without touching the working tree. The editor shows `+`/`~`/`-` gutter signs, the branch in the status line, and `:git-status` and `:worktrees` pickers. |
-| Agent terminals | not started |
-| One working agent integration | not started |
-| Sessions | not started |
-| Worktree-aware editing | not started |
-| Diff review and approval | not started; the unified diff model it needs exists in `maestro-git` |
-| Test execution | not started |
-| Safe merge or cherry-pick | not started; `can_fast_forward` and the `merge-tree` dry run exist in `maestro-git` |
+| Worktree management | done: `maestro-git` lists, adds, removes (refusing, unless forced, on uncommitted or untracked files and on commits that are ahead of the upstream or, without one, on no other branch) and prunes worktrees. Each agent task gets a worktree on a `maestro/<slug>-<id>` branch from the current `HEAD`; archiving removes it and keeps the branch, and forcing needs a second confirmation that lists what would be deleted. Gutter signs, the branch in the status line, `:git-status` and `:worktrees` pickers |
+| Agent terminals | done for the agent panel: terminal providers run in a PTY sized to the panel, drawn with their colors; `C-\` hands keys (and pastes) to the terminal and takes them back. Not shown in splits |
+| One working agent integration | partial: the ACP path (session, prompts, plan, tool, permission and file events, feedback prompts) is tested against the fake ACP agent; the terminal path against shell scripts, in tests and by hand in tmux. No real agent (gemini, opencode, claude, codex) has been run through the panel on this branch |
+| Sessions | not started: agent records live in memory and are forgotten on quit; worktrees and branches stay |
+| Worktree-aware editing | done: `Enter` in the review opens the worktree's file at the line in a normal buffer; the status line says which agent's worktree it belongs to; integration and archiving refuse while such a buffer has unsaved edits |
+| Diff review and approval | done: review screen per agent with file list, unified and side-by-side layouts, intraline marks, hunk and file navigation, line comments sent back as feedback; reject and integrate with confirmations |
+| Test execution | done: `t` runs `[agents] test-command` (default `cargo test` with a `Cargo.toml`) in the worktree through `maestro-tasks`, with live output and parsed `cargo test` totals in the panel and the agent list |
+| Safe merge or cherry-pick | done: integrate commits the worktree's work, then merges, fast-forwards or cherry-picks into the main worktree's branch through `maestro-git`'s checked `integrate`; a dirty or detached main worktree is refused before anything is committed |
+
+Acceptance (launch two independent agent tasks, have them edit isolated worktrees, review both, reject one, safely integrate the other): `m2_acceptance_two_agents_reject_one_integrate_the_other` in `crates/maestro-editor/tests/agents.rs` drives it through `Editor::handle_key` with real repositories and worktrees, including the refusal with a dirty main worktree. On October 30, 2026 the release binary was driven through the same flow in tmux with two terminal providers written as shell scripts. M2 stays partial until a real agent has been run through the panel and agent sessions survive a restart.
 
 ## M3: differentiating capabilities (partial)
 

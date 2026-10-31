@@ -14,7 +14,7 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 |---|---|---|
 | `maestro-core` | Rope text, position types, selections, change sets, transactions, undo tree, documents, file IO | ropey, unicode-segmentation, unicode-width, thiserror |
 | `maestro-config` | TOML config, theme tokens, the Duskfox palette | serde, toml |
-| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, Git gutter signs and pickers, language server integration (`lsp.rs`, `lsp_commands.rs`), per-buffer syntax state | core, config, git, lsp, syntax, regex |
+| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, Git gutter signs and pickers, language server integration (`lsp.rs`, `lsp_commands.rs`), per-buffer syntax state, coding agents with the agent panel and review screen (`agents/`) | core, config, git, lsp, syntax, agent, term, tasks, regex |
 | `maestro-git` | Repository discovery, status, line diffs for gutter signs, a unified diff model, worktree lifecycle with safety checks, merge dry runs, the review diff of a worktree against its base, intraline ranges, committing a worktree's work, and integrating a branch by fast-forward, merge or cherry-pick with checks before and after; all through the `git` CLI (ADR 0005) | similar, thiserror |
 | `maestro-term` | Programs in pseudo-terminals: a VT screen with scrollback, key and paste encoding, resize, exit status, kill (ADR 0006) | portable-pty, vt100 |
 | `maestro-agent` | Agent providers found on `PATH`, the Agent Client Protocol client on plain threads (handshake, prompts, cancel, permission requests, transcript events), file reads and writes for an agent confined to its root by path checks (not a sandbox), and a fake agent for tests behind `fake-agent` (ADR 0006) | agent-client-protocol-schema, serde_json |
@@ -26,7 +26,7 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 | `maestro-automation` | Runs protocol requests against an `Editor`; headless (stdio) and Unix socket transports | core, config, editor, protocol |
 | `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui, automation |
 
-The agent crates are not wired into the editor yet; ADR 0006 records how they will be. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
+`maestro-editor` uses the agent crates (`maestro-agent`, `maestro-term`, `maestro-tasks`) for the agent panel in `src/agents/`; `maestro-tui` draws it (`src/agents.rs`). ADR 0006 records how they fit together and `docs/agent-model.md` what the panel does. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 
 ## Rules
 

@@ -215,6 +215,8 @@ pub struct Editor {
     pub lsp: crate::lsp::Lsp,
     /// Sessions, recent files and the state they are stored in.
     pub navigation: crate::navigation::NavState,
+    /// Coding agents and the agent panel (see [`crate::agents`]).
+    pub agents: crate::agents::AgentState,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -264,6 +266,7 @@ impl Editor {
             git: crate::git::GitState::default(),
             lsp: Default::default(),
             navigation: Default::default(),
+            agents: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -1051,6 +1054,10 @@ impl Editor {
             self.selected_register = None;
             return;
         }
+        if self.agents.panel_open() {
+            crate::agents::panel::handle_key(self, key);
+            return;
+        }
         if self.mode == Mode::Insert {
             // An open completion popup takes its keys first.
             if self.pending.is_empty() && crate::lsp::completion::handle_key(self, key) {
@@ -1157,7 +1164,7 @@ impl Editor {
 
     /// Handles a mouse event at screen cell (x, y).
     pub fn handle_mouse(&mut self, kind: MouseKind, x: u16, y: u16) {
-        if self.picker.is_some() || self.prompt.is_some() {
+        if self.picker.is_some() || self.prompt.is_some() || self.agents.panel_open() {
             return;
         }
         let Some(view_id) = self
@@ -1229,6 +1236,10 @@ impl Editor {
         }
         if self.prompt.is_some() {
             crate::prompt::insert_text(self, text);
+            return;
+        }
+        if self.agents.panel_open() {
+            crate::agents::panel::paste(self, text);
             return;
         }
         if self.pending_char.is_some() || self.awaiting_register || !self.pending.is_empty() {
@@ -1341,7 +1352,8 @@ impl Editor {
         if ran {
             self.ensure_cursor_visible();
         }
-        ran
+        // Terminal output only wakes the loop; this notices it.
+        crate::agents::poll(self) || ran
     }
 
     /// Bookkeeping every text change needs, whatever caused it: the buffer's
@@ -1407,6 +1419,7 @@ impl Editor {
         self.check_disk_changes();
         crate::git::tick(self);
         crate::lsp::reconcile(self);
+        crate::agents::tick(self, now);
     }
 
     fn check_disk_changes(&mut self) {

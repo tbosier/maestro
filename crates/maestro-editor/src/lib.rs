@@ -5,8 +5,11 @@
 //! dependency: a front end feeds it [`KeyEvent`]s and draws what it holds.
 //! Git runs only on background threads (see [`git`]); language servers run
 //! on their own threads (see [`lsp`]); large parses run in the background
-//! (see [`syntax`]).
+//! (see [`syntax`]). Coding agents, their terminals, tests and review run
+//! through `maestro-agent`, `maestro-term`, `maestro-tasks` and
+//! `maestro-git` (see [`agents`]).
 
+pub mod agents;
 pub mod commands;
 pub mod editor;
 pub mod git;
