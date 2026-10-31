@@ -6,10 +6,26 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# A scriptable fake ACP agent used by tests in this crate and in
+# maestro-editor, as the `fake-acp-agent` binary or through
+# `fake::run_if_requested`. Not part of the editor.
+fake-agent = []
+
 [dependencies]
 agent-client-protocol-schema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Turns on the fake agent for this crate's own tests.
+maestro-agent = { path = ".", features = ["fake-agent"] }
+
+[[bin]]
+name = "fake-acp-agent"
+path = "src/bin/fake-acp-agent.rs"
+required-features = ["fake-agent"]
+test = false
 
 [lints]
 workspace = true

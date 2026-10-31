@@ -96,7 +96,12 @@ title = "Agent providers and the ACP client (maestro-agent)"
 crates = ["maestro-agent"]
 branch = "feat/agent"
 owner = "agent"
-status = "in-progress"
+status = "done"
+# Done: providers (gemini --acp, opencode acp, claude and codex as
+# terminal), AcpClient (initialize, session/new, prompt, cancel,
+# permissions, updates, stderr, exit, process-group kill), confined fs
+# read/write, fake ACP agent behind `fake-agent`. Real check: gemini
+# initialize works, session/new fails without a Gemini API key.
 
 [[task]]
 id = "m2-review"

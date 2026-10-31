@@ -65,26 +65,68 @@ pub enum ProviderKind { Acp, Terminal }
 /// From config. `Terminal` providers get the task text as `{task}` in args, or typed in after start when no arg names it.
 pub struct ProviderSpec { pub name: String, pub kind: ProviderKind, pub program: String, pub args: Vec<String>, pub env: Vec<(String, String)> }
 pub fn builtin_providers() -> Vec<ProviderSpec>; // only programs found on PATH
+/// Built in: `gemini --acp` and `opencode acp` (ACP), `claude {task}` and `codex {task}` (Terminal).
+/// Checked against the installed programs' `--help`; `--experimental-acp` is gemini's deprecated spelling.
+pub fn builtin_providers_in(path_var: Option<&OsStr>) -> Vec<ProviderSpec>;
+pub const TASK_PLACEHOLDER: &str = "{task}";
+pub fn find_executable(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf>;
 
 /// Messages and tool activity from an ACP agent, in arrival order.
+/// `User`, `Agent` and `Thought` are streamed chunks; the editor's own prompt text is not echoed as `User`.
 pub enum TranscriptEntry { User(String), Agent(String), Thought(String), Tool { id: String, title: String, kind: String, status: String, locations: Vec<PathBuf> }, Plan(Vec<(String, String)>), System(String) }
 
-pub struct PermissionRequest { pub request_id: serde_json::Value, pub tool_title: String, pub options: Vec<PermissionChoice> }
+pub struct PermissionRequest { pub request_id: serde_json::Value, pub tool_id: String, pub tool_title: String, pub options: Vec<PermissionChoice> }
 pub struct PermissionChoice { pub id: String, pub label: String, pub kind: String /* allow_once, allow_always, reject_once, reject_always */ }
 
-pub enum AcpEvent { Initialized { agent_name: Option<String>, load_session: bool }, SessionStarted { session_id: String }, Update(TranscriptEntry), ToolUpdate { id: String, status: String }, PermissionRequested(PermissionRequest), TurnEnded { stop_reason: String }, FileWritten(PathBuf), Stderr(String), Exited(Option<i32>), Error(String) }
+pub enum AcpEvent {
+    Initialized { agent_name: Option<String>, load_session: bool },
+    SessionStarted { session_id: String },
+    Update(TranscriptEntry),
+    /// A change to an earlier `Tool` entry; `None` fields are unchanged.
+    ToolUpdate { id: String, status: Option<String>, title: Option<String>, locations: Option<Vec<PathBuf>> },
+    PermissionRequested(PermissionRequest),
+    /// The agent's stop reason, or `error` when the prompt failed or the session could not start.
+    TurnEnded { stop_reason: String },
+    FileWritten(PathBuf),
+    Stderr(String),
+    /// Always the last event.
+    Exited(Option<i32>),
+    Error(String),
+}
 
 pub struct AcpClient;
 impl AcpClient {
-    /// Starts the agent process, runs `initialize` and `session/new` with `root` as cwd.
+    /// Starts the agent process (in its own process group on Unix), runs `initialize` and `session/new` with `root` as cwd.
+    /// Returns once the process runs; the handshake is reported as `Initialized` and `SessionStarted`.
     /// File reads and writes the agent asks the client for are confined to `root`:
     /// paths outside it, symlinks out of it and the `.git` directory are refused.
+    /// `on_event` runs on a dispatcher thread, one event at a time, and may call back into the client.
     pub fn start(spec: &ProviderSpec, root: &Path, on_event: impl Fn(AcpEvent) + Send + Sync + 'static) -> io::Result<AcpClient>;
+    /// Fails when a turn is already running or the agent is gone. Before `SessionStarted` it is queued.
     pub fn prompt(&self, text: &str) -> io::Result<()>;
+    /// Sends `session/cancel` and answers pending permission requests as cancelled.
     pub fn cancel(&self) -> io::Result<()>;
+    /// Fails, sending nothing, unless the request is pending and the choice was offered.
     pub fn answer_permission(&self, request_id: serde_json::Value, choice: Option<&str> /* None = cancelled */) -> io::Result<()>;
+    /// Kills the agent's process group. Dropping the client does the same.
     pub fn shutdown(&self);
+    pub fn root(&self) -> &Path; // canonical
+    pub fn session_id(&self) -> Option<String>;
 }
+
+/// The confinement itself, usable on its own.
+pub struct FileAccess;
+impl FileAccess {
+    pub fn new(root: &Path) -> io::Result<FileAccess>;
+    pub fn root(&self) -> &Path;
+    pub fn read(&self, path: &Path, line: Option<u32> /* 1-based */, limit: Option<u32>) -> Result<String, AccessError>;
+    /// Atomic: temp file in the same directory, then rename. Creates missing parent directories inside the root.
+    pub fn write(&self, path: &Path, content: &str) -> Result<PathBuf, AccessError>;
+}
+pub enum AccessError { OutsideRoot(PathBuf), GitDir(PathBuf), NotRegularFile(PathBuf), NotFound(PathBuf), BadPath(PathBuf), Refused(String), Io(io::Error) }
+
+// Behind the `fake-agent` feature: `maestro_agent::fake` (a scriptable fake ACP agent,
+// command language documented in its source) and the `fake-acp-agent` binary.
 ```
 
 The editor keeps the rest of an agent's record (task text, worktree, history, test runs, files changed) in its own state; `maestro-agent` holds only what the protocol needs.
