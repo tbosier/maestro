@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use maestro_config::{Config, LanguageServerConfig};
-use maestro_editor::lsp::{self, DiagnosticSeverity};
-use maestro_editor::{Editor, KeyCode, KeyEvent, Rect};
+use maestro_editor::lsp::{self, DiagnosticSeverity, completion};
+use maestro_editor::{Editor, KeyCode, KeyEvent, Mode, Rect};
 use maestro_lsp::fake::{self, FAKE_ARG};
 use maestro_lsp::{Value, json};
 
@@ -61,6 +61,82 @@ fn main() {
         (
             "definition_reply_dropped_while_a_prompt_is_open",
             definition_reply_dropped_while_a_prompt_is_open,
+        ),
+        (
+            "completion_on_demand_filters_and_accepts",
+            completion_on_demand_filters_and_accepts,
+        ),
+        (
+            "completion_after_typing_waits_for_the_debounce",
+            completion_after_typing_waits_for_the_debounce,
+        ),
+        (
+            "completion_on_a_trigger_character",
+            completion_on_a_trigger_character,
+        ),
+        (
+            "completion_escape_and_motion_close_the_popup",
+            completion_escape_and_motion_close_the_popup,
+        ),
+        (
+            "completion_insert_replace_edit_uses_the_insert_range",
+            completion_insert_replace_edit_uses_the_insert_range,
+        ),
+        (
+            "completion_insert_text_and_label_only_items",
+            completion_insert_text_and_label_only_items,
+        ),
+        (
+            "completion_additional_edits_apply_in_one_transaction",
+            completion_additional_edits_apply_in_one_transaction,
+        ),
+        (
+            "completion_snippet_puts_the_cursor_at_the_final_stop",
+            completion_snippet_puts_the_cursor_at_the_final_stop,
+        ),
+        (
+            "completion_utf16_positions_with_emoji_and_cjk",
+            completion_utf16_positions_with_emoji_and_cjk,
+        ),
+        (
+            "completion_stale_replies_are_dropped",
+            completion_stale_replies_are_dropped,
+        ),
+        (
+            "completion_at_every_cursor_where_the_text_matches",
+            completion_at_every_cursor_where_the_text_matches,
+        ),
+        (
+            "completion_incomplete_list_asks_again",
+            completion_incomplete_list_asks_again,
+        ),
+        (
+            "completion_dot_repeats_an_accepted_item",
+            completion_dot_repeats_an_accepted_item,
+        ),
+        (
+            "completion_in_a_crlf_document_inserts_crlf",
+            completion_in_a_crlf_document_inserts_crlf,
+        ),
+        (
+            "completion_that_skipped_a_cursor_is_not_repeated",
+            completion_that_skipped_a_cursor_is_not_repeated,
+        ),
+        (
+            "completion_item_dropped_when_its_import_spot_is_edited",
+            completion_item_dropped_when_its_import_spot_is_edited,
+        ),
+        (
+            "completion_closes_when_a_secondary_cursor_moves",
+            completion_closes_when_a_secondary_cursor_moves,
+        ),
+        (
+            "completion_debounce_does_not_follow_a_click_to_another_view",
+            completion_debounce_does_not_follow_a_click_to_another_view,
+        ),
+        (
+            "completion_keys_pass_through_when_the_popup_cannot_be_drawn",
+            completion_keys_pass_through_when_the_popup_cannot_be_drawn,
         ),
     ]);
 }
@@ -589,4 +665,473 @@ fn definition_reply_dropped_while_a_prompt_is_open() {
     assert_eq!(head(ed), before, "did not jump while the prompt was open");
     assert!(ed.prompt.is_some(), "the user's prompt is still open");
     run(ed, "<esc>");
+}
+
+// ----- completion ---------------------------------------------------------
+
+/// Labels in the open popup, in order; empty when none is shown.
+fn labels(ed: &Editor) -> Vec<String> {
+    completion::visible(ed)
+        .map(|m| {
+            m.matches
+                .iter()
+                .map(|x| m.items[x.index].label.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn wait_for_popup(ed: &mut Editor) {
+    assert!(
+        wait_until(ed, |ed| completion::visible(ed).is_some()),
+        "no popup; status {:?}, dropped {:?}",
+        ed.status,
+        ed.lsp.completion.last_dropped
+    );
+}
+
+/// The completion requests the fake server answered, with their params.
+fn completion_requests(ed: &Editor) -> Vec<Value> {
+    let rx = ed
+        .lsp
+        .raw_request(ed.view().doc, "fake/stats", json!({}))
+        .expect("synced");
+    let stats = maestro_lsp::client::recv_reply(&rx, WAIT).unwrap().unwrap();
+    stats["requests"].as_array().unwrap().clone()
+}
+
+fn line(ed: &Editor, n: usize) -> String {
+    ed.doc().text().line(n).to_string()
+}
+
+fn completion_on_demand_filters_and_accepts() {
+    let mut f = open_synced("compl-demand", "fn main() {\n    std::\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GAcol<C-x>");
+    wait_for_popup(ed);
+    // Fuzzy and case-smart: lowercase `col` also matches `Color`. Equal
+    // scores keep the server's sortText order.
+    assert_eq!(
+        labels(ed),
+        ["collections", "column", "Color", "col_label_only"]
+    );
+    let menu = completion::visible(ed).unwrap();
+    let item = &menu.items[menu.matches[0].index];
+    assert_eq!(
+        (item.kind, item.detail.as_str()),
+        ("module", "std::collections")
+    );
+    let reqs = completion_requests(ed);
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0]["context"], json!({"triggerKind": 1}));
+    assert_eq!(reqs[0]["position"], json!({"line": 1, "character": 12}));
+    // The list is complete: typing narrows it without asking again.
+    run(ed, "l");
+    assert_eq!(labels(ed), ["collections", "col_label_only"]);
+    run(ed, "<C-n>");
+    assert_eq!(completion::visible(ed).unwrap().selected, 1);
+    run(ed, "<C-n>");
+    assert_eq!(completion::visible(ed).unwrap().selected, 0, "wraps");
+    run(ed, "<down><up><C-p>");
+    assert_eq!(completion::visible(ed).unwrap().selected, 1);
+    run(ed, "<C-p>");
+    run(ed, "<tab>");
+    assert!(completion::visible(ed).is_none());
+    assert_eq!(ed.mode, Mode::Insert, "accepting stays in insert mode");
+    assert_eq!(line(ed, 1), "    std::collections\n");
+    assert_eq!(head(ed), ed.doc().text().line_to_char(1) + 20);
+    run(ed, "::<esc>");
+    assert_eq!(line(ed, 1), "    std::collections::\n");
+    assert_eq!(completion_requests(ed).len(), 1);
+    assert_server_matches(ed, "after completion");
+}
+
+fn completion_after_typing_waits_for_the_debounce() {
+    let mut f = open_synced("compl-typing", "fn main() {\n    \n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GAco");
+    let typed = Instant::now();
+    // Nothing is sent while the debounce runs.
+    assert!(!ed.lsp.completion.is_pending());
+    assert!(completion::visible(ed).is_none());
+    assert!(
+        wait_until(ed, |ed| ed.lsp.completion.is_pending()
+            || completion::visible(ed).is_some()),
+        "never sent"
+    );
+    assert!(
+        typed.elapsed() >= completion::DEBOUNCE,
+        "sent after {:?}",
+        typed.elapsed()
+    );
+    wait_for_popup(ed);
+    let reqs = completion_requests(ed);
+    assert_eq!(reqs.len(), 1, "one request for the burst of two keys");
+    assert_eq!(reqs[0]["context"], json!({"triggerKind": 1}));
+    // Nothing matches `cox`: the popup closes.
+    run(ed, "x");
+    assert!(completion::visible(ed).is_none());
+    run(ed, "<esc>");
+}
+
+fn completion_on_a_trigger_character() {
+    let mut f = open_synced("compl-trigger", "fn main() {\n    v\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GA.");
+    // A trigger character asks at once.
+    assert!(ed.lsp.completion.is_pending());
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["len", "push"]);
+    let reqs = completion_requests(ed);
+    assert_eq!(
+        reqs.last().unwrap()["context"],
+        json!({"triggerKind": 2, "triggerCharacter": "."})
+    );
+    run(ed, "p");
+    assert_eq!(labels(ed), ["push"]);
+    // A snippet without $0 leaves the cursor at its end.
+    run(ed, "<ret>");
+    assert_eq!(line(ed, 1), "    v.push(value)\n");
+    assert_eq!(head(ed), ed.doc().text().line_to_char(1) + 17);
+    run(ed, "<esc>");
+    assert_server_matches(ed, "trigger");
+}
+
+fn completion_escape_and_motion_close_the_popup() {
+    let mut f = open_synced("compl-close", "fn main() {\n    co\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    // Escape closes the popup only, as it closes a picker or a prompt.
+    run(ed, "<esc>");
+    assert!(completion::visible(ed).is_none());
+    assert_eq!(ed.mode, Mode::Insert);
+    run(ed, "<esc>");
+    assert_eq!(ed.mode, Mode::Normal);
+    // Moving the cursor closes it too.
+    run(ed, "A<C-x>");
+    wait_for_popup(ed);
+    run(ed, "<left>");
+    assert!(completion::visible(ed).is_none());
+    assert_eq!(ed.mode, Mode::Insert);
+    // Enter with no popup is a newline again.
+    run(ed, "<ret><esc>");
+    assert_eq!(
+        ed.doc().text().to_string(),
+        "fn main() {\n    c\n    o\n}\n"
+    );
+}
+
+fn completion_insert_replace_edit_uses_the_insert_range() {
+    let mut f = open_synced("compl-insrep", "fn main() {\n    coxyz\n}\n");
+    let ed = &mut f.ed;
+    // Insert between `co` and `xyz`.
+    run(ed, "2G^lli<C-x>");
+    wait_for_popup(ed);
+    run(ed, "lu");
+    assert_eq!(labels(ed), ["column"]);
+    run(ed, "<tab>");
+    // The insert range ends at the cursor: `xyz` stays.
+    assert_eq!(line(ed, 1), "    columnxyz\n");
+    assert_eq!(head(ed), ed.doc().text().line_to_char(1) + 10);
+    run(ed, "<esc>");
+    assert_server_matches(ed, "insert-replace");
+}
+
+fn completion_insert_text_and_label_only_items() {
+    let mut f = open_synced("compl-text", "fn main() {\n    Colo\n    col_l\n}\n");
+    let ed = &mut f.ed;
+    // An uppercase letter makes the filter case-sensitive.
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["Color"]);
+    run(ed, "<tab><esc>");
+    assert_eq!(line(ed, 1), "    Color\n", "insertText replaces the prefix");
+    run(ed, "3GA<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["col_label_only"]);
+    run(ed, "<tab><esc>");
+    assert_eq!(line(ed, 2), "    col_label_only\n", "the label is the text");
+    assert_server_matches(ed, "insertText and label");
+}
+
+fn completion_additional_edits_apply_in_one_transaction() {
+    let text = "fn main() {\n    let m: Hash\n}\n";
+    let mut f = open_synced("compl-additional", text);
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["HashMap"]);
+    let version = ed.doc().version().0;
+    run(ed, "<tab>");
+    assert_eq!(ed.doc().version().0, version + 1, "one transaction");
+    assert_eq!(
+        ed.doc().text().to_string(),
+        "use std::collections::HashMap;\nfn main() {\n    let m: HashMap\n}\n"
+    );
+    assert_eq!(head(ed), ed.doc().text().line_to_char(2) + 18);
+    run(ed, "<esc>");
+    assert_server_matches(ed, "additional edits");
+    // `.` cannot repeat an edit in two places as typing, so it repeats
+    // nothing rather than something else.
+    run(ed, ".");
+    assert_eq!(ed.doc().version().0, version + 1);
+    // The whole insert session is one undo step.
+    run(ed, "u");
+    assert_eq!(ed.doc().text().to_string(), text);
+}
+
+fn completion_snippet_puts_the_cursor_at_the_final_stop() {
+    let mut f = open_synced("compl-snippet", "fn main() {\n    conf\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["configure"]);
+    run(ed, "<tab>");
+    // `configure(${1:value}, ${2:\$x})$0;`
+    assert_eq!(line(ed, 1), "    configure(value, $x);\n");
+    run(ed, "X<esc>");
+    assert_eq!(line(ed, 1), "    configure(value, $x)X;\n");
+}
+
+fn completion_utf16_positions_with_emoji_and_cjk() {
+    let before = "    let s = \"😀日本\"; co";
+    let text = format!("fn main() {{\n{before}\n}}\n");
+    let mut f = open_synced("compl-utf16", &text);
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    let units: usize = before.chars().map(char::len_utf16).sum();
+    assert_eq!(units, before.chars().count() + 1, "the emoji is two units");
+    assert_eq!(
+        completion_requests(ed)[0]["position"],
+        json!({"line": 1, "character": units})
+    );
+    run(ed, "<tab>");
+    assert_eq!(line(ed, 1), format!("{before}llections\n"));
+    // Non-ASCII labels, and a CJK prefix inside the server's range.
+    run(ed, " caf<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["café_crème"]);
+    run(ed, "<tab> 日<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["日本語"]);
+    run(ed, "<tab><esc>");
+    assert_eq!(
+        line(ed, 1),
+        format!("{before}llections café_crème 日本語\n")
+    );
+    assert_server_matches(ed, "utf-16");
+}
+
+fn completion_stale_replies_are_dropped() {
+    // `@slow` holds every reply for 600 ms.
+    let mut f = open_synced("compl-stale", "// @slow\nfn main() {\n    \n}\n");
+    let ed = &mut f.ed;
+    let doc = ed.view().doc;
+    // The text changed while the request was out.
+    run(ed, "3GAco<C-x> ");
+    let edited = ed.doc().text().to_string();
+    assert!(
+        wait_until(ed, |ed| ed.lsp.completion.last_dropped.as_deref()
+            == Some("the buffer changed")),
+        "dropped {:?}",
+        ed.lsp.completion.last_dropped
+    );
+    assert!(completion::visible(ed).is_none());
+    assert_eq!(ed.doc().text().to_string(), edited);
+    // The cursor moved.
+    run(ed, "<C-x><left>");
+    assert!(
+        wait_until(ed, |ed| ed.lsp.completion.last_dropped.as_deref()
+            == Some("the cursor moved")),
+        "dropped {:?}",
+        ed.lsp.completion.last_dropped
+    );
+    assert!(completion::visible(ed).is_none());
+    // Leaving insert mode cancels the request outright.
+    run(ed, "<C-x>");
+    assert!(ed.lsp.completion.is_pending());
+    run(ed, "<esc>");
+    assert!(!ed.lsp.completion.is_pending());
+    std::thread::sleep(Duration::from_millis(fake::SLOW_MS + 200));
+    ed.poll_background();
+    assert!(completion::visible(ed).is_none());
+    assert_eq!(ed.view().doc, doc);
+    assert_eq!(ed.doc().text().to_string(), edited);
+}
+
+fn completion_at_every_cursor_where_the_text_matches() {
+    let mut f = open_synced(
+        "compl-multi",
+        "fn main() {\n    co\n    co\n    xo\n    co\n}\n",
+    );
+    let ed = &mut f.ed;
+    // Cursors at the ends of lines 2 and 3; `C` makes the new one primary.
+    run(ed, "2GCA<C-x>");
+    assert_eq!(ed.view().selection.len(), 2);
+    wait_for_popup(ed);
+    run(ed, "<tab>");
+    assert_eq!(line(ed, 1), "    collections\n");
+    assert_eq!(line(ed, 2), "    collections\n");
+    let heads: Vec<usize> = ed.view().selection.iter().map(|r| r.head).collect();
+    let text = ed.doc().text().clone();
+    assert_eq!(
+        heads,
+        [text.line_to_char(1) + 15, text.line_to_char(2) + 15]
+    );
+    run(ed, "<esc>,");
+    // A cursor whose text differs from the primary's is left alone.
+    run(ed, "4GCA<C-x>");
+    assert_eq!(ed.view().selection.primary_index(), 1, "primary on `co`");
+    wait_for_popup(ed);
+    run(ed, "<tab>");
+    assert_eq!(line(ed, 4), "    collections\n");
+    assert_eq!(line(ed, 3), "    xo\n", "left alone");
+    assert!(
+        status(ed).contains("completed at 1 of 2 cursors"),
+        "{}",
+        status(ed)
+    );
+    let heads: Vec<usize> = ed.view().selection.iter().map(|r| r.head).collect();
+    let text = ed.doc().text().clone();
+    assert_eq!(heads, [text.line_to_char(3) + 6, text.line_to_char(4) + 15]);
+    run(ed, "<esc>");
+    assert_server_matches(ed, "multi-cursor");
+}
+
+fn completion_incomplete_list_asks_again() {
+    let mut f = open_synced("compl-incomplete", "// @incomplete\nfn main() {\n    \n}\n");
+    let ed = &mut f.ed;
+    run(ed, "3GAab<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["abEcho"]);
+    assert!(completion::visible(ed).unwrap().incomplete);
+    run(ed, "c");
+    assert!(
+        wait_until(ed, |ed| labels(ed) == ["abcEcho"]),
+        "labels {:?}",
+        labels(ed)
+    );
+    let reqs = completion_requests(ed);
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1]["context"], json!({"triggerKind": 3}));
+    run(ed, "<tab><esc>");
+    assert_eq!(line(ed, 2), "    abcEcho\n");
+}
+
+fn completion_dot_repeats_an_accepted_item() {
+    let mut f = open_synced("compl-dot", "fn main() {\n    co\n    co\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    run(ed, "<tab>()<esc>");
+    assert_eq!(line(ed, 1), "    collections()\n");
+    // `.` replays the session as typed keys, with no server involved.
+    run(ed, "j.");
+    assert_eq!(line(ed, 2), "    collections()\n");
+    assert!(!ed.lsp.completion.is_pending());
+    assert_server_matches(ed, "dot repeat");
+}
+
+fn completion_in_a_crlf_document_inserts_crlf() {
+    let mut f = open_synced("compl-crlf", "fn main() {\r\n    let m: Hash\r\n}\r\n");
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    run(ed, "<tab>");
+    // The import's `\n` arrives as the document's line ending.
+    assert_eq!(
+        ed.doc().text().to_string(),
+        "use std::collections::HashMap;\r\nfn main() {\r\n    let m: HashMap\r\n}\r\n"
+    );
+    assert_eq!(head(ed), ed.doc().text().line_to_char(2) + 18);
+    run(ed, "<esc>");
+    assert_server_matches(ed, "crlf");
+}
+
+/// Replayed keys act at every cursor, so a completion that skipped a
+/// cursor is not repeated by `.`.
+fn completion_that_skipped_a_cursor_is_not_repeated() {
+    let mut f = open_synced("compl-skipdot", "xo\nco\nxo\nco\n");
+    let ed = &mut f.ed;
+    run(ed, "CA<C-x>");
+    wait_for_popup(ed);
+    run(ed, "<tab><esc>");
+    assert_eq!(ed.doc().text().to_string(), "xo\ncollections\nxo\nco\n");
+    let version = ed.doc().version();
+    run(ed, ",jj.");
+    assert_eq!(ed.doc().version(), version, "`.` changed nothing");
+    assert_eq!(ed.doc().text().to_string(), "xo\ncollections\nxo\nco\n");
+}
+
+/// Typing where an item's additional edit goes makes that item stale.
+fn completion_item_dropped_when_its_import_spot_is_edited() {
+    let mut f = open_synced("compl-importspot", "Hash\n");
+    let ed = &mut f.ed;
+    run(ed, "A<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["HashMap"]);
+    // Clearing the line deletes text at the import's position (0).
+    run(ed, "<C-u>H");
+    assert!(
+        !labels(ed).contains(&"HashMap".to_string()),
+        "{:?}",
+        labels(ed)
+    );
+    run(ed, "<tab><esc>");
+    assert!(
+        !ed.doc().text().to_string().contains("use std"),
+        "{:?}",
+        ed.doc().text().to_string()
+    );
+}
+
+/// Moving a cursor other than the primary also closes the popup.
+fn completion_closes_when_a_secondary_cursor_moves() {
+    use maestro_core::{Range, Selection};
+    let mut f = open_synced("compl-secondary", "co\nco\n");
+    let ed = &mut f.ed;
+    run(ed, "i");
+    ed.set_selection(Selection::new(vec![Range::point(0), Range::point(5)], 0));
+    run(ed, "<C-x>");
+    wait_for_popup(ed);
+    // The primary is at the start of the text and cannot move left.
+    run(ed, "<left>");
+    assert_eq!(head(ed), 0);
+    assert!(completion::visible(ed).is_none());
+    run(ed, "<tab><esc>");
+    assert!(!ed.doc().text().to_string().contains("collections"));
+}
+
+/// A debounce started in one view does not fire after a click moved the
+/// focus to another.
+fn completion_debounce_does_not_follow_a_click_to_another_view() {
+    use maestro_editor::MouseKind;
+    let mut f = open_synced("compl-click", "fn main() {\n    \n}\n");
+    let ed = &mut f.ed;
+    run(ed, "<C-w>v2GAco");
+    let first = ed.focus;
+    // Click into the other split while still in insert mode.
+    let other = ed.views.values().find(|v| v.id != first).unwrap().area;
+    ed.handle_mouse(MouseKind::Down, other.x + other.width / 2, other.y);
+    assert_ne!(ed.focus, first);
+    std::thread::sleep(completion::DEBOUNCE * 2);
+    ed.poll_background();
+    assert!(!ed.lsp.completion.is_pending());
+    assert!(completion::visible(ed).is_none());
+    run(ed, "<esc>");
+}
+
+/// In a view too small to draw the popup, its keys do their usual work.
+fn completion_keys_pass_through_when_the_popup_cannot_be_drawn() {
+    let mut f = open_synced("compl-small", "fn main() {\n    co\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    ed.resize(Rect::new(0, 0, 7, 30));
+    assert!(completion::visible(ed).is_none());
+    run(ed, "<ret><esc>");
+    assert!(!ed.doc().text().to_string().contains("collections"));
+    assert_eq!(ed.doc().text().len_lines(), 5, "Enter made a new line");
 }

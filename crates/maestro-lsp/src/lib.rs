@@ -10,6 +10,7 @@
 //! `maestro_core::pos`.
 
 pub mod client;
+pub mod completion;
 pub mod convert;
 pub mod framing;
 pub mod jsonrpc;

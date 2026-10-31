@@ -899,7 +899,63 @@ impl Editor {
         }
         self.track_change(version_before, doc_before, mode_before);
         crate::lsp::reconcile(self);
+        crate::lsp::completion::after_key(self, key, mode_before, doc_before, version_before);
         self.ensure_cursor_visible();
+    }
+
+    /// True while `.` or a macro replays keys. Completion stays off then:
+    /// a replay must not depend on a server's answer.
+    pub(crate) fn is_replaying(&self) -> bool {
+        self.replaying || self.macro_depth > 0
+    }
+
+    /// Removes `key`, just pushed by [`Editor::handle_key`], from the keys
+    /// recorded for `.` and for a macro. The completion popup calls this for
+    /// the keys it uses (moving, accepting, closing), which mean nothing
+    /// without the popup.
+    pub(crate) fn forget_recorded_key(&mut self, key: KeyEvent) {
+        if let Some((_, keys)) = &mut self.recording
+            && keys.last() == Some(&key)
+        {
+            keys.pop();
+        }
+        if !self.replaying && self.in_insert_change && self.change_keys.last() == Some(&key) {
+            self.change_keys.pop();
+        }
+    }
+
+    /// Records an accepted completion for `.` and macros. `Some(keys)`:
+    /// keys that, typed, make the same edit; they stand in for the
+    /// completion. `None`: typing cannot reproduce it, so this insert
+    /// session is not repeatable with `.` and a macro being recorded stops
+    /// with a warning (replaying it would make a different edit).
+    pub(crate) fn record_completion(&mut self, keys: Option<Vec<KeyEvent>>) {
+        match keys {
+            Some(keys) => {
+                if let Some((_, rec)) = &mut self.recording {
+                    rec.extend_from_slice(&keys);
+                }
+                if !self.replaying && self.in_insert_change {
+                    self.change_keys.extend_from_slice(&keys);
+                }
+            }
+            None => {
+                if !self.replaying {
+                    self.in_insert_change = false;
+                    self.change_keys.clear();
+                    self.last_change.clear();
+                }
+                if let Some((reg, _)) = self.recording.take() {
+                    self.set_status(
+                        Severity::Warning,
+                        format!(
+                            "recording into register {reg} stopped: this completion \
+                             cannot be replayed as typed keys"
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn status_clear_on_key(&mut self, _key: KeyEvent) {
@@ -996,6 +1052,10 @@ impl Editor {
             return;
         }
         if self.mode == Mode::Insert {
+            // An open completion popup takes its keys first.
+            if self.pending.is_empty() && crate::lsp::completion::handle_key(self, key) {
+                return;
+            }
             self.dispatch_insert(key);
             return;
         }

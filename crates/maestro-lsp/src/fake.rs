@@ -14,12 +14,19 @@
 //!   document;
 //! * references: every whole-word occurrence;
 //! * hover: a markdown block naming the word;
-//! * a document containing `@slow` delays definition, references and hover
-//!   by [`SLOW_MS`]; one containing `@crash` makes the server exit with
+//! * completion: after `.`, two methods (`len`, `push`, the second a
+//!   snippet); elsewhere a fixed, complete list that covers each kind of
+//!   edit (see [`completion`]). In a document containing `@incomplete` the
+//!   list is marked incomplete, filtered here by the typed prefix, and has
+//!   an extra item `<prefix>Echo`, so a client must ask again as the
+//!   prefix grows;
+//! * a document containing `@slow` delays definition, references, hover
+//!   and completion by [`SLOW_MS`]; one containing `@crash` makes the server exit with
 //!   code 3 as soon as it sees it; `@orphan` makes it start a `sleep`
 //!   child that keeps stdout open and exit with code 4;
 //! * `fake/documentText` returns its copy of a document and any protocol
-//!   errors it noticed; `fake/stats` returns the notifications it received.
+//!   errors it noticed; `fake/stats` returns the notifications it received
+//!   and the completion requests it answered.
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
@@ -54,6 +61,8 @@ struct State {
     docs: HashMap<String, Doc>,
     errors: Vec<String>,
     received: Vec<Value>,
+    /// Completion requests, with their params.
+    requests: Vec<Value>,
 }
 
 fn serve() -> i32 {
@@ -186,7 +195,10 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
     let doc = st.docs.get(uri);
     if matches!(
         method,
-        "textDocument/definition" | "textDocument/references" | "textDocument/hover"
+        "textDocument/definition"
+            | "textDocument/references"
+            | "textDocument/hover"
+            | "textDocument/completion"
     ) && doc.is_some_and(|d| d.text.contains("@slow"))
     {
         std::thread::sleep(std::time::Duration::from_millis(SLOW_MS));
@@ -208,6 +220,7 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
                     "definitionProvider": true,
                     "referencesProvider": true,
                     "hoverProvider": true,
+                    "completionProvider": {"triggerCharacters": ["."]},
                 },
                 "serverInfo": {"name": "fake-lsp"},
             })
@@ -217,7 +230,15 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
             Some(d) => json!({"text": d.text, "version": d.version, "errors": st.errors}),
             None => json!({"text": null, "errors": st.errors}),
         },
-        "fake/stats" => json!({"received": st.received}),
+        "fake/stats" => json!({"received": st.received, "requests": st.requests}),
+        "textDocument/completion" => {
+            st.requests.push(params.clone());
+            let doc = st.docs.get(uri);
+            match doc.and_then(|d| Some((d, offset(&d.text, &params["position"])?))) {
+                Some((d, at)) => completion(&d.text, at),
+                None => Value::Null,
+            }
+        }
         "textDocument/definition" | "textDocument/references" | "textDocument/hover" => {
             let Some(doc) = doc else {
                 return Value::Null;
@@ -262,6 +283,63 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
         }
         _ => Value::Null,
     }
+}
+
+/// The completion list for a cursor at byte `at`. Ranges are computed
+/// here, in UTF-16, independently of the client.
+pub fn completion(text: &str, at: usize) -> Value {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_word(c))
+        .last()
+        .map_or(at, |(i, _)| i);
+    let end = text[at..]
+        .char_indices()
+        .find(|&(_, c)| !is_word(c))
+        .map_or(text.len(), |(i, _)| at + i);
+    let prefix = &text[start..at];
+    let range = |a: usize, b: usize| json!({"start": position(text, a), "end": position(text, b)});
+    let edit = |new: &str| json!({"range": range(start, at), "newText": new});
+    if text[..start].ends_with('.') {
+        return json!({"isIncomplete": false, "items": [
+            {"label": "len", "kind": 2, "detail": "fn(&self) -> usize", "textEdit": edit("len()")},
+            {"label": "push", "kind": 2, "detail": "fn(&mut self, value: T)",
+             "insertTextFormat": 2, "textEdit": edit("push(${1:value})")},
+        ]});
+    }
+    let mut items = vec![
+        json!({"label": "collections", "kind": 9, "detail": "std::collections", "sortText": "1",
+               "textEdit": edit("collections")}),
+        json!({"label": "column", "kind": 3, "detail": "fn() -> u32", "sortText": "2",
+               "textEdit": {"insert": range(start, at), "replace": range(start, end), "newText": "column"}}),
+        json!({"label": "Color", "kind": 22, "detail": "struct Color", "sortText": "3",
+               "insertText": "Color"}),
+        json!({"label": "col_label_only", "kind": 6, "sortText": "4"}),
+        json!({"label": "HashMap", "kind": 22, "detail": "std::collections::HashMap", "sortText": "5",
+               "textEdit": edit("HashMap"),
+               "additionalTextEdits": [{"range": range(0, 0), "newText": "use std::collections::HashMap;\n"}]}),
+        json!({"label": "configure", "kind": 3, "detail": "fn(value: u32, x: &str)", "sortText": "6",
+               "insertTextFormat": 2, "textEdit": edit("configure(${1:value}, ${2:\\$x})$0;")}),
+        json!({"label": "café_crème", "kind": 6, "detail": "café", "sortText": "7",
+               "textEdit": edit("café_crème")}),
+        json!({"label": "日本語", "kind": 21, "sortText": "8", "textEdit": edit("日本語")}),
+    ];
+    let incomplete = text.contains("@incomplete");
+    if incomplete {
+        let lower = prefix.to_lowercase();
+        items.retain(|i| {
+            i["label"]
+                .as_str()
+                .is_some_and(|l| l.to_lowercase().starts_with(&lower))
+        });
+        items.push(
+            json!({"label": format!("{prefix}Echo"), "kind": 1, "sortText": "0",
+                          "textEdit": edit(&format!("{prefix}Echo"))}),
+        );
+    }
+    json!({"isIncomplete": incomplete, "items": items})
 }
 
 fn is_word_byte(b: u8) -> bool {

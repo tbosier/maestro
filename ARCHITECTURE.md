@@ -63,6 +63,8 @@ The terminal front end draws each frame into an off-screen grid (`Surface`) and 
 
 Every text-change path in the editor calls `lsp::document_changed`, which maps stored diagnostics through the change and sends an incremental `didChange` built from the change set in old-document coordinates. `lsp::reconcile` runs after each key, on open and on tick: it opens and closes documents on servers to match the buffers, and resends full text for any document whose version moved without the hook. Positions are UTF-16 through `maestro_core::pos`.
 
+Completion (`lsp/completion.rs`) hooks into the same paths: the open popup takes its keys before the insert keymap, `document_changed` maps the popup's char ranges through each edit, and a hook after each key refilters the popup or starts a request. Its reply guard is stricter than the one above: the version, every cursor, the focused view and insert mode must all be unchanged.
+
 ## Persistence
 
 - Files: `maestro_core::io::save` (atomic rename, fsync of file and directory).

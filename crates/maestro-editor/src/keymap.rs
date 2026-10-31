@@ -425,6 +425,9 @@ impl Keymaps {
         ] {
             b(&mut insert, k, c);
         }
+        for (k, c) in crate::lsp_commands::INSERT_KEYS {
+            b(&mut insert, k, c);
+        }
 
         Self {
             normal,
@@ -463,6 +466,30 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `C-x` asks for completions in insert mode in both profiles, and the
+    /// keys the open popup takes (`C-n`, `C-p`) are not bound to anything
+    /// else there.
+    #[test]
+    fn insert_completion_keys_do_not_clash() {
+        for profile in [Profile::Maestro, Profile::Vim] {
+            let maps = Keymaps::defaults(profile);
+            let key = |s: &str| parse_sequence(s).unwrap();
+            assert_eq!(
+                maps.lookup(Mode::Insert, &key("C-x")),
+                Lookup::Command("completion".into())
+            );
+            let bound: Vec<String> = maps
+                .bindings(Mode::Insert)
+                .into_iter()
+                .filter(|(_, c)| c == "completion")
+                .map(|(k, _)| k)
+                .collect();
+            assert_eq!(bound.len(), 1, "{bound:?}");
+            assert_eq!(maps.lookup(Mode::Insert, &key("C-n")), Lookup::None);
+            assert_eq!(maps.lookup(Mode::Insert, &key("C-p")), Lookup::None);
         }
     }
 

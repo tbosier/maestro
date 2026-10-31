@@ -20,13 +20,13 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. Age
 - UTF-8, UTF-8 with BOM, and UTF-16 files with a BOM. LF and CRLF are preserved. Binary files and invalid UTF-8 open read-only.
 - The Duskfox theme from nightfox.nvim, with every interface text pair checked for WCAG AA contrast by a test.
 
-- Language servers (rust-analyzer, pyright or pylsp, typescript-language-server, clangd when installed): diagnostics in the gutter and status line, `]d`/`[d`, `gd`, `gr` and hover on `space k`. No completion yet.
+- Language servers (rust-analyzer, pyright or pylsp, typescript-language-server, clangd when installed): diagnostics in the gutter and status line, `]d`/`[d`, `gd`, `gr`, hover on `space k`, and completion in insert mode: a popup opens after a trigger character, after a short pause in typing an identifier, or on `C-x`, and narrows as you type. Snippets go in as plain text. No signature help, code actions, rename or formatting yet.
 - Git: `+`, `~` and `-` signs in the gutter, the branch in the status line, and `:git-status` and `:worktrees` pickers.
 - An automation API for agents and scripts: `maestro --headless` (JSON-RPC on stdio) or `--listen <socket>` alongside the interactive editor, with version-checked edits. See [docs/automation.md](docs/automation.md).
 
 - Tree-sitter syntax highlighting for Rust, Python, TOML, JSON, Markdown, JavaScript, TypeScript and C, and structural selection: `A-o` grows the selection to the enclosing syntax node, `A-i` shrinks it, `A-n`/`A-p` move between siblings.
 
-Not built yet: completion and the agent features (M2). Those are tracked in the roadmap.
+Not built yet: the agent features (M2). Those are tracked in the roadmap.
 
 ## Build and run
 
@@ -60,6 +60,8 @@ cargo build --release
 | `.` | repeat the last change |
 | `gg G` / `3G` / `:42` | go to the start, end, or a line |
 | `space f` / `space /` / `space r` | find a file / search the workspace / recent files |
+| `C-x` (insert mode) | ask the language server for completions |
+| `C-n` `C-p`, Tab or Enter, Escape | in the completion popup: move, accept, close |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
 

@@ -18,6 +18,8 @@
 //!   as needed, and resends the full text of any document whose version
 //!   moved without a `document_changed` call (a safety net, not the normal
 //!   path).
+//!
+//! Completion in insert mode lives in [`completion`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +32,8 @@ use maestro_lsp::{Client, Event, Reply, RequestId, RpcError, StartOptions, Value
 
 use crate::editor::{DocumentId, Editor, JobSender, Severity};
 use crate::picker::{Picker, PickerAction, PickerItem};
+
+pub mod completion;
 
 /// How long a request may take before the editor gives up on it.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -255,6 +259,8 @@ pub struct Lsp {
     /// stopped until `:lsp-restart`, so a broken server cannot loop.
     stopped: HashSet<(String, PathBuf)>,
     pub hover: Option<HoverPopup>,
+    /// The completion popup and its request.
+    pub completion: completion::Completion,
     /// The log of each server that stopped, kept so `:lsp-log` can show
     /// why. One entry per server name, the latest stop.
     stopped_logs: BTreeMap<String, Vec<String>>,
@@ -359,6 +365,7 @@ pub fn document_changed(ed: &mut Editor, doc: DocumentId, changes: &[ChangeSet])
     if ed.lsp.hover.as_ref().is_some_and(|h| h.doc == doc) {
         ed.lsp.hover = None;
     }
+    completion::document_changed(ed, doc, changes);
     let Some(buf) = ed.buffers.get(&doc) else {
         return;
     };
@@ -429,9 +436,11 @@ pub fn document_saved(ed: &mut Editor, doc: DocumentId) {
     }
 }
 
-/// Hook at the start of each key: the hover popup closes.
+/// Hook at the start of each key: the hover popup closes and a pending
+/// completion debounce is superseded.
 pub fn on_key(ed: &mut Editor) {
     ed.lsp.hover = None;
+    completion::on_key(ed);
 }
 
 /// Matches open documents on servers to the buffer list. Cheap when
@@ -676,6 +685,7 @@ fn stop_server(ed: &mut Editor, id: ServerId, why: &str) {
         ed.lsp.diagnostics.remove(&d);
     }
     ed.lsp.pending.retain(|_, p| p.server != id);
+    completion::server_stopped(ed, id);
     ed.set_status(
         Severity::Warning,
         format!(
@@ -1213,6 +1223,7 @@ pub fn restart(ed: &mut Editor) {
     ed.lsp.diagnostics.clear();
     ed.lsp.pending.clear();
     ed.lsp.hover = None;
+    completion::close(ed);
     ed.lsp.missing.clear();
     ed.lsp.stopped.clear();
     if !ed.lsp.enabled {
