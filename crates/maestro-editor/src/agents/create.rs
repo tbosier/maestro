@@ -31,6 +31,7 @@ pub fn create(ed: &mut Editor, new: NewAgent) -> AgentId {
     };
     let mut agent = Agent::new(id, new.task.clone(), group, new.provider);
     agent.log("creating a worktree");
+    agent.git_busy = Some(super::CREATING);
     ed.agents.agents.push(agent);
     ed.agents.panel.selected = ed.agents.agents.len() - 1;
 
@@ -55,6 +56,7 @@ pub fn create(ed: &mut Editor, new: NewAgent) -> AgentId {
 
 fn fail(ed: &mut Editor, id: AgentId, msg: String) {
     if let Some(a) = ed.agents.get_mut(id) {
+        a.git_busy = None;
         a.log(msg.clone());
         a.errors.push(msg.clone());
         a.set_status(Status::Failed);
@@ -151,6 +153,9 @@ pub fn worktree_root(main_root: &Path, setting: Option<&str>) -> PathBuf {
 }
 
 fn on_worktree(ed: &mut Editor, id: AgentId, result: Result<WorktreeInfo, String>) {
+    if let Some(a) = ed.agents.get_mut(id) {
+        a.git_busy = None;
+    }
     match result {
         Ok(info) => {
             let Some(a) = ed.agents.get_mut(id) else {
@@ -163,6 +168,10 @@ fn on_worktree(ed: &mut Editor, id: AgentId, result: Result<WorktreeInfo, String
                 short(&info.base)
             ));
             a.worktree = Some(info);
+            if a.base_status().is_decided() {
+                a.log("rejected before it started; not launched");
+                return;
+            }
             launch(ed, id);
         }
         Err(e) => fail(ed, id, e),

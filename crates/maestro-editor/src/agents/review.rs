@@ -283,9 +283,14 @@ pub fn request(ed: &mut Editor, id: AgentId) {
     a.review.running = true;
     a.review.again = false;
     let spawned = ed.spawn_background("agent-review", move |tx| {
+        // Discovery climbs to a parent repository when the worktree
+        // directory is gone; only the worktree itself counts.
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
         let result = match git.discover(&w.path) {
-            Ok(Some(repo)) => repo.review_diff(&w.base).map_err(|e| e.to_string()),
-            Ok(None) => Err(format!("{} is no longer a worktree", w.path.display())),
+            Ok(Some(repo)) if canon(repo.root()) == canon(&w.path) => {
+                repo.review_diff(&w.base).map_err(|e| e.to_string())
+            }
+            Ok(_) => Err(format!("{} is no longer a worktree", w.path.display())),
             Err(e) => Err(e.to_string()),
         };
         tx.send(move |ed| applied(ed, id, result));
@@ -497,6 +502,24 @@ fn open_at_cursor(ed: &mut Editor, v: &ReviewView, rows: &[Row]) {
         return;
     };
     let path: PathBuf = w.path.join(rel);
+    // The agent controls this file. A FIFO or device (directly or through
+    // a symlink) could block the editor thread or never end, so only a
+    // regular file is opened. A swap in the instant before the open is
+    // not caught.
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            ed.error(format!(
+                "{} is not a regular file; not opened",
+                path.display()
+            ));
+            return;
+        }
+        Err(e) => {
+            ed.error(format!("{}: {e}", path.display()));
+            return;
+        }
+    }
     let line = rows
         .get(v.cursor)
         .and_then(Row::target_line)

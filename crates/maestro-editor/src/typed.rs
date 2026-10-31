@@ -421,6 +421,15 @@ fn quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
             modified.join(", ")
         ));
     }
+    // Git work for an agent (a worktree being made, an integration, an
+    // archive) must not be cut off half done, even with `!`.
+    let busy = ed.agents.git_busy();
+    if !busy.is_empty() {
+        return Err(format!(
+            "wait: Git work is running for {}; quitting now could leave it half done",
+            busy.join(", ")
+        ));
+    }
     // Running agents are asked about even with `!`, which only discards
     // unsaved buffers.
     let running = ed.agents.running().len();

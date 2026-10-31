@@ -8,7 +8,8 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use maestro_git::{Head, IntegrateError, Integration, RemoveError, RemoveRefusal};
 use maestro_tasks::TaskEvent;
@@ -87,8 +88,31 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
         cwd: root,
     };
     let shown = cmd.join(" ");
-    let started = maestro_tasks::start(&spec, move |event| {
-        tx.send(move |ed| on_test_event(ed, id, event));
+    // Lines collect here and one job drains them, so a chatty test run
+    // cannot queue unbounded jobs: the buffer keeps at most
+    // MAX_TEST_LINES lines and counts the rest as dropped.
+    let buffer: Arc<Mutex<OutputBuffer>> = Default::default();
+    let started = maestro_tasks::start(&spec, move |event| match event {
+        TaskEvent::Output(line) => {
+            let mut b = buffer.lock().unwrap_or_else(|e| e.into_inner());
+            b.lines.push_back(line);
+            if b.lines.len() > super::MAX_TEST_LINES {
+                b.lines.pop_front();
+                b.dropped += 1;
+            }
+            if !b.scheduled {
+                b.scheduled = true;
+                let buffer = buffer.clone();
+                tx.send(move |ed| drain_output(ed, id, &buffer));
+            }
+        }
+        finished => {
+            let buffer = buffer.clone();
+            tx.send(move |ed| {
+                drain_output(ed, id, &buffer);
+                on_test_event(ed, id, finished);
+            });
+        }
     });
     let Some(a) = ed.agents.get_mut(id) else {
         return;
@@ -116,6 +140,38 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
     }
 }
 
+/// Test output waiting for the editor thread.
+#[derive(Default)]
+struct OutputBuffer {
+    lines: VecDeque<String>,
+    dropped: usize,
+    /// A job to drain the buffer is queued.
+    scheduled: bool,
+}
+
+fn drain_output(ed: &mut Editor, id: AgentId, buffer: &Mutex<OutputBuffer>) {
+    let (lines, dropped) = {
+        let mut b = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        b.scheduled = false;
+        (std::mem::take(&mut b.lines), std::mem::take(&mut b.dropped))
+    };
+    let Some(run) = ed.agents.get_mut(id).and_then(|a| a.tests.last_mut()) else {
+        return;
+    };
+    run.dropped += dropped;
+    for line in lines {
+        on_line(run, line);
+    }
+}
+
+fn on_line(run: &mut TestRun, line: String) {
+    run.output.push_back(line);
+    if run.output.len() > super::MAX_TEST_LINES {
+        run.output.pop_front();
+        run.dropped += 1;
+    }
+}
+
 fn on_test_event(ed: &mut Editor, id: AgentId, event: TaskEvent) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
@@ -124,13 +180,7 @@ fn on_test_event(ed: &mut Editor, id: AgentId, event: TaskEvent) {
         return;
     };
     match event {
-        TaskEvent::Output(line) => {
-            run.output.push_back(line);
-            if run.output.len() > super::MAX_TEST_LINES {
-                run.output.pop_front();
-                run.dropped += 1;
-            }
-        }
+        TaskEvent::Output(line) => on_line(run, line),
         TaskEvent::Finished { code, duration } => {
             let text: Vec<&str> = run.output.iter().map(String::as_str).collect();
             let summary = maestro_tasks::parse_cargo_test(&text.join("\n"));
@@ -262,7 +312,11 @@ pub fn send_feedback(ed: &mut Editor, id: AgentId, text: &str) {
 
 /// `p`: lists the choices of the pending permission request.
 pub fn choose_permission(ed: &mut Editor, id: AgentId) {
-    let Some(req) = ed.agents.get(id).and_then(|a| a.permission.clone()) else {
+    let Some(req) = ed
+        .agents
+        .get(id)
+        .and_then(|a| a.permissions.first().cloned())
+    else {
         ed.error("no permission request is pending for this agent");
         return;
     };
@@ -281,7 +335,11 @@ pub fn choose_permission(ed: &mut Editor, id: AgentId) {
 
 /// A choice was picked. Granting asks first; refusing is sent at once.
 pub fn permission_chosen(ed: &mut Editor, id: AgentId, index: usize) {
-    let Some(req) = ed.agents.get(id).and_then(|a| a.permission.clone()) else {
+    let Some(req) = ed
+        .agents
+        .get(id)
+        .and_then(|a| a.permissions.first().cloned())
+    else {
         ed.error("the permission request is no longer pending");
         return;
     };
@@ -326,8 +384,9 @@ pub fn answer_permission(
         return;
     };
     let label = a
-        .permission
-        .as_ref()
+        .permissions
+        .iter()
+        .find(|p| p.request_id == request_id)
         .and_then(|p| p.options.iter().find(|o| o.id == option))
         .map(|o| o.label.clone())
         .unwrap_or_else(|| option.to_string());
@@ -335,10 +394,11 @@ pub fn answer_permission(
         ed.error("the agent is not running");
         return;
     };
-    match client.answer_permission(request_id, Some(option)) {
+    match client.answer_permission(request_id.clone(), Some(option)) {
         Ok(()) => {
-            a.permission = None;
-            if a.turn_running {
+            a.permissions.retain(|p| p.request_id != request_id);
+            // Still awaiting approval while other requests wait.
+            if a.turn_running && a.permissions.is_empty() {
                 a.set_status(Status::Working);
             }
             a.log(format!("permission answered: {label}"));
@@ -349,6 +409,12 @@ pub fn answer_permission(
 }
 
 // ----- reject and archive --------------------------------------------------
+
+/// Why an action cannot run while Git work for the agent is in flight.
+fn busy(a: &super::Agent) -> Option<String> {
+    a.git_busy
+        .map(|what| format!("{} is busy ({what}); wait for it to finish", a.name))
+}
 
 /// `X`: asks before rejecting.
 pub fn confirm_reject(ed: &mut Editor, id: AgentId) {
@@ -361,6 +427,12 @@ pub fn confirm_reject(ed: &mut Editor, id: AgentId) {
     }
     if a.base_status() == Status::Integrated {
         ed.error("the agent's work is already integrated; rejecting it now changes nothing");
+        return;
+    }
+    // Rejecting while the worktree is still being made is allowed: the
+    // agent is then never launched.
+    if let Some(why) = busy(a).filter(|_| a.git_busy != Some(super::CREATING)) {
+        ed.error(why);
         return;
     }
     let mut lines = vec![];
@@ -380,12 +452,16 @@ pub fn confirm_reject(ed: &mut Editor, id: AgentId) {
                 w.branch
             ));
             lines.push(
-                "a also removes the worktree; if it holds files, you are asked again first.".into(),
+                "a also removes the worktree. Ignored files in it (build output, .env) are deleted without asking; if it holds uncommitted or untracked files, you are asked again first."
+                    .into(),
             );
         }
-        None => lines.push("It has no worktree.".into()),
+        None => lines.push("Its worktree is still being made; the agent will not start.".into()),
     }
-    lines.push("Nothing reaches the main worktree either way.".into());
+    lines.push(
+        "Maestro copies nothing into the main worktree. It cannot undo what the agent's own tools wrote outside its worktree."
+            .into(),
+    );
     ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
         title: format!("reject {}", a.name),
         lines,
@@ -404,15 +480,22 @@ pub fn reject(ed: &mut Editor, id: AgentId, then_archive: bool) {
     };
     a.stop();
     a.decide(Status::Rejected);
-    a.permission = None;
+    a.permissions.clear();
     a.log("rejected by the user");
     let name = a.name.clone();
+    let has_worktree = a.worktree.is_some();
     if ed.agents.panel.terminal_focus == Some(id) {
         ed.agents.panel.terminal_focus = None;
     }
     ed.info(format!("rejected {name}"));
     if then_archive {
-        archive(ed, id, false);
+        if has_worktree {
+            archive(ed, id, false);
+        } else {
+            ed.info(format!(
+                "rejected {name}; its worktree is still being made, archive it with A once it exists"
+            ));
+        }
     }
 }
 
@@ -429,17 +512,25 @@ pub fn confirm_archive(ed: &mut Editor, id: AgentId) {
         ed.error("the worktree is already archived");
         return;
     }
+    if let Some(why) = busy(a) {
+        ed.error(why);
+        return;
+    }
     let mut lines = vec![];
     if a.is_running() || a.tests_running() {
         lines.push(format!("Stops {} first.", a.name));
     }
     lines.push(format!("Removes the worktree {}.", w.path.display()));
     lines.push(format!(
-        "Keeps the branch {}, so its commits stay reachable.",
+        "Keeps the branch {}, so commits on it stay reachable.",
         w.branch
     ));
     lines.push(
-        "Refused if the worktree has uncommitted or untracked files; you are asked again before anything is forced."
+        "Ignored files in it (build output, .env) are deleted without asking, as git worktree remove does."
+            .into(),
+    );
+    lines.push(
+        "Refused if the worktree has uncommitted or untracked files, or commits on no branch; you are asked again before anything is forced."
             .into(),
     );
     ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
@@ -453,21 +544,21 @@ pub fn confirm_archive(ed: &mut Editor, id: AgentId) {
     }));
 }
 
+/// The outcome of a removal attempt.
+struct Removal {
+    result: Result<(), RemoveError>,
+    /// The branch the worktree had checked out when it was checked.
+    branch_now: Option<String>,
+}
+
 /// Removes the agent's worktree on a background thread. Without `force`,
 /// work in it makes `maestro-git` refuse, and the user is asked again with
 /// a list of what forcing would delete.
 pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
     let git = ed.git.git().clone();
-    let Some(a) = ed.agents.get_mut(id) else {
+    let Some(w) = ed.agents.get(id).and_then(|a| a.worktree.clone()) else {
         return;
     };
-    let Some(w) = a.worktree.clone() else {
-        return;
-    };
-    if a.is_running() || a.tests_running() {
-        a.stop();
-        a.log("stopped before archiving");
-    }
     let unsaved = unsaved_under(ed, &w.path);
     if !unsaved.is_empty() {
         ed.error(format!(
@@ -476,29 +567,80 @@ pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
         ));
         return;
     }
+    let Some(a) = ed.agents.get_mut(id) else {
+        return;
+    };
+    if a.is_running() || a.tests_running() {
+        a.stop();
+        a.log("stopped before archiving");
+    }
+    // A terminal program gets SIGHUP and, 200 ms later, SIGKILL on another
+    // thread; removal waits until it is gone.
+    let terminal = a.runtime.terminal().cloned();
+    a.git_busy = Some("archiving");
     let spawned = ed.spawn_background("agent-archive", move |tx| {
-        let result = match git.discover(&w.main_root) {
-            Ok(Some(repo)) => repo.remove_worktree(&w.path, force),
-            Ok(None) => Err(RemoveError::Git(maestro_git::GitError::NotARepository(
-                w.main_root.clone(),
-            ))),
-            Err(e) => Err(RemoveError::Git(e)),
-        };
-        tx.send(move |ed| archived(ed, id, force, result));
+        let removal = (|| {
+            if let Some(t) = terminal {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while t.exit_status().is_none() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if t.exit_status().is_none() {
+                    return Removal {
+                        result: Err(RemoveError::Git(maestro_git::GitError::InvalidArgument(
+                            "the agent's program is still running after being stopped".into(),
+                        ))),
+                        branch_now: None,
+                    };
+                }
+            }
+            let repo = match git.discover(&w.main_root) {
+                Ok(Some(repo)) => repo,
+                Ok(None) => {
+                    return Removal {
+                        result: Err(RemoveError::Git(maestro_git::GitError::NotARepository(
+                            w.main_root.clone(),
+                        ))),
+                        branch_now: None,
+                    };
+                }
+                Err(e) => {
+                    return Removal {
+                        result: Err(RemoveError::Git(e)),
+                        branch_now: None,
+                    };
+                }
+            };
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let branch_now = repo.worktrees().ok().and_then(|list| {
+                list.into_iter()
+                    .find(|x| canon(&x.path) == canon(&w.path))
+                    .and_then(|x| x.branch)
+            });
+            Removal {
+                result: repo.remove_worktree(&w.path, force),
+                branch_now,
+            }
+        })();
+        tx.send(move |ed| archived(ed, id, force, removal));
     });
     if let Err(e) = spawned {
+        if let Some(a) = ed.agents.get_mut(id) {
+            a.git_busy = None;
+        }
         ed.error(format!("could not start archiving: {e}"));
     }
 }
 
-fn archived(ed: &mut Editor, id: AgentId, forced: bool, result: Result<(), RemoveError>) {
+fn archived(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
+    a.git_busy = None;
     let Some(w) = a.worktree.clone() else {
         return;
     };
-    match result {
+    match removal.result {
         Ok(()) => {
             a.archived = true;
             a.review = Default::default();
@@ -537,6 +679,7 @@ fn archived(ed: &mut Editor, id: AgentId, forced: bool, result: Result<(), Remov
                 "The worktree {} still holds work. Forcing deletes:",
                 w.path.display()
             )];
+            let mut kept = Vec::new();
             for r in &reasons {
                 match r {
                     RemoveRefusal::Uncommitted(p) => lines.push(format!(
@@ -549,18 +692,21 @@ fn archived(ed: &mut Editor, id: AgentId, forced: bool, result: Result<(), Remov
                         p.len(),
                         list_paths(p)
                     )),
+                    // The branch survives removal, so commits on it do too.
+                    // Commits on a detached HEAD do not.
+                    RemoveRefusal::Unpushed { count, .. } => match &removal.branch_now {
+                        Some(b) => kept.push(format!(
+                            "Not deleted: {count} commit(s) only on branch {b}, which is kept."
+                        )),
+                        None => lines.push(format!(
+                            "  {count} commit(s) on no branch (the worktree is detached); they become unreachable"
+                        )),
+                    },
                     _ => {}
                 }
             }
-            lines.push("  ignored files in it (build output) too".into());
-            for r in &reasons {
-                if let RemoveRefusal::Unpushed { count, .. } = r {
-                    lines.push(format!(
-                        "Not lost: {count} commit(s) only on branch {}, which is kept.",
-                        w.branch
-                    ));
-                }
-            }
+            lines.push("  ignored files in it (build output, .env)".into());
+            lines.extend(kept);
             a.log("archive refused: the worktree holds work");
             ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
                 title: "force archive".into(),
@@ -588,12 +734,89 @@ pub struct IntegrateFacts {
     pub branch: String,
     pub worktree: PathBuf,
     pub main_root: PathBuf,
+    /// The commit the agent's branch started from.
+    pub base: String,
     /// The main worktree's checked-out branch.
     pub target: String,
-    /// Uncommitted or untracked files in the agent's worktree.
+    /// Uncommitted or untracked files in the agent's worktree when checked.
     pub uncommitted: Vec<PathBuf>,
     pub message: String,
     pub agent_running: bool,
+}
+
+/// The repository whose root is exactly `path`. Discovery alone would
+/// climb to a parent repository when the worktree directory is gone.
+fn open_exact(git: &maestro_git::Git, path: &Path) -> Result<maestro_git::Repository, String> {
+    let gone = || format!("{} is no longer a worktree", path.display());
+    let repo = git
+        .discover(path)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(gone)?;
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(repo.root()) != canon(path) {
+        return Err(gone());
+    }
+    Ok(repo)
+}
+
+/// Everything integration needs to hold before anything is committed:
+/// both worktrees exist and are on the expected branches, the main
+/// worktree is clean, and the agent's base commit is on the target branch
+/// (so integrating brings only what the review showed, plus later commits
+/// on the agent's branch). Returns the agent's and the main repositories.
+fn check_before_commit(
+    git: &maestro_git::Git,
+    f: &IntegrateFacts,
+) -> Result<(maestro_git::Repository, maestro_git::Repository), String> {
+    let wt = open_exact(git, &f.worktree)?;
+    match wt.head().map_err(|e| e.to_string())? {
+        Head::Branch(b) if b == f.branch => {}
+        other => {
+            return Err(format!(
+                "the agent's worktree is on {}, not {}",
+                other.label(),
+                f.branch
+            ));
+        }
+    }
+    let main = open_exact(git, &f.main_root)?;
+    match main.head().map_err(|e| e.to_string())? {
+        Head::Branch(b) if b == f.target => {}
+        Head::Detached(_) => {
+            return Err("the main worktree is not on a branch (detached HEAD)".into());
+        }
+        other => {
+            return Err(format!(
+                "the main worktree is now on {}, not {}",
+                other.label(),
+                f.target
+            ));
+        }
+    }
+    let dirty: Vec<PathBuf> = main
+        .status()
+        .map_err(|e| e.to_string())?
+        .uncommitted()
+        .map(|e| e.path.clone())
+        .collect();
+    if !dirty.is_empty() {
+        return Err(format!(
+            "the main worktree has uncommitted changes in {}; commit or stash them first",
+            list_paths(&dirty)
+        ));
+    }
+    if !main
+        .can_fast_forward(&f.base, "HEAD")
+        .map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "the agent started from {}, which is not on {}; integrating would also bring in \
+             the commits between them, which the review does not show",
+            super::create::short(&f.base),
+            f.target
+        ));
+    }
+    Ok((wt, main))
 }
 
 /// `I`: checks what integration would do on a background thread, then
@@ -616,6 +839,10 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
         ed.error("the agent was rejected; its work is not integrated");
         return;
     }
+    if let Some(why) = busy(a) {
+        ed.error(why);
+        return;
+    }
     if let Some(msg) = unsaved_block(ed, &w) {
         ed.error(msg);
         return;
@@ -631,45 +858,29 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
     let agent_running = a.is_running();
     let spawned = ed.spawn_background("agent-integrate-check", move |tx| {
         let facts = (|| -> Result<IntegrateFacts, String> {
-            let main = git
-                .discover(&w.main_root)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("{} is not a repository", w.main_root.display()))?;
+            let main = open_exact(&git, &w.main_root)?;
             let Head::Branch(target) = main.head().map_err(|e| e.to_string())? else {
                 return Err("the main worktree is not on a branch (detached HEAD)".into());
             };
-            let dirty: Vec<PathBuf> = main
-                .status()
-                .map_err(|e| e.to_string())?
-                .uncommitted()
-                .map(|e| e.path.clone())
-                .collect();
-            if !dirty.is_empty() {
-                return Err(format!(
-                    "the main worktree has uncommitted changes in {}; commit or stash them first",
-                    list_paths(&dirty)
-                ));
-            }
-            let wt = git
-                .discover(&w.path)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("{} is no longer a worktree", w.path.display()))?;
-            let st = wt.status().map_err(|e| e.to_string())?;
-            let uncommitted: Vec<PathBuf> = st
-                .uncommitted()
-                .chain(st.untracked())
-                .map(|e| e.path.clone())
-                .collect();
-            Ok(IntegrateFacts {
+            let mut facts = IntegrateFacts {
                 name,
                 branch: w.branch.clone(),
                 worktree: w.path.clone(),
                 main_root: w.main_root.clone(),
+                base: w.base.clone(),
                 target,
-                uncommitted,
+                uncommitted: Vec::new(),
                 message,
                 agent_running,
-            })
+            };
+            let (wt, _) = check_before_commit(&git, &facts)?;
+            let st = wt.status().map_err(|e| e.to_string())?;
+            facts.uncommitted = st
+                .uncommitted()
+                .chain(st.untracked())
+                .map(|e| e.path.clone())
+                .collect();
+            Ok(facts)
         })();
         tx.send(move |ed| match facts {
             Ok(f) => {
@@ -715,15 +926,18 @@ fn how_label(how: Integration) -> &'static str {
 
 pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts) -> Confirm {
     let mut lines = vec![];
+    let subject = facts.message.lines().next().unwrap_or_default();
     if facts.uncommitted.is_empty() {
-        lines.push("1. The agent's worktree has no uncommitted work; nothing is committed.".into());
+        lines.push(format!(
+            "1. The agent's worktree had nothing uncommitted when checked; anything new by then is committed to {} as \"{subject}\".",
+            facts.branch
+        ));
     } else {
         lines.push(format!(
-            "1. Commit {} file(s) in {} to branch {} as \"{}\".",
-            facts.uncommitted.len(),
+            "1. Commit all uncommitted and untracked files in {} ({} when checked) to branch {} as \"{subject}\".",
             facts.worktree.display(),
+            facts.uncommitted.len(),
             facts.branch,
-            facts.message.lines().next().unwrap_or_default()
         ));
     }
     let step = match how {
@@ -745,7 +959,14 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
         "   in the main worktree {}.",
         facts.main_root.display()
     ));
-    lines.push("Git checks again first and refuses on uncommitted changes or conflicts.".into());
+    lines.push(
+        "Before step 1 Maestro checks both branches and the main worktree again, and stops on a change. Git then refuses on conflicts."
+            .into(),
+    );
+    lines.push(
+        "Like git merge, this can overwrite ignored files in the main worktree that the agent's branch adds as tracked files."
+            .into(),
+    );
     if facts.agent_running {
         lines.push(
             "The agent is still running: what it changes after the commit is left out.".into(),
@@ -767,18 +988,31 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
 /// background thread.
 pub fn integrate(ed: &mut Editor, id: AgentId, how: Integration, facts: IntegrateFacts) {
     let git = ed.git.git().clone();
-    let Some(w) = ed.agents.get(id).and_then(|a| a.worktree.clone()) else {
+    let Some(a) = ed.agents.get(id) else {
         return;
     };
+    let Some(w) = a.worktree.clone() else {
+        return;
+    };
+    if let Some(why) = busy(a) {
+        ed.error(why);
+        return;
+    }
     if let Some(msg) = unsaved_block(ed, &w) {
         ed.error(msg);
         return;
+    }
+    if let Some(a) = ed.agents.get_mut(id) {
+        a.git_busy = Some("integrating");
     }
     let spawned = ed.spawn_background("agent-integrate", move |tx| {
         let result = run_integration(&git, &facts, how);
         tx.send(move |ed| integrated(ed, id, how, result));
     });
     if let Err(e) = spawned {
+        if let Some(a) = ed.agents.get_mut(id) {
+            a.git_busy = None;
+        }
         ed.error(format!("could not start integrating: {e}"));
     }
 }
@@ -798,14 +1032,10 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
         target: f.target.clone(),
         outcome: Err(String::new()),
     };
-    let wt = match git.discover(&f.worktree) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            out.outcome = Err(format!("{} is no longer a worktree", f.worktree.display()));
-            return out;
-        }
+    let (wt, main) = match check_before_commit(git, f) {
+        Ok(r) => r,
         Err(e) => {
-            out.outcome = Err(e.to_string());
+            out.outcome = Err(format!("{e}; nothing changed"));
             return out;
         }
     };
@@ -823,17 +1053,6 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             return out;
         }
     }
-    let main = match git.discover(&f.main_root) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            out.outcome = Err(format!("{} is not a repository", f.main_root.display()));
-            return out;
-        }
-        Err(e) => {
-            out.outcome = Err(e.to_string());
-            return out;
-        }
-    };
     out.outcome = main
         .integrate(&f.branch, how)
         .map_err(|e| integrate_words(&e, &f.target));
@@ -869,9 +1088,9 @@ pub fn integrate_words(e: &IntegrateError, target: &str) -> String {
             "the agent's branch has {} merge commit(s); choose merge instead",
             c.len()
         ),
-        IntegrateError::Git(g) => format!(
-            "git failed ({g}); what it started was aborted and the main worktree is back where it was"
-        ),
+        IntegrateError::Git(g) => {
+            format!("git failed ({g}); check the main worktree with git status before going on")
+        }
         IntegrateError::AbortFailed { cause, detail } => format!(
             "git failed ({cause}) and the main worktree could not be put back: {detail}. \
              Look at it with git status before doing anything else"
@@ -887,6 +1106,7 @@ fn integrated(ed: &mut Editor, id: AgentId, how: Integration, r: Integrated) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
+    a.git_busy = None;
     if let Some(c) = &r.committed {
         a.log(format!(
             "committed the worktree's work as {}",

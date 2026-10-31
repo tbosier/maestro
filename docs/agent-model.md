@@ -65,11 +65,12 @@ Terminal agents have no structured status. The panel says so ("terminal only") n
 
 - Tests (`t`): runs `[agents] test-command`, or `cargo test` when the worktree has a `Cargo.toml`, with `maestro-tasks`. Output streams into the tests view; the totals are parsed from `cargo test` output.
 - Feedback (`f`): unsent comments plus typed text. An ACP agent gets them as a new prompt (refused while a turn is running). A terminal agent gets them typed into its terminal, and the input box says that is all Maestro can do.
-- Permission (`p`): lists the agent's choices. Choices that allow something ask for confirmation first; rejecting is sent at once.
-- Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree.
-- Archive (`A`): removes the worktree with `remove_worktree`, keeping the branch. If the worktree has uncommitted or untracked files, the removal is refused and a second dialog lists what forcing would delete; only `F` there forces it.
-- Integrate (`I`): checks the main worktree first and refuses, changing nothing, if it is detached or has uncommitted changes, or if any open buffer in either worktree has unsaved edits. The dialog says what will be committed and how the branch will be integrated (`tab` cycles merge, fast-forward and cherry-pick). On `y`, uncommitted work in the agent's worktree is committed with the task's first line as the subject, then `integrate` runs in the main worktree. `maestro-git` checks everything again and refuses on its own.
-- Quitting with agents or tests running asks first and stops them on `y`. Dropping the editor (any other way of exiting) also stops them.
+- Permission (`p`): lists the choices of the oldest unanswered request (requests queue; the transcript says how many more wait). Choices that allow something ask for confirmation first; rejecting is sent at once.
+- Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree. Rejecting while the worktree is still being made means the agent is never launched.
+- Archive (`A`): removes the worktree with `remove_worktree`, keeping the branch, after the agent's program has exited. Ignored files in it are deleted without a second question, and the dialog says so. If the worktree has uncommitted or untracked files, or commits on no branch, the removal is refused and a second dialog lists what forcing would delete; only `F` there forces it.
+- Integrate (`I`): checks first and refuses, changing nothing, if either worktree is gone or on another branch, the main worktree is detached or has uncommitted changes, the agent's starting commit is not on the main worktree's branch, or an open buffer in either worktree has unsaved edits. The dialog says what will be committed and how the branch will be integrated (`tab` cycles merge, fast-forward and cherry-pick). On `y`, the same checks run again; then uncommitted work in the agent's worktree is committed with the task's first line as the subject, and `integrate` runs in the main worktree. `maestro-git` checks again and refuses on its own.
+- A dialog that does not fit the window cannot be accepted.
+- `:q` and `:qa` refuse while Git work for an agent runs (a worktree being made, an integration, an archive). With agents or tests running they ask first, and on `y` stop them and wait up to a second for terminal programs to exit. The automation API's `editor.quit` does not ask; agents are stopped when the editor is dropped on exit.
 
 ## Not built
 

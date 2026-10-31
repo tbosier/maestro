@@ -58,7 +58,8 @@ pub enum Status {
     Working,
     /// The ACP agent sent a plan during the current turn.
     Planning,
-    /// The ACP agent ran an edit tool or wrote a file during the turn.
+    /// The ACP agent reported an edit, delete or move tool call (in any
+    /// state) or wrote a file through Maestro during the turn.
     Editing,
     /// The ACP agent asked for permission and waits for an answer.
     AwaitingApproval,
@@ -272,7 +273,9 @@ pub struct Agent {
     pub runtime: Runtime,
     /// Merged ACP transcript: consecutive chunks of one message are joined.
     pub transcript: Vec<TranscriptEntry>,
-    pub permission: Option<PermissionRequest>,
+    /// Permission requests not answered yet, oldest first. The panel
+    /// answers the first.
+    pub permissions: Vec<PermissionRequest>,
     pub history: Vec<HistoryEntry>,
     pub created: SystemTime,
     pub tests: Vec<TestRun>,
@@ -287,6 +290,9 @@ pub struct Agent {
     pub exited: Option<String>,
     /// An ACP turn is running.
     pub turn_running: bool,
+    /// Git work for this agent runs in the background: [`CREATING`],
+    /// `"integrating"` or `"archiving"`.
+    pub git_busy: Option<&'static str>,
     /// Terminal output counter, bumped on the terminal's reader thread.
     output: Arc<AtomicU64>,
     seen_output: u64,
@@ -308,7 +314,7 @@ impl Agent {
             status: Status::Starting,
             runtime: Runtime::None,
             transcript: Vec::new(),
-            permission: None,
+            permissions: Vec::new(),
             history: Vec::new(),
             created: SystemTime::now(),
             tests: Vec::new(),
@@ -320,6 +326,7 @@ impl Agent {
             archived: false,
             exited: None,
             turn_running: false,
+            git_busy: None,
             output: Arc::new(AtomicU64::new(0)),
             seen_output: 0,
             pending_input: None,
@@ -443,6 +450,15 @@ impl AgentState {
     }
 
     /// Agents whose process or tests are still running.
+    /// Agents with Git work in flight (creating, integrating, archiving),
+    /// as `name (what)`. Quitting waits for them.
+    pub fn git_busy(&self) -> Vec<String> {
+        self.agents
+            .iter()
+            .filter_map(|a| a.git_busy.map(|w| format!("{} ({w})", a.name)))
+            .collect()
+    }
+
     pub fn running(&self) -> Vec<&Agent> {
         self.agents
             .iter()
@@ -483,6 +499,17 @@ impl Drop for AgentState {
     fn drop(&mut self) {
         for a in &mut self.agents {
             a.stop();
+        }
+        // Give terminal programs their SIGKILL before the process ends.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline
+            && self.agents.iter().any(|a| {
+                a.runtime
+                    .terminal()
+                    .is_some_and(|t| t.exit_status().is_none())
+            })
+        {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -562,7 +589,7 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
         }
         E::Update(entry) => {
             match &entry {
-                TranscriptEntry::Plan(_) if a.turn_running && a.permission.is_none() => {
+                TranscriptEntry::Plan(_) if a.turn_running && a.permissions.is_empty() => {
                     a.set_status(Status::Planning);
                     a.log("sent a plan");
                 }
@@ -570,7 +597,7 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
                     kind, title, id: t, ..
                 } => {
                     if a.turn_running
-                        && a.permission.is_none()
+                        && a.permissions.is_empty()
                         && matches!(kind.as_str(), "edit" | "delete" | "move")
                     {
                         a.set_status(Status::Editing);
@@ -615,12 +642,12 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
         }
         E::PermissionRequested(req) => {
             a.log(format!("asks permission: {}", req.tool_title));
-            a.permission = Some(req);
+            a.permissions.push(req);
             a.set_status(Status::AwaitingApproval);
         }
         E::TurnEnded { stop_reason } => {
             a.turn_running = false;
-            a.permission = None;
+            a.permissions.clear();
             a.log(format!("turn ended: {stop_reason}"));
             a.set_status(match stop_reason.as_str() {
                 "end_turn" => Status::ReadyForReview,
@@ -638,7 +665,7 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
                 .display()
                 .to_string();
             a.log(format!("wrote {shown}"));
-            if a.turn_running && a.permission.is_none() {
+            if a.turn_running && a.permissions.is_empty() {
                 a.set_status(Status::Editing);
             }
             refresh = true;
@@ -658,7 +685,7 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
             let unfinished = a.turn_running || a.status == Status::Starting;
             a.exited = Some(desc);
             a.turn_running = false;
-            a.permission = None;
+            a.permissions.clear();
             if unfinished {
                 a.set_status(Status::Failed);
             }
@@ -768,7 +795,9 @@ pub fn tick(ed: &mut Editor, now: Instant) {
     }
 }
 
-/// Stops every agent and test run, for quitting.
+/// Stops every agent and test run, for quitting, and waits up to a second
+/// for terminal programs to exit: their SIGKILL comes 200 ms after SIGHUP
+/// on another thread, which would die with the editor's process.
 pub fn stop_all(ed: &mut Editor) {
     for a in &mut ed.agents.agents {
         if a.is_running() || a.tests_running() {
@@ -776,7 +805,21 @@ pub fn stop_all(ed: &mut Editor) {
             a.log("stopped: the editor quit");
         }
     }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline
+        && ed.agents.agents.iter().any(|a| {
+            a.runtime
+                .terminal()
+                .is_some_and(|t| t.exit_status().is_none())
+        })
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
+
+/// The Git work for this agent that runs in the background while its
+/// worktree is being made.
+pub const CREATING: &str = "creating its worktree";
 
 /// Lowercase ASCII words joined by `-`, at most 24 characters; `task` when
 /// nothing is left.

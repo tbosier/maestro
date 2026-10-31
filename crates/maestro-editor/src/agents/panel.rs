@@ -625,10 +625,79 @@ fn choose(ed: &mut Editor, purpose: ChoicePurpose, index: usize) {
     }
 }
 
+/// The box width and text width of a dialog drawn in `area`.
+pub fn dialog_width(area: Rect) -> (u16, usize) {
+    let w = area.width.saturating_sub(4).min(90);
+    (w, w.saturating_sub(4) as usize)
+}
+
+/// Splits `text` into lines of at most `width` chars, at spaces where it
+/// can.
+pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        let mut word = word.to_string();
+        loop {
+            let cur_len = cur.chars().count();
+            let word_len = word.chars().count();
+            let sep = usize::from(cur_len > 0);
+            if cur_len + sep + word_len <= width {
+                if sep == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(&word);
+                break;
+            }
+            if cur_len > 0 {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            // A word longer than a line is cut.
+            let head: String = word.chars().take(width).collect();
+            word = word.chars().skip(width).collect();
+            out.push(head);
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// A confirmation dialog's text as drawn in `area`.
+pub fn confirm_lines(area: Rect, c: &Confirm) -> Vec<String> {
+    let (_, inner) = dialog_width(area);
+    c.lines.iter().flat_map(|l| wrap_words(l, inner)).collect()
+}
+
+/// True when the whole dialog, keys included, fits on screen. A dialog
+/// that does not fit cannot be accepted, so nothing it would hide can be
+/// agreed to unseen.
+pub fn confirm_fits(area: Rect, c: &Confirm) -> bool {
+    let (_, inner) = dialog_width(area);
+    let keys: usize = c
+        .keys
+        .iter()
+        .map(|(k, d)| k.chars().count() + d.chars().count() + 4)
+        .sum();
+    area.width >= 20
+        && area.height >= 6
+        && confirm_lines(area, c).len() + 4 < area.height as usize
+        && keys <= inner + 3
+}
+
 fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
     let ch = key.typed_char();
     if key.code == KeyCode::Esc || ch == Some('n') || (key.mods.ctrl && ch.is_none()) {
         ed.info(format!("{}: cancelled, nothing changed", c.title));
+        return;
+    }
+    if !confirm_fits(ed.area, &c) && key.code != KeyCode::Tab {
+        ed.error("the window is too small to show this whole dialog; make it larger, or press n");
+        ed.agents.panel.overlay = Some(Overlay::Confirm(c));
         return;
     }
     match (&c.action, ch, key.code) {
@@ -699,7 +768,7 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     if a.kind() == ProviderKind::Terminal && a.is_running() {
         out.push(("C-\\", "keys to terminal"));
     }
-    if a.permission.is_some() {
+    if !a.permissions.is_empty() {
         out.push(("p", "answer permission"));
     }
     out.extend([
@@ -714,4 +783,30 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         ("esc", "close"),
     ]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_wrap_and_long_words_are_cut() {
+        assert_eq!(wrap_words("aa bb cc", 5), ["aa bb", "cc"]);
+        assert_eq!(wrap_words("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap_words("", 3), [""]);
+    }
+
+    #[test]
+    fn a_dialog_that_does_not_fit_cannot_be_accepted() {
+        let c = Confirm {
+            title: "t".into(),
+            lines: vec!["one line".into(); 6],
+            keys: vec![("y".into(), "do it".into())],
+            action: ConfirmAction::Archive(AgentId(1)),
+        };
+        assert!(confirm_fits(Rect::new(0, 0, 80, 20), &c));
+        // Six lines plus the frame and keys need eleven rows.
+        assert!(!confirm_fits(Rect::new(0, 0, 80, 10), &c));
+        assert!(!confirm_fits(Rect::new(0, 0, 10, 40), &c));
+    }
 }

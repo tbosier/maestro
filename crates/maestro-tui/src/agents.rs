@@ -473,7 +473,7 @@ fn transcript_lines(ed: &Editor, a: &Agent, width: usize) -> Vec<(String, Style)
     for e in &a.errors {
         push("error: ", e, ui.message_error);
     }
-    if let Some(p) = &a.permission {
+    if let Some(p) = a.permissions.first() {
         let warn = ui.text.patch(ed.theme.agent.awaiting_approval).bold();
         push("permission requested: ", &p.tool_title, warn);
         let opts: Vec<String> = p
@@ -482,7 +482,13 @@ fn transcript_lines(ed: &Editor, a: &Agent, width: usize) -> Vec<(String, Style)
             .map(|o| format!("{} ({})", o.label, o.kind.replace('_', " ")))
             .collect();
         push("choices: ", &opts.join(", "), warn);
-        push("", "p answers it", ui.text_muted);
+        let more = a.permissions.len() - 1;
+        let hint = if more > 0 {
+            format!("p answers it; {more} more request(s) wait after it")
+        } else {
+            "p answers it".to_string()
+        };
+        push("", &hint, ui.text_muted);
     }
     if out.is_empty() {
         let msg = match a.status() {
@@ -892,11 +898,19 @@ fn draw_overlay(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
             None
         }
         Overlay::Confirm(c) => {
-            let mut lines: Vec<(String, Style)> = Vec::new();
-            for l in &c.lines {
-                for wl in wrap(l, inner.max(1)) {
-                    lines.push((wl, ui.popup));
-                }
+            // The editor wraps the text, so it knows whether the dialog fits
+            // and refuses to accept one that does not.
+            let mut lines: Vec<(String, Style)> = panel::confirm_lines(area, c)
+                .into_iter()
+                .map(|l| (l, ui.popup))
+                .collect();
+            if !panel::confirm_fits(area, c) {
+                let room = (area.height as usize).saturating_sub(6);
+                lines.truncate(room);
+                lines.push((
+                    "the window is too small to show all of this; enlarge it to confirm".into(),
+                    ui.popup_title,
+                ));
             }
             let forced = matches!(c.action, ConfirmAction::ForceArchive(_));
             let h = (lines.len() as u16 + 4)

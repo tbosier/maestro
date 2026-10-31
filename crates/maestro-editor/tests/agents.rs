@@ -43,6 +43,18 @@ fn main() {
             quitting_with_running_agents_asks_and_stops_them,
         ),
         ("no_repository_is_reported", no_repository_is_reported),
+        (
+            "rejecting_during_creation_never_launches_and_quit_waits_for_git",
+            rejecting_during_creation_never_launches_and_quit_waits_for_git,
+        ),
+        (
+            "integrate_refuses_a_base_that_is_not_on_the_target",
+            integrate_refuses_a_base_that_is_not_on_the_target,
+        ),
+        (
+            "integrate_refuses_when_the_worktree_is_gone",
+            integrate_refuses_when_the_worktree_is_gone,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -311,7 +323,7 @@ fn acp_agent_permission_feedback_and_review() {
         status(ed, 0) == Status::AwaitingApproval
     });
     let a = agent(&ed, 0);
-    assert!(a.permission.is_some());
+    assert_eq!(a.permissions.len(), 1);
     assert_eq!(a.kind(), maestro_editor::agents::ProviderKind::Acp);
     assert!(
         a.transcript
@@ -343,9 +355,9 @@ fn acp_agent_permission_feedback_and_review() {
         other => panic!("expected a grant confirmation, got {other:?}"),
     }
     // Nothing is sent before the confirmation.
-    assert!(agent(&ed, 0).permission.is_some());
+    assert!(!agent(&ed, 0).permissions.is_empty());
     run(&mut ed, "y");
-    assert!(agent(&ed, 0).permission.is_none());
+    assert!(agent(&ed, 0).permissions.is_empty());
     poll_until(&mut ed, "the end of the turn", |ed| {
         status(ed, 0) == Status::ReadyForReview
     });
@@ -684,7 +696,7 @@ fn m2_acceptance_two_agents_reject_one_integrate_the_other() {
     match &ed.agents.panel.overlay {
         Some(Overlay::Confirm(c)) => {
             let text = c.lines.join("\n");
-            assert!(text.contains("Commit 1 file(s)"), "{text}");
+            assert!(text.contains("(1 when checked)"), "{text}");
             assert!(text.contains("Merge maestro/write-release-notes"), "{text}");
             assert!(text.contains("into main"), "{text}");
         }
@@ -747,9 +759,12 @@ fn quitting_with_running_agents_asks_and_stops_them() {
     assert!(agent(&ed, 0).is_running());
     run(&mut ed, ":qa\ny");
     assert!(ed.should_quit);
-    poll_until(&mut ed, "the program to stop", |ed| {
-        !agent(ed, 0).is_running()
-    });
+    // Quitting waits for the program to exit before the editor returns,
+    // so the front end can end the process right after.
+    assert!(
+        !agent(&ed, 0).is_running(),
+        "the program still runs when quit returns"
+    );
 }
 
 fn no_repository_is_reported() {
@@ -772,5 +787,136 @@ fn no_repository_is_reported() {
             .any(|e| e.contains("not in a Git repository")),
         "{:?}",
         a.errors
+    );
+}
+
+fn rejecting_during_creation_never_launches_and_quit_waits_for_git() {
+    let f = Fixture::new();
+    let mut ed = f.editor(config(&[(
+        "writer",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf x > late.txt", "sh", "{task}"],
+        ),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "never start", 0);
+    // The worktree is still being made on a background thread.
+    assert!(agent(&ed, 0).worktree.is_none());
+    run(&mut ed, ":qa\n");
+    assert!(!ed.should_quit);
+    let msg = ed.status.clone().unwrap().1;
+    assert!(msg.contains("Git work is running"), "{msg}");
+    run(&mut ed, "Xy");
+    assert_eq!(status(&ed, 0), Status::Rejected);
+    poll_until(&mut ed, "the worktree", |ed| {
+        agent(ed, 0).worktree.is_some()
+    });
+    let a = agent(&ed, 0);
+    assert!(
+        a.runtime.terminal().is_none(),
+        "a rejected agent was launched"
+    );
+    assert!(a.history.iter().any(|h| h.text.contains("not launched")));
+    assert!(!worktree(&ed, 0).join("late.txt").exists());
+    run(&mut ed, ":qa\n");
+    assert!(ed.should_quit);
+}
+
+fn integrate_refuses_a_base_that_is_not_on_the_target() {
+    let f = Fixture::new();
+    // The editor runs in a linked worktree on a feature branch that is one
+    // commit ahead of main.
+    let feature = f.tmp.join("feature");
+    f.git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            feature.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(feature.join("feature.txt"), "unreviewed\n").unwrap();
+    f.git(&feature, &["add", "-A"]);
+    f.git(&feature, &["commit", "-q", "-m", "feature work"]);
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    let mut ed = f.editor(config(&[(
+        "alpha",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf a > a.txt", "sh", "{task}"],
+        ),
+    )]));
+    ed.cwd = feature.clone();
+    run(&mut ed, " a");
+    start_task(&mut ed, "add a", 0);
+    poll_until(&mut ed, "the agent's exit", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    // The review shows only the agent's file.
+    poll_until(&mut ed, "the review", |ed| review_paths(ed, 0) == ["a.txt"]);
+    run(&mut ed, "I");
+    poll_until(&mut ed, "the refusal", |ed| {
+        ed.status
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("not integrated"))
+    });
+    let msg = ed.status.clone().unwrap().1;
+    assert!(msg.contains("which is not on main"), "{msg}");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    assert_eq!(
+        f.git(&worktree(&ed, 0), &["status", "--porcelain"]),
+        "?? a.txt\n"
+    );
+}
+
+fn integrate_refuses_when_the_worktree_is_gone() {
+    let f = Fixture::new();
+    // Worktrees inside the repository: if the agent's directory vanishes,
+    // Git discovery from it finds the main repository instead.
+    let mut c = config(&[(
+        "alpha",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf a > a.txt", "sh", "{task}"],
+        ),
+    )]);
+    c.agents.worktree_dir = Some(".agents".into());
+    let mut ed = f.editor(c);
+    run(&mut ed, " a");
+    start_task(&mut ed, "add a", 0);
+    poll_until(&mut ed, "the agent's exit", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    let wt = worktree(&ed, 0);
+    assert!(wt.starts_with(f.repo.join(".agents")), "{wt:?}");
+    std::fs::write(f.repo.join("untracked-in-main.txt"), "mine\n").unwrap();
+    run(&mut ed, "I");
+    poll_until(&mut ed, "the integrate dialog", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Integrate { .. }))
+    });
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    std::fs::remove_dir_all(&wt).unwrap();
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the refusal", |ed| {
+        ed.status
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("not integrated"))
+    });
+    let msg = ed.status.clone().unwrap().1;
+    assert!(msg.contains("no longer a worktree"), "{msg}");
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    assert!(
+        f.git(&f.repo, &["status", "--porcelain"])
+            .contains("?? untracked-in-main.txt"),
+        "the main worktree's own files were not committed"
     );
 }
