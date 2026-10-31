@@ -24,35 +24,47 @@ Every producer that changes state off the main thread wakes the event loop throu
 ## `maestro-term`
 
 ```rust
+/// `env` is added to the inherited environment after TERM=xterm-256color and COLORTERM=truecolor, so it wins.
+/// `cwd` must exist: spawn fails with NotFound instead of starting the program somewhere else.
 pub struct CommandSpec { pub program: String, pub args: Vec<String>, pub cwd: PathBuf, pub env: Vec<(String, String)> }
-#[derive(Clone, Copy)] pub struct TermSize { pub rows: u16, pub cols: u16 }
+#[derive(Clone, Copy)] pub struct TermSize { pub rows: u16, pub cols: u16 } // raised to at least 1 row, 2 columns
+pub const SCROLLBACK_LINES: usize = 3000;
+pub const MAX_QUEUED_INPUT: usize = 16 << 20; // bytes waiting for a program that is not reading
 
 pub struct Terminal; // Send + Sync, cheap to share behind Arc
 impl Terminal {
-    /// Spawns `spec` in a new PTY. `on_output` runs on the reader thread after each chunk is parsed.
+    /// Spawns `spec` in a new PTY. `on_output` runs on the reader thread after each chunk is parsed,
+    /// and once more after the program exits. No new call starts after drop returns (one already starting may finish).
     pub fn spawn(spec: &CommandSpec, size: TermSize, on_output: impl Fn() + Send + Sync + 'static) -> io::Result<Terminal>;
-    pub fn write(&self, bytes: &[u8]) -> io::Result<()>;
-    pub fn resize(&self, size: TermSize) -> io::Result<()>;
+    pub fn write(&self, bytes: &[u8]) -> io::Result<()>; // queued for a writer thread, never blocks; BrokenPipe after exit, WouldBlock past MAX_QUEUED_INPUT
+    pub fn resize(&self, size: TermSize) -> io::Result<()>; // PTY and parser; a no-op when unchanged
     pub fn snapshot(&self) -> Screen;          // the visible screen, or a scrolled-back view
-    pub fn scroll(&self, lines: isize);        // into scrollback; 0 returns to the live screen
+    pub fn scroll(&self, lines: isize);        // positive moves back into scrollback, negative toward live; 0 returns to the live screen
     pub fn exit_status(&self) -> Option<ExitInfo>; // None while running
-    pub fn kill(&self) -> io::Result<()>;
+    pub fn kill(&self) -> io::Result<()>;      // returns at once; the waiter thread sends SIGHUP, then SIGKILL after 200 ms
     pub fn application_cursor(&self) -> bool; // DECCKM, for key encoding
-    pub fn title(&self) -> String;
+    pub fn bracketed_paste(&self) -> bool;    // for encode_paste
+    pub fn title(&self) -> String;            // OSC 0 or 2, control characters removed, at most 256 chars
 }
+// Dropping a Terminal kills the program without waiting; the threads end once nothing holds the PTY open.
 
-pub struct Screen { pub rows: u16, pub cols: u16, pub cells: Vec<Cell> /* row-major */, pub cursor: Option<(u16, u16)>, pub scrolled: bool }
-pub struct Cell { pub text: String /* empty for the right half of a wide char */, pub fg: TermColor, pub bg: TermColor, pub bold: bool, pub italic: bool, pub underline: bool, pub inverse: bool, pub wide: bool }
+pub struct Screen { pub rows: u16, pub cols: u16, pub cells: Vec<Cell> /* row-major */, pub cursor: Option<(u16, u16)> /* None when hidden or scrolled back */, pub scrolled: bool }
+impl Screen { pub fn cell(&self, row: u16, col: u16) -> Option<&Cell>; pub fn row_text(&self, row: u16) -> String /* trailing blanks trimmed */; }
+pub struct Cell { pub text: String /* " " when blank, empty for the right half of a wide char */, pub fg: TermColor, pub bg: TermColor, pub bold: bool, pub dim: bool, pub italic: bool, pub underline: bool, pub inverse: bool, pub wide: bool /* left half only */ }
 pub enum TermColor { Default, Indexed(u8), Rgb(u8, u8, u8) }
-pub struct ExitInfo { pub code: Option<i32>, pub description: String }
+pub struct ExitInfo { pub code: Option<i32> /* None when a signal ended the program */, pub description: String }
 
 pub enum TermKey { Char(char), Enter, Esc, Backspace, Delete, Tab, BackTab, Left, Right, Up, Down, Home, End, PageUp, PageDown, Insert, F(u8) }
-pub struct TermMods { pub ctrl: bool, pub alt: bool, pub shift: bool }
+#[derive(Default)] pub struct TermMods { pub ctrl: bool, pub alt: bool, pub shift: bool }
 /// xterm encoding of a key press.
 pub fn encode_key(key: TermKey, mods: TermMods, application_cursor: bool) -> Vec<u8>;
-/// Bracketed paste when the program enabled it, else raw text.
+/// Bracketed paste (with ESC bytes removed from the text) when the program enabled it, else raw text with newlines sent as CR.
 pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8>;
 ```
+
+Each terminal runs three threads: a reader (PTY to parser), a writer (input queue to PTY) and a waiter that owns the child. The emulator answers cursor position (`CSI 6 n`), device status (`CSI 5 n`) and device attribute (`CSI c`, `CSI > c`) queries itself, because some programs wait seconds for those answers before they draw anything.
+
+Known gaps: kill and drop signal only the child, so a descendant that ignores SIGHUP keeps the PTY and the reader thread alive until it exits (killing the process group needs `killpg`, which std lacks and `unsafe` is forbidden). portable-pty starts the program in `$HOME` if the working directory vanishes between the check and the spawn. The cursor position reply ignores origin mode (DECOM), because vt100 does not expose the scroll region.
 
 ## `maestro-agent`
 
