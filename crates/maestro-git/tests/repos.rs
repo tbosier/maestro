@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maestro_git::{
     Base, ChangeKind, ConflictKind, DiffLineKind, DiffSpec, EntryState, FileChange, Git, Head,
-    MergeCheck, RemoveError, RemoveRefusal, Sign, SignMap,
+    IntegrateError, IntegrateOutcome, Integration, MergeCheck, RemoveError, RemoveRefusal, Sign,
+    SignMap,
 };
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -596,5 +597,638 @@ fn base_text_resolves_dot_dot_paths() {
     assert_eq!(
         repo.base_text(&odd, Base::Index).unwrap().as_deref(),
         Some(&b"x\n"[..])
+    );
+}
+
+// ---- Review diff, commit_all and integrate (ADR 0006) ----
+
+/// Everything a refusal must leave alone in a worktree: `HEAD`, the raw
+/// index file, every file on disk (outside `.git`), and no operation in
+/// progress.
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot {
+    head: String,
+    index: Vec<u8>,
+    files: Vec<(PathBuf, Vec<u8>)>,
+    in_progress: Vec<&'static str>,
+}
+
+fn snapshot(f: &Fixture, dir: &Path) -> Snapshot {
+    let git_dir = PathBuf::from(
+        f.git_ok(dir, &["rev-parse", "--absolute-git-dir"])
+            .trim()
+            .to_string(),
+    );
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
+    files.sort();
+    Snapshot {
+        head: f.git_ok(dir, &["rev-parse", "HEAD"]).trim().to_string(),
+        index: std::fs::read(git_dir.join("index")).unwrap_or_default(),
+        files,
+        in_progress: ["MERGE_HEAD", "CHERRY_PICK_HEAD", "sequencer"]
+            .into_iter()
+            .filter(|n| git_dir.join(n).exists())
+            .collect(),
+    }
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.file_name().is_some_and(|n| n == ".git") {
+            continue;
+        }
+        if p.is_dir() {
+            walk(root, &p, out);
+        } else {
+            let rel = p.strip_prefix(root).unwrap().to_path_buf();
+            out.push((rel, std::fs::read(&p).unwrap()));
+        }
+    }
+}
+
+fn hook(f: &Fixture, name: &str, body: &str) {
+    let path = f.repo.join(".git/hooks").join(name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn unhook(f: &Fixture, name: &str) {
+    std::fs::remove_file(f.repo.join(".git/hooks").join(name)).unwrap();
+}
+
+/// A worktree on a new branch `name` from main with one commit that adds
+/// `file` with `text`.
+fn agent_branch(f: &Fixture, name: &str, file: &str, text: &str) -> PathBuf {
+    let path = f.tmp.join(name.replace('/', "-"));
+    f.repo().add_worktree(&path, name, "main").unwrap();
+    commit_in(f, &path, file, text, &format!("{name}: {file}"));
+    path
+}
+
+fn commit_in(f: &Fixture, dir: &Path, file: &str, text: &str, msg: &str) {
+    write_in(dir, file, text);
+    f.git_ok(dir, &["add", "-A"]);
+    f.git_ok(dir, &["commit", "-q", "-m", msg]);
+}
+
+fn rev(f: &Fixture, dir: &Path, r: &str) -> String {
+    f.git_ok(dir, &["rev-parse", r]).trim().to_string()
+}
+
+fn by_path(files: &[maestro_git::DiffFile], p: &str) -> maestro_git::DiffFile {
+    files
+        .iter()
+        .find(|d| d.path() == Some(&PathBuf::from(p)))
+        .unwrap_or_else(|| panic!("{p} missing from {files:#?}"))
+        .clone()
+}
+
+fn numbered(prefix: &str, n: usize) -> String {
+    (1..=n).map(|i| format!("{prefix} {i}\n")).collect()
+}
+
+#[test]
+fn review_diff_shows_committed_staged_unstaged_and_untracked_work() {
+    let f = Fixture::new();
+    f.write("keep.txt", "k1\nk2\nk3\n");
+    f.write("gone.txt", "bye\n");
+    f.write("staged gone.txt", "bye too\n");
+    f.write("big.txt", &numbered("line", 40));
+    f.write("moved by git.txt", &numbered("row", 30));
+    f.commit_all("files");
+    let repo = f.repo();
+    let wt = f.tmp.join("review");
+    repo.add_worktree(&wt, "agent/review", "main").unwrap();
+
+    // Committed on the branch.
+    write_in(&wt, "a.txt", "one\nTWO\nthree\n");
+    f.git_ok(&wt, &["commit", "-q", "-am", "agent edits a"]);
+    // Main moves on; that must not show up as a reverse change.
+    f.write("main only.txt", "main\n");
+    f.commit_all("main moves");
+
+    // Staged: a deletion, a new file and a rename with git mv.
+    f.git_ok(&wt, &["rm", "-q", "staged gone.txt"]);
+    write_in(&wt, "staged.txt", "staged\n");
+    f.git_ok(&wt, &["add", "staged.txt"]);
+    f.git_ok(&wt, &["mv", "moved by git.txt", "renamed by git.txt"]);
+    // Unstaged: an edit and a deletion from disk.
+    write_in(&wt, "keep.txt", "k1\nk2 edited\nk3\n");
+    std::fs::remove_file(wt.join("gone.txt")).unwrap();
+    // A plain rename on disk, the way an agent's tools do it.
+    std::fs::rename(wt.join("big.txt"), wt.join("big moved.txt")).unwrap();
+    // Untracked: text, binary, a nested directory; one ignored file.
+    write_in(&wt, "new dir/new.txt", "fresh\nlines\n");
+    std::fs::write(wt.join("blob.bin"), [0u8, 1, 2, 0, 255]).unwrap();
+    write_in(&wt, ".gitignore", "*.log\n");
+    write_in(&wt, "debug.log", "noise\n");
+
+    let inner = f.api().discover(&wt).unwrap().unwrap();
+    let before = snapshot(&f, &wt);
+    let files = inner.review_diff("main").unwrap();
+    assert_eq!(
+        snapshot(&f, &wt),
+        before,
+        "review_diff changed the worktree"
+    );
+
+    let mut paths: Vec<String> = files
+        .iter()
+        .map(|d| d.path().unwrap().display().to_string())
+        .collect();
+    paths.sort();
+    let mut want = vec![
+        ".gitignore",
+        "a.txt",
+        "big moved.txt",
+        "blob.bin",
+        "gone.txt",
+        "keep.txt",
+        "new dir/new.txt",
+        "renamed by git.txt",
+        "staged gone.txt",
+        "staged.txt",
+    ];
+    want.sort();
+    assert_eq!(paths, want);
+
+    let a = by_path(&files, "a.txt");
+    assert_eq!(a.change, FileChange::Modified);
+    assert_eq!(a.counts(), (1, 1));
+    assert_eq!(by_path(&files, "keep.txt").change, FileChange::Modified);
+
+    let gone = by_path(&files, "gone.txt");
+    assert_eq!(gone.change, FileChange::Deleted);
+    assert_eq!(gone.new_path, None);
+    assert_eq!(
+        by_path(&files, "staged gone.txt").change,
+        FileChange::Deleted
+    );
+
+    let moved = by_path(&files, "big moved.txt");
+    assert_eq!(moved.change, FileChange::Renamed { similarity: 100 });
+    assert_eq!(moved.old_path, Some(PathBuf::from("big.txt")));
+    let by_git = by_path(&files, "renamed by git.txt");
+    assert!(matches!(by_git.change, FileChange::Renamed { .. }));
+    assert_eq!(by_git.old_path, Some(PathBuf::from("moved by git.txt")));
+
+    let new = by_path(&files, "new dir/new.txt");
+    assert_eq!(new.change, FileChange::Added);
+    assert_eq!(new.counts(), (2, 0));
+    assert_eq!(new.hunks[0].lines[0].text, "fresh");
+    assert_eq!(by_path(&files, "staged.txt").change, FileChange::Added);
+
+    let bin = by_path(&files, "blob.bin");
+    assert_eq!(bin.change, FileChange::Added);
+    assert!(bin.binary);
+
+    // Without untracked files the plain path runs.
+    std::fs::remove_dir_all(wt.join("new dir")).unwrap();
+    for p in ["blob.bin", ".gitignore", "debug.log", "big moved.txt"] {
+        std::fs::remove_file(wt.join(p)).unwrap();
+    }
+    let files = inner.review_diff("main").unwrap();
+    assert_eq!(by_path(&files, "big.txt").change, FileChange::Deleted);
+    assert_eq!(by_path(&files, "a.txt").counts(), (1, 1));
+    assert_eq!(files.len(), 7, "{files:#?}");
+
+    assert!(inner.review_diff("--all").is_err());
+    assert!(inner.review_diff("no-such-branch").is_err());
+}
+
+#[test]
+fn commit_all_commits_everything_or_nothing() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    assert_eq!(repo.commit_all("nothing").unwrap(), None);
+
+    f.write("a.txt", "changed\n");
+    f.write("new/untracked.txt", "u\n");
+    f.write(".gitignore", "*.log\n");
+    f.write("skip.log", "ignored\n");
+    let id = repo.commit_all("agent work").unwrap().expect("a commit");
+    assert_eq!(rev(&f, &f.repo, "HEAD"), id);
+    assert_eq!(f.git(&["log", "-1", "--format=%s"]).trim(), "agent work");
+    let tree = f.git(&["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(tree.contains("new/untracked.txt"), "{tree}");
+    assert!(!tree.contains("skip.log"), "{tree}");
+    assert!(repo.status().unwrap().is_clean());
+    assert_eq!(repo.commit_all("again").unwrap(), None);
+
+    // Deletions are committed too.
+    std::fs::remove_file(f.repo.join("new/untracked.txt")).unwrap();
+    repo.commit_all("delete").unwrap().expect("a commit");
+    let tree = f.git(&["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!tree.contains("untracked.txt"), "{tree}");
+}
+
+#[test]
+fn commit_all_respects_hooks_and_identity() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let head = rev(&f, &f.repo, "HEAD");
+
+    hook(&f, "pre-commit", "echo 'tests failed' >&2; exit 1");
+    f.write("a.txt", "blocked\n");
+    let err = repo.commit_all("blocked").unwrap_err();
+    assert!(err.to_string().contains("tests failed"), "{err}");
+    assert_eq!(rev(&f, &f.repo, "HEAD"), head);
+    unhook(&f, "pre-commit");
+
+    // No identity: refused before anything is staged.
+    let mut nobody = Git::new()
+        .env("HOME", f.tmp.join("home"))
+        .env("XDG_CONFIG_HOME", f.tmp.join("home"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", f.tmp.join("home/.gitconfig"))
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .config("user.useConfigOnly=true")
+        .config("commit.gpgSign=false");
+    for v in [
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
+    ] {
+        nobody = nobody.env_remove(v);
+    }
+    let anon = nobody.discover(&f.repo).unwrap().unwrap();
+    f.git(&["reset", "-q"]);
+    f.write("b.txt", "untracked\n");
+    let before = snapshot(&f, &f.repo);
+    let err = anon.commit_all("who am I").unwrap_err();
+    assert!(matches!(err, maestro_git::GitError::NoIdentity(_)), "{err}");
+    assert!(err.to_string().contains("user.name"), "{err}");
+    assert_eq!(snapshot(&f, &f.repo), before);
+
+    // With the identity back, it commits.
+    assert!(repo.commit_all("works").unwrap().is_some());
+}
+
+#[test]
+fn commit_all_refuses_conflicted_files() {
+    let f = Fixture::new();
+    f.git(&["checkout", "-q", "-b", "other"]);
+    f.write("a.txt", "other\n");
+    f.commit_all("other");
+    f.git(&["checkout", "-q", "main"]);
+    f.write("a.txt", "main\n");
+    f.commit_all("main");
+    let out = f.git_in(&f.repo, &["merge", "other"]);
+    assert!(!out.status.success());
+    let repo = f.repo();
+    let before = snapshot(&f, &f.repo);
+    let err = repo.commit_all("markers").unwrap_err();
+    assert!(
+        matches!(&err, maestro_git::GitError::Unmerged(p) if p == &vec![PathBuf::from("a.txt")]),
+        "{err}"
+    );
+    assert_eq!(snapshot(&f, &f.repo), before);
+    f.git(&["merge", "--abort"]);
+}
+
+/// Runs `run`, requires an error `check` accepts, and requires every
+/// worktree in `dirs` to be exactly as before.
+fn assert_refused(
+    f: &Fixture,
+    dirs: &[&Path],
+    run: impl FnOnce() -> Result<IntegrateOutcome, IntegrateError>,
+    check: impl FnOnce(&IntegrateError) -> bool,
+) {
+    let before: Vec<Snapshot> = dirs.iter().map(|d| snapshot(f, d)).collect();
+    let err = run().expect_err("expected a refusal");
+    assert!(check(&err), "unexpected error: {err:?}");
+    let after: Vec<Snapshot> = dirs.iter().map(|d| snapshot(f, d)).collect();
+    assert_eq!(after, before, "a refusal changed something ({err})");
+}
+
+const ALL: [Integration; 3] = [
+    Integration::FastForwardOnly,
+    Integration::Merge,
+    Integration::CherryPick,
+];
+
+#[test]
+fn integrate_refuses_without_changing_anything() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/a", "agent.txt", "agent\n");
+    let both: [&Path; 2] = [&f.repo, &wt];
+
+    // The target has unstaged, then staged, changes.
+    f.write("a.txt", "dirty\n");
+    for how in ALL {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate("agent/a", how),
+            |e| matches!(e, IntegrateError::Dirty(p) if p == &vec![PathBuf::from("a.txt")]),
+        );
+    }
+    f.git(&["add", "a.txt"]);
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/a", Integration::Merge),
+        |e| matches!(e, IntegrateError::Dirty(_)),
+    );
+    f.git(&["reset", "-q", "--hard"]);
+
+    // Untracked files in the target do not count as dirty, but the source
+    // worktree's do: they would be left behind.
+    f.write("scratch.txt", "mine\n");
+    write_in(&wt, "forgotten.txt", "not committed\n");
+    for how in ALL {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate("agent/a", how),
+            |e| {
+                matches!(e, IntegrateError::SourceDirty(p)
+                    if p == &vec![PathBuf::from("forgotten.txt")])
+            },
+        );
+    }
+    std::fs::remove_file(wt.join("forgotten.txt")).unwrap();
+    write_in(&wt, "agent.txt", "edited, not committed\n");
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/a", Integration::CherryPick),
+        |e| matches!(e, IntegrateError::SourceDirty(_)),
+    );
+    f.git_ok(&wt, &["checkout", "--", "agent.txt"]);
+
+    // Nothing to integrate: main itself, and a branch main already has.
+    f.git(&["branch", "old", "main"]);
+    for how in ALL {
+        for b in ["main", "old"] {
+            assert_refused(
+                &f,
+                &both,
+                || repo.integrate(b, how),
+                |e| matches!(e, IntegrateError::NothingToIntegrate),
+            );
+        }
+    }
+
+    // Diverged: fast-forward only refuses.
+    f.write("main.txt", "main\n");
+    f.commit_all("main moves");
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/a", Integration::FastForwardOnly),
+        |e| matches!(e, IntegrateError::NotFastForward),
+    );
+
+    // Conflicts found by the dry run, for merge and cherry-pick.
+    write_in(&wt, "a.txt", "agent line\n");
+    f.git_ok(&wt, &["commit", "-q", "-am", "agent edits a"]);
+    f.write("a.txt", "main line\n");
+    f.commit_all("main edits a");
+    for how in [Integration::Merge, Integration::CherryPick] {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate("agent/a", how),
+            |e| matches!(e, IntegrateError::Conflicts(p) if p == &vec![PathBuf::from("a.txt")]),
+        );
+    }
+
+    // Not a branch, or not a valid name.
+    for b in ["no-such", "--all", "a..b"] {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate(b, Integration::Merge),
+            |e| matches!(e, IntegrateError::Git(_)),
+        );
+    }
+
+    // A detached target.
+    f.git(&["checkout", "-q", "--detach"]);
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/a", Integration::Merge),
+        |e| matches!(e, IntegrateError::DetachedHead),
+    );
+    f.git(&["checkout", "-q", "main"]);
+}
+
+#[test]
+fn integrate_refuses_while_another_operation_is_in_progress() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/p", "p.txt", "p\n");
+    f.write("b.txt", "b\n");
+    f.commit_all("b");
+    f.git(&["revert", "--no-commit", "HEAD"]);
+    let both: [&Path; 2] = [&f.repo, &wt];
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/p", Integration::Merge),
+        |e| matches!(e, IntegrateError::InProgress(_)),
+    );
+    f.git(&["revert", "--abort"]);
+}
+
+#[test]
+fn integrate_refuses_cherry_picking_merge_commits() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/m", "x.txt", "x\n");
+    f.write("main.txt", "main\n");
+    f.commit_all("main moves");
+    f.git_ok(&wt, &["merge", "-q", "--no-edit", "main"]);
+    let both: [&Path; 2] = [&f.repo, &wt];
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/m", Integration::CherryPick),
+        |e| matches!(e, IntegrateError::MergeCommits(m) if m.len() == 1),
+    );
+    // Merging it is fine.
+    let out = repo.integrate("agent/m", Integration::Merge).unwrap();
+    assert_eq!(out.new_head, rev(&f, &f.repo, "HEAD"));
+}
+
+#[test]
+fn integrate_fast_forwards() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/ff", "one.txt", "1\n");
+    commit_in(&f, &wt, "two.txt", "2\n", "two");
+    let tip = rev(&f, &wt, "HEAD");
+    f.write("untracked here.txt", "kept\n");
+
+    let out = repo
+        .integrate("agent/ff", Integration::FastForwardOnly)
+        .unwrap();
+    assert_eq!(out.new_head, tip);
+    assert_eq!(out.commits.len(), 2);
+    assert_eq!(out.commits[1], tip);
+    assert_eq!(rev(&f, &f.repo, "main"), tip);
+    assert!(f.repo.join("two.txt").exists());
+    assert!(f.repo.join("untracked here.txt").exists());
+    assert_eq!(repo.head().unwrap(), Head::Branch("main".into()));
+}
+
+#[test]
+fn integrate_merges_with_a_merge_commit() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/m", "agent.txt", "agent\n");
+    let tip = rev(&f, &wt, "HEAD");
+    f.write("main.txt", "main\n");
+    f.commit_all("main moves");
+    let main_before = rev(&f, &f.repo, "HEAD");
+
+    let out = repo.integrate("agent/m", Integration::Merge).unwrap();
+    let parents = f.git(&["rev-list", "--parents", "-n1", "HEAD"]);
+    assert_eq!(
+        parents.split_whitespace().collect::<Vec<_>>(),
+        vec![out.new_head.as_str(), main_before.as_str(), tip.as_str()]
+    );
+    assert_eq!(out.commits, vec![tip.clone(), out.new_head.clone()]);
+    assert_eq!(
+        f.git(&["log", "-1", "--format=%s"]).trim(),
+        "Merge branch 'agent/m' into main"
+    );
+    assert!(f.repo.join("agent.txt").exists());
+    assert!(repo.status().unwrap().is_clean());
+
+    // Even when a fast-forward is possible, Merge makes a merge commit.
+    agent_branch(&f, "agent/m2", "second.txt", "2\n");
+    let out = repo.integrate("agent/m2", Integration::Merge).unwrap();
+    let parents = f.git(&["rev-list", "--parents", "-n1", &out.new_head]);
+    assert_eq!(parents.split_whitespace().count(), 3);
+}
+
+#[test]
+fn integrate_cherry_picks_oldest_first() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/cp", "first.txt", "1\n");
+    commit_in(&f, &wt, "second.txt", "2\n", "second");
+    // A commit whose change main already has is skipped, not a failure.
+    commit_in(&f, &wt, "main.txt", "same\n", "duplicate");
+    f.write("main.txt", "same\n");
+    f.commit_all("main has it");
+    let main_before = rev(&f, &f.repo, "HEAD");
+
+    let out = repo.integrate("agent/cp", Integration::CherryPick).unwrap();
+    assert_eq!(out.commits.len(), 2);
+    assert_eq!(out.new_head, rev(&f, &f.repo, "HEAD"));
+    let subjects = f.git(&[
+        "log",
+        "--reverse",
+        "--format=%s",
+        &format!("{main_before}..HEAD"),
+    ]);
+    assert_eq!(
+        subjects.lines().collect::<Vec<_>>(),
+        vec!["agent/cp: first.txt", "second"]
+    );
+    // Linear history on main: copies, no merge commit.
+    let parents = f.git(&["rev-list", "--parents", "-n1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 2);
+    assert!(f.repo.join("first.txt").exists() && f.repo.join("second.txt").exists());
+    assert!(repo.status().unwrap().is_clean());
+
+    // Every commit already applied: nothing to integrate.
+    let both: [&Path; 2] = [&f.repo, &wt];
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/cp", Integration::CherryPick),
+        |e| matches!(e, IntegrateError::NothingToIntegrate),
+    );
+}
+
+#[test]
+fn a_failing_hook_leaves_no_merge_in_progress() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/h", "agent.txt", "agent\n");
+    // Diverge so a merge commit is needed for every mode but fast-forward.
+    f.write("main.txt", "main\n");
+    f.commit_all("main moves");
+    let both: [&Path; 2] = [&f.repo, &wt];
+
+    hook(
+        &f,
+        "pre-merge-commit",
+        "echo 'pre-merge-commit says no' >&2; exit 1",
+    );
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/h", Integration::Merge),
+        |e| matches!(e, IntegrateError::Git(g) if g.to_string().contains("says no")),
+    );
+    unhook(&f, "pre-merge-commit");
+
+    hook(&f, "commit-msg", "echo 'commit-msg says no' >&2; exit 1");
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate("agent/h", Integration::Merge),
+        |e| matches!(e, IntegrateError::Git(g) if g.to_string().contains("says no")),
+    );
+    unhook(&f, "commit-msg");
+
+    hook(
+        &f,
+        "prepare-commit-msg",
+        "echo 'prepare says no' >&2; exit 1",
+    );
+    for how in [Integration::Merge, Integration::CherryPick] {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate("agent/h", how),
+            |e| matches!(e, IntegrateError::Git(g) if g.to_string().contains("says no")),
+        );
+    }
+    unhook(&f, "prepare-commit-msg");
+
+    // Without the hooks it goes through.
+    repo.integrate("agent/h", Integration::Merge).unwrap();
+}
+
+#[test]
+fn an_untracked_file_in_the_way_is_aborted_cleanly() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    // Two commits: the first applies, the second adds a file that exists
+    // untracked in the target, so a cherry-pick stops half way.
+    let wt = agent_branch(&f, "agent/u", "fine.txt", "fine\n");
+    commit_in(&f, &wt, "clash.txt", "from the branch\n", "clash");
+    f.write("clash.txt", "the user's own file\n");
+    let both: [&Path; 2] = [&f.repo, &wt];
+
+    for how in ALL {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate("agent/u", how),
+            |e| matches!(e, IntegrateError::Git(g) if g.to_string().contains("would be overwritten")),
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("clash.txt")).unwrap(),
+        "the user's own file\n"
     );
 }

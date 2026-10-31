@@ -1,0 +1,10 @@
+# A crate with a passing, a failing and an ignored test, plus doc tests, so
+# maestro-tasks can test against real `cargo test` output. Its own workspace
+# root, so cargo does not treat it as part of the Maestro workspace.
+[package]
+name = "tiny"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]

@@ -342,7 +342,7 @@ impl Repository {
     }
 }
 
-fn check_branch_name(repo: &Repository, branch: &str) -> Result<()> {
+pub(crate) fn check_branch_name(repo: &Repository, branch: &str) -> Result<()> {
     if branch.starts_with('-') {
         return Err(GitError::InvalidArgument(format!(
             "bad branch name {branch:?}"

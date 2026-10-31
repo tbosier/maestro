@@ -110,35 +110,7 @@ impl Repository {
     /// `paths` limits it to those files (relative to the root); empty means
     /// every file.
     pub fn diff(&self, spec: &DiffSpec, paths: &[PathBuf]) -> Result<Vec<DiffFile>> {
-        let mut args: Vec<OsString> = [
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--find-renames",
-            "--unified=3",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-        ]
-        .iter()
-        .map(OsString::from)
-        .collect();
-        match spec {
-            DiffSpec::Unstaged => {}
-            DiffSpec::Staged => args.push("--cached".into()),
-            DiffSpec::AgainstHead => args.push("HEAD".into()),
-            DiffSpec::Revisions { from, to } => {
-                check_rev(from)?;
-                check_rev(to)?;
-                args.push(from.into());
-                args.push(to.into());
-            }
-            DiffSpec::SinceForkPoint { base, head } => {
-                check_rev(base)?;
-                check_rev(head)?;
-                args.push(format!("{base}...{head}").into());
-            }
-        }
+        let mut args = diff_args(spec)?;
         args.push("--".into());
         args.extend(paths.iter().map(|p| p.clone().into_os_string()));
         let out = self.run(&args, Access::ReadOnly)?;
@@ -147,6 +119,40 @@ impl Repository {
             detail,
         })
     }
+}
+
+/// `git diff` and its options for `spec`, up to (not including) `--`.
+pub(crate) fn diff_args(spec: &DiffSpec) -> Result<Vec<OsString>> {
+    let mut args: Vec<OsString> = [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames",
+        "--unified=3",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    match spec {
+        DiffSpec::Unstaged => {}
+        DiffSpec::Staged => args.push("--cached".into()),
+        DiffSpec::AgainstHead => args.push("HEAD".into()),
+        DiffSpec::Revisions { from, to } => {
+            check_rev(from)?;
+            check_rev(to)?;
+            args.push(from.into());
+            args.push(to.into());
+        }
+        DiffSpec::SinceForkPoint { base, head } => {
+            check_rev(base)?;
+            check_rev(head)?;
+            args.push(format!("{base}...{head}").into());
+        }
+    }
+    Ok(args)
 }
 
 /// Undoes git's C-style quoting of unusual path names.
