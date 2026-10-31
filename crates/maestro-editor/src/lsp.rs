@@ -937,7 +937,7 @@ fn on_reply(ed: &mut Editor, kind: RequestKind, token: u64, reply: Reply, files:
             ) =>
         {
             ed.info(format!(
-                "{}: the server cancelled the request",
+                "{}: the server canceled the request",
                 kind.label()
             ));
             return;

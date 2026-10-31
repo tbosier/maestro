@@ -698,7 +698,7 @@ pub fn confirm_fits(area: Rect, c: &Confirm) -> bool {
 fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
     let ch = key.typed_char();
     if key.code == KeyCode::Esc || ch == Some('n') || (key.mods.ctrl && ch.is_none()) {
-        ed.info(format!("{}: cancelled, nothing changed", c.title));
+        ed.info(format!("{}: canceled, nothing changed", c.title));
         return;
     }
     if !confirm_fits(ed.area, &c) && key.code != KeyCode::Tab {
