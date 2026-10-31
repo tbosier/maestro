@@ -1,10 +1,13 @@
-//! Session restore: on quit, the open files, each one's primary cursor and
-//! the focused view's file are saved to
-//! `<state>/sessions/<hash of cwd>.toml`. Starting `maestro` with no file
-//! arguments in the same directory opens them again.
+//! Session restore: on quit, the open files, each one's primary cursor, the
+//! split layout (each view's file, cursor and first visible line) and the
+//! focused view are saved to `<state>/sessions/<hash of cwd>.toml`.
+//! Starting `maestro` with no file arguments in the same directory opens
+//! them again.
 //!
-//! Not restored in this slice: splits (only the focused view's file is
-//! shown), scroll positions, multiple selections, unnamed buffers.
+//! Not restored: multiple selections, horizontal scroll, unnamed buffers
+//! (a view that showed one shows another restored file instead). Session
+//! files written before layouts were saved still load; they restore one
+//! view.
 
 use std::fs;
 use std::io::Write;
@@ -13,7 +16,8 @@ use std::path::{Path, PathBuf};
 use maestro_core::Selection;
 use serde::{Deserialize, Serialize};
 
-use crate::editor::{DocumentId, Editor, Severity};
+use crate::editor::{DocumentId, Editor, Severity, ViewId};
+use crate::layout::{Direction, Layout, Node};
 
 const VERSION: u32 = 1;
 
@@ -25,6 +29,33 @@ pub struct SessionFile {
     /// The file shown in the focused view.
     pub focused: Option<String>,
     pub buffers: Vec<SessionBuffer>,
+    /// The split layout. Absent in files from before layouts were saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<SessionNode>,
+    /// Index of the focused view in the layout's left-to-right,
+    /// top-to-bottom order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_view: Option<usize>,
+}
+
+/// A node of the saved split layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SessionNode {
+    View {
+        /// `None` for a view showing an unnamed buffer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        line: usize,
+        column: usize,
+        #[serde(default)]
+        top_line: usize,
+    },
+    Split {
+        /// `vertical` places children side by side; `horizontal` stacks them.
+        direction: String,
+        children: Vec<SessionNode>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +166,7 @@ pub fn capture(ed: &Editor, cwd: &Path) -> SessionFile {
             column,
         });
     }
+    let order = ed.layout.views();
     SessionFile {
         version: VERSION,
         cwd: crate::editor::normalize_path(cwd)
@@ -142,7 +174,149 @@ pub fn capture(ed: &Editor, cwd: &Path) -> SessionFile {
             .into_owned(),
         focused,
         buffers,
+        layout: Some(capture_node(ed, ed.layout.root())),
+        focused_view: order.iter().position(|v| *v == ed.focus),
     }
+}
+
+/// Line and char column of a view's primary cursor.
+fn cursor_of(ed: &Editor, view: ViewId) -> (usize, usize) {
+    let v = &ed.views[&view];
+    let text = ed.buffers[&v.doc].doc.text();
+    let head = v.selection.primary().head.min(text.len_chars());
+    let line = text.char_to_line(head);
+    (line, head - text.line_to_char(line))
+}
+
+fn capture_node(ed: &Editor, node: &Node) -> SessionNode {
+    match node {
+        Node::Leaf(id) => {
+            let v = &ed.views[id];
+            let path = ed.buffers[&v.doc]
+                .doc
+                .path()
+                .and_then(Path::to_str)
+                .map(str::to_string);
+            let (line, column) = cursor_of(ed, *id);
+            SessionNode::View {
+                path,
+                line,
+                column,
+                top_line: v.top_line,
+            }
+        }
+        Node::Split { dir, children } => SessionNode::Split {
+            direction: match dir {
+                Direction::Vertical => "vertical",
+                Direction::Horizontal => "horizontal",
+            }
+            .into(),
+            children: children.iter().map(|c| capture_node(ed, c)).collect(),
+        },
+    }
+}
+
+/// A selection at `line`/`column`, clamped to the file as it is now.
+fn point_at(ed: &Editor, id: DocumentId, line: usize, column: usize) -> Selection {
+    let text = ed.buffers[&id].doc.text();
+    let line = line.min(text.len_lines().saturating_sub(1));
+    let line_start = text.line_to_char(line);
+    let line_len =
+        maestro_core::text::line_end_excluding_terminator(text.slice(..), line) - line_start;
+    Selection::point(line_start + column.min(line_len)).clamp_normal(text.slice(..))
+}
+
+/// Builds the restored layout's views. Leaves whose file was not opened
+/// are dropped and leaves of unnamed buffers show `fallback`; splits left
+/// with one child collapse into it. Returns
+/// the tree and its views in layout order.
+fn restore_node(
+    ed: &mut Editor,
+    node: &SessionNode,
+    opened: &[(DocumentId, &SessionBuffer)],
+    fallback: DocumentId,
+    order: &mut Vec<ViewId>,
+) -> Option<Node> {
+    match node {
+        SessionNode::View {
+            path,
+            line,
+            column,
+            top_line,
+        } => {
+            // A file that could not be opened loses its view; a view of an
+            // unnamed buffer shows the fallback instead.
+            let found = match path.as_deref() {
+                Some(p) => Some(opened.iter().find(|(_, e)| e.path == p)?.0),
+                None => None,
+            };
+            let doc = found.unwrap_or(fallback);
+            let view = ed.new_view(doc);
+            if found.is_some() {
+                let sel = point_at(ed, doc, *line, *column);
+                let lines = ed.buffers[&doc].doc.text().len_lines();
+                let v = ed.views.get_mut(&view).expect("view just made");
+                v.selection = sel;
+                v.top_line = (*top_line).min(lines.saturating_sub(1));
+            }
+            order.push(view);
+            Some(Node::Leaf(view))
+        }
+        SessionNode::Split {
+            direction,
+            children,
+        } => {
+            let dir = match direction.as_str() {
+                "vertical" => Direction::Vertical,
+                "horizontal" => Direction::Horizontal,
+                _ => return None,
+            };
+            let mut kids: Vec<Node> = children
+                .iter()
+                .filter_map(|c| restore_node(ed, c, opened, fallback, order))
+                .collect();
+            match kids.len() {
+                0 => None,
+                1 => kids.pop(),
+                _ => Some(Node::Split {
+                    dir,
+                    children: kids,
+                }),
+            }
+        }
+    }
+}
+
+/// Replaces the editor's views with the saved layout. Gives up (keeping
+/// the single view) on an empty or malformed layout.
+fn restore_layout(
+    ed: &mut Editor,
+    layout: &SessionNode,
+    focused_view: Option<usize>,
+    opened: &[(DocumentId, &SessionBuffer)],
+    fallback: DocumentId,
+) {
+    let old: Vec<ViewId> = ed.layout.views();
+    let mut order = Vec::new();
+    let Some(root) = restore_node(ed, layout, opened, fallback, &mut order) else {
+        for v in order {
+            ed.views.remove(&v);
+        }
+        return;
+    };
+    let shown_before: Vec<DocumentId> = old.iter().map(|v| ed.views[v].doc).collect();
+    for v in &old {
+        ed.views.remove(v);
+    }
+    ed.layout = Layout::from_root(root);
+    ed.focus = focused_view
+        .and_then(|i| order.get(i))
+        .copied()
+        .unwrap_or(order[0]);
+    for doc in shown_before {
+        ed.remove_scratch_if_unused(doc);
+    }
+    ed.relayout();
 }
 
 /// Saves the session if sessions are enabled. With no named buffers open
@@ -220,13 +394,7 @@ pub fn restore(ed: &mut Editor) {
     ed.navigation.restoring = false;
     // Put each cursor back, clamped to the file as it is now.
     for (id, entry) in &opened {
-        let text = ed.buffers[id].doc.text().clone();
-        let line = entry.line.min(text.len_lines().saturating_sub(1));
-        let line_start = text.line_to_char(line);
-        let line_len =
-            maestro_core::text::line_end_excluding_terminator(text.slice(..), line) - line_start;
-        let pos = line_start + entry.column.min(line_len);
-        let sel = Selection::point(pos).clamp_normal(text.slice(..));
+        let sel = point_at(ed, *id, entry.line, entry.column);
         if let Some(b) = ed.buffers.get_mut(id) {
             b.last_selection = sel.clone();
         }
@@ -242,13 +410,24 @@ pub fn restore(ed: &mut Editor) {
         .map(|(id, _)| *id);
     if let Some(id) = focus {
         ed.switch_to(id);
+        if let Some(layout) = &session.layout {
+            restore_layout(ed, layout, session.focused_view, &opened, id);
+        }
     }
-    // Restoring is not navigation: start with an empty jump list.
-    let view = ed.view_mut();
-    view.jumps.clear();
-    view.jump_index = 0;
-    ed.ensure_cursor_visible();
-    crate::commands::align_view_center(ed);
+    // Restoring is not navigation: start with empty jump lists.
+    for view in ed.views.values_mut() {
+        view.jumps.clear();
+        view.jump_index = 0;
+    }
+    if session.layout.is_none() {
+        ed.ensure_cursor_visible();
+        crate::commands::align_view_center(ed);
+    } else {
+        // Keep each view's saved scroll unless its cursor is off screen.
+        for id in ed.layout.views() {
+            ed.ensure_visible_in(id);
+        }
+    }
 
     let mut msg = format!(
         "restored session: {} file{}",
@@ -295,9 +474,43 @@ mod tests {
                 line: 3,
                 column: 7,
             }],
+            layout: Some(SessionNode::Split {
+                direction: "vertical".into(),
+                children: vec![
+                    SessionNode::View {
+                        path: Some("/w/a b.rs".into()),
+                        line: 3,
+                        column: 7,
+                        top_line: 1,
+                    },
+                    SessionNode::Split {
+                        direction: "horizontal".into(),
+                        children: vec![
+                            SessionNode::View {
+                                path: None,
+                                line: 0,
+                                column: 0,
+                                top_line: 0,
+                            },
+                            SessionNode::View {
+                                path: Some("/w/a b.rs".into()),
+                                line: 0,
+                                column: 0,
+                                top_line: 0,
+                            },
+                        ],
+                    },
+                ],
+            }),
+            focused_view: Some(2),
         };
         let text = toml::to_string(&s).unwrap();
         assert_eq!(toml::from_str::<SessionFile>(&text).unwrap(), s);
+        // Files written before layouts were saved still load.
+        let old = "version = 1\ncwd = \"/w\"\nbuffers = []\n";
+        let parsed: SessionFile = toml::from_str(old).unwrap();
+        assert_eq!(parsed.layout, None);
+        assert_eq!(parsed.focused_view, None);
     }
 
     #[cfg(unix)]

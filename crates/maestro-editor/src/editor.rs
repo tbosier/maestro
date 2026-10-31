@@ -302,7 +302,7 @@ impl Editor {
         id
     }
 
-    fn new_view(&mut self, doc: DocumentId) -> ViewId {
+    pub(crate) fn new_view(&mut self, doc: DocumentId) -> ViewId {
         let id = ViewId(self.fresh_id());
         let selection = self.buffers[&doc].last_selection.clone();
         self.views.insert(
@@ -540,7 +540,7 @@ impl Editor {
 
     /// Drops an untouched, unnamed scratch buffer once nothing shows it, so
     /// opening a file from an empty start does not leave clutter behind.
-    fn remove_scratch_if_unused(&mut self, id: DocumentId) {
+    pub(crate) fn remove_scratch_if_unused(&mut self, id: DocumentId) {
         let Some(b) = self.buffers.get(&id) else {
             return;
         };
@@ -803,7 +803,7 @@ impl Editor {
         self.ensure_visible_in(self.focus);
     }
 
-    fn ensure_visible_in(&mut self, id: ViewId) {
+    pub(crate) fn ensure_visible_in(&mut self, id: ViewId) {
         let Some(view) = self.views.get(&id) else {
             return;
         };

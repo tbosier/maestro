@@ -302,6 +302,57 @@ fn session_is_saved_on_quit_and_restored() {
 }
 
 #[test]
+fn splits_are_saved_and_restored() {
+    let dir = temp_dir("session-splits");
+    let state = dir.join("state");
+    let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    write(&dir, "one.txt", &long);
+    write(&dir, "two.txt", "alpha\nbeta\ngamma\n");
+    write(&dir, "gone.txt", "temporary\n");
+
+    // Left: one.txt scrolled down. Right: two.txt over gone.txt.
+    let mut ed = configured(&dir, &state);
+    run(&mut ed, ":e one.txt\n150G");
+    run(&mut ed, ":vsplit two.txt\njw");
+    run(&mut ed, ":split gone.txt\n");
+    run(&mut ed, "<C-w>k");
+    assert_eq!(doc_path(&ed), dir.join("two.txt"));
+    let left_top = ed.views[&ed.layout.views()[0]].top_line;
+    assert!(
+        left_top > 100,
+        "left view should be scrolled, top {left_top}"
+    );
+    let two_head = ed.view().selection.primary().head;
+    run(&mut ed, ":qa\n");
+    assert!(ed.should_quit);
+
+    std::fs::remove_file(dir.join("gone.txt")).unwrap();
+    let mut ed = configured(&dir, &state);
+    session::restore(&mut ed);
+    // gone.txt's view is dropped and its split collapses: two side by side.
+    let order = ed.layout.views();
+    assert_eq!(order.len(), 2);
+    assert_eq!(ed.views.len(), 2, "no orphaned views");
+    let path_of = |ed: &Editor, i: usize| {
+        let v = &ed.views[&ed.layout.views()[i]];
+        ed.buffers[&v.doc].doc.path().unwrap().to_path_buf()
+    };
+    assert_eq!(path_of(&ed, 0), dir.join("one.txt"));
+    assert_eq!(path_of(&ed, 1), dir.join("two.txt"));
+    let rects: Vec<_> = order.iter().map(|v| ed.views[v].area).collect();
+    assert_eq!(rects[0].y, rects[1].y, "side by side");
+    assert!(rects[0].x < rects[1].x);
+    // Each view keeps its own cursor and scroll; focus is restored.
+    assert_eq!(ed.focus, order[1]);
+    assert_eq!(ed.view().selection.primary().head, two_head);
+    assert_eq!(ed.views[&order[0]].top_line, left_top);
+    let left = &ed.views[&order[0]];
+    let text = ed.buffers[&left.doc].doc.text();
+    assert_eq!(text.char_to_line(left.selection.primary().head), 149);
+    assert_eq!(ed.buffers.len(), 2, "the startup scratch buffer is gone");
+}
+
+#[test]
 fn sessions_are_per_directory_and_can_be_disabled() {
     let dir = temp_dir("session-off");
     let state = dir.join("state");

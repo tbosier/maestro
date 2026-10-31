@@ -67,6 +67,15 @@ impl Layout {
         }
     }
 
+    /// Builds a layout from a tree, as session restore does.
+    pub fn from_root(root: Node) -> Self {
+        Self { root }
+    }
+
+    pub fn root(&self) -> &Node {
+        &self.root
+    }
+
     pub fn views(&self) -> Vec<ViewId> {
         fn walk(n: &Node, out: &mut Vec<ViewId>) {
             match n {

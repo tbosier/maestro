@@ -14,7 +14,7 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. Age
 - Text objects and surround: `mi(`, `ma"`, `ms[`, `mr([`, `md{`, `mm` for the matching bracket.
 - Splits (`C-w v`, `C-w s`), multiple buffers, a buffer picker and a command palette listing every command with its key.
 - A file finder (`space f`) that respects `.gitignore`, `.ignore` and Git's global excludes and fills in on a background thread, so you can type while a large tree is still being listed. Workspace search (`space /` or `:grep <regex>`) streams `path:line:col` results; accepting one opens the file there. Both pickers preview the file on the right when the terminal is at least 100 columns wide.
-- Session restore: quitting saves the open files and cursors for the directory; starting `maestro` there with no file arguments reopens them. `space r` lists recently opened files.
+- Session restore: quitting saves the open files, the split layout, and each view's cursor and scroll for the directory; starting `maestro` there with no file arguments reopens them. `space r` lists recently opened files.
 - Detects files changed on disk (metadata, file identity, and a content hash at save time). A clean buffer reloads; a modified one warns and refuses to overwrite until you choose.
 - Crash recovery: unsaved changes are journaled after two idle seconds, one journal per editor session, and `:recover` in a later session brings them back.
 - UTF-8, UTF-8 with BOM, and UTF-16 files with a BOM. LF and CRLF are preserved. Binary files and invalid UTF-8 open read-only.
