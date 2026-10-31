@@ -222,7 +222,7 @@ fn git_line_paths(rest: &[u8]) -> Option<(PathBuf, PathBuf)> {
         return Some((a, b));
     }
     let n = rest.len();
-    if n < 5 || (n - 5) % 2 != 0 {
+    if n < 5 || !(n - 5).is_multiple_of(2) {
         return None;
     }
     let half = (n - 5) / 2;

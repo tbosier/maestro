@@ -81,3 +81,34 @@ crates = ["maestro-editor"]
 branch = "feat/vim-profile"
 owner = "unassigned"
 status = "not-started"
+
+[[task]]
+id = "m2-term"
+title = "PTY terminals with VT emulation (maestro-term)"
+crates = ["maestro-term"]
+branch = "feat/term"
+owner = "agent"
+status = "in-progress"
+
+[[task]]
+id = "m2-agent"
+title = "Agent providers and the ACP client (maestro-agent)"
+crates = ["maestro-agent"]
+branch = "feat/agent"
+owner = "agent"
+status = "in-progress"
+
+[[task]]
+id = "m2-review"
+title = "Review diff, safe integration, verification runner (maestro-git, maestro-tasks)"
+crates = ["maestro-git", "maestro-tasks"]
+branch = "feat/review"
+owner = "agent"
+status = "in-progress"
+
+[[task]]
+id = "m2-panel"
+title = "Agent panel and review screen in the editor"
+crates = ["maestro-editor", "maestro-tui"]
+owner = "lead"
+status = "not-started"

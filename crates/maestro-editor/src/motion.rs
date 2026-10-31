@@ -271,8 +271,10 @@ pub fn surrounding_pair(
         let quotes: Vec<usize> = (start..end).filter(|&i| text.char(i) == open).collect();
         // Pair quotes left to right and pick the pair containing pos.
         return quotes
-            .chunks_exact(2)
-            .map(|w| (w[0], w[1]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[a, b]| (a, b))
             .find(|(a, b)| *a <= pos && pos <= *b);
     }
     let c = text.char(pos);

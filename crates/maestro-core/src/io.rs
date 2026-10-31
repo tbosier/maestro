@@ -125,11 +125,10 @@ impl ContentHasher {
             self.mix(u64::from_le_bytes(self.buf));
             self.buf_len = 0;
         }
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            self.mix(u64::from_le_bytes(c.try_into().expect("8 bytes")));
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            self.mix(u64::from_le_bytes(*c));
         }
-        let rest = chunks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
         self.buf_len = rest.len();
     }
@@ -252,12 +251,13 @@ fn lossy(bytes: &[u8], reason: ReadOnlyReason) -> (Rope, Encoding, Option<ReadOn
 }
 
 fn decode_utf16(bytes: &[u8], enc: Encoding) -> (Rope, Encoding, Option<ReadOnlyReason>) {
-    if bytes.len() % 2 != 0 {
+    let (pairs, odd) = bytes.as_chunks::<2>();
+    if !odd.is_empty() {
         return lossy(bytes, ReadOnlyReason::InvalidEncoding);
     }
-    let units = bytes.chunks_exact(2).map(|c| match enc {
-        Encoding::Utf16Le => u16::from_le_bytes([c[0], c[1]]),
-        _ => u16::from_be_bytes([c[0], c[1]]),
+    let units = pairs.iter().map(|&c| match enc {
+        Encoding::Utf16Le => u16::from_le_bytes(c),
+        _ => u16::from_be_bytes(c),
     });
     match char::decode_utf16(units).collect::<Result<String, _>>() {
         Ok(s) => (Rope::from_str(&s), enc, None),

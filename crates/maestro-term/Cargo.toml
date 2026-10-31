@@ -1,0 +1,14 @@
+[package]
+name = "maestro-term"
+description = "Pseudo-terminals and terminal emulation for Maestro's agent terminals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+portable-pty.workspace = true
+vt100.workspace = true
+
+[lints]
+workspace = true

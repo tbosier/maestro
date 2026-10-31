@@ -395,12 +395,12 @@ fn route(msg: Message, shared: &Shared, out: &Sender<Outgoing>, sink: &Mutex<Eve
             let Some(id) = id.as_i64() else {
                 return;
             };
-            if id == INITIALIZE_ID {
-                if let Ok(v) = &result {
-                    let caps = v.get("capabilities").cloned().unwrap_or(json!({}));
-                    *lock(&shared.capabilities) = Some(caps);
-                    let _ = out.send(Outgoing::Ready);
-                }
+            if id == INITIALIZE_ID
+                && let Ok(v) = &result
+            {
+                let caps = v.get("capabilities").cloned().unwrap_or(json!({}));
+                *lock(&shared.capabilities) = Some(caps);
+                let _ = out.send(Outgoing::Ready);
             }
             let tx = lock(&shared.pending).remove(&id);
             if let Some(tx) = tx {
