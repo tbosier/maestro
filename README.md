@@ -2,7 +2,7 @@
 
 A modal text editor written in Rust, built for a workflow where one person and several coding agents edit the same codebase. The editing core comes first: it has to be good with every agent feature turned off.
 
-Status: milestone M0 is done (a working terminal editor). M1 is in progress. Agent features (M2 and later) are not built yet. [ROADMAP.md](ROADMAP.md) says exactly what works.
+Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 (agents in worktrees, review, integration) is partly built: the agent panel works, but agents are forgotten on restart and no real agent program has been run through it yet. [ROADMAP.md](ROADMAP.md) says exactly what works.
 
 ## What works today
 
@@ -26,7 +26,10 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. Age
 
 - Tree-sitter syntax highlighting for Rust, Python, TOML, JSON, Markdown, JavaScript, TypeScript and C, and structural selection: `A-o` grows the selection to the enclosing syntax node, `A-i` shrinks it, `A-n`/`A-p` move between siblings.
 
-Not built yet: completion and the agent features (M2). Those are tracked in the roadmap.
+- Coding agents in Git worktrees (`space a` or `:agents`). `n` asks for a task and a provider, makes a worktree on a new `maestro/<task>-<id>` branch from the current commit, and starts the agent there: over the Agent Client Protocol (`gemini --acp`, `opencode acp`) or in a terminal (`claude`, `codex`, or any program you configure). `N` starts the same task with another provider, and the list shows each agent's status, files changed, lines added and removed, and last test result side by side. Status comes from what the agent reports, the process exit, test runs and your decisions; a terminal agent says "running" and nothing more, because Maestro cannot see inside it. `C-\` gives your keys to an agent's terminal and takes them back.
+- Review per agent (`Enter` in the panel): changed files, unified or side-by-side diffs with changed words marked, line comments (`c`), and `Enter` to open the worktree's file at that line. `t` runs the tests in the worktree, `f` sends your comments and notes back to the agent, `p` answers a permission request, `X` rejects, `A` archives the worktree, and `I` commits the agent's work and merges, fast-forwards or cherry-picks it into your branch. Each of those asks first and says what it will do; Git refuses on its own when your worktree is dirty or the merge would conflict.
+
+Not built yet: completion, agent sessions that survive a restart, and an OS sandbox for agents (a worktree keeps their files apart, not their permissions; see [docs/security.md](docs/security.md)). Those are tracked in the roadmap.
 
 ## Build and run
 
@@ -60,6 +63,8 @@ cargo build --release
 | `.` | repeat the last change |
 | `gg G` / `3G` / `:42` | go to the start, end, or a line |
 | `space f` / `space /` / `space r` | find a file / search the workspace / recent files |
+| `space a` | the agent panel: `n` new task, `N` same task with another provider, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate, `X` reject, `A` archive, `v` history or test output, `C-\` keys to the agent's terminal and back |
+| in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `ret` open the file there |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
 
@@ -81,6 +86,20 @@ restore-session = true     # reopen the last session's files in this directory
 
 [keys.normal]
 "space w" = "write"
+
+[agents]
+worktree-dir = "~/worktrees"          # default: <repository>-worktrees next to it
+test-command = ["cargo", "test", "--workspace"]   # default: cargo test when there is a Cargo.toml
+
+[agents.provider.mine]                # any command-line agent, run in a terminal
+kind = "terminal"
+command = "my-agent"
+args = ["--prompt", "{task}"]         # without {task}, the task is typed in after start
+
+[agents.provider.codex]
+kind = "terminal"
+command = "codex"
+enabled = false                       # hides a built-in provider
 ```
 
 Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config, and reads and writes neither the session nor the recent-files list.

@@ -1,16 +1,79 @@
 # Agent model
 
-Nothing in this document is built yet except where marked. It records the decisions that the existing code already commits to, so agent work (M2, M3) starts from them.
+This describes what is built as of October 30, 2026. Anything marked partial or not built is not there.
 
-## Built: version-checked edits
+## Version-checked edits
 
 `Document::apply_at_version(tx, expected_version, selection)` applies a transaction only if the document is still at the version the edit was computed against. Otherwise it returns `EditError::Stale` and changes nothing. Separately, every `ChangeSet` records the length of the document it was built for and refuses to apply to any other length.
 
 Edits produced away from the keyboard and computed against a known version must go through `apply_at_version`. The automation API's `document.apply_edit` does. Its `command.run` and `editor.execute` do not: they run editor commands on the current text, as a key press would, with no version check and no entry in the edit history (see `docs/automation.md`).
 
-## Planned
+Coding agents started from the agent panel do not edit buffers. They change files in their own worktree, and the user reviews and integrates those files through Git (below).
 
-- An agent is a record with an id, a name, a task, a provider, an optional worktree, a status (planning, editing, running tests, awaiting approval, blocked, ready for review, completed, failed) and a history. Status colors already exist in the theme (`AgentTheme`) and each is always shown with its name.
-- Providers: Agent Client Protocol where the agent supports it; a managed PTY for any other CLI agent. The UI will say which kind a session is, and will not show structured progress for PTY-only agents.
-- A worktree is source isolation, not a security boundary. Agents run with the user's permissions unless an OS sandbox is configured; the permission system will be enforced in backend code, not by confirmation dialogs alone.
-- Edit proposals carry base versions or content hashes per file, the operations, the originating actor and a review status. Multi-file application uses a durable journal; it will not be described as atomic.
+## Agents
+
+An agent is a record in the editor (`maestro_editor::agents::Agent`) with:
+
+- an id and a name (`<provider>-<id>`), the task text, and a group number shared by agents started on the same task;
+- the provider it runs (see Providers);
+- its worktree: a path, a branch named `maestro/<slug>-<id>`, the commit it started from, and the repository's main worktree, where its work is integrated;
+- a status (below);
+- the runtime: an ACP client, or a terminal (a PTY) for terminal providers;
+- for ACP agents, the transcript (messages, thoughts, tool calls, plans), the pending permission request and the agent's stderr (last 500 lines);
+- a history of timestamped events;
+- verification runs with their output (last 20,000 lines each), exit code, duration and parsed `cargo test` totals;
+- errors, and the files changed according to the last review diff;
+- review comments, each on one line of one file, marked once sent.
+
+Records live only in memory. Quitting the editor forgets them; the worktrees and branches stay on disk.
+
+## Providers
+
+The provider list is the enabled `[agents.provider.<name>]` entries from the config, then the built-in providers found on `PATH` that the config does not name: `gemini --acp` and `opencode acp` (ACP), `claude {task}` and `codex {task}` (terminal). A config entry with `enabled = false` hides the built-in of the same name.
+
+- An ACP agent is started with its worktree as the working directory, gets `session/new` there, and receives the task as its first prompt.
+- A terminal agent runs in a PTY in its worktree. Each argument containing `{task}` has it replaced by the task text, as one argument with no shell quoting. If no argument contains `{task}`, the task is typed into the terminal once the program first draws something, or after one second.
+
+## Status
+
+Status comes only from these signals:
+
+| Status | Set when |
+|---|---|
+| starting | the worktree is being created or the ACP session is starting |
+| working | an ACP prompt was sent and the agent has not sent a plan or edit in this turn |
+| planning | the ACP agent sent a plan during the turn |
+| editing | the ACP agent reported an edit, delete or move tool, or wrote a file through the client |
+| awaiting approval | the ACP agent asked for permission |
+| running | a terminal agent's program is running; Maestro cannot see what it is doing |
+| running tests | Maestro's verification command runs in the worktree (shown over the agent's own status) |
+| ready for review | the ACP turn ended with `end_turn`, or the terminal program exited with code 0 |
+| blocked | the ACP turn ended any other way (`refusal`, `cancelled`, `max_tokens`, `max_turn_requests`) |
+| failed | the worktree or process could not start, the turn ended with an error, the ACP process exited mid-turn, or the terminal program exited with a nonzero code |
+| rejected | the user rejected the agent |
+| integrated | the user integrated its work |
+
+Once rejected or integrated, agent events no longer change the status. `maestro_agent::AgentStatus` has no state for "working" or for a running terminal program, so the editor has its own status type with those two added. Each status is drawn with its name next to its color.
+
+## The panel and review screen
+
+`space a` or `:agents` opens the panel over the editor area. The keys are listed on its last line. The review screen (`Enter` on an agent) shows the diff of the worktree against the commit it started from: commits on its branch, staged, unstaged and untracked files. Diffs are computed on a background thread when the panel opens, when an ACP turn ends or the agent writes a file, when a process exits, after integration, every three seconds for running agents while the panel is open, and on `r`.
+
+Terminal agents have no structured status. The panel says so ("terminal only") next to every terminal agent.
+
+## Actions
+
+- Tests (`t`): runs `[agents] test-command`, or `cargo test` when the worktree has a `Cargo.toml`, with `maestro-tasks`. Output streams into the tests view; the totals are parsed from `cargo test` output.
+- Feedback (`f`): unsent comments plus typed text. An ACP agent gets them as a new prompt (refused while a turn is running). A terminal agent gets them typed into its terminal, and the input box says that is all Maestro can do.
+- Permission (`p`): lists the agent's choices. Choices that allow something ask for confirmation first; rejecting is sent at once.
+- Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree.
+- Archive (`A`): removes the worktree with `remove_worktree`, keeping the branch. If the worktree has uncommitted or untracked files, the removal is refused and a second dialog lists what forcing would delete; only `F` there forces it.
+- Integrate (`I`): checks the main worktree first and refuses, changing nothing, if it is detached or has uncommitted changes, or if any open buffer in either worktree has unsaved edits. The dialog says what will be committed and how the branch will be integrated (`tab` cycles merge, fast-forward and cherry-pick). On `y`, uncommitted work in the agent's worktree is committed with the task's first line as the subject, then `integrate` runs in the main worktree. `maestro-git` checks everything again and refuses on its own.
+- Quitting with agents or tests running asks first and stops them on `y`. Dropping the editor (any other way of exiting) also stops them.
+
+## Not built
+
+- Agent records do not survive a restart, so the "Sessions" item of M2 is not done.
+- Agents cannot propose edits to open buffers; there is no edit proposal or review status per buffer edit.
+- No OS sandbox around agent processes (see `docs/security.md`).
+- Terminals show only in the panel, not in splits.

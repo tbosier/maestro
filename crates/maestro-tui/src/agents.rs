@@ -257,12 +257,12 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     // Row 3: worktree.
     let wt = match &a.worktree {
         Some(w) if a.archived => format!("worktree archived; branch {} kept", w.branch),
-        Some(w) => format!(
-            "{}  {}  from {}",
-            w.path.display(),
-            w.branch,
-            &w.base[..w.base.len().min(8)]
-        ),
+        Some(w) => {
+            // The branch first; the path gives way from the left.
+            let head = format!("{} from {}  ", w.branch, &w.base[..w.base.len().min(8)]);
+            let room = (r.saturating_sub(x0) as usize).saturating_sub(head.chars().count());
+            format!("{head}{}", tail_of(&w.path.display().to_string(), room))
+        }
         None => "worktree not created yet".to_string(),
     };
     s.print(x0, y, &wt, ui.text_muted, r);
@@ -278,6 +278,19 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     let x = s.print(x0, y, "task: ", ui.text_muted, task_r);
     s.print(x, y, first, ui.text, task_r);
     s.print(task_r, y, &view, ui.text_muted, r);
+}
+
+/// The end of `text` in at most `width` columns, with `…` when cut.
+fn tail_of(text: &str, width: usize) -> String {
+    let n = text.chars().count();
+    if n <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let kept: String = text.chars().skip(n - (width - 1)).collect();
+    format!("…{kept}")
 }
 
 fn draw_content(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) -> Option<CursorShape> {
@@ -358,7 +371,9 @@ fn draw_content(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) -> Option<C
                         Some(false) => ui.text.patch(ed.theme.agent.failed),
                         None => ui.text.patch(ed.theme.agent.running),
                     };
-                    lines.push((head, style.bold()));
+                    for w in wrap(&head, width) {
+                        lines.push((w, style.bold()));
+                    }
                     if let Some(sum) = run.finished.as_ref().and_then(|f| f.summary.as_ref()) {
                         for f in &sum.failures {
                             lines.push((

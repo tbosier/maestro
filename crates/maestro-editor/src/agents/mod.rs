@@ -476,6 +476,17 @@ impl AgentState {
     }
 }
 
+impl Drop for AgentState {
+    /// Stops every agent process and test run, whatever ends the editor
+    /// (`:qa`, the automation API's quit, a test). A test run's handle does
+    /// not stop it on drop, so this does.
+    fn drop(&mut self) {
+        for a in &mut self.agents {
+            a.stop();
+        }
+    }
+}
+
 /// The providers to choose from: enabled `[agents.provider.*]` entries,
 /// then the built-in ones found on `PATH` that the config does not name.
 /// A config entry with `enabled = false` hides the built-in of that name.

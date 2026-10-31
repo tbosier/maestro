@@ -563,7 +563,7 @@ fn archived(ed: &mut Editor, id: AgentId, forced: bool, result: Result<(), Remov
             }
             a.log("archive refused: the worktree holds work");
             ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
-                title: "force archive?".into(),
+                title: "force archive".into(),
                 lines,
                 keys: vec![
                     ("F".into(), "delete them and remove the worktree".into()),

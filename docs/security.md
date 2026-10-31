@@ -2,7 +2,7 @@
 
 ## What exists today
 
-Maestro is currently a local editor with no network code and no plugin system. Its only subprocesses are the clipboard helpers, `git`, and the language servers, all described below. The automation API (below) listens only on a Unix socket, and only when started with `--listen`.
+Maestro is currently a local editor with no network code and no plugin system. Its subprocesses are the clipboard helpers, `git`, the language servers, and the coding agents and verification commands the user starts from the agent panel, all described below. The automation API (below) listens only on a Unix socket, and only when started with `--listen`.
 
 - Files are written atomically through a temp file in the same directory, created with `create_new` so an existing file of that name is never clobbered, and removed on failure only if this save created it. When an existing file is replaced, the temp file is created owner-only (0600) and gets the original's permissions just before the rename, so private contents are never briefly readable by others. Symlinks, including dangling ones, are followed so the link survives.
 - Before overwriting, a save compares the file's metadata, identity (device and inode on Unix) and a hash of its bytes with what was last read or written. Any difference refuses the save until the user picks `:w!` or `:reload`.
@@ -38,13 +38,28 @@ Maestro is currently a local editor with no network code and no plugin system. I
 - The socket is removed when the editor exits normally. After a crash it stays behind; the next `--listen` on that path replaces it only if connecting is refused (nobody listening). Any other connection error is reported and the file is left alone. Between that check and the removal there is a small window in which another process could put a new socket there and have it removed.
 - Windows has no socket transport yet; `--listen` is refused there.
 
+## Coding agents
+
+The agent panel (`space a`) runs coding agents. What they can and cannot do:
+
+- An agent is a program from the user's config (`[agents.provider.<name>]`) or a built-in provider found on `PATH` (`gemini`, `opencode`, `claude`, `codex`). Like language servers, providers are never read from files inside a repository. Nothing starts until the user types a task and picks a provider.
+- The agent runs as the user, with the editor's full environment (API keys and tokens in it included) and its worktree as the working directory. A Git worktree isolates source, not privileges: the agent can read, write and run anything the user can, anywhere on the machine, and reach the network. There is no OS sandbox.
+- For ACP agents, file reads and writes the agent asks Maestro to do (`fs/read_text_file`, `fs/write_text_file`) are confined to the worktree by path checks: paths outside it, symlinks out of it and the `.git` directory are refused. That confinement covers only those requests. The agent's own tools (its shell, its own file writes) do not go through Maestro and are not confined at all. The path checks also have a race: a process swapping a checked directory for a symlink at the right moment can redirect a write.
+- Permission requests from an ACP agent are shown in the panel. Granting one needs a second key in a confirmation dialog; nothing is granted automatically. An agent that does not ask (most terminal agents, and any agent using its own tools) is not stopped by this.
+- A terminal agent's task text is passed as an argument (one argument per `{task}`, no shell involved) or typed into its terminal. A provider configured as `sh -c "... {task}"` would hand the task text to a shell; do not configure one that way.
+- Agent output is untrusted and only reaches the main worktree through integration, which the user starts and confirms. `maestro-git` refuses to integrate into a dirty, detached or mid-operation worktree, refuses on conflicts found by a dry run, and aborts what it started if git fails. Maestro also refuses before committing anything when the main worktree is dirty or a buffer in either worktree has unsaved edits.
+- Integration runs the repository's Git hooks (`commit_all` and the merge or cherry-pick commit), and the agent controls the files in its worktree, so integrating runs hooks over files the agent wrote.
+- Archiving removes the worktree only when `maestro-git` finds no uncommitted or untracked work in it. Forcing needs a second confirmation that lists the files it deletes; ignored files are deleted too. The branch is always kept.
+- Rejecting, archiving and quitting stop the agent. ACP agents run in their own process group, which is killed. Terminal agents get SIGHUP and then SIGKILL, but only the direct child is signaled, so a descendant that ignores SIGHUP can survive. Test runs are killed by process group.
+- Terminal output is drawn cell by cell through the same renderer as files, so control characters show as `?` and cannot reach the user's terminal.
+- Verification runs `[agents] test-command`, or `cargo test` when the worktree has a `Cargo.toml`. `cargo test` builds and runs code from the worktree, which the agent wrote.
+
 ## Trust boundaries for what comes next
 
 - Repository contents are untrusted. Maestro will not run tasks, hooks or language servers named by a repository without the user approving them for that workspace. Note that a trusted server can still act on repository contents: `rust-analyzer`, for example, runs `cargo` and build scripts from the project it indexes. Opening a Rust file from an untrusted repository with the default config runs that repository's build scripts. Set `enabled = false` under `[language-server.rust]` to avoid it.
-- Agent output is untrusted. Agent edits arrive as proposals checked against document versions, never as silent writes. Destructive shell commands are not auto-approved. Merges of agent work need explicit approval.
-- A Git worktree isolates source, not privileges. An agent in a worktree can read anything the user can unless an OS sandbox is in use.
-- Secrets: environment variables are not forwarded to agents by default, and tokens are not written to logs or config.
-- No project contents go to a model provider unless the user configured that provider and authorized it for the workspace.
+- Agent output is untrusted. Today agents write files in their own worktree, and the user integrates them with explicit approval (see Coding agents). Planned: agent edits to open buffers arriving as proposals checked against document versions, never as silent writes.
+- Planned: an OS sandbox for agent processes, and not forwarding environment variables to agents by default. Neither exists yet; today agents get the editor's whole environment.
+- Project contents go to a model provider only through an agent the user started from the panel. What that agent sends is up to the agent program; Maestro does not filter it.
 
 ## Known gaps
 
