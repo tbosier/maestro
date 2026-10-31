@@ -25,7 +25,11 @@
 //! | `tool-update <id> <status>` | sends a `tool_call_update` with a new status |
 //! | `write <path> <text>` | calls `fs/write_text_file`, then says `wrote <path>` or `write failed: <code> <message>` |
 //! | `read <path> [line] [limit]` | calls `fs/read_text_file`, then says `read: <content>` or `read failed: <code> <message>` |
-//! | `ask <title>` | calls `session/request_permission` (options `allow`: allow_once, `reject`: reject_once), then says `permission: <option>`; a cancelled answer says `permission: cancelled` and ends the turn as `cancelled` |
+//! | `write-raw <path> <text>` | like `write`, with the path sent exactly as given (relative paths stay relative) |
+//! | `ask <title>` | calls `session/request_permission` (options `allow`: allow_once, `reject`: reject_once), then says `permission: <option>`; a cancelled answer says `permission: cancelled` (or `permission: cancelled after session/cancel` when that notification came first) and ends the turn as `cancelled` |
+//! | `ask-dup <title>` | sends two permission requests with the same id before either is answered; says `duplicate: <error code>` and `permission: <option>` as the answers arrive |
+//! | `fake-response` | writes `{"id": <id of the current prompt>}`, which is not a valid response |
+//! | `unversioned-write <path>` | writes an `fs/write_text_file` request without `"jsonrpc": "2.0"` and does not wait for an answer |
 //! | `wait-cancel` | waits for `session/cancel`, then ends the turn as `cancelled` |
 //! | `unknown-request` | calls `fake/unknown`, then says `unknown: <error code>` |
 //! | `stderr <text>` | writes a line to stderr |
@@ -80,6 +84,7 @@ pub fn serve() -> i32 {
     let mut agent = Agent {
         input: BufReader::new(std::io::stdin().lock()),
         next_id: 0,
+        prompt_id: Value::Null,
         cwd: PathBuf::new(),
         session: None,
         client_caps: Value::Null,
@@ -109,6 +114,8 @@ enum Incoming {
 }
 
 struct Agent {
+    /// The id of the `session/prompt` being served.
+    prompt_id: Value,
     input: BufReader<std::io::StdinLock<'static>>,
     next_id: i64,
     cwd: PathBuf,
@@ -253,6 +260,7 @@ impl Agent {
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.cancelled = false;
+                self.prompt_id = id.clone();
                 match self.script(&text) {
                     End::Stop(reason) => reply(id, json!({"stopReason": reason})),
                     End::Error(message) => reply_error(id, -32603, &message),
@@ -420,13 +428,85 @@ impl Agent {
                                 self.say(&format!("permission: {option}"))
                             }
                             (Some("cancelled"), _) => {
-                                self.say("permission: cancelled");
+                                // Whether session/cancel arrived first.
+                                if self.cancelled {
+                                    self.say("permission: cancelled after session/cancel");
+                                } else {
+                                    self.say("permission: cancelled");
+                                }
                                 return End::Stop("cancelled".to_string());
                             }
                             _ => self.say(&format!("permission: malformed {r}")),
                         },
                         Err(e) => self.say(&format!("permission: error {e}")),
                     }
+                }
+                "write-raw" => {
+                    let (path, content) = rest.split_once(' ').unwrap_or((rest, ""));
+                    let params = json!({"sessionId": SESSION_ID, "path": path, "content": content});
+                    match self.call("fs/write_text_file", params) {
+                        Ok(_) => self.say(&format!("wrote {path}")),
+                        Err(e) => self.say(&format!(
+                            "write failed: {} {}",
+                            e["code"],
+                            e["message"].as_str().unwrap_or("")
+                        )),
+                    }
+                }
+                "ask-dup" => {
+                    // Two permission requests with one id, before either
+                    // is answered.
+                    let id = format!("dup-{}", self.next_id);
+                    self.next_id += 1;
+                    for title in [rest, "second request"] {
+                        send(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": "session/request_permission",
+                            "params": {
+                                "sessionId": SESSION_ID,
+                                "toolCall": {"toolCallId": title, "title": title},
+                                "options": [
+                                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                                ],
+                            },
+                        }));
+                    }
+                    let mut answers = 0;
+                    while answers < 2 {
+                        match self.next() {
+                            Some(Incoming::Response { id: rid, result }) if rid == id => {
+                                answers += 1;
+                                match result {
+                                    Ok(r) => self.say(&format!(
+                                        "permission: {}",
+                                        r["outcome"]["optionId"].as_str().unwrap_or("cancelled")
+                                    )),
+                                    Err(e) => self.say(&format!("duplicate: {}", e["code"])),
+                                }
+                            }
+                            Some(Incoming::Notification { method, params }) => {
+                                self.note_cancel(&method, &params)
+                            }
+                            Some(_) => {}
+                            None => std::process::exit(0),
+                        }
+                    }
+                }
+                "fake-response" => {
+                    // Shaped like an answer to the prompt being served, but
+                    // without `jsonrpc` or `result`.
+                    send(&json!({"id": self.prompt_id}));
+                }
+                "unversioned-write" => {
+                    // A write request without `"jsonrpc": "2.0"`; nothing
+                    // answers it, so do not wait.
+                    send(&json!({
+                        "id": "unversioned",
+                        "method": "fs/write_text_file",
+                        "params": {"sessionId": SESSION_ID, "path": self.path(rest), "content": "x"},
+                    }));
                 }
                 "wait-cancel" => {
                     while !self.cancelled {

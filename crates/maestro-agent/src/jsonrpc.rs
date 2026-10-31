@@ -5,6 +5,7 @@ use std::io::{self, BufRead, Read, Write};
 
 use serde_json::{Value, json};
 
+pub(crate) const INVALID_REQUEST: i64 = -32600;
 pub(crate) const METHOD_NOT_FOUND: i64 = -32601;
 pub(crate) const INVALID_PARAMS: i64 = -32602;
 pub(crate) const INTERNAL_ERROR: i64 = -32603;
@@ -60,26 +61,34 @@ pub(crate) enum Message {
 
 impl Message {
     /// Classifies a parsed JSON value. `None` for anything that is not a
-    /// JSON-RPC message.
+    /// JSON-RPC 2.0 message: no `"jsonrpc": "2.0"`, a request id that is
+    /// not a string or number, or a response with neither `result` nor
+    /// `error`.
     pub(crate) fn parse(v: Value) -> Option<Self> {
         let Value::Object(mut map) = v else {
             return None;
         };
+        if map.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return None;
+        }
         let id = map.remove("id");
         match (map.remove("method"), id) {
-            (Some(Value::String(method)), Some(id)) => Some(Message::Request {
-                id,
-                method,
-                params: map.remove("params").unwrap_or(Value::Null),
-            }),
+            (Some(Value::String(method)), Some(id)) if id.is_string() || id.is_number() => {
+                Some(Message::Request {
+                    id,
+                    method,
+                    params: map.remove("params").unwrap_or(Value::Null),
+                })
+            }
             (Some(Value::String(method)), None) => Some(Message::Notification {
                 method,
                 params: map.remove("params").unwrap_or(Value::Null),
             }),
             (None, Some(id)) => {
-                let result = match map.remove("error") {
-                    Some(e) if !e.is_null() => Err(RpcError::from_value(&e)),
-                    _ => Ok(map.remove("result").unwrap_or(Value::Null)),
+                let result = match (map.remove("result"), map.remove("error")) {
+                    (_, Some(e)) if e.is_object() => Err(RpcError::from_value(&e)),
+                    (Some(r), None | Some(Value::Null)) => Ok(r),
+                    _ => return None,
                 };
                 Some(Message::Response { id, result })
             }
@@ -104,12 +113,11 @@ pub(crate) fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-/// Writes one message as a single line and flushes.
-pub(crate) fn write_line(w: &mut impl Write, v: &Value) -> io::Result<()> {
-    // serde_json escapes control characters, so the text has no newline.
-    let mut text = serde_json::to_string(v).map_err(io::Error::other)?;
-    text.push('\n');
+/// Writes one serialized message as a single line and flushes. Text from
+/// serde_json has no raw newline: it escapes control characters.
+pub(crate) fn write_text(w: &mut impl Write, text: &str) -> io::Result<()> {
     w.write_all(text.as_bytes())?;
+    w.write_all(b"\n")?;
     w.flush()
 }
 
@@ -181,6 +189,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_envelopes() {
+        // No version, or the wrong one.
+        assert_eq!(
+            Message::parse(json!({"id": 1, "method": "fs/read_text_file"})),
+            None
+        );
+        assert_eq!(
+            Message::parse(json!({"jsonrpc": "1.0", "id": 1, "result": 1})),
+            None
+        );
+        // An id alone is not a response.
+        assert_eq!(Message::parse(json!({"jsonrpc": "2.0", "id": 1})), None);
+        assert_eq!(
+            Message::parse(json!({"jsonrpc": "2.0", "id": 1, "error": null})),
+            None
+        );
+        // Request ids are strings or numbers.
+        assert_eq!(
+            Message::parse(json!({"jsonrpc": "2.0", "id": null, "method": "x"})),
+            None
+        );
+        assert_eq!(
+            Message::parse(json!({"jsonrpc": "2.0", "id": [1], "method": "x"})),
+            None
+        );
+        // A null result is still a result.
+        assert_eq!(
+            Message::parse(json!({"jsonrpc": "2.0", "id": 1, "result": null})),
+            Some(Message::Response {
+                id: json!(1),
+                result: Ok(Value::Null)
+            })
+        );
+    }
+
+    #[test]
     fn reads_lines_and_rejects_overlong_ones() {
         let mut r = io::Cursor::new(b"{\"a\":1}\r\n\nlast".to_vec());
         assert!(matches!(read_line(&mut r).unwrap(), Line::Text(t) if t == b"{\"a\":1}"));
@@ -195,7 +239,7 @@ mod tests {
     #[test]
     fn written_lines_are_single_lines() {
         let mut out = Vec::new();
-        write_line(&mut out, &json!({"text": "a\nb"})).unwrap();
+        write_text(&mut out, &json!({"text": "a\nb"}).to_string()).unwrap();
         assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
         assert_eq!(out.last(), Some(&b'\n'));
     }

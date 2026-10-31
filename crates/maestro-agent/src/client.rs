@@ -27,7 +27,7 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, BufWriter, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -49,8 +49,17 @@ use crate::{AcpEvent, ProviderSpec, convert, find_executable};
 
 const STDERR_LINE_BYTES: u64 = 8 * 1024;
 
+/// Bytes waiting for the writer before the agent counts as stuck. An agent
+/// that stops reading stdin while asking for files would otherwise grow
+/// this queue without bound.
+const MAX_QUEUED_BYTES: usize = 128 * 1024 * 1024;
+
+/// Unanswered permission requests one agent may have at a time.
+const MAX_PENDING_PERMISSIONS: usize = 64;
+
 enum Outgoing {
-    Message(Value),
+    /// One serialized message, without the newline.
+    Message(String),
     Close,
 }
 
@@ -89,6 +98,10 @@ struct Shared {
     state: Mutex<State>,
     child: Mutex<Child>,
     out: Sender<Outgoing>,
+    /// Bytes sent to `out` and not yet written.
+    queued_bytes: AtomicUsize,
+    /// The agent's pid, which is also its process group id on Unix.
+    pid: u32,
     next_id: AtomicI64,
     exit_reported: AtomicBool,
     /// Disconnects when the stderr thread finishes.
@@ -120,7 +133,8 @@ impl AcpClient {
     /// Starts the agent process, runs `initialize` and `session/new` with
     /// `root` as cwd. File reads and writes the agent asks the client for
     /// are confined to `root`: paths outside it, symlinks out of it and the
-    /// `.git` directory are refused.
+    /// `.git` directory are refused. See [`crate::files`] for what that
+    /// check does not cover.
     ///
     /// Returns once the process is running. Fails if `root` is not a
     /// directory or the program cannot be found or started. `on_event`
@@ -181,8 +195,10 @@ impl AcpClient {
                 turn: Turn::Idle,
                 permissions: Vec::new(),
             }),
+            pid: child.id(),
             child: Mutex::new(child),
             out,
+            queued_bytes: AtomicUsize::new(0),
             next_id: AtomicI64::new(0),
             exit_reported: AtomicBool::new(false),
             stderr_done: Mutex::new(stderr_rx),
@@ -377,23 +393,32 @@ impl Drop for AcpClient {
     }
 }
 
-/// Kills the agent's process group, then the agent itself.
-///
-/// The group id is the agent's pid (see `start`). A group outlives its
-/// leader while any member runs, so the id cannot be reused while there is
-/// anything left to kill. std has no `killpg`, and this crate forbids
-/// `unsafe`, so this runs kill(1).
+/// Kills the agent's process group, then the agent itself, while the agent
+/// has not been reaped. Its pid, which is also the group id (see `start`),
+/// cannot be reused before that, so the signal cannot reach a stranger.
+/// Once the agent is reaped this does nothing; [`Shared::report_exit`]
+/// cleans up what it left behind.
 fn kill_tree(child: &mut Child) {
+    if let Ok(None) = child.try_wait() {
+        kill_group(child.id());
+        let _ = child.kill();
+    }
+}
+
+/// Sends SIGKILL to process group `pgid`. std has no `killpg`, and this
+/// crate forbids `unsafe`, so this runs kill(1).
+fn kill_group(pgid: u32) {
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .args(["-KILL", "--", &format!("-{pgid}")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
-    let _ = child.kill();
+    #[cfg(not(unix))]
+    let _ = pgid;
 }
 
 fn permission_answer(id: Value, choice: Option<&str>) -> Value {
@@ -411,8 +436,22 @@ impl Shared {
         let _ = self.events.send(e);
     }
 
+    /// Queues a message for the writer. An agent that leaves more than
+    /// [`MAX_QUEUED_BYTES`] unread is stopped instead.
     fn send(&self, v: Value) {
-        let _ = self.out.send(Outgoing::Message(v));
+        let text = v.to_string();
+        let queued = self.queued_bytes.fetch_add(text.len(), Ordering::SeqCst) + text.len();
+        if queued > MAX_QUEUED_BYTES {
+            self.queued_bytes.fetch_sub(text.len(), Ordering::SeqCst);
+            if !self.exit_reported.load(Ordering::SeqCst) {
+                self.emit(AcpEvent::Error(format!(
+                    "the agent left more than {MAX_QUEUED_BYTES} bytes unread; stopping it"
+                )));
+                kill_tree(&mut lock(&self.child));
+            }
+            return;
+        }
+        let _ = self.out.send(Outgoing::Message(text));
     }
 
     /// Sends a request of ours. Takes the state lock so the pending entry
@@ -457,6 +496,12 @@ impl Shared {
 
     fn handle_line(&self, bytes: &[u8]) {
         if bytes.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        // After shutdown or the exit report, nothing the agent (or what it
+        // left running) still has buffered is acted on: no file is read or
+        // written past that point.
+        if !lock(&self.state).alive {
             return;
         }
         let value: Value = match serde_json::from_slice(bytes) {
@@ -577,10 +622,22 @@ impl Shared {
                             jsonrpc::error_response(id, jsonrpc::INVALID_PARAMS, "unknown session")
                         } else if st.turn == Turn::Cancelling {
                             permission_answer(id, None)
+                        } else if st.permissions.iter().any(|(pending, _)| *pending == id) {
+                            // Replacing it would let an answer meant for
+                            // the first request approve the second.
+                            jsonrpc::error_response(
+                                id,
+                                jsonrpc::INVALID_REQUEST,
+                                "a permission request with this id is already pending",
+                            )
+                        } else if st.permissions.len() >= MAX_PENDING_PERMISSIONS {
+                            jsonrpc::error_response(
+                                id,
+                                jsonrpc::INVALID_REQUEST,
+                                "too many permission requests are pending",
+                            )
                         } else {
                             let options = request.options.iter().map(|o| o.id.clone()).collect();
-                            // A repeated id replaces the earlier request.
-                            st.permissions.retain(|(pending, _)| *pending != id);
                             st.permissions.push((id, options));
                             drop(st);
                             self.emit(AcpEvent::PermissionRequested(request));
@@ -696,8 +753,12 @@ impl Shared {
         }
         let _ = self.out.send(Outgoing::Close);
         // The agent is gone; so are the programs it left running in its
-        // process group (which may be what still holds stdout open).
-        kill_tree(&mut lock(&self.child));
+        // process group (which may be what still holds stdout open). This
+        // runs once, within a second of the agent being reaped. While any
+        // member of the group lives its id cannot be reused; once none
+        // does, the signal could only reach a stranger if the system
+        // handed out that same id as a new group in the meantime.
+        kill_group(self.pid);
         // Let the last stderr lines, often the reason for the exit, arrive
         // first. A descendant holding stderr open must not delay this long.
         let _ = lock(&self.stderr_done).recv_timeout(Duration::from_millis(200));
@@ -708,10 +769,12 @@ impl Shared {
 fn writer_loop(stdin: ChildStdin, rx: Receiver<Outgoing>, sh: &Shared) {
     let mut w = BufWriter::new(stdin);
     for msg in rx {
-        let Outgoing::Message(v) = msg else {
+        let Outgoing::Message(text) = msg else {
             break;
         };
-        if let Err(e) = jsonrpc::write_line(&mut w, &v) {
+        let written = jsonrpc::write_text(&mut w, &text);
+        sh.queued_bytes.fetch_sub(text.len(), Ordering::SeqCst);
+        if let Err(e) = written {
             // An agent that stopped reading cannot be kept in sync. Kill it
             // so the exit is reported like any other.
             if !sh.exit_reported.load(Ordering::SeqCst) {

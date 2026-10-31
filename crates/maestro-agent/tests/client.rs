@@ -82,13 +82,13 @@ fn ready(name: &str) -> Harness {
 
 impl Harness {
     /// The next event other than stderr, within the deadline.
-    fn next(&self, deadline: Instant) -> AcpEvent {
+    fn next(&self, deadline: Instant, seen: &[AcpEvent]) -> AcpEvent {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.events.recv_timeout(left) {
                 Ok(AcpEvent::Stderr(_)) => continue,
                 Ok(e) => return e,
-                Err(e) => panic!("no event before the deadline: {e:?}"),
+                Err(e) => panic!("no event before the deadline ({e:?}); saw {seen:?}"),
             }
         }
     }
@@ -98,7 +98,7 @@ impl Harness {
         let deadline = Instant::now() + WAIT;
         let mut seen = Vec::new();
         loop {
-            let e = self.next(deadline);
+            let e = self.next(deadline, &seen);
             let done = pred(&e);
             seen.push(e);
             if done {
@@ -364,6 +364,68 @@ fn refuses_non_regular_files() {
 }
 
 #[test]
+fn relative_paths_are_refused() {
+    let h = ready("relative");
+    let events = h.turn("write-raw src/lib.rs pwned");
+    let said = said(&events);
+    assert!(
+        said[0].starts_with("write failed: -32602") && said[0].contains("not an absolute path"),
+        "{said:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(h.root.join("src/lib.rs")).unwrap(),
+        "one\ntwo\nthree\n"
+    );
+}
+
+#[test]
+fn a_reused_permission_id_is_refused() {
+    let h = ready("dup-permission");
+    h.client.prompt("ask-dup First").unwrap();
+    // Wait for the refusal of the second request before answering the
+    // first: once answered, the id is free to be used again.
+    let mut events = h.wait_for(
+        |e| matches!(e, AcpEvent::Update(TranscriptEntry::Agent(t)) if t.starts_with("duplicate")),
+    );
+    let req = events
+        .iter()
+        .find_map(|e| match e {
+            AcpEvent::PermissionRequested(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("the first request was shown");
+    assert_eq!(req.tool_title, "First");
+    h.client
+        .answer_permission(req.request_id.clone(), Some("allow"))
+        .unwrap();
+    events.extend(h.until_turn_end());
+    // The second request was refused, not shown, and did not take over
+    // the first one's answer.
+    let shown = events
+        .iter()
+        .filter(|e| matches!(e, AcpEvent::PermissionRequested(_)))
+        .count();
+    assert_eq!(shown, 1, "{events:?}");
+    assert_eq!(said(&events), ["duplicate: -32600", "permission: allow"]);
+}
+
+#[test]
+fn invalid_envelopes_are_not_acted_on() {
+    let h = ready("envelope");
+    let events = h.turn("fake-response\nunversioned-write planted.txt\nsay after");
+    let errs = errors(&events);
+    assert_eq!(errs.len(), 2, "{events:?}");
+    assert!(
+        errs.iter().all(|m| m.contains("not a JSON-RPC message")),
+        "{errs:?}"
+    );
+    // The fake response did not end the turn, and the write did not run.
+    assert_eq!(said(&events), ["after"]);
+    assert_eq!(stop_reason(&events), "end_turn");
+    assert!(!h.root.join("planted.txt").exists());
+}
+
+#[test]
 fn permission_is_answered_with_a_choice() {
     let h = ready("permission");
     h.client.prompt("ask Write src/lib.rs\nsay done").unwrap();
@@ -429,7 +491,10 @@ fn cancel_answers_a_pending_permission() {
     };
     h.client.cancel().unwrap();
     let events = h.until_turn_end();
-    assert_eq!(said(&events), ["permission: cancelled"]);
+    assert_eq!(
+        said(&events),
+        ["permission: cancelled after session/cancel"]
+    );
     assert_eq!(stop_reason(&events), "cancelled");
     // The request was answered by the cancel.
     assert!(

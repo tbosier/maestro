@@ -114,20 +114,23 @@ impl AcpClient {
     pub fn session_id(&self) -> Option<String>;
 }
 
-/// The confinement itself, usable on its own.
+/// The confinement itself, usable on its own. Paths must be absolute.
 pub struct FileAccess;
 impl FileAccess {
     pub fn new(root: &Path) -> io::Result<FileAccess>;
     pub fn root(&self) -> &Path;
+    /// On Unix, refuses a file with more than one hard link and a file that changed between the check and the open.
     pub fn read(&self, path: &Path, line: Option<u32> /* 1-based */, limit: Option<u32>) -> Result<String, AccessError>;
-    /// Atomic: temp file in the same directory, then rename. Creates missing parent directories inside the root.
+    /// Temp file in the same directory, then rename. Creates missing parent directories inside the root.
     pub fn write(&self, path: &Path, content: &str) -> Result<PathBuf, AccessError>;
 }
-pub enum AccessError { OutsideRoot(PathBuf), GitDir(PathBuf), NotRegularFile(PathBuf), NotFound(PathBuf), BadPath(PathBuf), Refused(String), Io(io::Error) }
+pub enum AccessError { OutsideRoot(PathBuf), GitDir(PathBuf), NotRegularFile(PathBuf), NotFound(PathBuf), NotAbsolute(PathBuf), BadPath(PathBuf), Refused(String), Io(io::Error) }
 
 // Behind the `fake-agent` feature: `maestro_agent::fake` (a scriptable fake ACP agent,
 // command language documented in its source) and the `fake-acp-agent` binary.
 ```
+
+The file confinement checks paths and then acts on them. It refuses what the agent asks the client to do; it does not sandbox the agent. A process changing the tree at the same moment (swapping a checked directory for a symlink between the check and the rename) can still redirect a write, and the agent's own tools (a shell, its own file writes) are not affected by it at all. Workstreams that need a real boundary need an OS sandbox around the agent process.
 
 The editor keeps the rest of an agent's record (task text, worktree, history, test runs, files changed) in its own state; `maestro-agent` holds only what the protocol needs.
 
