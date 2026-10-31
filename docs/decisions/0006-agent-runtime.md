@@ -105,30 +105,76 @@ The editor keeps the rest of an agent's record (task text, worktree, history, te
 
 ```rust
 pub struct TaskSpec { pub program: String, pub args: Vec<String>, pub cwd: PathBuf }
+/// Output lines (stdout and stderr, in arrival order), then exactly one Finished.
+/// `code` is None when a signal ended the program.
 pub enum TaskEvent { Output(String), Finished { code: Option<i32>, duration: Duration } }
-pub struct TaskHandle; impl TaskHandle { pub fn kill(&self); pub fn id(&self) -> u32; }
+/// Longer output lines arrive in pieces of at most this many bytes of raw output, cut on char
+/// boundaries. Invalid UTF-8 becomes U+FFFD, so a piece can be longer as text.
+pub const MAX_LINE: usize = 64 * 1024;
+/// Dropping the handle does not stop the task.
+pub struct TaskHandle; impl TaskHandle {
+    /// SIGKILL to the task's process group (Unix), then to the child. No-op once finished.
+    pub fn kill(&self);
+    pub fn id(&self) -> u32;
+}
+/// stdin is null; on Unix the child leads a new process group. `on_event` runs on a thread of the task's own.
 pub fn start(spec: &TaskSpec, on_event: impl Fn(TaskEvent) + Send + 'static) -> io::Result<TaskHandle>;
 pub struct TestSummary { pub passed: u64, pub failed: u64, pub ignored: u64, pub failures: Vec<String> }
 /// Sums every `test result:` line of `cargo test` output. None if there is none.
+/// Failure names come from `test x ... FAILED`, `x --- FAILED` (-q) and the closing `failures:` list.
 pub fn parse_cargo_test(output: &str) -> Option<TestSummary>;
 ```
+
+Killing a process group needs `killpg`, which the standard library does not offer safely, and the workspace forbids `unsafe`. `TaskHandle::kill` runs `kill -KILL -- -<pgid>` as a program, only while the child is still unreaped (so the id cannot have been reused), and falls back to killing the direct child. Lines go through a queue of 1,024; when `on_event` is slower than the output, the program blocks on its writes instead of the queue growing. After the program exits, `Finished` waits for its output pipes to close, but no longer than half a second with no new line and five seconds in all, so a background process that keeps them open does not hold it back; lines already queued are delivered first. The reader threads of such a task stay blocked until that process closes the pipes.
 
 ## `maestro-git` additions
 
 ```rust
 impl Repository {
-    /// Everything a worktree changed since `base`: commits on its branch, staged, unstaged and untracked files.
+    /// Everything a worktree changed since it forked from `base` (the merge base of `base` and HEAD):
+    /// commits on its branch, staged, unstaged and untracked files (as added; ignored files skipped),
+    /// with rename detection. Untracked files get intent-to-add entries in a temporary copy of the
+    /// index, written as a whole (not split) index; the real index and its shared index files are
+    /// not touched. The only object it can write is the empty blob.
     pub fn review_diff(&self, base: &str) -> Result<Vec<DiffFile>>;
     /// Stages everything (untracked included) and commits it. Returns the new commit, or None when there was nothing to commit.
+    /// Refuses with GitError::Unmerged while files are in conflict, and with GitError::NoIdentity
+    /// (before staging) when git has no user name and email. Hooks run; if one rejects the commit, files stay staged.
     pub fn commit_all(&self, message: &str) -> Result<Option<String>>;
-    /// Integrates `branch` into the checked-out branch of this (target) worktree. Refuses, changing nothing, when this worktree has uncommitted changes, when `branch` has uncommitted changes in its own worktree, or when the merge dry run reports conflicts.
+    /// Integrates the local branch `branch` into the checked-out branch of this (target) worktree.
+    /// Refuses, changing nothing, when this worktree is detached, mid-operation or has staged,
+    /// unstaged or conflicted files (untracked files do not block), when the worktree that has
+    /// `branch` checked out has uncommitted or untracked files, when there is nothing to integrate,
+    /// when fast-forward only cannot fast-forward, or when the merge-tree dry run reports conflicts.
+    /// The target is checked again just before git runs. `branch.<target>.mergeOptions` is ignored
+    /// and `--commit --no-squash` passed, so user defaults cannot leave a merge open.
+    /// If git fails part way, the merge or cherry-pick is aborted (only if this call started it),
+    /// then HEAD, open operations and changed files are checked. After a success, the result is
+    /// checked too (nothing open, same branch, HEAD moved forward).
     pub fn integrate(&self, branch: &str, how: Integration) -> Result<IntegrateOutcome, IntegrateError>;
 }
+/// Merge always creates a merge commit (--no-ff). CherryPick copies the branch's commits not on
+/// the target, oldest first, skipping ones whose changes the target already has.
 pub enum Integration { FastForwardOnly, Merge, CherryPick }
+/// `commits`: commits now on the target that were not before, oldest first.
 pub struct IntegrateOutcome { pub new_head: String, pub commits: Vec<String> }
-pub enum IntegrateError { Dirty(Vec<PathBuf>), SourceDirty(Vec<PathBuf>), Conflicts(Vec<PathBuf>), NotFastForward, NothingToIntegrate, Git(GitError) }
-/// Changed character ranges for a removed line and the added line paired with it.
+pub enum IntegrateError {
+    Dirty(Vec<PathBuf>), SourceDirty(Vec<PathBuf>), Conflicts(Vec<PathBuf>), NotFastForward, NothingToIntegrate,
+    DetachedHead, InProgress(&'static str), MergeCommits(Vec<String>) /* cherry-pick refuses merges */,
+    Git(GitError) /* git failed; any operation was aborted */,
+    AbortFailed { cause: GitError, detail: String } /* git failed and the worktree could not be restored */,
+    TargetChanged /* the target moved during the checks; nothing was integrated */,
+    Unexpected(String) /* git reported success but the result is wrong; says what was done */,
+}
+/// Cherry-pick dry run needs merge-tree with trees (git 2.45+); older git gets GitError::Unsupported.
+pub const MERGE_TREE_TREES: GitVersion;
+/// GitError gains NoIdentity(String) and Unmerged(Vec<PathBuf>).
+///
+/// Changed byte ranges, on char boundaries, for a removed line and the added line paired with it.
+/// Tokens are word runs, whitespace runs and single other chars. Lines over INTRALINE_MAX_LINE bytes,
+/// or with under 40% matching non-whitespace text, are marked whole.
 pub fn intraline(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>);
+pub const INTRALINE_MAX_LINE: usize = 1024;
 ```
 
 Archiving is the existing `remove_worktree`, which refuses on uncommitted or unmerged work unless forced; the UI asks before forcing.

@@ -124,6 +124,15 @@ impl Repository {
         &self.git
     }
 
+    /// The same working tree, run through a different [`Git`] (for example
+    /// one with an extra environment variable).
+    pub(crate) fn with_git(&self, git: Git) -> Repository {
+        Repository {
+            git,
+            ..self.clone()
+        }
+    }
+
     /// True for the main working tree, false for a linked worktree.
     pub fn is_main_worktree(&self) -> bool {
         self.git_dir == self.common_dir

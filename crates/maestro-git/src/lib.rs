@@ -10,9 +10,11 @@
 //! should run them on a background thread.
 
 mod diff;
+mod intraline;
 mod linediff;
 mod merge;
 mod repo;
+mod review;
 mod status;
 mod worktree;
 
@@ -21,9 +23,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 pub use diff::{DiffFile, DiffLine, DiffLineKind, DiffSpec, FileChange, Hunk};
+pub use intraline::{INTRALINE_MAX_LINE, intraline};
 pub use linediff::{LineHunk, LineHunkKind, Sign, SignMap, diff_lines};
 pub use merge::MergeCheck;
 pub use repo::{Base, Head, Repository};
+pub use review::{IntegrateError, IntegrateOutcome, Integration, MERGE_TREE_TREES};
 pub use status::{BranchInfo, ChangeKind, ConflictKind, EntryState, Status, StatusEntry};
 pub use worktree::{RemoveError, RemoveRefusal, Worktree};
 
@@ -50,6 +54,12 @@ pub enum GitError {
     Parse { args: String, detail: String },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// Git has no user name and email to commit with. Holds git's message.
+    #[error("git has no identity to commit with; set user.name and user.email ({0})")]
+    NoIdentity(String),
+    /// Files are in conflict; committing now would commit conflict markers.
+    #[error("{} file(s) are in conflict; resolve them first", .0.len())]
+    Unmerged(Vec<PathBuf>),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
