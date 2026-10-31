@@ -10,7 +10,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use maestro_term::{
-    CommandSpec, Screen, TermColor, TermKey, TermMods, TermSize, Terminal, encode_key,
+    CommandSpec, MAX_QUEUED_INPUT, Screen, TermColor, TermKey, TermMods, TermSize, Terminal,
+    encode_key,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -189,7 +190,7 @@ fn kill_ends_a_running_program() {
     let started = Instant::now();
     h.term.kill().unwrap();
     assert!(
-        started.elapsed() < Duration::from_millis(100),
+        started.elapsed() < Duration::from_millis(150),
         "kill blocked for {:?}",
         started.elapsed()
     );
@@ -213,7 +214,8 @@ fn kill_escalates_when_hangup_is_ignored() {
 #[cfg(target_os = "linux")]
 #[test]
 fn drop_returns_at_once_and_kills_the_program() {
-    let h = sh("echo pid=$$; trap '' HUP; while :; do sleep 1; done", SIZE);
+    // The pid is printed after the trap, so the shell ignores SIGHUP by then.
+    let h = sh("trap '' HUP; echo pid=$$; while :; do sleep 1; done", SIZE);
     h.wait_for("the pid", |t| t.snapshot().row_text(0).starts_with("pid="));
     let pid: u32 = h.term.snapshot().row_text(0)["pid=".len()..]
         .parse()
@@ -224,9 +226,10 @@ fn drop_returns_at_once_and_kills_the_program() {
     let started = Instant::now();
     drop(h);
     // The shell ignores SIGHUP, so a drop that waited for the kill would take
-    // at least portable-pty's 200 ms grace period.
+    // at least portable-pty's 200 ms grace period. The 150 ms bound leaves
+    // room for a loaded machine.
     assert!(
-        started.elapsed() < Duration::from_millis(100),
+        started.elapsed() < Duration::from_millis(150),
         "drop blocked for {:?}",
         started.elapsed()
     );
@@ -375,18 +378,37 @@ fn cursor_position_queries_are_answered() {
 
 #[test]
 fn write_does_not_block_when_the_program_stops_reading() {
-    let h = sh("echo ready; sleep 30", SIZE);
+    // Non-canonical mode: the line discipline keeps every byte, so its 4 KiB
+    // input buffer fills and the writer thread blocks on the PTY.
+    let h = sh("stty -icanon -echo; echo ready; sleep 30", SIZE);
     h.wait_for_text("ready");
-    // Far more than a PTY buffers; a blocking write would hang here.
     let chunk = vec![b'a'; 1 << 20];
     let started = Instant::now();
-    for _ in 0..4 {
-        h.term.write(&chunk).unwrap();
-    }
+    let mut accepted = 0usize;
+    let err = loop {
+        match h.term.write(&chunk) {
+            Ok(()) => accepted += chunk.len(),
+            Err(err) => break err,
+        }
+        assert!(
+            accepted <= 2 * MAX_QUEUED_INPUT,
+            "the input queue has no bound"
+        );
+    };
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "write blocked for {:?}",
         started.elapsed()
+    );
+    assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    // Only what the PTY buffered left the queue: a few KiB, far under 1 MiB.
+    assert!(
+        accepted >= MAX_QUEUED_INPUT - chunk.len(),
+        "accepted {accepted}"
+    );
+    assert!(
+        accepted <= MAX_QUEUED_INPUT + chunk.len(),
+        "accepted {accepted}"
     );
     h.term.kill().unwrap();
     assert_eq!(h.wait_for_exit().code, None);

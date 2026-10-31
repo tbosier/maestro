@@ -10,7 +10,20 @@
 //! - the waiter owns the child process, records how it exited, and kills it
 //!   when asked or when the `Terminal` is dropped.
 //!
-//! No call on a `Terminal`, including drop, waits for the child or for IO.
+//! No call on a `Terminal`, including drop, waits for the child or for PTY
+//! input or output. Calls that read the screen share a mutex with the reader,
+//! which parses at most `PARSE_SLICE` bytes per lock, so a caller waits for one
+//! slice at most. Hostile output can still make one slice slow: 512 bytes of
+//! `CSI 65535 b` (repeat) asks the parser for about four million characters.
+//!
+//! Known gaps, all on Unix:
+//! - Kill and drop signal only the child. A descendant that ignores SIGHUP
+//!   and keeps the PTY open keeps the reader thread and the PTY alive until it
+//!   exits. Killing the whole process group needs `killpg`, which std does not
+//!   offer and `unsafe` is forbidden here.
+//! - portable-pty starts the program in `$HOME` when the working directory is
+//!   missing. `spawn` checks the directory just before spawning, which narrows
+//!   but does not close that window.
 
 mod keys;
 
@@ -18,7 +31,9 @@ pub use keys::{TermKey, TermMods, encode_key, encode_paste};
 
 use std::io::{self, Read, Write};
 use std::num::NonZeroU16;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -48,6 +63,15 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// `MAX_POLL` while it keeps running.
 const MIN_POLL: Duration = Duration::from_millis(2);
 const MAX_POLL: Duration = Duration::from_millis(100);
+/// The most input, in bytes, queued for a program that is not reading it.
+/// Past this `write` fails and status query replies are dropped.
+pub const MAX_QUEUED_INPUT: usize = 16 << 20;
+/// The reader parses output in slices this long, releasing the parser lock
+/// between them.
+const PARSE_SLICE: usize = 512;
+/// The narrowest screen. vt100 0.18 panics on a wide character in a
+/// one-column screen.
+const MIN_COLS: u16 = 2;
 /// The longest window title kept, in characters.
 const MAX_TITLE: usize = 256;
 
@@ -65,7 +89,8 @@ pub struct CommandSpec {
     pub env: Vec<(String, String)>,
 }
 
-/// A terminal size in character cells. Zero is treated as one.
+/// A terminal size in character cells. The screen is at least 1 row by 2
+/// columns; smaller sizes are raised to that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermSize {
     pub rows: u16,
@@ -166,6 +191,8 @@ pub struct ExitInfo {
 pub struct Terminal {
     shared: Arc<Shared>,
     input: Sender<Vec<u8>>,
+    /// Bytes sent to the writer thread and not yet written.
+    queued: Arc<AtomicUsize>,
 }
 
 struct Shared {
@@ -185,7 +212,8 @@ struct Control {
 }
 
 impl Shared {
-    /// Tells the UI something changed, unless the `Terminal` is gone.
+    /// Tells the UI something changed, unless the `Terminal` is gone. A call
+    /// that has already passed the check can still run after drop returns.
     fn changed(&self) {
         let dropped = lock(&self.control).dropped;
         if !dropped {
@@ -197,20 +225,15 @@ impl Shared {
 impl Terminal {
     /// Spawns `spec` in a new PTY. `on_output` runs on the reader thread after
     /// each chunk is parsed, and once more on the waiter thread after the
-    /// program exits. It is not called after the `Terminal` is dropped.
+    /// program exits. Once drop returns no new call starts, though one that
+    /// was already starting may still run.
     pub fn spawn(
         spec: &CommandSpec,
         size: TermSize,
         on_output: impl Fn() + Send + Sync + 'static,
     ) -> io::Result<Terminal> {
         if !spec.cwd.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "working directory {} is not a directory",
-                    spec.cwd.display()
-                ),
-            ));
+            return Err(missing_cwd(spec));
         }
         let (rows, cols) = dimensions(size);
         let pair = native_pty_system()
@@ -233,18 +256,31 @@ impl Terminal {
             on_output: Box::new(on_output),
         });
 
-        // The reader and writer start before the child so that a failure here
-        // leaves no process behind. If the spawn below fails, dropping the
-        // slave ends the reader (EIO) and dropping `input` ends the writer.
+        // Every thread starts before the child, so a failure here leaves no
+        // process behind. If the spawn below fails, dropping the slave ends the
+        // reader (EIO), dropping `input` ends the writer, and dropping
+        // `child_tx` ends the waiter.
         let (input, input_rx) = mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let writer_queued = Arc::clone(&queued);
         thread::Builder::new()
             .name("maestro-term-writer".into())
-            .spawn(move || write_loop(writer, input_rx))?;
+            .spawn(move || write_loop(writer, &input_rx, &writer_queued))?;
+        let (child_tx, child_rx) = mpsc::channel::<Box<dyn Child + Send + Sync>>();
+        let waiter_shared = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("maestro-term-wait".into())
+            .spawn(move || {
+                if let Ok(child) = child_rx.recv() {
+                    wait_loop(&waiter_shared, child);
+                }
+            })?;
         let replies = input.clone();
+        let reader_queued = Arc::clone(&queued);
         let reader_shared = Arc::clone(&shared);
         thread::Builder::new()
             .name("maestro-term-reader".into())
-            .spawn(move || read_loop(&reader_shared, reader, &replies))?;
+            .spawn(move || read_loop(&reader_shared, reader, &replies, &reader_queued))?;
 
         let mut cmd = CommandBuilder::new(&spec.program);
         cmd.args(&spec.args);
@@ -254,27 +290,31 @@ impl Terminal {
         for (key, value) in &spec.env {
             cmd.env(key, value);
         }
+        // Check again as late as possible: portable-pty would start the
+        // program in $HOME instead.
+        if !spec.cwd.is_dir() {
+            return Err(missing_cwd(spec));
+        }
         let child = pair.slave.spawn_command(cmd).map_err(pty_error!())?;
         // The parent's copy of the slave must close, or the reader never sees
         // the end of the output when the child exits.
         drop(pair.slave);
+        // The waiter is alive and holds the receiver until it gets the child,
+        // so this send cannot fail.
+        let _ = child_tx.send(child);
 
-        let mut killer = child.clone_killer();
-        let waiter_shared = Arc::clone(&shared);
-        if let Err(err) = thread::Builder::new()
-            .name("maestro-term-wait".into())
-            .spawn(move || wait_loop(&waiter_shared, child))
-        {
-            let _ = killer.kill();
-            return Err(err);
-        }
-
-        Ok(Terminal { shared, input })
+        Ok(Terminal {
+            shared,
+            input,
+            queued,
+        })
     }
 
     /// Queues bytes for the program's input. Never blocks on the PTY. Fails
     /// with `BrokenPipe` once the program has exited (Linux would otherwise
-    /// accept and discard the bytes) or the PTY stopped accepting input.
+    /// accept and discard the bytes) or the PTY stopped accepting input, and
+    /// with `WouldBlock` when more than [`MAX_QUEUED_INPUT`] bytes would be
+    /// waiting for a program that is not reading.
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
         if self.exit_status().is_some() {
             return Err(io::Error::new(
@@ -284,6 +324,12 @@ impl Terminal {
         }
         if bytes.is_empty() {
             return Ok(());
+        }
+        if !reserve(&self.queued, bytes.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the program is not reading its input",
+            ));
         }
         self.input.send(bytes.to_vec()).map_err(|_| {
             io::Error::new(
@@ -364,7 +410,8 @@ impl Terminal {
 
 impl Drop for Terminal {
     /// Kills the program without waiting for it. The threads end on their own
-    /// once it is gone.
+    /// once every process holding the PTY is gone (see the crate docs for a
+    /// descendant that ignores SIGHUP).
     fn drop(&mut self) {
         let mut control = lock(&self.shared.control);
         control.dropped = true;
@@ -374,19 +421,24 @@ impl Drop for Terminal {
     }
 }
 
-fn read_loop(shared: &Shared, mut reader: Box<dyn Read + Send>, replies: &Sender<Vec<u8>>) {
+fn read_loop(
+    shared: &Shared,
+    mut reader: Box<dyn Read + Send>,
+    replies: &Sender<Vec<u8>>,
+    queued: &AtomicUsize,
+) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let answer = {
-                    let mut parser = lock(&shared.parser);
-                    parser.process(&buf[..n]);
-                    std::mem::take(&mut parser.callbacks_mut().replies)
-                };
-                if !answer.is_empty() {
-                    let _ = replies.send(answer);
+                for slice in buf[..n].chunks(PARSE_SLICE) {
+                    let answer = process_guarded(&mut lock(&shared.parser), slice);
+                    // A program that does not read its input gets no replies
+                    // once the queue is full.
+                    if !answer.is_empty() && reserve(queued, answer.len()) {
+                        let _ = replies.send(answer);
+                    }
                 }
                 shared.changed();
             }
@@ -399,16 +451,62 @@ fn read_loop(shared: &Shared, mut reader: Box<dyn Read + Send>, replies: &Sender
     shared.control_changed.notify_all();
 }
 
-fn write_loop(mut writer: Box<dyn Write + Send>, input: Receiver<Vec<u8>>) {
+/// Parses `bytes` and returns the replies they asked for. If vt100 panics,
+/// its state may be inconsistent, so the screen is replaced by a blank one of
+/// the same size with a note, and the terminal keeps working.
+fn process_guarded(parser: &mut vt100::Parser<Events>, bytes: &[u8]) -> Vec<u8> {
+    if panic::catch_unwind(AssertUnwindSafe(|| parser.process(bytes))).is_err() {
+        let (rows, cols) = parser.screen().size();
+        let title = std::mem::take(&mut parser.callbacks_mut().title);
+        *parser = vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            SCROLLBACK_LINES,
+            Events {
+                title,
+                replies: Vec::new(),
+            },
+        );
+        parser.process(b"[maestro: the terminal emulator failed on this output and was reset]\r\n");
+    }
+    std::mem::take(&mut parser.callbacks_mut().replies)
+}
+
+fn write_loop(mut writer: Box<dyn Write + Send>, input: &Receiver<Vec<u8>>, queued: &AtomicUsize) {
     while let Ok(bytes) = input.recv() {
-        if writer
-            .write_all(&bytes)
-            .and_then(|()| writer.flush())
-            .is_err()
-        {
+        let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+        queued.fetch_sub(bytes.len(), Ordering::AcqRel);
+        if result.is_err() {
             break;
         }
     }
+}
+
+/// Counts `len` more bytes against [`MAX_QUEUED_INPUT`], or returns false
+/// without counting them when they do not fit.
+fn reserve(queued: &AtomicUsize, len: usize) -> bool {
+    // A compare-exchange loop: `fetch_update` is deprecated on current Rust
+    // and its replacement is newer than the workspace's rust-version.
+    let mut current = queued.load(Ordering::Acquire);
+    loop {
+        let Some(total) = current.checked_add(len).filter(|&t| t <= MAX_QUEUED_INPUT) else {
+            return false;
+        };
+        match queued.compare_exchange_weak(current, total, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => current = now,
+        }
+    }
+}
+
+fn missing_cwd(spec: &CommandSpec) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "working directory {} is not a directory",
+            spec.cwd.display()
+        ),
+    )
 }
 
 fn wait_loop(shared: &Shared, mut child: Box<dyn Child + Send + Sync>) {
@@ -419,8 +517,9 @@ fn wait_loop(shared: &Shared, mut child: Box<dyn Child + Send + Sync>) {
             description: format!("could not wait for the program: {err}"),
         },
     };
-    // Give the reader a moment to parse the last output, so the screen is
-    // complete when the exit is reported.
+    // Give the reader up to DRAIN_TIMEOUT to parse the last output, so the
+    // screen is usually complete when the exit is reported. Output parsed
+    // later still calls on_output.
     let control = lock(&shared.control);
     let _ = shared
         .control_changed
@@ -519,7 +618,9 @@ impl vt100::Callbacks for Events {
         match (first, second, c, param) {
             // DSR: device status.
             (None, None, 'n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
-            // DSR: cursor position report, 1-based.
+            // DSR: cursor position report, 1-based. Always relative to the
+            // screen: vt100 does not expose origin mode or the scroll region,
+            // so under DECOM the row is off by the region's top.
             (None, None, 'n', 6) => {
                 let (row, col) = screen.cursor_position();
                 let (_, cols) = screen.size();
@@ -605,7 +706,7 @@ fn convert_color(color: vt100::Color) -> TermColor {
 fn dimensions(size: TermSize) -> (NonZeroU16, NonZeroU16) {
     (
         NonZeroU16::new(size.rows).unwrap_or(NonZeroU16::MIN),
-        NonZeroU16::new(size.cols).unwrap_or(NonZeroU16::MIN),
+        NonZeroU16::new(size.cols.max(MIN_COLS)).unwrap_or(NonZeroU16::MIN),
     )
 }
 
@@ -640,9 +741,49 @@ mod tests {
     }
 
     #[test]
-    fn zero_sizes_become_one() {
+    fn tiny_sizes_are_raised() {
         let (rows, cols) = dimensions(TermSize { rows: 0, cols: 0 });
-        assert_eq!((rows.get(), cols.get()), (1, 1));
+        assert_eq!((rows.get(), cols.get()), (1, 2));
+        let (rows, cols) = dimensions(TermSize { rows: 2, cols: 1 });
+        assert_eq!((rows.get(), cols.get()), (2, 2));
+    }
+
+    #[test]
+    fn a_parser_panic_resets_the_screen() {
+        // Built directly at one column, which `dimensions` never allows,
+        // because vt100 0.18 panics on a wide character there.
+        let one = NonZeroU16::MIN;
+        let mut parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(4).unwrap(),
+            one,
+            10,
+            Events::default(),
+        );
+        parser.process(b"\x1b]2;kept\x07");
+        process_guarded(&mut parser, "#\u{FE0F}".as_bytes());
+        assert_eq!(parser.callbacks().title, "kept");
+        assert_eq!(parser.screen().size().0.get(), 4);
+        let replies = process_guarded(&mut parser, b"\x1b[5n");
+        assert_eq!(replies, b"\x1b[0n");
+    }
+
+    #[test]
+    fn the_input_budget_is_enforced() {
+        let queued = AtomicUsize::new(0);
+        assert!(reserve(&queued, MAX_QUEUED_INPUT - 1));
+        assert!(!reserve(&queued, 2));
+        assert!(reserve(&queued, 1));
+        assert!(!reserve(&queued, 1));
+        assert!(!reserve(&queued, usize::MAX));
+        assert_eq!(queued.load(Ordering::Acquire), MAX_QUEUED_INPUT);
+    }
+
+    /// vt100 0.18 panics on this at one column. Two columns must not.
+    #[test]
+    fn wide_characters_at_the_narrowest_size() {
+        let mut parser = parse(2, 1, "#\u{FE0F}中x中\u{FE0F}".as_bytes());
+        assert_eq!(parser.screen().size().1.get(), 2);
+        parser.process("a#\u{FE0F}b".as_bytes());
     }
 
     #[test]
