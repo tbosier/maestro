@@ -88,7 +88,10 @@ title = "PTY terminals with VT emulation (maestro-term)"
 crates = ["maestro-term"]
 branch = "feat/term"
 owner = "agent"
-status = "in-progress"
+status = "done"
+# Done: Terminal (spawn, write, resize, snapshot, scroll, exit, kill, modes,
+# title), key and paste encoding, real PTY tests. The editor panel that uses
+# it is separate work.
 
 [[task]]
 id = "m2-agent"
