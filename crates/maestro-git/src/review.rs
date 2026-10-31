@@ -73,9 +73,19 @@ pub enum IntegrateError {
     #[error(transparent)]
     Git(#[from] GitError),
     /// Git failed and the repository could not be put back: the abort
-    /// failed or `HEAD` moved. The user needs to look at it.
+    /// failed, `HEAD` moved, files changed, or an operation someone else
+    /// started was found and left alone. The user needs to look at it.
     #[error("{cause}; then restoring the worktree failed: {detail}")]
     AbortFailed { cause: GitError, detail: String },
+    /// The target worktree's branch, `HEAD` or state changed while the
+    /// checks ran. Nothing was integrated.
+    #[error("the target worktree changed during the checks; nothing was integrated")]
+    TargetChanged,
+    /// Git reported success but the result is not what was asked (an
+    /// operation left open, another branch checked out, `HEAD` not moved
+    /// forward). The text says what was found and what was done about it.
+    #[error("git reported success, but {0}")]
+    Unexpected(String),
 }
 
 /// `git merge-tree` accepts trees, not only commits, with `--merge-base`
@@ -148,8 +158,9 @@ impl Repository {
     /// detection, so a file moved with plain `mv` shows as a rename.
     ///
     /// Untracked files are found by giving a copy of the index an
-    /// intent-to-add entry for each, in a temporary file; the real index is
-    /// not touched and no objects are written.
+    /// intent-to-add entry for each, in a temporary file. The real index and
+    /// the split index files it relies on are not touched. The only object
+    /// this can write is the empty blob, which intent-to-add entries name.
     pub fn review_diff(&self, base: &str) -> Result<Vec<DiffFile>> {
         check_rev(base)?;
         let out = self.run(
@@ -187,7 +198,16 @@ impl Repository {
             Err(e) => return Err(e.into()),
         };
         let list = TempFile::create("review-paths", &untracked)?;
-        let shadow = self.with_git(self.git().clone().env("GIT_INDEX_FILE", &index.0));
+        // With a split index, the copy points at shared index files in the
+        // real git directory, and writing it could make a new shared file
+        // and expire the one the real index needs. Writing the copy as one
+        // whole index never touches them.
+        let shadow = self.with_git(
+            self.git()
+                .clone()
+                .env("GIT_INDEX_FILE", &index.0)
+                .config("core.splitIndex=false"),
+        );
         let mut from_file = OsString::from("--pathspec-from-file=");
         from_file.push(&list.0);
         shadow.run(
@@ -228,22 +248,34 @@ impl Repository {
     /// commits it with `message`. Returns the new commit, or `None` when
     /// there was nothing to commit. The user's hooks and configuration
     /// apply. Refuses with [`GitError::Unmerged`] while files are in
-    /// conflict, so conflict markers are never committed, and with
+    /// conflict, so conflict markers are not committed, and with
     /// [`GitError::NoIdentity`] before staging anything when git has no user
     /// name and email. When the commit itself fails (a hook rejects it), the
     /// files stay staged and the working tree is unchanged.
+    ///
+    /// The conflict check runs before staging. If another program starts a
+    /// merge in this worktree in between, staging has already resolved its
+    /// conflicts with the markers in them; the merge state is checked again
+    /// after staging and the commit is refused, but the conflict entries in
+    /// the index are gone.
     pub fn commit_all(&self, message: &str) -> Result<Option<String>> {
         let status = self.status()?;
         let conflicted: Vec<PathBuf> = status.conflicted().map(|e| e.path.clone()).collect();
         if !conflicted.is_empty() {
             return Err(GitError::Unmerged(conflicted));
         }
-        let merging = self.git_dir().join("MERGE_HEAD").exists();
-        if status.is_clean() && !merging {
+        let merging = self.pseudo_ref("MERGE_HEAD")?;
+        if status.is_clean() && merging.is_none() {
             return Ok(None);
         }
         self.check_identity()?;
         self.run(&["add", "--all"], Access::Write)?;
+        if self.pseudo_ref("MERGE_HEAD")? != merging {
+            return Err(GitError::InvalidArgument(
+                "a merge started in this worktree while committing; nothing was committed".into(),
+            ));
+        }
+        let merging = merging.is_some();
         let (out, shown) = self.run_status(&["diff", "--cached", "--quiet"], Access::ReadOnly)?;
         match out.status.code() {
             Some(0) if !merging => return Ok(None),
@@ -261,20 +293,45 @@ impl Repository {
         Ok(Some(self.resolve("HEAD")?))
     }
 
+    /// The commit a pseudo-ref such as `MERGE_HEAD` names in this worktree,
+    /// or `None` when it is not set. Asked through git, not by looking for a
+    /// file, because the reftable backend does not keep most of them as
+    /// files.
+    fn pseudo_ref(&self, name: &str) -> Result<Option<String>> {
+        let (out, shown) = self.run_status(
+            &["rev-parse", "--verify", "--quiet", name],
+            Access::ReadOnly,
+        )?;
+        match out.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            )),
+            Some(1) => Ok(None),
+            _ => Err(command_error(shown, &out)),
+        }
+    }
+
     /// A merge, cherry-pick, revert or rebase in progress in this worktree.
-    fn operation_in_progress(&self) -> Option<&'static str> {
-        let d = self.git_dir();
-        [
+    fn operation_in_progress(&self) -> Result<Option<&'static str>> {
+        for (name, what) in [
             ("MERGE_HEAD", "merge"),
             ("CHERRY_PICK_HEAD", "cherry-pick"),
             ("REVERT_HEAD", "revert"),
+        ] {
+            if self.pseudo_ref(name)?.is_some() {
+                return Ok(Some(what));
+            }
+        }
+        // State directories, always plain directories in the git dir.
+        let d = self.git_dir();
+        Ok([
             ("sequencer", "cherry-pick or revert"),
             ("rebase-merge", "rebase"),
             ("rebase-apply", "rebase or am"),
         ]
         .into_iter()
         .find(|(f, _)| d.join(f).exists())
-        .map(|(_, what)| what)
+        .map(|(_, what)| what))
     }
 
     /// Integrates `branch` (a local branch) into the branch checked out in
@@ -289,10 +346,16 @@ impl Repository {
     /// worktree do not block it: git refuses to overwrite them.
     ///
     /// The exact commit the checks ran on is what gets integrated, even if
-    /// the branch moves meanwhile. The user's hooks run. If git fails part
-    /// way (a hook rejects the commit, an untracked file is in the way), the
-    /// merge or cherry-pick is aborted so the repository is never left
-    /// mid-operation, and the error is returned.
+    /// the branch moves meanwhile. The target is checked again just before
+    /// git runs ([`IntegrateError::TargetChanged`]); a change in the last
+    /// moment before that is not caught. The user's hooks run;
+    /// `branch.<target>.mergeOptions` does not apply.
+    ///
+    /// If git fails part way (a hook rejects the commit, an untracked file
+    /// is in the way), the merge or cherry-pick this call started is
+    /// aborted, and [`IntegrateError::Git`] means `HEAD` is back, nothing is
+    /// in progress and no tracked file differs from it. Anything else comes
+    /// back as [`IntegrateError::AbortFailed`] with what was found.
     ///
     /// Like `git merge`, it may overwrite ignored files that the branch
     /// adds as tracked files.
@@ -305,7 +368,7 @@ impl Repository {
         let Head::Branch(target) = self.head()? else {
             return Err(IntegrateError::DetachedHead);
         };
-        if let Some(op) = self.operation_in_progress() {
+        if let Some(op) = self.operation_in_progress()? {
             return Err(IntegrateError::InProgress(op));
         }
         let source = self.resolve(&format!("refs/heads/{branch}"))?;
@@ -349,13 +412,23 @@ impl Repository {
             }
         }
 
+        // `--commit --no-squash` and an empty `branch.<target>.mergeOptions`
+        // keep the user's merge defaults from turning this into a merge
+        // left open for a commit, a squash, or another strategy than the
+        // dry run used.
         let args: Vec<String> = match how {
-            Integration::FastForwardOnly => {
-                vec!["merge".into(), "--ff-only".into(), source.clone()]
-            }
+            Integration::FastForwardOnly => vec![
+                "merge".into(),
+                "--ff-only".into(),
+                "--commit".into(),
+                "--no-squash".into(),
+                source.clone(),
+            ],
             Integration::Merge => vec![
                 "merge".into(),
                 "--no-ff".into(),
+                "--commit".into(),
+                "--no-squash".into(),
                 "--no-edit".into(),
                 "-m".into(),
                 format!("Merge branch '{branch}' into {target}"),
@@ -367,15 +440,56 @@ impl Repository {
                 v
             }
         };
-        let (out, shown) = self.writer().run_status(&args, Access::Write)?;
+        let writer = self.with_git(
+            self.writer()
+                .git()
+                .clone()
+                .config(format!("branch.{target}.mergeOptions=")),
+        );
+
+        // The checks took a moment; make sure the target is still where
+        // they left it. This narrows the window, it cannot close it.
+        if self.head()? != Head::Branch(target.clone())
+            || self.resolve("HEAD")? != old_head
+            || self.operation_in_progress()?.is_some()
+        {
+            return Err(IntegrateError::TargetChanged);
+        }
+
+        let (out, shown) = writer.run_status(&args, Access::Write)?;
         if !out.status.success() {
             let cause = command_error(shown, &out);
-            return Err(match self.abort_operation(&old_head) {
-                Ok(()) => IntegrateError::Git(cause),
-                Err(detail) => IntegrateError::AbortFailed { cause, detail },
-            });
+            return Err(
+                match self.restore_after_failure(&old_head, &source, &commits) {
+                    Ok(()) => IntegrateError::Git(cause),
+                    Err(detail) => IntegrateError::AbortFailed { cause, detail },
+                },
+            );
+        }
+
+        // Git said yes. Check it did what was asked: no operation left open,
+        // the same branch checked out, and HEAD moved forward from where it
+        // was.
+        if let Some(op) = self.operation_in_progress()? {
+            let detail = match self.restore_after_failure(&old_head, &source, &commits) {
+                Ok(()) => format!("git left a {op} open; it was aborted"),
+                Err(e) => format!("git left a {op} open, and restoring failed: {e}"),
+            };
+            return Err(IntegrateError::Unexpected(detail));
         }
         let new_head = self.resolve("HEAD")?;
+        let mut wrong = Vec::new();
+        if self.head()? != Head::Branch(target.clone()) {
+            wrong.push(format!("{target} is no longer checked out"));
+        }
+        if new_head == old_head || !self.can_fast_forward(&old_head, &new_head)? {
+            wrong.push(format!(
+                "HEAD is at {new_head}, not a descendant of {old_head}"
+            ));
+        }
+        if !wrong.is_empty() {
+            return Err(IntegrateError::Unexpected(wrong.join("; ")));
+        }
         let commits = self.rev_list(&["--reverse", &format!("{old_head}..{new_head}")])?;
         Ok(IntegrateOutcome { new_head, commits })
     }
@@ -410,7 +524,8 @@ impl Repository {
 
     /// Applies `commits` one by one onto `onto` in memory, the way
     /// `cherry-pick` would, and returns the ones that change something.
-    /// Writes tree objects only.
+    /// Writes objects (merged trees and blobs) to the object store, never
+    /// refs, the index or files.
     fn cherry_pick_check(
         &self,
         onto: &str,
@@ -477,29 +592,79 @@ impl Repository {
         Ok(kept)
     }
 
-    /// After a failed merge or cherry-pick: aborts whatever git left in
-    /// progress and checks `HEAD` is back at `old_head`. The error text says
-    /// what could not be restored.
-    fn abort_operation(&self, old_head: &str) -> Result<(), String> {
-        let d = self.git_dir().to_path_buf();
-        let mut problems = Vec::new();
-        if d.join("MERGE_HEAD").exists()
-            && let Err(e) = self.run(&["merge", "--abort"], Access::Write)
-        {
-            problems.push(e.to_string());
+    /// After a failed merge or cherry-pick (of `source`, or of `commits`
+    /// onto `old_head`): aborts the operation git left open, if it is the
+    /// one this call started, then checks that `HEAD` is back at `old_head`,
+    /// nothing is in progress, and no tracked file differs from `HEAD` (the
+    /// target was clean before). An operation started by someone else in
+    /// the meantime is left alone and reported. The error text says what
+    /// could not be restored.
+    fn restore_after_failure(
+        &self,
+        old_head: &str,
+        source: &str,
+        commits: &[String],
+    ) -> Result<(), String> {
+        let mut problems: Vec<String> = Vec::new();
+        let abort = |args: &[&str]| self.run(args, Access::Write).err().map(|e| e.to_string());
+        match self.pseudo_ref("MERGE_HEAD") {
+            Ok(Some(m)) if m == source => problems.extend(abort(&["merge", "--abort"])),
+            Ok(Some(m)) => problems.push(format!(
+                "a merge of {m} that this integration did not start is in progress; left alone"
+            )),
+            Ok(None) => {}
+            Err(e) => problems.push(e.to_string()),
         }
-        if (d.join("CHERRY_PICK_HEAD").exists() || d.join("sequencer").exists())
-            && let Err(e) = self.run(&["cherry-pick", "--abort"], Access::Write)
-        {
-            problems.push(e.to_string());
+        let picking = match self.pseudo_ref("CHERRY_PICK_HEAD") {
+            Ok(p) => p,
+            Err(e) => {
+                problems.push(e.to_string());
+                None
+            }
+        };
+        let sequencer = self.git_dir().join("sequencer");
+        // `sequencer/head` holds the HEAD a multi-commit pick started from.
+        let seq_head = std::fs::read_to_string(sequencer.join("head"))
+            .ok()
+            .map(|s| s.trim().to_string());
+        if picking.is_some() || sequencer.exists() {
+            let ours = picking.as_ref().is_some_and(|p| commits.contains(p))
+                || seq_head.as_deref() == Some(old_head);
+            if ours {
+                problems.extend(abort(&["cherry-pick", "--abort"]));
+            } else {
+                problems.push(
+                    "a cherry-pick that this integration did not start is in progress; left alone"
+                        .into(),
+                );
+            }
         }
         match self.resolve("HEAD") {
             Ok(now) if now == old_head => {}
             Ok(now) => problems.push(format!("HEAD is at {now}, it was {old_head}")),
             Err(e) => problems.push(e.to_string()),
         }
-        if let Some(op) = self.operation_in_progress() {
-            problems.push(format!("a {op} is still in progress"));
+        match self.operation_in_progress() {
+            Ok(Some(op)) => problems.push(format!("a {op} is still in progress")),
+            Ok(None) => {}
+            Err(e) => problems.push(e.to_string()),
+        }
+        // Git can fail part way through updating files without leaving any
+        // operation to abort (a failing filter, a full disk).
+        match self.status() {
+            Ok(s) => {
+                let changed: Vec<String> = s
+                    .uncommitted()
+                    .map(|e| e.path.display().to_string())
+                    .collect();
+                if !changed.is_empty() {
+                    problems.push(format!(
+                        "these files now differ from HEAD: {}",
+                        changed.join(", ")
+                    ));
+                }
+            }
+            Err(e) => problems.push(e.to_string()),
         }
         if problems.is_empty() {
             Ok(())

@@ -109,6 +109,38 @@ fn events_arrive_while_the_task_runs() {
 }
 
 #[test]
+fn a_slow_callback_still_gets_every_line_written_before_exit() {
+    // 100 lines at once, then exit; the callback takes 10 ms per line, so
+    // delivering them all takes about twice the drain grace.
+    let (tx, rx) = mpsc::channel();
+    let _h = start(&sh("seq 1 100"), move |e| {
+        if matches!(e, TaskEvent::Output(_)) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = tx.send(e);
+    })
+    .unwrap();
+    let (lines, code, _) = collect(&rx, Duration::from_secs(20));
+    assert_eq!(code, Some(0));
+    let want: Vec<String> = (1..=100).map(|i| i.to_string()).collect();
+    assert_eq!(lines, want);
+}
+
+#[test]
+fn many_lines_arrive_complete_and_in_order() {
+    let (_h, rx) = run(&sh("seq 1 50000"));
+    let (lines, code, _) = collect(&rx, Duration::from_secs(30));
+    assert_eq!(code, Some(0));
+    assert_eq!(lines.len(), 50_000);
+    assert!(
+        lines
+            .iter()
+            .enumerate()
+            .all(|(i, l)| *l == (i + 1).to_string())
+    );
+}
+
+#[test]
 fn long_output_lines_arrive_in_pieces() {
     let (_h, rx) = run(&sh(
         "head -c 200000 /dev/zero | tr '\\0' a; echo; echo after",

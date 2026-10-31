@@ -1232,3 +1232,95 @@ fn an_untracked_file_in_the_way_is_aborted_cleanly() {
         "the user's own file\n"
     );
 }
+
+#[test]
+fn a_checkout_that_fails_half_way_is_reported_not_hidden() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    // The branch changes a.txt and adds a file whose required smudge
+    // filter fails, so git can stop after writing some files.
+    let wt = agent_branch(&f, "agent/filter", ".gitattributes", "z.dat filter=boom\n");
+    write_in(&wt, "a.txt", "changed by the branch\n");
+    commit_in(&f, &wt, "z.dat", "data\n", "a and z");
+    f.git(&["config", "filter.boom.smudge", "false"]);
+    f.git(&["config", "filter.boom.clean", "cat"]);
+    f.git(&["config", "filter.boom.required", "true"]);
+    let head = rev(&f, &f.repo, "HEAD");
+
+    let err = repo
+        .integrate("agent/filter", Integration::FastForwardOnly)
+        .unwrap_err();
+    let status = f.git(&["status", "--porcelain"]);
+    match &err {
+        // Either git changed nothing...
+        IntegrateError::Git(_) => assert_eq!(status, "", "{err}"),
+        // ...or it left files changed and that is reported.
+        IntegrateError::AbortFailed { detail, .. } => {
+            assert!(detail.contains("differ from HEAD"), "{detail}")
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(rev(&f, &f.repo, "HEAD"), head);
+}
+
+fn shared_index_files(f: &Fixture) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(f.repo.join(".git"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("sharedindex."))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn review_diff_leaves_a_split_index_readable() {
+    let f = Fixture::new();
+    // Every index write makes a new shared index and expires old ones at
+    // once, the harshest split index setup.
+    f.git(&["config", "core.splitIndex", "true"]);
+    f.git(&["config", "splitIndex.maxPercentChange", "0"]);
+    f.git(&["config", "splitIndex.sharedIndexExpire", "now"]);
+    f.git(&["update-index", "--split-index"]);
+    f.write("b.txt", "b\n");
+    f.commit_all("b");
+    f.write("new.txt", "untracked\n");
+    let shared = shared_index_files(&f);
+    assert!(!shared.is_empty(), "the fixture should use a split index");
+    let before = snapshot(&f, &f.repo);
+
+    let files = f.repo().review_diff("main").unwrap();
+    assert_eq!(by_path(&files, "new.txt").change, FileChange::Added);
+    assert_eq!(snapshot(&f, &f.repo), before);
+    assert_eq!(shared_index_files(&f), shared);
+    // The real index still reads.
+    f.git(&["ls-files", "--stage"]);
+}
+
+#[test]
+fn branch_merge_options_cannot_leave_a_merge_open() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    agent_branch(&f, "agent/nc", "nc.txt", "nc\n");
+    f.write("main.txt", "main\n");
+    f.commit_all("main moves");
+    let main_before = rev(&f, &f.repo, "HEAD");
+    f.git(&["config", "branch.main.mergeOptions", "--no-commit --squash"]);
+
+    let out = repo.integrate("agent/nc", Integration::Merge).unwrap();
+    assert_ne!(out.new_head, main_before);
+    let parents = f.git(&["rev-list", "--parents", "-n1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 3, "{parents}");
+    assert!(!f.repo.join(".git/MERGE_HEAD").exists());
+    assert!(repo.status().unwrap().is_clean());
+
+    // Fast-forward too.
+    let wt = agent_branch(&f, "agent/ff2", "ff.txt", "ff\n");
+    let tip = rev(&f, &wt, "HEAD");
+    let out = repo
+        .integrate("agent/ff2", Integration::FastForwardOnly)
+        .unwrap();
+    assert_eq!(out.new_head, tip);
+    assert_eq!(rev(&f, &f.repo, "HEAD"), tip);
+    assert!(!f.repo.join(".git/MERGE_HEAD").exists());
+}

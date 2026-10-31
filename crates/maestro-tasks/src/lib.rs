@@ -25,7 +25,9 @@ pub struct TaskSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskEvent {
     /// One line from stdout or stderr, without its line ending. Lines longer
-    /// than [`MAX_LINE`] bytes arrive in pieces. Invalid UTF-8 is replaced.
+    /// than [`MAX_LINE`] bytes of raw output arrive in pieces. Invalid UTF-8
+    /// is replaced with U+FFFD, which can make a piece longer than
+    /// `MAX_LINE` bytes as text (up to three times).
     Output(String),
     /// The program exited. `code` is `None` when a signal ended it (for
     /// example after [`TaskHandle::kill`]).
@@ -35,13 +37,19 @@ pub enum TaskEvent {
     },
 }
 
-/// Longest piece of output delivered as one line.
+/// Longest piece of raw output (in bytes) delivered as one line.
 pub const MAX_LINE: usize = 64 * 1024;
 
-/// After the program exits, how long to wait for its output pipes to close.
-/// A background process it started can hold them open indefinitely; output
-/// that arrives after this is dropped so `Finished` is not held back.
+/// Lines read but not yet passed to `on_event`.
+const QUEUE: usize = 1024;
+
+/// After the program exits, `Finished` waits for its output pipes to close,
+/// but no longer than this with no new line, and no longer than
+/// [`DRAIN_LIMIT`] in all. A background process it started can hold the
+/// pipes open indefinitely; its later output is dropped, and the reader
+/// threads stay blocked on the pipes until that process closes them.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
+const DRAIN_LIMIT: Duration = Duration::from_secs(5);
 
 /// How often the event thread checks whether the program has exited when
 /// no output is arriving.
@@ -162,7 +170,10 @@ fn spawn_threads(
     on_event: impl Fn(TaskEvent) + Send + 'static,
 ) -> io::Result<()> {
     let pid = handle.pid;
-    let (tx, rx) = mpsc::channel::<String>();
+    // Bounded: when `on_event` is slower than the output, the readers wait,
+    // the pipes fill and the program blocks on its writes, instead of lines
+    // piling up in memory.
+    let (tx, rx) = mpsc::sync_channel::<String>(QUEUE);
     for pipe in [
         stdout.map(|p| Box::new(p) as Box<dyn Read + Send>),
         stderr.map(|p| Box::new(p) as Box<dyn Read + Send>),
@@ -184,6 +195,7 @@ fn spawn_threads(
             let mut exit: Option<(Option<ExitStatus>, Instant)> = None;
             let mut pipes_open = true;
             let mut polled: Option<Instant> = None;
+            let mut last_line = Instant::now();
             loop {
                 // At most once per POLL while output streams in.
                 if exit.is_none() && polled.is_none_or(|p| p.elapsed() >= POLL) {
@@ -191,23 +203,30 @@ fn spawn_threads(
                     polled = Some(Instant::now());
                 }
                 if let Some((_, at)) = exit
-                    && (!pipes_open || at.elapsed() >= DRAIN_GRACE)
+                    && (!pipes_open
+                        || last_line.elapsed() >= DRAIN_GRACE
+                        || at.elapsed() >= DRAIN_LIMIT)
                 {
                     break;
                 }
-                let wait = match exit {
-                    Some((_, at)) => DRAIN_GRACE.saturating_sub(at.elapsed()).min(POLL),
-                    None => POLL,
-                };
                 if !pipes_open {
-                    thread::sleep(wait);
+                    thread::sleep(POLL);
                     continue;
                 }
-                match rx.recv_timeout(wait) {
-                    Ok(line) => on_event(TaskEvent::Output(line)),
+                match rx.recv_timeout(POLL) {
+                    Ok(line) => {
+                        last_line = Instant::now();
+                        on_event(TaskEvent::Output(line));
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => pipes_open = false,
                 }
+            }
+            // Lines already read and queued are delivered; at most one
+            // queue's worth, so a process that keeps writing cannot hold
+            // `Finished` back.
+            for line in rx.try_iter().take(QUEUE) {
+                on_event(TaskEvent::Output(line));
             }
             let (status, at) = exit.expect("loop ends only after exit");
             on_event(TaskEvent::Finished {
