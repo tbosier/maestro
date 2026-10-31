@@ -474,6 +474,105 @@ pub fn confirm_reject(ed: &mut Editor, id: AgentId) {
     }));
 }
 
+/// Asks before discarding the agent's change to one file (`D` in the
+/// review).
+pub fn ask_drop_file(ed: &mut Editor, id: AgentId, file: &maestro_git::DiffFile) {
+    let Some(a) = ed.agents.get(id) else {
+        return;
+    };
+    let Some(w) = a.worktree.clone() else {
+        return;
+    };
+    let base = &w.base[..w.base.len().min(8)];
+    let shown = |p: &Option<PathBuf>| p.as_deref().map(|p| p.display().to_string());
+    let (old, new) = (file.old_path.clone(), file.new_path.clone());
+    let what = match (shown(&old), shown(&new)) {
+        (Some(o), Some(n)) if o == n => {
+            format!("{n} goes back to its version at {base}, the commit the agent started from.")
+        }
+        (Some(o), Some(n)) => {
+            format!("{n} is deleted and {o} comes back as it was at {base}.")
+        }
+        (None, Some(n)) => format!("{n} is deleted; the agent added it."),
+        (Some(o), None) => format!("{o} comes back as it was at {base}; the agent deleted it."),
+        (None, None) => return,
+    };
+    let mut lines = vec![
+        format!(
+            "Discard {}'s change to this file in {}.",
+            a.name,
+            w.path.display()
+        ),
+        what,
+        "The agent's version is not kept anywhere if it was never committed; this cannot be undone from Maestro."
+            .into(),
+    ];
+    if a.is_running() {
+        lines.push("The agent is still running and may change the file again.".into());
+    }
+    ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
+        title: format!("drop a change from {}", a.name),
+        lines,
+        keys: vec![
+            ("y".into(), "discard the change".into()),
+            ("n".into(), "cancel".into()),
+        ],
+        action: ConfirmAction::DropFile {
+            agent: id,
+            old,
+            new,
+        },
+    }));
+}
+
+/// Discards the agent's change to one file in its worktree, on a
+/// background thread, then refreshes the review.
+pub fn drop_file(ed: &mut Editor, id: AgentId, old: Option<PathBuf>, new: Option<PathBuf>) {
+    let git = ed.git.git().clone();
+    let Some(w) = ed.agents.get(id).and_then(|a| a.worktree.clone()) else {
+        return;
+    };
+    let touched: Vec<PathBuf> = [&old, &new]
+        .into_iter()
+        .flatten()
+        .map(|p| w.path.join(p))
+        .collect();
+    let unsaved: Vec<String> = touched.iter().flat_map(|p| unsaved_under(ed, p)).collect();
+    if !unsaved.is_empty() {
+        ed.error(format!(
+            "not dropped: {} has unsaved edits; save or close it first",
+            unsaved.join(", ")
+        ));
+        return;
+    }
+    let label = new
+        .as_deref()
+        .or(old.as_deref())
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let spawned = ed.spawn_background("agent-drop", move |tx| {
+        let result = open_exact(&git, &w.path).and_then(|repo| {
+            repo.drop_change(&w.base, old.as_deref(), new.as_deref())
+                .map_err(|e| e.to_string())
+        });
+        tx.send(move |ed| {
+            match result {
+                Ok(()) => {
+                    if let Some(a) = ed.agents.get_mut(id) {
+                        a.log(format!("dropped the change to {label}"));
+                    }
+                    ed.info(format!("dropped the change to {label}"));
+                }
+                Err(e) => ed.error(format!("could not drop the change to {label}: {e}")),
+            }
+            super::review::request(ed, id);
+        });
+    });
+    if let Err(e) = spawned {
+        ed.error(format!("could not start: {e}"));
+    }
+}
+
 pub fn reject(ed: &mut Editor, id: AgentId, then_archive: bool) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
@@ -933,11 +1032,21 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
             facts.branch
         ));
     } else {
+        const SHOWN: usize = 8;
+        let mut names: Vec<String> = facts
+            .uncommitted
+            .iter()
+            .take(SHOWN)
+            .map(|p| p.display().to_string())
+            .collect();
+        if facts.uncommitted.len() > SHOWN {
+            names.push(format!("and {} more", facts.uncommitted.len() - SHOWN));
+        }
         lines.push(format!(
-            "1. Commit all uncommitted and untracked files in {} ({} when checked) to branch {} as \"{subject}\".",
+            "1. Commit all uncommitted and untracked files in {} to branch {} as \"{subject}\". When checked: {}. (D in the review drops a file you do not want.)",
             facts.worktree.display(),
-            facts.uncommitted.len(),
             facts.branch,
+            names.join(", "),
         ));
     }
     let step = match how {

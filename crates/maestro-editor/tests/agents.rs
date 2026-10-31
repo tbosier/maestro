@@ -55,6 +55,10 @@ fn main() {
             "integrate_refuses_when_the_worktree_is_gone",
             integrate_refuses_when_the_worktree_is_gone,
         ),
+        (
+            "a_dropped_file_leaves_the_review_and_the_integration",
+            a_dropped_file_leaves_the_review_and_the_integration,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -696,7 +700,7 @@ fn m2_acceptance_two_agents_reject_one_integrate_the_other() {
     match &ed.agents.panel.overlay {
         Some(Overlay::Confirm(c)) => {
             let text = c.lines.join("\n");
-            assert!(text.contains("(1 when checked)"), "{text}");
+            assert!(text.contains("When checked: notes.txt."), "{text}");
             assert!(text.contains("Merge maestro/write-release-notes"), "{text}");
             assert!(text.contains("into main"), "{text}");
         }
@@ -919,4 +923,68 @@ fn integrate_refuses_when_the_worktree_is_gone() {
             .contains("?? untracked-in-main.txt"),
         "the main worktree's own files were not committed"
     );
+}
+
+/// `D` in the review discards one file's change in the agent's worktree,
+/// after a confirmation, and integration then leaves it out.
+fn a_dropped_file_leaves_the_review_and_the_integration() {
+    let f = Fixture::new();
+    let script = "printf 'wanted\\n' > notes.txt; printf 'cache' > junk.pyc";
+    let mut ed = f.editor(config(&[(
+        "writer",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", script, "sh", "{task}"],
+        ),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    poll_until(&mut ed, "the program and its diff", |ed| {
+        ed.agents
+            .agents
+            .first()
+            .is_some_and(|a| a.exited.is_some() && a.review.files.len() == 2)
+    });
+    let wt = worktree(&ed, 0);
+    run(&mut ed, "\n");
+    // Files are listed by path: junk.pyc comes before notes.txt.
+    assert_eq!(review_paths(&ed, 0), ["junk.pyc", "notes.txt"]);
+    run(&mut ed, "D");
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Confirm(c)) => {
+            let text = c.lines.join(" ");
+            assert!(text.contains("junk.pyc is deleted"), "{text}");
+        }
+        other => panic!("expected a confirmation, got {other:?}"),
+    }
+    run(&mut ed, "n");
+    assert!(wt.join("junk.pyc").exists(), "cancel must change nothing");
+    run(&mut ed, "Dy");
+    poll_until(&mut ed, "the file to be dropped", |ed| {
+        ed.agents.agents[0].review.files.len() == 1 && !ed.agents.agents[0].review.running
+    });
+    assert!(!wt.join("junk.pyc").exists());
+    assert_eq!(review_paths(&ed, 0), ["notes.txt"]);
+
+    // The integrate dialog names what will be committed.
+    run(&mut ed, "I");
+    poll_until(&mut ed, "the integrate dialog", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Integrate { .. }))
+    });
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Confirm(c)) => {
+            let text = c.lines.join(" ");
+            assert!(text.contains("When checked: notes.txt."), "{text}");
+        }
+        other => panic!("expected the integrate dialog, got {other:?}"),
+    }
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        ed.agents.agents[0].status() == Status::Integrated
+    });
+    let tree = f.git(&f.repo, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(tree.lines().any(|l| l == "notes.txt"), "{tree}");
+    assert!(!tree.lines().any(|l| l == "junk.pyc"), "{tree}");
 }

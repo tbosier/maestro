@@ -2,7 +2,7 @@
 //! committing everything, and integrating a branch with safety checks.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::diff::diff_args;
@@ -291,6 +291,86 @@ impl Repository {
         ];
         self.writer().run(&args, Access::Write)?;
         Ok(Some(self.resolve("HEAD")?))
+    }
+
+    /// Takes one file out of the work under review: afterward the file is
+    /// as it was at the fork point of `base` and `HEAD`, the point
+    /// [`Repository::review_diff`] compares against. `old_path` (the file at
+    /// the fork point, if it existed) is restored there in the index and the
+    /// working tree; `new_path` (the file now, if it exists and differs from
+    /// `old_path`) is removed from both. For a modified file both are the
+    /// same path; for an added file `old_path` is `None`; for a deleted
+    /// file `new_path` is `None`; for a rename both are given.
+    ///
+    /// This discards the worktree's change to that file. Paths are relative
+    /// to this worktree's root; absolute paths and `..` are refused. A
+    /// directory at `new_path` is refused rather than removed.
+    pub fn drop_change(
+        &self,
+        base: &str,
+        old_path: Option<&Path>,
+        new_path: Option<&Path>,
+    ) -> Result<()> {
+        check_rev(base)?;
+        for p in [old_path, new_path].into_iter().flatten() {
+            let plain = p.components().all(|c| matches!(c, Component::Normal(_)));
+            if p.as_os_str().is_empty() || !plain {
+                return Err(GitError::InvalidArgument(format!(
+                    "{} is not a path inside the worktree",
+                    p.display()
+                )));
+            }
+        }
+        if old_path.is_none() && new_path.is_none() {
+            return Err(GitError::InvalidArgument("no path to drop".into()));
+        }
+        let out = self.run(
+            &["merge-base", "--end-of-options", base, "HEAD"],
+            Access::ReadOnly,
+        )?;
+        let fork = String::from_utf8_lossy(&out).trim().to_string();
+        check_rev(&fork)?;
+
+        if let Some(new) = new_path.filter(|n| Some(*n) != old_path) {
+            let full = self.root().join(new);
+            match std::fs::symlink_metadata(&full) {
+                Ok(m) if m.is_dir() => {
+                    return Err(GitError::InvalidArgument(format!(
+                        "{} is a directory; not removing it",
+                        new.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(GitError::Io(e)),
+            }
+            let args: Vec<OsString> = vec![
+                "rm".into(),
+                "-q".into(),
+                "--cached".into(),
+                "--ignore-unmatch".into(),
+                "--".into(),
+                new.into(),
+            ];
+            self.run(&args, Access::Write)?;
+            match std::fs::remove_file(&full) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(GitError::Io(e)),
+            }
+        }
+        if let Some(old) = old_path {
+            let args: Vec<OsString> = vec![
+                "restore".into(),
+                format!("--source={fork}").into(),
+                "--staged".into(),
+                "--worktree".into(),
+                "--".into(),
+                old.into(),
+            ];
+            self.run(&args, Access::Write)?;
+        }
+        Ok(())
     }
 
     /// The commit a pseudo-ref such as `MERGE_HEAD` names in this worktree,

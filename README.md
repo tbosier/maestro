@@ -27,7 +27,7 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 
 - Tree-sitter syntax highlighting for Rust, Python, TOML, JSON, Markdown, JavaScript, TypeScript and C, and structural selection: `A-o` grows the selection to the enclosing syntax node, `A-i` shrinks it, `A-n`/`A-p` move between siblings.
 
 - Coding agents in Git worktrees (`space a` or `:agents`). `n` asks for a task and a provider, makes a worktree on a new `maestro/<task>-<id>` branch from the current commit, and starts the agent there: over the Agent Client Protocol (`gemini --acp`, `opencode acp`) or in a terminal (`claude`, `codex`, or any program you configure). `N` starts the same task with another provider, and the list shows each agent's status, files changed, lines added and removed, and last test result side by side. Status comes from what the agent reports, the process exit, test runs and your decisions; a terminal agent says "running" and nothing more, because Maestro cannot see inside it. `C-\` gives your keys to an agent's terminal and takes them back.
-- Review per agent (`Enter` in the panel): changed files, unified or side-by-side diffs with changed words marked, line comments (`c`), and `Enter` to open the worktree's file at that line. `t` runs the tests in the worktree, `f` sends your comments and notes back to the agent, `p` answers a permission request, `X` rejects, `A` archives the worktree, and `I` commits the agent's work and merges, fast-forwards or cherry-picks it into your branch. Each of those asks first and says what it will do, and Maestro refuses, changing nothing, when either worktree is dirty or the merge would conflict.
+- Review per agent (`Enter` in the panel): changed files, unified or side-by-side diffs with changed words marked, line comments (`c`), `D` to drop one file's change (a stray cache file, say), and `Enter` to open the worktree's file at that line. `t` runs the tests in the worktree, `f` sends your comments and notes back to the agent, `p` answers a permission request, `X` rejects, `A` archives the worktree, and `I` commits the agent's work and merges, fast-forwards or cherry-picks it into your branch. Each of those asks first and says what it will do, and Maestro refuses, changing nothing, when either worktree is dirty or the merge would conflict.
 
 Not built yet: agent sessions that survive a restart, and an OS sandbox for agents (a worktree keeps their files apart, not their permissions; see [docs/security.md](docs/security.md)). Those are tracked in the roadmap.
 
@@ -66,7 +66,7 @@ cargo build --release
 | `C-x` (insert mode) | ask the language server for completions |
 | `C-n` `C-p`, Tab or Enter, Escape | in the completion popup: move, accept, close |
 | `space a` | the agent panel: `n` new task, `N` same task with another provider, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate, `X` reject, `A` archive, `v` history or test output, `C-\` keys to the agent's terminal and back |
-| in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `ret` open the file there |
+| in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `D` drop the file's change, `ret` open the file there |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
 

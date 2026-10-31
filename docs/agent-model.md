@@ -64,6 +64,7 @@ Terminal agents have no structured status. The panel says so ("terminal only") n
 ## Actions
 
 - Tests (`t`): runs `[agents] test-command`, or `cargo test` when the worktree has a `Cargo.toml`, with `maestro-tasks`. Output streams into the tests view; the totals are parsed from `cargo test` output.
+- Drop a file (`D` in the review): discards the agent's change to the file under the cursor in its worktree, after a dialog that says what happens to it (restored to the starting commit's version, or deleted if the agent added it). Refused while that file has unsaved edits in a buffer. This is how to keep stray files (build output, caches) out of an integration; there is no partial staging of hunks.
 - Feedback (`f`): unsent comments plus typed text. An ACP agent gets them as a new prompt (refused while a turn is running). A terminal agent gets them typed into its terminal, and the input box says that is all Maestro can do.
 - Permission (`p`): lists the choices of the oldest unanswered request (requests queue; the transcript says how many more wait). Choices that allow something ask for confirmation first; rejecting is sent at once.
 - Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree. Rejecting while the worktree is still being made means the agent is never launched.

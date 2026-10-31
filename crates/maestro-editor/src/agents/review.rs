@@ -466,6 +466,17 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             open_at_cursor(ed, &v, &rows);
             return;
         }
+        KeyCode::Char('D') if !ctrl => {
+            let file = ed
+                .agents
+                .get(id)
+                .and_then(|a| a.review.files.get(v.file))
+                .cloned();
+            match file {
+                Some(f) => super::actions::ask_drop_file(ed, id, &f),
+                None => ed.error("no file to drop"),
+            }
+        }
         KeyCode::Char('t') if !ctrl => super::actions::run_tests(ed, id),
         KeyCode::Char('f') if !ctrl => super::actions::ask_feedback(ed, id),
         KeyCode::Char('I') if !ctrl => super::actions::prepare_integrate(ed, id),
@@ -546,6 +557,7 @@ pub fn hints() -> Vec<(&'static str, &'static str)> {
         ("tab", "file"),
         ("s", "side by side"),
         ("c", "comment"),
+        ("D", "drop file"),
         ("ret", "open file"),
         ("f", "feedback"),
         ("t", "test"),

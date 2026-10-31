@@ -1324,3 +1324,87 @@ fn branch_merge_options_cannot_leave_a_merge_open() {
     assert_eq!(rev(&f, &f.repo, "HEAD"), tip);
     assert!(!f.repo.join(".git/MERGE_HEAD").exists());
 }
+
+#[test]
+fn drop_change_takes_single_files_out_of_the_review() {
+    let f = Fixture::new();
+    f.write("keep.txt", "k1\nk2\n");
+    f.write("gone.txt", "bye\n");
+    f.write("old name.txt", &numbered("row", 20));
+    f.commit_all("files");
+    let repo = f.repo();
+    let wt = f.tmp.join("drop");
+    repo.add_worktree(&wt, "agent/drop", "main").unwrap();
+    let inner = f.api().discover(&wt).unwrap().unwrap();
+
+    // A committed edit, an uncommitted edit, an untracked file, a
+    // deletion and a rename on disk.
+    write_in(&wt, "a.txt", "one\nTWO\nthree\n");
+    f.git_ok(&wt, &["commit", "-q", "-am", "agent edits a"]);
+    write_in(&wt, "keep.txt", "k1\nk2 edited\n");
+    write_in(&wt, "junk/cache.pyc", "\0binary\0");
+    std::fs::remove_file(wt.join("gone.txt")).unwrap();
+    std::fs::rename(wt.join("old name.txt"), wt.join("new name.txt")).unwrap();
+    // A change the user keeps.
+    write_in(&wt, "wanted.txt", "keep me\n");
+
+    let files = inner.review_diff("main").unwrap();
+    for p in [
+        "a.txt",
+        "keep.txt",
+        "junk/cache.pyc",
+        "gone.txt",
+        "new name.txt",
+    ] {
+        let d = by_path(&files, p);
+        inner
+            .drop_change("main", d.old_path.as_deref(), d.new_path.as_deref())
+            .unwrap_or_else(|e| panic!("dropping {p}: {e}"));
+    }
+    let files = inner.review_diff("main").unwrap();
+    let paths: Vec<String> = files
+        .iter()
+        .map(|d| d.path().unwrap().display().to_string())
+        .collect();
+    assert_eq!(paths, ["wanted.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "one\ntwo\nthree\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("gone.txt")).unwrap(),
+        "bye\n"
+    );
+    assert!(!wt.join("junk/cache.pyc").exists());
+    assert!(!wt.join("new name.txt").exists());
+    assert!(wt.join("old name.txt").exists());
+
+    // Refusals change nothing.
+    let before = snapshot(&f, &wt);
+    assert!(
+        inner
+            .drop_change("main", None, Some(Path::new("../a.txt")))
+            .is_err()
+    );
+    assert!(
+        inner
+            .drop_change("main", None, Some(&wt.join("wanted.txt")))
+            .is_err()
+    );
+    assert!(
+        inner
+            .drop_change("--all", Some(Path::new("a.txt")), None)
+            .is_err()
+    );
+    assert!(inner.drop_change("main", None, None).is_err());
+    std::fs::create_dir_all(wt.join("somedir")).unwrap();
+    write_in(&wt, "somedir/x.txt", "x\n");
+    let before_dir = snapshot(&f, &wt);
+    assert!(
+        inner
+            .drop_change("main", None, Some(Path::new("somedir")))
+            .is_err()
+    );
+    assert_eq!(snapshot(&f, &wt), before_dir);
+    assert_ne!(before, before_dir);
+}

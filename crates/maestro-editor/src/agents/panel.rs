@@ -82,6 +82,12 @@ pub enum ConfirmAction {
     Archive(AgentId),
     /// `F` force-removes the worktree, deleting what `lines` lists.
     ForceArchive(AgentId),
+    /// `y` discards the agent's change to one file in its worktree.
+    DropFile {
+        agent: AgentId,
+        old: Option<std::path::PathBuf>,
+        new: Option<std::path::PathBuf>,
+    },
     /// `y` sends the permission answer.
     Grant {
         agent: AgentId,
@@ -720,6 +726,9 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
         }
         (ConfirmAction::Archive(id), Some('y'), _) => super::actions::archive(ed, *id, false),
         (ConfirmAction::ForceArchive(id), Some('F'), _) => super::actions::archive(ed, *id, true),
+        (ConfirmAction::DropFile { agent, old, new }, Some('y'), _) => {
+            super::actions::drop_file(ed, *agent, old.clone(), new.clone())
+        }
         (
             ConfirmAction::Grant {
                 agent,

@@ -186,6 +186,10 @@ impl Repository {
     /// Refuses with GitError::Unmerged while files are in conflict, and with GitError::NoIdentity
     /// (before staging) when git has no user name and email. Hooks run; if one rejects the commit, files stay staged.
     pub fn commit_all(&self, message: &str) -> Result<Option<String>>;
+    /// Takes one file out of the work under review: `old_path` is restored to its version at the fork point
+    /// of `base` and HEAD (index and working tree), and `new_path`, when it differs, is removed. Paths are
+    /// relative to the worktree; absolute paths, `..` and a directory at `new_path` are refused.
+    pub fn drop_change(&self, base: &str, old_path: Option<&Path>, new_path: Option<&Path>) -> Result<()>;
     /// Integrates the local branch `branch` into the checked-out branch of this (target) worktree.
     /// Refuses, changing nothing, when this worktree is detached, mid-operation or has staged,
     /// unstaged or conflicted files (untracked files do not block), when the worktree that has
