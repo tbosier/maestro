@@ -107,7 +107,7 @@ title = "Review diff, safe integration, verification runner (maestro-git, maestr
 crates = ["maestro-git", "maestro-tasks"]
 branch = "feat/review"
 owner = "agent"
-status = "in-progress"
+status = "done"
 
 [[task]]
 id = "m2-panel"
