@@ -190,11 +190,22 @@ pub struct DiffTheme {
     pub git_changed: Style,
     pub git_conflict: Style,
     pub git_ignored: Style,
+    /// Intraline marks: the changed part of an added or removed line, on
+    /// top of `add_bg` or `delete_bg`.
+    pub add_text_bg: Rgb,
+    pub delete_text_bg: Rgb,
+    /// `@@` hunk headers in the review screen.
+    pub hunk: Style,
+    /// Review comments under their lines.
+    pub comment: Style,
 }
 
 /// Agent lifecycle states. Each color is always shown with the state's name.
 #[derive(Debug, Clone)]
 pub struct AgentTheme {
+    pub starting: Style,
+    /// An ACP turn is running and the agent has not said what it does.
+    pub working: Style,
     pub planning: Style,
     pub editing: Style,
     pub running: Style,
@@ -203,6 +214,7 @@ pub struct AgentTheme {
     pub ready: Style,
     pub completed: Style,
     pub failed: Style,
+    pub rejected: Style,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +225,8 @@ pub struct Theme {
     pub diagnostic: DiagnosticTheme,
     pub diff: DiffTheme,
     pub agent: AgentTheme,
+    /// The 16 base colors programs in agent terminals ask for by index.
+    pub terminal: [Rgb; 16],
     syntax: HashMap<String, Style>,
 }
 
@@ -226,6 +240,23 @@ impl Theme {
                 return Some(*s);
             }
             scope = &scope[..scope.rfind('.')?];
+        }
+    }
+
+    /// An xterm 256-color index as a color: the theme's 16 base colors,
+    /// then the standard 6x6x6 cube and the 24-step gray ramp.
+    pub fn term_color(&self, index: u8) -> Rgb {
+        match index {
+            0..=15 => self.terminal[index as usize],
+            16..=231 => {
+                let i = index - 16;
+                let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                Rgb(level(i / 36), level((i / 6) % 6), level(i % 6))
+            }
+            _ => {
+                let v = 8 + (index - 232) * 10;
+                Rgb(v, v, v)
+            }
         }
     }
 
@@ -311,9 +342,15 @@ impl Theme {
             git_changed: Style::fg(p::YELLOW.base),
             git_conflict: Style::fg(p::ORANGE.base),
             git_ignored: Style::fg(p::COMMENT),
+            add_text_bg: blend(p::GREEN.base, 0.35),
+            delete_text_bg: blend(p::RED.base, 0.35),
+            hunk: Style::on(p::CYAN.base, p::BG1),
+            comment: Style::on(p::MAGENTA.base, p::BG1),
         };
 
         let agent = AgentTheme {
+            starting: Style::fg(muted),
+            working: Style::fg(p::WHITE.dim),
             planning: Style::fg(p::BLUE.bright),
             editing: Style::fg(p::MAGENTA.base),
             running: Style::fg(p::CYAN.base),
@@ -322,7 +359,28 @@ impl Theme {
             ready: Style::fg(p::GREEN.base),
             completed: Style::fg(p::GREEN.dim),
             failed: Style::fg(p::RED.base),
+            rejected: Style::fg(muted),
         };
+
+        // nightfox's terminal colors: the base shades, then the bright ones.
+        let terminal = [
+            p::BLACK.base,
+            p::RED.base,
+            p::GREEN.base,
+            p::YELLOW.base,
+            p::BLUE.base,
+            p::MAGENTA.base,
+            p::CYAN.base,
+            p::WHITE.base,
+            p::BLACK.bright,
+            p::RED.bright,
+            p::GREEN.bright,
+            p::YELLOW.bright,
+            p::BLUE.bright,
+            p::MAGENTA.bright,
+            p::CYAN.bright,
+            p::WHITE.bright,
+        ];
 
         // Capture names follow the nvim-treesitter / Helix conventions and
         // map onto upstream's `spec.syntax` roles.
@@ -416,6 +474,7 @@ impl Theme {
             diagnostic,
             diff,
             agent,
+            terminal,
             syntax,
         }
     }
@@ -560,6 +619,75 @@ mod tests {
     fn active_border_meets_non_text_contrast() {
         let t = Theme::duskfox();
         assert!(ratio(t.ui.border_active, t.background) >= 3.0);
+    }
+
+    /// Agent status names are drawn in their color on the panel's
+    /// background and on the selected row (the popup surface).
+    #[test]
+    fn agent_status_colors_meet_contrast() {
+        let t = Theme::duskfox();
+        let a = &t.agent;
+        let surfaces = [
+            ("text", t.ui.text.bg.unwrap()),
+            ("popup", t.ui.popup.bg.unwrap()),
+        ];
+        let mut failing = Vec::new();
+        for (name, s) in [
+            ("starting", a.starting),
+            ("working", a.working),
+            ("planning", a.planning),
+            ("editing", a.editing),
+            ("running", a.running),
+            ("awaiting_approval", a.awaiting_approval),
+            ("blocked", a.blocked),
+            ("ready", a.ready),
+            ("completed", a.completed),
+            ("failed", a.failed),
+            ("rejected", a.rejected),
+        ] {
+            for (surface, bg) in surfaces {
+                let r = s.fg.unwrap().contrast(bg);
+                if r < 4.5 {
+                    failing.push((name, surface, r));
+                }
+            }
+        }
+        assert!(failing.is_empty(), "under 4.5:1: {failing:?}");
+    }
+
+    /// The review screen draws text on the add and delete tints and on the
+    /// stronger intraline tints, signs and line numbers on the text
+    /// background, and hunk headers and comments on the text background.
+    #[test]
+    fn review_diff_colors_meet_contrast() {
+        let t = Theme::duskfox();
+        let d = &t.diff;
+        let fg = t.ui.text.fg.unwrap();
+        let bg = t.ui.text.bg.unwrap();
+        let pairs = [
+            ("text on add_bg", fg.contrast(d.add_bg)),
+            ("text on delete_bg", fg.contrast(d.delete_bg)),
+            ("text on add_text_bg", fg.contrast(d.add_text_bg)),
+            ("text on delete_text_bg", fg.contrast(d.delete_text_bg)),
+            ("git_add sign", d.git_add.fg.unwrap().contrast(bg)),
+            ("git_removed sign", d.git_removed.fg.unwrap().contrast(bg)),
+            ("line numbers", ratio(t.ui.text_muted, bg)),
+            ("hunk", ratio(d.hunk, bg)),
+            ("comment", ratio(d.comment, bg)),
+        ];
+        let failing: Vec<_> = pairs.iter().filter(|(_, r)| *r < 4.5).collect();
+        assert!(failing.is_empty(), "under 4.5:1: {failing:?}");
+    }
+
+    #[test]
+    fn term_colors_follow_xterm() {
+        let t = Theme::duskfox();
+        assert_eq!(t.term_color(1), p::RED.base);
+        assert_eq!(t.term_color(16), Rgb(0, 0, 0));
+        assert_eq!(t.term_color(196), Rgb(255, 0, 0));
+        assert_eq!(t.term_color(231), Rgb(255, 255, 255));
+        assert_eq!(t.term_color(232), Rgb(8, 8, 8));
+        assert_eq!(t.term_color(255), Rgb(238, 238, 238));
     }
 
     #[test]

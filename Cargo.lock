@@ -704,14 +704,18 @@ name = "maestro-editor"
 version = "0.1.0"
 dependencies = [
  "ignore",
+ "maestro-agent",
  "maestro-config",
  "maestro-core",
  "maestro-git",
  "maestro-lsp",
  "maestro-syntax",
+ "maestro-tasks",
+ "maestro-term",
  "proptest",
  "regex",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "toml",
 ]

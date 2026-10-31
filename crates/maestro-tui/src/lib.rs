@@ -1,6 +1,7 @@
 //! Terminal front end. Owns the terminal, converts input into editor key
 //! events and draws frames; all editing logic lives in `maestro-editor`.
 
+mod agents;
 pub mod clipboard;
 mod preview;
 pub mod render;

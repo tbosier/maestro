@@ -17,14 +17,24 @@ thiserror.workspace = true
 ignore.workspace = true
 serde.workspace = true
 toml.workspace = true
+serde_json.workspace = true
+maestro-agent.workspace = true
+maestro-term.workspace = true
+maestro-tasks.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 maestro-lsp = { workspace = true, features = ["fake-server"] }
+maestro-agent = { workspace = true, features = ["fake-agent"] }
 
 # Runs its own main so the test binary can double as the fake server.
 [[test]]
 name = "lsp"
+harness = false
+
+# Runs its own main so the test binary can double as the fake ACP agent.
+[[test]]
+name = "agents"
 harness = false
 
 [lints]

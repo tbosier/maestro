@@ -40,7 +40,10 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     draw_dividers(ed, surface, &placements);
     draw_hover(ed, surface);
     let mut cursor = CursorShape::Hidden;
-    if ed.mode == Mode::Insert && ed.prompt.is_none() && ed.picker.is_none() {
+    if ed.agents.panel_open() {
+        // The agent panel covers the editor area (crate::agents).
+        cursor = crate::agents::draw(ed, surface);
+    } else if ed.mode == Mode::Insert && ed.prompt.is_none() && ed.picker.is_none() {
         cursor = insert_cursor(ed, ed.view());
     }
     if let Some(c) = draw_cmdline(ed, surface, cmdline) {
@@ -495,7 +498,7 @@ fn draw_hover(ed: &Editor, s: &mut Surface) {
 
 /// Splits `line` into pieces at most `width` columns wide, preferring
 /// spaces as break points.
-fn wrap(line: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(line: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     if line.is_empty() {
         return vec![String::new()];
@@ -595,6 +598,10 @@ fn draw_statusline(ed: &Editor, view: &View, s: &mut Surface, area: Rect) {
                 view.selection.primary_index() + 1,
                 sels
             ));
+        }
+        // The agent whose worktree holds this file (crate::agents).
+        if let Some(a) = doc.path().and_then(|p| ed.agents.owner_of(p)) {
+            right.push_str(&format!("agent {} worktree  ", a.name));
         }
         // Git branch (maestro-git), shortened so it never crowds out the rest.
         if let Some(branch) = ed.git.branch_label(view.doc) {
@@ -832,7 +839,7 @@ fn draw_which_key(ed: &Editor, s: &mut Surface, cmdline: Rect) {
     }
 }
 
-fn draw_box(
+pub(crate) fn draw_box(
     s: &mut Surface,
     area: Rect,
     title: &str,
