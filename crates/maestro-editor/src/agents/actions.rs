@@ -954,9 +954,9 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
             facts.branch, facts.target
         ),
     };
-    lines.push(step);
     lines.push(format!(
-        "   in the main worktree {}.",
+        "{} The main worktree is {}.",
+        step,
         facts.main_root.display()
     ));
     lines.push(
