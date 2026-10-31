@@ -86,7 +86,7 @@ Selections use the editor's model: a range covers every grapheme from `min(ancho
 | -32013 | permission denied | the operating system refused a file operation |
 | -32014 | conflict | the file changed on disk since it was read; save again with `force` |
 | -32015 | unsaved changes | `editor.quit` with modified buffers; `data` lists them |
-| -32016 | command failed | a command reported an error in the status line, needed a prompt, picker or typed character, or the user was in the middle of input |
+| -32016 | command failed | a command reported an error in the status line, needed a prompt, picker or typed character, or the user was in the middle of input; `editor.quit` while agents, their tests or their Git work are running |
 | -32017 | I/O | any other file error |
 
 ## Methods
@@ -220,7 +220,7 @@ Params: `line`, a `:` command line with or without the colon. Same result and fa
 
 ### editor.quit
 
-Params: `force` (default false). Refused with `-32015` while buffers have unsaved changes. On success the response is written before the editor stops: the headless process exits, and the interactive editor exits after its next frame.
+Params: `force` (default false). Refused with `-32015` while buffers have unsaved changes, and with `-32016` (command failed) while agents or their test runs are still running; `data` lists them. `force` overrides both, and stops the agents first. Git work for an agent (creating its worktree, integrating, archiving) refuses the quit even with `force`, until it finishes. On success the response is written before the editor stops: the headless process exits, and the interactive editor exits after its next frame.
 
 ```
 --> {"jsonrpc":"2.0","id":19,"method":"editor.quit"}

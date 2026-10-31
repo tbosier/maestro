@@ -718,3 +718,94 @@ fn language_server_ui_commands_are_refused_through_the_api() {
     // Ordinary commands still run afterwards.
     h.ok("command.run", json!({"name": "move_char_right"}));
 }
+
+/// `editor.quit` refuses while an agent runs, and `force` stops it.
+#[test]
+fn quit_refuses_while_agents_run_and_force_stops_them() {
+    use maestro_config::{AgentProviderConfig, AgentProviderKind};
+
+    let dir = std::fs::canonicalize(temp_dir("agents-quit")).unwrap();
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CEILING_DIRECTORIES", &dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "initial"]);
+
+    let mut config = Config::default();
+    let sleeper = AgentProviderConfig {
+        kind: AgentProviderKind::Terminal,
+        command: "sh".into(),
+        args: ["-c", "sleep 30", "sh", "{task}"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+        env: Default::default(),
+        enabled: true,
+    };
+    config.agents.provider.insert("sleeper".into(), sleeper);
+    for builtin in ["gemini", "opencode", "claude", "codex"] {
+        config.agents.provider.insert(
+            builtin.into(),
+            AgentProviderConfig {
+                kind: AgentProviderKind::Terminal,
+                command: builtin.into(),
+                args: Vec::new(),
+                env: Default::default(),
+                enabled: false,
+            },
+        );
+    }
+    let mut h = Harness::new();
+    h.ed.config = config;
+    h.ed.cwd = repo.clone();
+    let key = |c: char| KeyEvent::char(c);
+    for k in [key(' '), key('a'), key('n')] {
+        h.ed.handle_key(k);
+    }
+    h.ed.paste_text("wait");
+    h.ed.handle_key(KeyEvent::plain(KeyCode::Enter));
+    h.ed.handle_key(KeyEvent::plain(KeyCode::Enter));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !h.ed.agents.agents.first().is_some_and(|a| a.is_running()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent never started; status {:?}",
+            h.ed.status
+        );
+        h.ed.poll_background();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let (code, msg, data) = h.fails("editor.quit", json!({}));
+    assert_eq!(code, ErrorCode::CommandFailed);
+    assert!(msg.contains("agents or their tests are running"), "{msg}");
+    assert_eq!(data, Some(json!([h.ed.agents.agents[0].name.clone()])));
+    assert!(!h.ed.should_quit);
+    assert!(h.ed.agents.agents[0].is_running());
+
+    h.ok("editor.quit", json!({"force": true}));
+    assert!(h.ed.should_quit);
+    assert!(
+        !h.ed.agents.agents[0].is_running(),
+        "force must stop the agent"
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}

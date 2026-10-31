@@ -793,6 +793,27 @@ fn run_command(ed: &mut Editor, p: p::CommandRunParams) -> Res<p::CommandResult>
 }
 
 fn quit(ed: &mut Editor, p: p::QuitParams) -> Res<p::QuitResult> {
+    // Git work for an agent (a worktree being made, an integration, an
+    // archive) must finish first; `force` does not override that.
+    let busy = ed.agents.git_busy();
+    if !busy.is_empty() {
+        return Err(err(
+            ErrorCode::CommandFailed,
+            format!("Git work for agents is running: {}", busy.join(", ")),
+        )
+        .with_data(busy));
+    }
+    let running: Vec<String> = ed.agents.running().iter().map(|a| a.name.clone()).collect();
+    if !p.force && !running.is_empty() {
+        return Err(err(
+            ErrorCode::CommandFailed,
+            format!(
+                "agents or their tests are running: {}; pass force to stop them and quit",
+                running.join(", ")
+            ),
+        )
+        .with_data(running));
+    }
     let modified = ed.modified_buffers();
     if !p.force && !modified.is_empty() {
         return Err(err(
@@ -804,6 +825,7 @@ fn quit(ed: &mut Editor, p: p::QuitParams) -> Res<p::QuitResult> {
         )
         .with_data(modified));
     }
+    maestro_editor::agents::stop_all(ed);
     // Quitting through the API saves the session the same way :q does.
     if let Err(e) = maestro_editor::navigation::session::save(ed) {
         ed.set_status(maestro_editor::Severity::Warning, e);
