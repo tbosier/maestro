@@ -285,10 +285,18 @@ fn parse_dollar(s: &[char], i: &mut usize, out: &mut String, cursor: &mut Option
             }
         }
         // `${VAR/regex/format/}` and anything malformed: skip to the
-        // closing brace and insert nothing.
+        // closing brace (past any nested `${1:/upcase}`) and insert nothing.
         _ => {
-            while *i < s.len() && s[*i] != '}' {
-                *i += if s[*i] == '\\' { 2 } else { 1 };
+            let mut depth = 0;
+            while *i < s.len() {
+                match s[*i] {
+                    '\\' => *i += 1,
+                    '{' => depth += 1,
+                    '}' if depth == 0 => break,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                *i += 1;
             }
             *i = (*i + 1).min(s.len());
         }
@@ -330,6 +338,11 @@ mod tests {
         assert_eq!(
             snippet_to_text("${TM_FILENAME/(.*)/$1/}x"),
             ("x".into(), None)
+        );
+        // A format with its own braces is skipped whole.
+        assert_eq!(
+            snippet_to_text("${TM_FILENAME/(.*)/${1:/upcase}/}x$0"),
+            ("x".into(), Some(1))
         );
     }
 

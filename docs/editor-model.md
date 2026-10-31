@@ -85,7 +85,7 @@ The popup opens under the word being completed, or above it when there is no roo
 | Escape | close the popup and stay in insert mode |
 | `C-x` | ask again |
 
-Escape closes only the popup, the way it closes a picker or a prompt and does nothing else; a second Escape leaves insert mode. Any key that moves the cursor without editing closes the popup, and so does typing a character that ends the identifier.
+Escape closes only the popup, the way it closes a picker or a prompt and does nothing else; a second Escape leaves insert mode. Any key that moves a cursor (primary or not) without editing closes the popup, and so does typing a character that ends the identifier.
 
 Accepting applies the item as one transaction:
 
@@ -97,11 +97,15 @@ Snippets (`insertTextFormat` 2) are inserted as plain text. Tab stops disappear,
 
 With several cursors, the item's edit goes in at the primary cursor. Every other cursor gets the same edit only if the text around it is the same as the text the edit replaces at the primary (the same characters from the edit's start up to the cursor, and from the cursor to the edit's end). The others are left alone and the status line says "completed at N of M cursors". An item whose additional edits overlap its main edit is refused and nothing changes.
 
-A reply is dropped, and nothing is shown, if since the request the document version or any cursor changed, another view or buffer was focused, insert mode was left, or a prompt or picker opened. Leaving insert mode or closing the popup also cancels the request.
+A reply is dropped, and nothing is shown, unless on arrival the document version, every cursor, the focused view and its buffer are the same as when the request was sent, the editor is in insert mode, and no prompt or picker is open. The version only grows, so any edit in between drops the reply; a cursor that moved and came back does not. Leaving insert mode or closing the popup also cancels the request. The 150 ms timer checks the same things before it sends anything, so a mouse click into another view or another spot cancels it.
+
+An item whose additional edits sit where you have typed or deleted since the reply is dropped from the popup, since where they belong is no longer known.
+
+In a view smaller than 8 columns or 8 rows the popup is not shown and its keys do their usual work.
 
 `completionItem/resolve` is never sent. The editor does not tell servers it can resolve properties later, so servers send `additionalTextEdits` with the list. Item documentation is not shown.
 
-Repeat and macros: the popup's own keys are not recorded. An accepted item is recorded as the keys that type the same edit (backspaces over the replaced text, the new text, Left to the cursor stop), so `.` and macros repeat it without a server. When typing cannot reproduce the edit (it has additional edits, its new text has line breaks or tabs, or it replaces text after the cursor or text with whitespace in it), `.` repeats nothing for that insert session and a macro being recorded stops with a warning.
+Repeat and macros: the popup's own keys are not recorded. An accepted item is recorded as the keys that type the same edit (backspaces over the replaced text, the new text, Left to the cursor stop), so `.` and macros repeat it without a server. When typing cannot reproduce the edit (it has additional edits, it skipped a cursor, its new text has line breaks or tabs, or it replaces text after the cursor or text with whitespace in it), `.` repeats nothing for that insert session and a macro being recorded stops with a warning.
 
 ## The sign column
 

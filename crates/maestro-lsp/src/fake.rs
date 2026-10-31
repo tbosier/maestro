@@ -306,7 +306,7 @@ pub fn completion(text: &str, at: usize) -> Value {
         return json!({"isIncomplete": false, "items": [
             {"label": "len", "kind": 2, "detail": "fn(&self) -> usize", "textEdit": edit("len()")},
             {"label": "push", "kind": 2, "detail": "fn(&mut self, value: T)",
-             "insertTextFormat": 2, "textEdit": edit("push(${1:value})$0")},
+             "insertTextFormat": 2, "textEdit": edit("push(${1:value})")},
         ]});
     }
     let mut items = vec![

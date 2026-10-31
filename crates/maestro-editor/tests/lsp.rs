@@ -118,6 +118,26 @@ fn main() {
             "completion_in_a_crlf_document_inserts_crlf",
             completion_in_a_crlf_document_inserts_crlf,
         ),
+        (
+            "completion_that_skipped_a_cursor_is_not_repeated",
+            completion_that_skipped_a_cursor_is_not_repeated,
+        ),
+        (
+            "completion_item_dropped_when_its_import_spot_is_edited",
+            completion_item_dropped_when_its_import_spot_is_edited,
+        ),
+        (
+            "completion_closes_when_a_secondary_cursor_moves",
+            completion_closes_when_a_secondary_cursor_moves,
+        ),
+        (
+            "completion_debounce_does_not_follow_a_click_to_another_view",
+            completion_debounce_does_not_follow_a_click_to_another_view,
+        ),
+        (
+            "completion_keys_pass_through_when_the_popup_cannot_be_drawn",
+            completion_keys_pass_through_when_the_popup_cannot_be_drawn,
+        ),
     ]);
 }
 
@@ -730,9 +750,20 @@ fn completion_after_typing_waits_for_the_debounce() {
     let mut f = open_synced("compl-typing", "fn main() {\n    \n}\n");
     let ed = &mut f.ed;
     run(ed, "2GAco");
+    let typed = Instant::now();
     // Nothing is sent while the debounce runs.
     assert!(!ed.lsp.completion.is_pending());
     assert!(completion::visible(ed).is_none());
+    assert!(
+        wait_until(ed, |ed| ed.lsp.completion.is_pending()
+            || completion::visible(ed).is_some()),
+        "never sent"
+    );
+    assert!(
+        typed.elapsed() >= completion::DEBOUNCE,
+        "sent after {:?}",
+        typed.elapsed()
+    );
     wait_for_popup(ed);
     let reqs = completion_requests(ed);
     assert_eq!(reqs.len(), 1, "one request for the burst of two keys");
@@ -1017,4 +1048,90 @@ fn completion_in_a_crlf_document_inserts_crlf() {
     assert_eq!(head(ed), ed.doc().text().line_to_char(2) + 18);
     run(ed, "<esc>");
     assert_server_matches(ed, "crlf");
+}
+
+/// Replayed keys act at every cursor, so a completion that skipped a
+/// cursor is not repeated by `.`.
+fn completion_that_skipped_a_cursor_is_not_repeated() {
+    let mut f = open_synced("compl-skipdot", "xo\nco\nxo\nco\n");
+    let ed = &mut f.ed;
+    run(ed, "CA<C-x>");
+    wait_for_popup(ed);
+    run(ed, "<tab><esc>");
+    assert_eq!(ed.doc().text().to_string(), "xo\ncollections\nxo\nco\n");
+    let version = ed.doc().version();
+    run(ed, ",jj.");
+    assert_eq!(ed.doc().version(), version, "`.` changed nothing");
+    assert_eq!(ed.doc().text().to_string(), "xo\ncollections\nxo\nco\n");
+}
+
+/// Typing where an item's additional edit goes makes that item stale.
+fn completion_item_dropped_when_its_import_spot_is_edited() {
+    let mut f = open_synced("compl-importspot", "Hash\n");
+    let ed = &mut f.ed;
+    run(ed, "A<C-x>");
+    wait_for_popup(ed);
+    assert_eq!(labels(ed), ["HashMap"]);
+    // Clearing the line deletes text at the import's position (0).
+    run(ed, "<C-u>H");
+    assert!(
+        !labels(ed).contains(&"HashMap".to_string()),
+        "{:?}",
+        labels(ed)
+    );
+    run(ed, "<tab><esc>");
+    assert!(
+        !ed.doc().text().to_string().contains("use std"),
+        "{:?}",
+        ed.doc().text().to_string()
+    );
+}
+
+/// Moving a cursor other than the primary also closes the popup.
+fn completion_closes_when_a_secondary_cursor_moves() {
+    use maestro_core::{Range, Selection};
+    let mut f = open_synced("compl-secondary", "co\nco\n");
+    let ed = &mut f.ed;
+    run(ed, "i");
+    ed.set_selection(Selection::new(vec![Range::point(0), Range::point(5)], 0));
+    run(ed, "<C-x>");
+    wait_for_popup(ed);
+    // The primary is at the start of the text and cannot move left.
+    run(ed, "<left>");
+    assert_eq!(head(ed), 0);
+    assert!(completion::visible(ed).is_none());
+    run(ed, "<tab><esc>");
+    assert!(!ed.doc().text().to_string().contains("collections"));
+}
+
+/// A debounce started in one view does not fire after a click moved the
+/// focus to another.
+fn completion_debounce_does_not_follow_a_click_to_another_view() {
+    use maestro_editor::MouseKind;
+    let mut f = open_synced("compl-click", "fn main() {\n    \n}\n");
+    let ed = &mut f.ed;
+    run(ed, "<C-w>v2GAco");
+    let first = ed.focus;
+    // Click into the other split while still in insert mode.
+    let other = ed.views.values().find(|v| v.id != first).unwrap().area;
+    ed.handle_mouse(MouseKind::Down, other.x + other.width / 2, other.y);
+    assert_ne!(ed.focus, first);
+    std::thread::sleep(completion::DEBOUNCE * 2);
+    ed.poll_background();
+    assert!(!ed.lsp.completion.is_pending());
+    assert!(completion::visible(ed).is_none());
+    run(ed, "<esc>");
+}
+
+/// In a view too small to draw the popup, its keys do their usual work.
+fn completion_keys_pass_through_when_the_popup_cannot_be_drawn() {
+    let mut f = open_synced("compl-small", "fn main() {\n    co\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2GA<C-x>");
+    wait_for_popup(ed);
+    ed.resize(Rect::new(0, 0, 7, 30));
+    assert!(completion::visible(ed).is_none());
+    run(ed, "<ret><esc>");
+    assert!(!ed.doc().text().to_string().contains("collections"));
+    assert_eq!(ed.doc().text().len_lines(), 5, "Enter made a new line");
 }

@@ -85,6 +85,9 @@ pub struct MenuItem {
     text: String,
     snippet: bool,
     additional: Vec<(usize, usize, String)>,
+    /// An edit touched one of the additional edits' ranges, so where they
+    /// go is no longer known. The item is no longer offered.
+    stale: bool,
 }
 
 /// An item that matches the typed prefix, with the label chars to
@@ -102,11 +105,11 @@ pub struct Menu {
     pub view: ViewId,
     /// Char index where the identifier being completed starts.
     pub start: usize,
-    /// The primary cursor, document version and cursor count the popup is
-    /// in step with. If any differs, the popup is stale and closes.
+    /// The primary cursor, document version and cursors the popup is in
+    /// step with. If any differs, the popup is stale and closes.
     pub head: usize,
     pub version: DocumentVersion,
-    cursors: usize,
+    selection: Selection,
     /// The version the stored ranges were last mapped to.
     mapped: DocumentVersion,
     pub items: Vec<MenuItem>,
@@ -131,6 +134,7 @@ impl Menu {
             .items
             .iter()
             .enumerate()
+            .filter(|(_, item)| !item.stale)
             .filter_map(|(index, item)| {
                 let (score, positions) = crate::picker::fuzzy_match(&query, &item.filter)?;
                 let positions = if item.filter == item.label {
@@ -199,7 +203,7 @@ fn word_start(text: &Rope, head: usize) -> usize {
 /// The popup, if it is in step with the focused view and has matches.
 pub fn visible(ed: &Editor) -> Option<&Menu> {
     let menu = ed.lsp.completion.menu.as_ref()?;
-    (in_step(ed, menu) && !menu.matches.is_empty()).then_some(menu)
+    (in_step(ed, menu) && !menu.matches.is_empty() && usable(ed)).then_some(menu)
 }
 
 fn in_step(ed: &Editor, menu: &Menu) -> bool {
@@ -210,8 +214,16 @@ fn in_step(ed: &Editor, menu: &Menu) -> bool {
         && ed.focus == menu.view
         && ed.view().doc == menu.doc
         && ed.doc().version() == menu.version
-        && sel.primary().head == menu.head
-        && sel.len() == menu.cursors
+        && *sel == menu.selection
+}
+
+/// Smallest view area the popup is drawn in. Below it the popup is neither
+/// drawn nor takes keys, so Tab and Enter never accept an item the user
+/// cannot see. The front end draws it whenever this holds.
+pub const MIN_AREA: (u16, u16) = (8, 8);
+
+fn usable(ed: &Editor) -> bool {
+    ed.area.width >= MIN_AREA.0 && ed.area.height >= MIN_AREA.1
 }
 
 /// Closes the popup and cancels any request or timer behind it.
@@ -272,7 +284,15 @@ pub(super) fn document_changed(ed: &mut Editor, doc: DocumentId, changes: &[Chan
             return;
         }
         menu.start = cs.map_pos(menu.start, Assoc::Before);
+        let edits = cs.changes();
         for item in &mut menu.items {
+            let touched = item
+                .additional
+                .iter()
+                .any(|&(a, b, _)| edits.iter().any(|c| c.from <= b && c.to >= a));
+            if touched {
+                item.stale = true;
+            }
             if let Some((a, b)) = &mut item.range {
                 *a = cs.map_pos(*a, Assoc::Before);
                 *b = cs.map_pos(*b, Assoc::After).max(*a);
@@ -292,7 +312,7 @@ pub(crate) fn handle_key(ed: &mut Editor, key: KeyEvent) -> bool {
     let Some(menu) = ed.lsp.completion.menu.as_ref() else {
         return false;
     };
-    if !in_step(ed, menu) {
+    if !in_step(ed, menu) || !usable(ed) {
         close(ed);
         return false;
     }
@@ -348,16 +368,16 @@ pub(crate) fn after_key(
         return;
     }
     let version = ed.doc().version();
-    let head = ed.view().selection.primary().head;
-    let cursors = ed.view().selection.len();
+    let selection = ed.view().selection.clone();
+    let head = selection.primary().head;
     let text = ed.doc().text().clone();
     if let Some(menu) = ed.lsp.completion.menu.as_ref() {
         let same_place = ed.focus == menu.view && ed.view().doc == menu.doc;
-        let keep = if !same_place || cursors != menu.cursors {
+        let keep = if !same_place || selection.len() != menu.selection.len() {
             false
         } else if version == menu.version {
-            // No edit: any cursor movement leaves the completion.
-            head == menu.head
+            // No edit: moving any cursor leaves the completion.
+            selection == menu.selection
         } else {
             menu.mapped == version
                 && menu.start <= head
@@ -368,6 +388,7 @@ pub(crate) fn after_key(
         } else if version != menu.version {
             let menu = ed.lsp.completion.menu.as_mut().expect("checked");
             menu.head = head;
+            menu.selection = selection;
             menu.version = version;
             menu.refilter(&text);
             if menu.incomplete {
@@ -432,10 +453,21 @@ fn schedule(ed: &mut Editor, trigger: Trigger) {
         return;
     }
     let token = ed.lsp.completion.debounce;
+    let (view, doc) = (ed.focus, ed.view().doc);
+    let version = ed.doc().version();
+    let selection = ed.view().selection.clone();
     let _ = ed.spawn_background("lsp-completion-wait", move |jobs| {
         std::thread::sleep(DEBOUNCE);
         jobs.send(move |ed: &mut Editor| {
-            if ed.lsp.completion.debounce == token && ed.mode == Mode::Insert {
+            // Only where it was scheduled: a mouse click can move focus or
+            // the cursor without a key.
+            let unchanged = ed.lsp.completion.debounce == token
+                && ed.mode == Mode::Insert
+                && ed.focus == view
+                && ed.view().doc == doc
+                && ed.doc().version() == version
+                && ed.view().selection == selection;
+            if unchanged {
                 request(ed, trigger);
             }
         });
@@ -621,7 +653,7 @@ pub fn show(ed: &mut Editor, result: &Value) -> bool {
         start: word_start(&text, head),
         head,
         version,
-        cursors: selection.len(),
+        selection,
         mapped: version,
         items,
         matches: Vec::new(),
@@ -672,6 +704,7 @@ fn menu_item(text: &Rope, head: usize, item: &proto::Item) -> Option<MenuItem> {
         text: new_text,
         snippet: item.snippet,
         additional,
+        stale: false,
     })
 }
 
@@ -712,6 +745,10 @@ fn accept(ed: &mut Editor) {
     let Some(item) = menu.selected_item().cloned() else {
         return;
     };
+    if item.stale {
+        ed.error("completion: the item is out of date; nothing was changed");
+        return;
+    }
     let text = ed.doc().text().clone();
     let len = text.len_chars();
     let crlf = ed.doc().line_ending() == maestro_core::LineEnding::Crlf;
@@ -823,7 +860,9 @@ fn accept(ed: &mut Editor) {
             n - skipped
         ));
     }
-    let keys = (item.additional.is_empty())
+    // Replayed keys act at every cursor, so a completion that skipped
+    // some cannot be repeated as typing.
+    let keys = (item.additional.is_empty() && skipped == 0)
         .then(|| typed_keys(&text, from, head, to, &new_text, stop))
         .flatten();
     ed.record_completion(keys);

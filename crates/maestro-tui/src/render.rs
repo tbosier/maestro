@@ -498,7 +498,7 @@ fn draw_hover(ed: &Editor, s: &mut Surface) {
 /// and detail, under the identifier being completed (above it when there
 /// is not room below). The title shows the selected row's number.
 fn draw_completion(ed: &Editor, s: &mut Surface) {
-    use maestro_editor::lsp::completion::{self, MAX_VISIBLE};
+    use maestro_editor::lsp::completion::{self, MAX_VISIBLE, MIN_AREA};
     use unicode_width::UnicodeWidthStr;
     let Some(menu) = completion::visible(ed) else {
         return;
@@ -523,8 +523,8 @@ fn draw_completion(ed: &Editor, s: &mut Surface) {
     let detail_w = items().map(|i| i.detail.width()).max().unwrap_or(0).min(40);
     let gap = |w: usize| if w > 0 { w + 2 } else { 0 };
     let inner = 1 + label_w + gap(kind_w) + gap(detail_w) + 1;
-    let w = ((inner + 2) as u16).min(s.width);
-    if w < 8 {
+    let w = ((inner + 2) as u16).max(MIN_AREA.0).min(s.width);
+    if w < MIN_AREA.0 {
         return;
     }
     let below = s.height.saturating_sub(row_y + 2);
