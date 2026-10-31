@@ -115,12 +115,34 @@ type CharCallback = Box<dyn FnOnce(&mut Editor, char)>;
 /// thread by [`Editor::poll_background`].
 pub type Job = Box<dyn FnOnce(&mut Editor) + Send>;
 
+/// Wakes the front end's event loop from another thread. The front end
+/// installs the callback once with [`Editor::set_waker`]; until then (and in
+/// tests, which poll) waking does nothing. Handles made before the callback
+/// was installed still reach it.
+#[derive(Clone, Default)]
+pub struct WakeHandle(std::sync::Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>);
+
+impl WakeHandle {
+    pub fn wake(&self) {
+        if let Some(f) = self.0.get() {
+            f();
+        }
+    }
+}
+
+impl std::fmt::Debug for WakeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WakeHandle")
+    }
+}
+
 /// Handle a background thread uses to send results back to the editor.
-/// While any `JobSender` from [`Editor::spawn_background`] is alive, the
-/// front end polls quickly so results appear promptly.
+/// Each send wakes the front end, so results appear without waiting for
+/// the next key press or tick.
 #[derive(Clone)]
 pub struct JobSender {
     tx: std::sync::mpsc::Sender<Job>,
+    wake: WakeHandle,
     _active: std::sync::Arc<ActiveGuard>,
 }
 
@@ -138,7 +160,11 @@ impl Drop for ActiveGuard {
 impl JobSender {
     /// Queues `job` to run on the editor. Returns false if the editor is gone.
     pub fn send(&self, job: impl FnOnce(&mut Editor) + Send + 'static) -> bool {
-        self.tx.send(Box::new(job)).is_ok()
+        let sent = self.tx.send(Box::new(job)).is_ok();
+        if sent {
+            self.wake.wake();
+        }
+        sent
     }
 }
 
@@ -192,6 +218,7 @@ pub struct Editor {
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    wake: WakeHandle,
     next_id: u64,
 }
 
@@ -240,6 +267,7 @@ impl Editor {
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
+            wake: WakeHandle::default(),
             next_id: 1,
         };
         let doc = editor.add_document(Document::default());
@@ -1204,6 +1232,7 @@ impl Editor {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sender = JobSender {
             tx: self.jobs_tx.clone(),
+            wake: self.wake.clone(),
             _active: std::sync::Arc::new(ActiveGuard(Some(self.active_jobs.clone()))),
         };
         std::thread::Builder::new()
@@ -1213,12 +1242,26 @@ impl Editor {
     }
 
     /// A sender for long-lived producers (servers, sockets) that should not
-    /// keep the front end in fast-poll mode. Prefer [`Editor::spawn_background`].
+    /// count as running work in [`Editor::has_background_work`]. Prefer
+    /// [`Editor::spawn_background`].
     pub fn idle_job_sender(&self) -> JobSender {
         JobSender {
             tx: self.jobs_tx.clone(),
+            wake: self.wake.clone(),
             _active: std::sync::Arc::new(ActiveGuard(None)),
         }
+    }
+
+    /// Installs the front end's wake-up callback. Only the first call takes
+    /// effect; returns false for later calls.
+    pub fn set_waker(&self, f: impl Fn() + Send + Sync + 'static) -> bool {
+        self.wake.0.set(Box::new(f)).is_ok()
+    }
+
+    /// A handle that wakes the front end, for producers that change shared
+    /// state without sending a job (terminal output, for example).
+    pub fn wake_handle(&self) -> WakeHandle {
+        self.wake.clone()
     }
 
     /// True while background work started with `spawn_background` runs.

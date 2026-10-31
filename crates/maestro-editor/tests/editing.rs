@@ -456,6 +456,30 @@ fn background_jobs_apply_on_poll() {
     }
 }
 
+#[test]
+fn sending_a_job_wakes_the_front_end() {
+    let ed = editor("x\n");
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A sender made before the waker is installed must still reach it.
+    let idle = ed.idle_job_sender();
+    assert!(ed.set_waker(move || {
+        let _ = tx.send(());
+    }));
+    assert!(!ed.set_waker(|| {}), "a second waker must be refused");
+    idle.send(|ed| ed.info("idle"));
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("idle sender did not wake");
+    ed.spawn_background("wake", |tx| {
+        tx.send(|ed| ed.info("background"));
+    })
+    .unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("background sender did not wake");
+    ed.wake_handle().wake();
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("wake handle did not wake");
+}
+
 // ----- regressions from the M0 hostile review -------------------------------
 
 #[test]

@@ -8,6 +8,8 @@ pub mod surface;
 pub mod terminal;
 
 use std::io::{self, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -85,6 +87,90 @@ impl LatencyLog {
     }
 }
 
+/// What the event loop waits on: terminal input from the reader thread, or
+/// a wake-up from a background producer.
+enum Msg {
+    Input(Event),
+    Wake,
+    Failed(io::Error),
+}
+
+/// Starts the thread that reads terminal input and installs the editor's
+/// waker. Both feed one channel, so the loop sleeps until either arrives.
+/// Wakes are coalesced: at most one is queued until the loop drains it.
+fn start_input_reader(editor: &Editor) -> (mpsc::Receiver<Msg>, Arc<AtomicBool>) {
+    let (tx, rx) = mpsc::channel();
+    let pending = Arc::new(AtomicBool::new(false));
+    let wake_tx = tx.clone();
+    let flag = pending.clone();
+    editor.set_waker(move || {
+        if !flag.swap(true, Ordering::SeqCst) {
+            let _ = wake_tx.send(Msg::Wake);
+        }
+    });
+    // The thread blocks in `event::read` for the life of the process; it
+    // ends when the receiver is dropped and the next event fails to send.
+    let _ = std::thread::Builder::new()
+        .name("maestro-input".into())
+        .spawn(move || {
+            loop {
+                let msg = match event::read() {
+                    Ok(ev) => Msg::Input(ev),
+                    Err(e) => {
+                        let _ = tx.send(Msg::Failed(e));
+                        return;
+                    }
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        });
+    (rx, pending)
+}
+
+/// Applies one terminal event to the editor.
+fn handle_event(
+    editor: &mut Editor,
+    ev: Event,
+    w: &mut u16,
+    h: &mut u16,
+    prev: &mut Option<Surface>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match ev {
+        Event::Key(k) if k.kind != KeyEventKind::Release => {
+            if let Some(key) = convert_key(k) {
+                editor.handle_key(key);
+            }
+        }
+        Event::Paste(text) => editor.paste_text(&text),
+        Event::Resize(nw, nh) => {
+            (*w, *h) = (nw, nh);
+            *prev = None;
+            crossterm::execute!(
+                out,
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            )?;
+        }
+        Event::Mouse(m) => {
+            let kind = match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => Some(MouseKind::Down),
+                MouseEventKind::Drag(MouseButton::Left) => Some(MouseKind::Drag),
+                MouseEventKind::ScrollUp => Some(MouseKind::ScrollUp),
+                MouseEventKind::ScrollDown => Some(MouseKind::ScrollDown),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                editor.handle_mouse(kind, m.column, m.row);
+            }
+        }
+        Event::FocusGained => editor.tick(Instant::now()),
+        _ => {}
+    }
+    Ok(())
+}
+
 pub struct RunOptions {
     /// Draw one frame and exit; used to measure startup time.
     pub exit_after_first_frame: bool,
@@ -105,6 +191,7 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
     let tick_every = Duration::from_millis(1000);
     let mut handle_time = Duration::ZERO;
     let mut dirty = true;
+    let (msgs, wake_pending) = start_input_reader(&editor);
 
     loop {
         // Presentation changes (focus mode) move the view area.
@@ -132,56 +219,45 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
             return Ok(());
         }
 
+        // Clear the flag before draining, so a wake sent while jobs run
+        // queues another pass instead of being lost.
+        wake_pending.store(false, Ordering::SeqCst);
         if editor.poll_background() {
             dirty = true;
             continue;
         }
-        // Poll quickly while background work may deliver results.
-        let mut timeout = tick_every.saturating_sub(last_tick.elapsed());
-        if editor.has_background_work() {
-            timeout = timeout.min(Duration::from_millis(16));
-        }
-        if event::poll(timeout)? {
+        let timeout = tick_every.saturating_sub(last_tick.elapsed());
+        let first = match msgs.recv_timeout(timeout) {
+            Ok(m) => Some(m),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("terminal input reader stopped"));
+            }
+        };
+        if let Some(first) = first {
             let start = Instant::now();
+            let mut had_input = false;
             // Drain everything already queued before drawing, so a burst of
             // input (fast typing, key repeat) costs one frame.
-            loop {
-                match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => {
-                        if let Some(key) = convert_key(k) {
-                            editor.handle_key(key);
-                        }
+            let mut next = Some(first);
+            while let Some(msg) = next {
+                match msg {
+                    Msg::Wake => {}
+                    Msg::Failed(e) => return Err(e),
+                    Msg::Input(ev) => {
+                        had_input = true;
+                        handle_event(&mut editor, ev, &mut w, &mut h, &mut prev, &mut out)?;
                     }
-                    Event::Paste(text) => editor.paste_text(&text),
-                    Event::Resize(nw, nh) => {
-                        (w, h) = (nw, nh);
-                        prev = None;
-                        crossterm::execute!(
-                            out,
-                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                        )?;
-                    }
-                    Event::Mouse(m) => {
-                        let kind = match m.kind {
-                            MouseEventKind::Down(MouseButton::Left) => Some(MouseKind::Down),
-                            MouseEventKind::Drag(MouseButton::Left) => Some(MouseKind::Drag),
-                            MouseEventKind::ScrollUp => Some(MouseKind::ScrollUp),
-                            MouseEventKind::ScrollDown => Some(MouseKind::ScrollDown),
-                            _ => None,
-                        };
-                        if let Some(kind) = kind {
-                            editor.handle_mouse(kind, m.column, m.row);
-                        }
-                    }
-                    Event::FocusGained => editor.tick(Instant::now()),
-                    _ => {}
                 }
-                if editor.should_quit || !event::poll(Duration::ZERO)? {
+                if editor.should_quit {
                     break;
                 }
+                next = msgs.try_recv().ok();
             }
-            handle_time = start.elapsed();
-            dirty = true;
+            if had_input {
+                handle_time = start.elapsed();
+                dirty = true;
+            }
         }
         if last_tick.elapsed() >= tick_every {
             // Reloads and recovery messages change state without a key
