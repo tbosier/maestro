@@ -70,9 +70,15 @@ impl NodeQuery {
     /// capture named `@select`; without one, the query's only capture; and
     /// for a single pattern with no capture at all, the whole pattern (as if
     /// it ended in `@select`).
+    ///
+    /// Only the predicates tree-sitter evaluates itself are accepted:
+    /// `#eq?`, `#match?`, `#any-of?` and their `#not-` and `#any-` forms.
+    /// Any other (a misspelled `#equal?`, `#is?`) is refused, because it
+    /// would be ignored and the query would match more than it says.
     pub fn new(language: Language, source: &str) -> Result<NodeQuery, QueryError> {
         let grammar = language.grammar();
         let query = Query::new(&grammar, source).map_err(|e| convert_error(source, &e))?;
+        check_predicates(source, &query)?;
         let names = query.capture_names();
         if let Some(i) = names.iter().position(|n| *n == SELECT_CAPTURE) {
             return Ok(Self::with_capture(language, query, i));
@@ -80,7 +86,8 @@ impl NodeQuery {
         match names.len() {
             1 => Ok(Self::with_capture(language, query, 0)),
             0 if query.pattern_count() == 1 => {
-                let wrapped = format!("{} @{SELECT_CAPTURE}", source.trim_end());
+                // On its own line, so a trailing `;` comment cannot hide it.
+                let wrapped = format!("{}\n@{SELECT_CAPTURE}", source.trim_end());
                 let query =
                     Query::new(&grammar, &wrapped).map_err(|e| convert_error(&wrapped, &e))?;
                 Ok(Self::with_capture(language, query, 0))
@@ -125,17 +132,53 @@ impl NodeQuery {
     }
 }
 
-/// Turns tree-sitter's error (a byte offset and a kind) into a message with
-/// a char column.
-fn convert_error(source: &str, e: &tree_sitter::QueryError) -> QueryError {
-    let offset = e.offset.min(source.len());
+/// Refuses predicates that tree-sitter does not evaluate during matching.
+fn check_predicates(source: &str, query: &Query) -> Result<(), QueryError> {
+    for pattern in 0..query.pattern_count() {
+        let unsupported = query
+            .general_predicates(pattern)
+            .iter()
+            .map(|p| p.operator.to_string())
+            .chain(
+                query
+                    .property_predicates(pattern)
+                    .iter()
+                    .map(|(_, positive)| if *positive { "is?" } else { "is-not?" }.to_string()),
+            )
+            .next();
+        if let Some(op) = unsupported {
+            // Point at the predicate where it is written, if it can be found.
+            let (row, column) = source
+                .find(&format!("#{op}"))
+                .map_or((0, 0), |at| position(source, at));
+            return Err(QueryError {
+                row,
+                column,
+                message: format!(
+                    "unsupported predicate #{op} (supported: #eq?, #match?, #any-of? and their #not- and #any- forms)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The zero-based line and char column of byte `offset` in `source`.
+fn position(source: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(source.len());
     let offset = (0..=offset)
         .rev()
         .find(|&i| source.is_char_boundary(i))
         .unwrap_or(0);
     let line_start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
     let row = source[..offset].matches('\n').count();
-    let column = source[line_start..offset].chars().count();
+    (row, source[line_start..offset].chars().count())
+}
+
+/// Turns tree-sitter's error (a byte offset and a kind) into a message with
+/// a char column.
+fn convert_error(source: &str, e: &tree_sitter::QueryError) -> QueryError {
+    let (row, column) = position(source, e.offset);
     // Names arrive quoted for some kinds and bare for others.
     let name = e.message.trim_matches('"');
     let message = match e.kind {
@@ -214,10 +257,21 @@ const RUST: &[(&str, &str, &str)] = &[
     ),
     (
         "instrumented",
-        "functions with `#[instrument]` or `#[tracing::instrument]` among the attributes right above them",
+        "functions with `#[instrument]` or `#[tracing::instrument]` (also `::tracing::` and raw identifiers), with or without arguments, among the attributes and comments right above them",
         r#"((attribute_item
-             (attribute [(identifier) (scoped_identifier)] @_attr
-               (#match? @_attr "^(tracing::)?instrument$")))
+             (attribute (identifier) @_name
+               (#any-of? @_name "instrument" "r#instrument")))
+           .
+           [(attribute_item) (line_comment) (block_comment)]*
+           .
+           (function_item) @select)
+          ((attribute_item
+             (attribute
+               (scoped_identifier
+                 path: [(identifier) @_path (scoped_identifier !path name: (identifier) @_path)]
+                 name: (identifier) @_name)
+               (#any-of? @_path "tracing" "r#tracing")
+               (#any-of? @_name "instrument" "r#instrument")))
            .
            [(attribute_item) (line_comment) (block_comment)]*
            .
@@ -245,7 +299,7 @@ const JAVASCRIPT: &[(&str, &str, &str)] = &[
     (
         "fn",
         "function declarations and expressions, arrow functions and methods",
-        "[(function_declaration) (generator_function_declaration) (function_expression) (arrow_function) (method_definition)] @select",
+        "[(function_declaration) (generator_function_declaration) (function_expression) (generator_function) (arrow_function) (method_definition)] @select",
     ),
     (
         "class",
@@ -264,7 +318,7 @@ const TYPESCRIPT: &[(&str, &str, &str)] = &[
     (
         "fn",
         "function declarations and expressions, arrow functions and methods",
-        "[(function_declaration) (generator_function_declaration) (function_expression) (arrow_function) (method_definition)] @select",
+        "[(function_declaration) (generator_function_declaration) (function_expression) (generator_function) (arrow_function) (method_definition)] @select",
     ),
     (
         "class",
@@ -523,6 +577,63 @@ impl X {
         assert_eq!(select(Language::C, c, "struct"), ["struct Q { int x; }"]);
         assert_eq!(select(Language::C, c, "call"), ["g(\"s\")"]);
         assert_eq!(select(Language::C, c, "string"), ["\"s\""]);
+    }
+
+    #[test]
+    fn instrument_attributes_are_matched_by_path_not_by_spelling() {
+        let src = "#[tracing :: instrument]\nfn a() {}\n#[::tracing::instrument(skip(x))]\nfn b() {}\n#[r#tracing::r#instrument]\nfn c() {}\n#[tracing /* why */ :: instrument]\nfn d() {}\n#[other::tracing::instrument]\nfn e() {}\n#[tracing::instrumented]\nfn f() {}\n#[my::instrument]\nfn g() {}\n";
+        assert_eq!(fn_names(src, "instrumented"), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn predicates_tree_sitter_ignores_are_refused() {
+        for q in [
+            r#"(function_item name: (identifier) @n (#equal? @n "x")) @select"#,
+            r#"(function_item name: (identifier) @n (#is? @n local)) @select"#,
+        ] {
+            let e = NodeQuery::new(Language::Rust, q).unwrap_err();
+            assert!(e.message.starts_with("unsupported predicate #"), "{e}");
+            assert_eq!(e.column, 38, "{e}");
+        }
+        let src = "fn wanted() {}\nfn innocent() {}\n";
+        for q in [
+            r#"(function_item name: (identifier) @n (#eq? @n "wanted")) @select"#,
+            r#"(function_item name: (identifier) @n (#match? @n "^want")) @select"#,
+            r#"(function_item name: (identifier) @n (#any-of? @n "wanted" "x")) @select"#,
+        ] {
+            assert_eq!(fn_names(src, q), ["wanted"], "{q}");
+        }
+        assert_eq!(
+            fn_names(
+                src,
+                r#"(function_item name: (identifier) @n (#not-eq? @n "wanted")) @select"#
+            ),
+            ["innocent"]
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_hide_the_implied_capture() {
+        assert_eq!(
+            select(
+                Language::Rust,
+                "fn f() {}",
+                "(function_item) ; the functions"
+            ),
+            ["fn f() {}"]
+        );
+    }
+
+    #[test]
+    fn javascript_fn_includes_generator_expressions() {
+        let js = "const f = function* () { yield 1; };\nfunction* g() {}\n";
+        for lang in [Language::JavaScript, Language::TypeScript, Language::Tsx] {
+            assert_eq!(
+                select(lang, js, "fn"),
+                ["function* () { yield 1; }", "function* g() {}"],
+                "{lang:?}"
+            );
+        }
     }
 
     #[test]
