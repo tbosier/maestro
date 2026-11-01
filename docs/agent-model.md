@@ -6,7 +6,7 @@ This describes what is built as of October 31, 2026. Anything marked partial or 
 
 `Document::apply_at_version(tx, expected_version, selection)` applies a transaction only if the document is still at the version the edit was computed against. Otherwise it returns `EditError::Stale` and changes nothing. Separately, every `ChangeSet` records the length of the document it was built for and refuses to apply to any other length.
 
-Edits produced away from the keyboard and computed against a known version must go through `apply_at_version`. The automation API's `document.apply_edit` does. Its `command.run` and `editor.execute` do not: they run editor commands on the current text, as a key press would, with no version check and no entry in the edit history (see `docs/automation.md`).
+Edits produced away from the keyboard and computed against a known version must go through `apply_at_version`. The automation API's `document.apply_edit` does, and so does approving an edit proposal. Its `command.run` and `editor.execute` do not: they run editor commands on the current text, as a key press would, with no version check and no entry in the edit history (see `docs/automation.md`).
 
 Coding agents started from the agent panel do not edit buffers. They change files in their own worktree, and the user reviews and integrates those files through Git (below).
 
@@ -103,6 +103,6 @@ Terminal agents have no structured status. The panel says so ("terminal only") n
 
 - Two Maestro instances in one repository: each keeps the other's new records when it saves, but a change both make to one record (an archive in one, a comment in the other) keeps only the last save's. A record whose agent still runs in the other editor loads here as not running, and Maestro cannot tell.
 - Relaunch does not send the task again, and a relaunched terminal agent gets no task at all.
-- Agents cannot propose edits to open buffers; there is no edit proposal or review status per buffer edit.
+- Agents started from the panel cannot propose edits to open buffers. An automation client can (`proposal.create`, see `docs/automation.md`), and an agent that speaks the automation protocol could do so as a client, but the panel does not connect its agents to it.
 - No OS sandbox around agent processes (see `docs/security.md`).
 - Terminals show only in the panel, not in splits.
