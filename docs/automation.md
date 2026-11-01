@@ -332,6 +332,8 @@ In the editor, `space e` showed the diff (`-    return a + b`, `+    return a * 
 <-- {"jsonrpc":"2.0","id":6,"result":{"doc":3,"edits":[{"actor":"agent:m3demo","description":"fix mul: it added instead of multiplying","base_version":0,"new_version":1,"timestamp_ms":1793508185727,"proposal":1}],"proposals":[{"id":1, ... the same record as in proposal.resolved ...}]}}
 ```
 
+The login name in `decided_by` is shown as `user` here; the editor sends the real one.
+
 In the same session a proposal against version 0, sent after the first was applied, was refused at once with -32010. A second proposal against version 1 went stale when the user typed a line before approving it: `a` resolved it as `stale` ("the document is at version 21, the proposal was made against version 1"), and its command (`touch late-ran`) never ran. A third was rejected with the reason "unused import". Two `u` presses then undid the typed line and the approved proposal, one each.
 
 
