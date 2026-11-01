@@ -36,6 +36,11 @@ pub use parse::{
     parse_status, plain_text,
 };
 pub use time::{age_label, parse_time, utc_clock};
+
+/// Parses `gh pr diff` output with maestro-git's unified diff parser.
+pub fn parse_diff(out: &[u8]) -> std::result::Result<Vec<maestro_git::DiffFile>, String> {
+    maestro_git::parse_unified_diff(out)
+}
 pub use write::{MergeMethod, WriteAction, browse_command, checkout_command};
 
 /// How long a `gh` call may take before it is stopped.
@@ -69,7 +74,10 @@ impl ForgeError {
     /// True for errors that hold for every call (gh missing or logged
     /// out), as opposed to one call failing.
     pub fn is_setup(&self) -> bool {
-        matches!(self, ForgeError::NotInstalled { .. } | ForgeError::NotLoggedIn)
+        matches!(
+            self,
+            ForgeError::NotInstalled { .. } | ForgeError::NotLoggedIn
+        )
     }
 }
 
@@ -132,7 +140,8 @@ impl GhCommand {
 fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '@' | ',' | '+')
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '@' | ',' | '+')
         });
     if plain {
         s.to_string()

@@ -223,6 +223,8 @@ pub struct Editor {
     /// Edit proposals from automation clients and their review overlay
     /// (see [`crate::proposals`]).
     pub proposals: crate::proposals::Proposals,
+    /// The GitHub inbox (see [`crate::forge`]).
+    pub forge: crate::forge::Forge,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -275,6 +277,7 @@ impl Editor {
             navigation: Default::default(),
             agents: Default::default(),
             proposals: Default::default(),
+            forge: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -1088,6 +1091,10 @@ impl Editor {
             self.selected_register = None;
             return;
         }
+        if self.forge.screen_open() {
+            crate::forge::screen::handle_key(self, key);
+            return;
+        }
         if self.proposals.review_open() {
             crate::proposals::review::handle_key(self, key);
             return;
@@ -1206,6 +1213,7 @@ impl Editor {
             || self.prompt.is_some()
             || self.agents.panel_open()
             || self.proposals.review_open()
+            || self.forge.screen_open()
         {
             return;
         }
@@ -1278,6 +1286,10 @@ impl Editor {
         }
         if self.prompt.is_some() {
             crate::prompt::insert_text(self, text);
+            return;
+        }
+        if self.forge.screen_open() {
+            // The inbox has no text input; messages are written in buffers.
             return;
         }
         if self.proposals.review_open() {
@@ -1466,6 +1478,7 @@ impl Editor {
         crate::git::tick(self);
         crate::lsp::reconcile(self);
         crate::agents::tick(self, now);
+        crate::forge::tick(self, now);
     }
 
     fn check_disk_changes(&mut self) {

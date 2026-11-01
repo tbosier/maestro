@@ -707,6 +707,7 @@ dependencies = [
  "maestro-agent",
  "maestro-config",
  "maestro-core",
+ "maestro-forge",
  "maestro-git",
  "maestro-lsp",
  "maestro-syntax",

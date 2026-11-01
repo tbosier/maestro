@@ -346,7 +346,10 @@ mod tests {
     fn summary_labels() {
         use CheckState::*;
         let s = ChecksSummary::of(&[check(Passed), check(Failed), check(Pending)]);
-        assert_eq!((s.overall(), s.label()), (Overall::Failed, "failed 1/3".into()));
+        assert_eq!(
+            (s.overall(), s.label()),
+            (Overall::Failed, "failed 1/3".into())
+        );
         let s = ChecksSummary::of(&[check(Passed), check(Pending)]);
         assert_eq!(s.label(), "pending 1/2");
         let s = ChecksSummary::of(&[check(Passed), check(Skipped)]);

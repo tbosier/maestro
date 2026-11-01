@@ -127,7 +127,7 @@ pub fn pr_diff(gh: &Gh, pr: &PrRef) -> Result<Vec<DiffFile>> {
         "--color".into(),
         "never".into(),
     ]);
-    gh.json(&cmd, maestro_git::parse_unified_diff)
+    gh.json(&cmd, crate::parse_diff)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -283,7 +283,10 @@ pub fn load_inbox(gh: &Gh, cwd: &Path, limit: usize) -> Inbox {
         limited,
     });
 
-    let errors: Vec<&ForgeError> = sections.iter().filter_map(|s| s.items.as_ref().err()).collect();
+    let errors: Vec<&ForgeError> = sections
+        .iter()
+        .filter_map(|s| s.items.as_ref().err())
+        .collect();
     let fatal = errors
         .iter()
         .find(|e| e.is_setup())
@@ -325,10 +328,9 @@ fn fill_statuses(gh: &Gh, sections: &mut [Section]) {
     std::thread::scope(|s| {
         for _ in 0..STATUS_THREADS {
             s.spawn(|| {
-                loop {
-                    let Some(pr) = queue.lock().ok().and_then(|mut q| q.pop()) else {
-                        break;
-                    };
+                // The guard moves into the closure and is dropped there, so
+                // the queue is not locked while gh runs.
+                while let Some(pr) = queue.lock().ok().and_then(|mut q| q.pop()) {
                     let st = pr_status(gh, &pr);
                     if let Ok(mut d) = done.lock() {
                         d.insert(pr, st);
