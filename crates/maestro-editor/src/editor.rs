@@ -198,6 +198,9 @@ pub struct Editor {
     pub last_change: Vec<KeyEvent>,
     change_keys: Vec<KeyEvent>,
     in_insert_change: bool,
+    /// Set during a key whose edit cannot be repeated by replaying keys
+    /// (see [`Editor::not_repeatable`]).
+    unrepeatable: bool,
     replaying: bool,
     pub marks: HashMap<char, (DocumentId, usize)>,
     pub area: Rect,
@@ -257,6 +260,7 @@ impl Editor {
             last_change: Vec::new(),
             change_keys: Vec::new(),
             in_insert_change: false,
+            unrepeatable: false,
             replaying: false,
             marks: HashMap::new(),
             area,
@@ -1000,12 +1004,35 @@ impl Editor {
             self.last_change = std::mem::take(&mut self.change_keys);
             return;
         }
+        let unrepeatable = std::mem::take(&mut self.unrepeatable);
         if idle
             && self.mode != Mode::Insert
             && self.view().doc == doc_before
             && self.doc().version() != version_before
         {
-            self.last_change = std::mem::take(&mut self.change_keys);
+            if unrepeatable {
+                // `.` keeps repeating the change before this one.
+                self.change_keys.clear();
+            } else {
+                self.last_change = std::mem::take(&mut self.change_keys);
+            }
+        }
+    }
+
+    /// Marks the current key's edit as one `.` must not repeat: replaying
+    /// the keys that led to it (a picker query and Enter, say) would not
+    /// make the same edit, because the picker they went to depends on a
+    /// language server's answer. A macro being recorded stops with a
+    /// warning, for the same reason.
+    pub(crate) fn not_repeatable(&mut self, what: &str) {
+        if !self.replaying {
+            self.unrepeatable = true;
+        }
+        if let Some((reg, _)) = self.recording.take() {
+            self.set_status(
+                Severity::Warning,
+                format!("recording into register {reg} stopped: {what} cannot be replayed"),
+            );
         }
     }
 

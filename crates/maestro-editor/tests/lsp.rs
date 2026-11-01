@@ -206,6 +206,22 @@ fn main() {
             "signature_help_stale_replies_are_not_shown",
             signature_help_stale_replies_are_not_shown,
         ),
+        (
+            "rename_reply_dropped_when_a_file_is_opened_while_waiting",
+            rename_reply_dropped_when_a_file_is_opened_while_waiting,
+        ),
+        (
+            "rename_prepare_dropped_when_the_cursor_moves",
+            rename_prepare_dropped_when_the_cursor_moves,
+        ),
+        (
+            "command_edit_refused_after_typing",
+            command_edit_refused_after_typing,
+        ),
+        (
+            "code_action_is_not_repeated_or_recorded",
+            code_action_is_not_repeated_or_recorded,
+        ),
     ]);
 }
 
@@ -1516,7 +1532,8 @@ fn code_action_quick_fix_sends_diagnostics_and_runs_its_command() {
         "status {:?}",
         ed.status
     );
-    // Its command ran after the edit.
+    // Its command ran after the edit: the server saw the edited text when
+    // the command arrived.
     assert!(wait_until(ed, |ed| {
         fake_stats(ed)["commands"]
             .as_array()
@@ -1524,6 +1541,21 @@ fn code_action_quick_fix_sends_diagnostics_and_runs_its_command() {
             .iter()
             .any(|c| c["command"] == "fake.record" && c["arguments"] == json!(["quickfix"]))
     }));
+    let commands = fake_stats(ed)["commands"].clone();
+    let record = commands
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["command"] == "fake.record")
+        .unwrap();
+    assert!(
+        record["openTexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str().unwrap().contains("let x = OK;")),
+        "{record}"
+    );
     run(ed, "u");
     assert_eq!(text(ed), format!("// moved\n{original}"));
 }
@@ -1649,6 +1681,114 @@ fn code_action_stale_list_and_stale_choice_change_nothing() {
     assert_eq!(text(ed), edited);
 }
 
+/// A file that was not open when the rename went out is opened and edited
+/// before the answer arrives. The answer's unversioned edits for it were
+/// computed from the file on disk, so it is dropped.
+fn rename_reply_dropped_when_a_file_is_opened_while_waiting() {
+    let mut f = open_synced("rename-opened", "// @slow\nfn helper() {}\nhelper();\n");
+    let other = f.dir.join("other.rs");
+    std::fs::write(&other, "fn x() { helper(); }\n").unwrap();
+    let ed = &mut f.ed;
+    run(ed, "3G:rename renamed\n");
+    assert!(ed.lsp.actions.is_pending());
+    run(ed, &format!(":open {}\nixx <esc>", other.display()));
+    assert_eq!(text(ed), "xx fn x() { helper(); }\n");
+    assert!(
+        wait_until(ed, |ed| ed.lsp.actions.last_dropped.as_deref()
+            == Some("a buffer changed while waiting")),
+        "dropped {:?}, status {:?}",
+        ed.lsp.actions.last_dropped,
+        ed.status
+    );
+    assert_eq!(text(ed), "xx fn x() { helper(); }\n");
+}
+
+/// The cursor moves while `prepareRename` is out: no prompt opens, so the
+/// rename cannot go to the symbol the cursor moved to.
+fn rename_prepare_dropped_when_the_cursor_moves() {
+    let original = "// @slow\nfn foo() {}\nfn bar() {}\n";
+    let mut f = open_synced("rename-moved", original);
+    let ed = &mut f.ed;
+    run(ed, "2Gw<space>n");
+    assert!(ed.lsp.actions.is_pending());
+    run(ed, "j");
+    assert!(
+        wait_until(ed, |ed| ed.lsp.actions.last_dropped.as_deref()
+            == Some("the cursor moved")),
+        "dropped {:?}",
+        ed.lsp.actions.last_dropped
+    );
+    assert!(ed.prompt.is_none());
+    assert_eq!(text(ed), original);
+}
+
+/// A command's edit comes back as `workspace/applyEdit` after the user
+/// typed: it was computed from the old text and is refused.
+fn command_edit_refused_after_typing() {
+    let original = "// @slow\nfn main() {}\n";
+    let mut f = open_synced("command-stale", original);
+    let ed = &mut f.ed;
+    run(ed, "2G<space>c");
+    wait_picker(ed);
+    run(ed, "header<ret>");
+    run(ed, "ix<esc>");
+    let edited = text(ed);
+    assert!(
+        wait_until(ed, |ed| {
+            fake_stats(ed)["responses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| {
+                    r["result"]["applied"] == json!(false)
+                        && r["result"]["failureReason"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("changed since the command was sent"))
+                })
+        }),
+        "status {:?}",
+        ed.status
+    );
+    assert_eq!(text(ed), edited);
+    assert!(!text(ed).contains("// header"));
+}
+
+/// `.` after a code action does not replay the picker keys (which would
+/// run as normal-mode commands before the next picker arrives), and a
+/// macro being recorded stops at the picker.
+fn code_action_is_not_repeated_or_recorded() {
+    let mut f = open_synced("action-repeat", "fn main() {\n    let x = ERROR;\n}\n");
+    let ed = &mut f.ed;
+    let doc = ed.view().doc;
+    assert!(wait_until(ed, |ed| ed.lsp.diagnostics(doc).len() == 1));
+    run(ed, "2G^fE<space>c");
+    wait_picker(ed);
+    run(ed, "OK<ret>");
+    assert!(wait_until(ed, |ed| text(ed).contains("let x = OK;")));
+    let after = text(ed);
+    run(ed, ".");
+    std::thread::sleep(Duration::from_millis(200));
+    ed.poll_background();
+    assert_eq!(ed.mode, Mode::Normal);
+    assert_eq!(text(ed), after, "`.` replayed nothing");
+    run(ed, "<esc>");
+    ed.picker = None;
+    // Recording a macro stops when the picker is asked for.
+    let before = text(ed);
+    run(ed, "Q");
+    assert!(ed.recording.is_some());
+    run(ed, "<space>c");
+    assert!(ed.recording.is_none());
+    assert!(
+        status(ed).contains("recording into register @ stopped"),
+        "{:?}",
+        ed.status
+    );
+    assert_eq!(text(ed), before);
+    wait_picker(ed);
+    run(ed, "<esc>");
+}
+
 fn signature_active(ed: &Editor) -> Option<Option<(usize, usize)>> {
     let p = lsp::signature::visible(ed)?;
     Some(p.help.signatures[p.help.active].active)
@@ -1723,11 +1863,16 @@ fn signature_help_stale_replies_are_not_shown() {
         "popup {:?}",
         ed.lsp.signature.popup
     );
-    // A click moves the cursor without a key: the reply in flight no
-    // longer fits and is dropped.
+    // A click moves the cursor without a key: the help on screen no longer
+    // fits and is hidden at once, and the reply in flight is dropped.
     run(ed, "<C-k>");
+    assert!(lsp::signature::visible(ed).is_some());
     let area = ed.view().area;
     ed.handle_mouse(MouseKind::Down, area.x + 10, area.y);
+    assert!(
+        lsp::signature::visible(ed).is_none(),
+        "hidden after the click"
+    );
     assert!(
         wait_until(ed, |ed| ed.lsp.signature.last_dropped.as_deref()
             == Some("the cursor moved")),

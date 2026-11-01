@@ -47,13 +47,15 @@
 //!   parameter offsets and the parameter the cursor is in; `null`
 //!   elsewhere. Triggered by `(` and `,`;
 //! * a document containing `@slow` delays every `textDocument/` request
-//!   about it, and `codeAction/resolve`, by [`SLOW_MS`]; one containing
+//!   about it, `codeAction/resolve`, and the `workspace/applyEdit` of a
+//!   `fake.applyEdit` command, by [`SLOW_MS`]; one containing
 //!   `@crash` makes the server exit with code 3 as soon as it sees it;
 //!   `@orphan` makes it start a `sleep` child that keeps stdout open and
 //!   exit with code 4;
 //! * `fake/documentText` returns its copy of a document and any protocol
 //!   errors it noticed; `fake/stats` returns the notifications it received,
-//!   the completion requests it answered, the commands it ran, the
+//!   the completion requests it answered, the commands it ran (with the
+//!   text of every open document then, as `openTexts`), the
 //!   responses to its own requests and the `initialize` params.
 
 use std::collections::HashMap;
@@ -359,9 +361,17 @@ fn handle_request(
             action
         }
         "workspace/executeCommand" => {
-            st.commands.push(params.clone());
+            // With the text of every open document as the command saw it.
+            let mut texts: Vec<&str> = st.docs.values().map(|d| d.text.as_str()).collect();
+            texts.sort_unstable();
+            let mut record = params.clone();
+            record["openTexts"] = json!(texts);
+            st.commands.push(record);
             match params["command"].as_str() {
                 Some("fake.applyEdit") => {
+                    if st.docs.values().any(|d| d.text.contains("@slow")) {
+                        std::thread::sleep(std::time::Duration::from_millis(SLOW_MS));
+                    }
                     st.next_request += 1;
                     let request = json!({
                         "jsonrpc": "2.0",
