@@ -940,12 +940,15 @@ pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row, hscr
             let half = area.width.saturating_sub(1) / 2;
             let lx = area.x + 1;
             let rx = lx + half + 1;
-            for (side, x, w) in [
-                (left, lx, half),
-                (right, rx, area.right().saturating_sub(rx)),
+            for (side, x, w, old_side) in [
+                (left, lx, half, true),
+                (right, rx, area.right().saturating_sub(rx), false),
             ] {
                 if let Some(l) = side {
-                    let n = l.new.or(l.old).map(|n| n.to_string()).unwrap_or_default();
+                    // Each side counts lines in its own file: a context
+                    // line below an insertion has different numbers.
+                    let n = if old_side { l.old } else { l.new };
+                    let n = n.map(|n| n.to_string()).unwrap_or_default();
                     let nx = s.print(x, area.y, &format!("{n:>4} "), ui.text_muted, x + w);
                     draw_side(
                         ed,
