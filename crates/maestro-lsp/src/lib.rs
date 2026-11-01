@@ -12,8 +12,10 @@
 pub mod client;
 pub mod completion;
 pub mod convert;
+pub mod edit;
 pub mod framing;
 pub mod jsonrpc;
+pub mod signature;
 
 #[cfg(feature = "fake-server")]
 pub mod fake;

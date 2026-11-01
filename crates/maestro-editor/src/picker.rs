@@ -25,6 +25,9 @@ pub enum PickerAction {
         line: usize,
         column: usize,
     },
+    /// Run the code action at this index of the last list
+    /// (`crate::lsp::actions`).
+    CodeAction(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +326,7 @@ pub fn resolve(editor: &mut Editor, outcome: Outcome) {
                     }
                 }
                 PickerAction::Command(name) => editor.run_command(&name),
+                PickerAction::CodeAction(i) => crate::lsp::actions::run_code_action(editor, i),
                 PickerAction::ChangeDir(path) => match std::fs::canonicalize(&path) {
                     Ok(dir) if dir.is_dir() => {
                         let msg = format!("cwd: {}", dir.display());

@@ -909,6 +909,7 @@ impl Editor {
         self.track_change(version_before, doc_before, mode_before);
         crate::lsp::reconcile(self);
         crate::lsp::completion::after_key(self, key, mode_before, doc_before, version_before);
+        crate::lsp::signature::after_key(self, key, mode_before, doc_before, version_before);
         self.ensure_cursor_visible();
     }
 

@@ -282,6 +282,30 @@ static TYPED: &[TypedCommand] = &[
         doc: "Show language server logs in a scratch buffer",
         fun: lsp_log,
     },
+    TypedCommand {
+        name: "rename",
+        aliases: &[],
+        doc: "Rename the symbol under the cursor (prompts when no name is given)",
+        fun: rename,
+    },
+    TypedCommand {
+        name: "format",
+        aliases: &["fmt"],
+        doc: "Format the buffer with the language server",
+        fun: format,
+    },
+    TypedCommand {
+        name: "format-selection",
+        aliases: &[],
+        doc: "Format the primary selection with the language server",
+        fun: format_selection,
+    },
+    TypedCommand {
+        name: "code-action",
+        aliases: &[],
+        doc: "Pick a code action for the cursor or selection",
+        fun: code_action,
+    },
 ];
 
 /// Commands whose argument is a single path that may contain spaces.
@@ -294,6 +318,30 @@ fn lsp_restart(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
 
 fn lsp_log(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     crate::lsp::show_log(ed);
+    Ok(())
+}
+
+fn rename(ed: &mut Editor, args: &[&str], _: bool) -> Result<(), String> {
+    match args {
+        [] => crate::lsp::actions::rename(ed, None),
+        [name] => crate::lsp::actions::rename(ed, Some(name)),
+        _ => return Err("usage: :rename [new-name]".into()),
+    }
+    Ok(())
+}
+
+fn format(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::lsp::actions::format(ed, false);
+    Ok(())
+}
+
+fn format_selection(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::lsp::actions::format(ed, true);
+    Ok(())
+}
+
+fn code_action(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::lsp::actions::code_actions(ed);
     Ok(())
 }
 
