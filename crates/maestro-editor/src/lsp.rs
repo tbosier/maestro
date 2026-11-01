@@ -19,7 +19,10 @@
 //!   moved without a `document_changed` call (a safety net, not the normal
 //!   path).
 //!
-//! Completion in insert mode lives in [`completion`].
+//! Completion in insert mode lives in [`completion`], signature help in
+//! [`signature`], rename, formatting and code actions in [`actions`], and
+//! applying the edits those (and `workspace/applyEdit`) produce in
+//! [`edit`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,7 +36,10 @@ use maestro_lsp::{Client, Event, Reply, RequestId, RpcError, StartOptions, Value
 use crate::editor::{DocumentId, Editor, JobSender, Severity};
 use crate::picker::{Picker, PickerAction, PickerItem};
 
+pub mod actions;
 pub mod completion;
+pub mod edit;
+pub mod signature;
 
 /// How long a request may take before the editor gives up on it.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -91,6 +97,10 @@ pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub message: String,
     pub source: Option<String>,
+    /// The diagnostic as the server published it (`Null` when made
+    /// locally). Code action requests send it back, with its range
+    /// updated, so the server sees its own code and data fields.
+    pub raw: Value,
 }
 
 /// Hover text shown in a popup until the next key.
@@ -261,6 +271,10 @@ pub struct Lsp {
     pub hover: Option<HoverPopup>,
     /// The completion popup and its request.
     pub completion: completion::Completion,
+    /// The signature help popup and its request.
+    pub signature: signature::SignatureHelp,
+    /// Rename, formatting and code action requests.
+    pub actions: actions::Actions,
     /// The log of each server that stopped, kept so `:lsp-log` can show
     /// why. One entry per server name, the latest stop.
     stopped_logs: BTreeMap<String, Vec<String>>,
@@ -599,7 +613,8 @@ fn start_server(
         // Only queue work for what the editor uses, so a chatty server
         // does not fill the job queue with notifications nobody reads.
         let wanted = match &event {
-            Event::Exited { .. } => true,
+            // Requests must always be answered.
+            Event::Exited { .. } | Event::Request { .. } => true,
             Event::Notification { method, .. } => {
                 matches!(
                     method.as_str(),
@@ -686,6 +701,8 @@ fn stop_server(ed: &mut Editor, id: ServerId, why: &str) {
     }
     ed.lsp.pending.retain(|_, p| p.server != id);
     completion::server_stopped(ed, id);
+    signature::server_stopped(ed, id);
+    actions::server_stopped(ed, id);
     ed.set_status(
         Severity::Warning,
         format!(
@@ -714,6 +731,22 @@ pub fn on_event(ed: &mut Editor, id: ServerId, event: Event) {
     }
     match event {
         Event::Exited { status } => stop_server(ed, id, &format!("it exited ({status})")),
+        Event::Request {
+            id: request,
+            method,
+            params,
+        } => {
+            let answer = match method.as_str() {
+                "workspace/applyEdit" => Ok(actions::apply_edit_request(ed, id, &params)),
+                _ => Err(RpcError {
+                    code: RpcError::METHOD_NOT_FOUND,
+                    message: format!("maestro does not handle {method}"),
+                }),
+            };
+            if let Some(s) = ed.lsp.servers.get(&id) {
+                s.client.respond(request, answer);
+            }
+        }
         Event::Notification { method, params } => match method.as_str() {
             "textDocument/publishDiagnostics" => publish_diagnostics(ed, id, &params),
             "window/showMessage" => {
@@ -767,6 +800,7 @@ fn publish_diagnostics(ed: &mut Editor, server: ServerId, params: &Value) {
                 severity: DiagnosticSeverity::from_lsp(&d["severity"]),
                 message: d["message"].as_str().unwrap_or_default().to_string(),
                 source: d["source"].as_str().map(str::to_string),
+                raw: d.clone(),
             })
         })
         .collect();
@@ -774,6 +808,35 @@ fn publish_diagnostics(ed: &mut Editor, server: ServerId, params: &Value) {
 }
 
 // ----- requests ---------------------------------------------------------------
+
+/// The focused buffer's server and the buffer's URI, if the server is
+/// running and offers `capability`. Otherwise says why in the status line,
+/// starting with `what`.
+pub(crate) fn focused_server(
+    ed: &mut Editor,
+    what: &str,
+    capability: &str,
+) -> Option<(ServerId, String)> {
+    reconcile(ed);
+    let doc = ed.view().doc;
+    let Some(sync) = ed.lsp.docs.get(&doc) else {
+        let why = match ed.doc().path() {
+            None => "this buffer has no file",
+            Some(p) if language_for(p).is_none() => "no language server for this file type",
+            Some(_) if !ed.lsp.enabled => "language servers are off",
+            Some(_) => "the language server is not running or still starting",
+        };
+        ed.set_status(Severity::Warning, format!("{what}: {why}"));
+        return None;
+    };
+    let server = ed.lsp.servers.get(&sync.server)?;
+    if !server.supports(capability) {
+        let msg = format!("{} does not support {what}", server.name);
+        ed.set_status(Severity::Warning, msg);
+        return None;
+    }
+    Some((sync.server, sync.uri.clone()))
+}
 
 /// Sends a position request for the focused view's cursor. Returns false
 /// (with a status message) when no server can answer.
@@ -1221,6 +1284,8 @@ pub fn restart(ed: &mut Editor) {
     ed.lsp.pending.clear();
     ed.lsp.hover = None;
     completion::close(ed);
+    signature::close(ed);
+    actions::reset(ed);
     ed.lsp.missing.clear();
     ed.lsp.stopped.clear();
     if !ed.lsp.enabled {

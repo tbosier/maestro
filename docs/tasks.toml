@@ -52,6 +52,20 @@ status = "done"
 # snippet tab stops, signature help, code actions, rename, formatting.
 
 [[task]]
+id = "m1-lsp-actions"
+title = "LSP rename, formatting, code actions, signature help and workspace edits"
+crates = ["maestro-lsp", "maestro-editor", "maestro-tui"]
+branch = "feat/lsp-actions"
+owner = "agent"
+status = "done"
+# All-or-nothing workspace edits (versions, ranges, overlaps checked first;
+# unopened files become unsaved buffers; file operations refused),
+# workspace/applyEdit, rename with prepareRename, formatting and range
+# formatting, code actions with resolve and executeCommand, signature
+# help. Not in this task: format on save, file operations, snippet edits,
+# switching between several signatures.
+
+[[task]]
 id = "m2-git"
 title = "Git status, diffs and worktree lifecycle"
 crates = ["maestro-git", "maestro-editor"]

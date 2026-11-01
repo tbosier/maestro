@@ -20,6 +20,8 @@ pub enum PromptKind {
     },
     /// Workspace search; Enter starts it.
     GlobalSearch,
+    /// A new name for the symbol at the cursor (`crate::lsp::actions`).
+    Rename,
 }
 
 impl PromptKind {
@@ -33,12 +35,14 @@ impl PromptKind {
             PromptKind::Keep { remove: false } => "keep: ",
             PromptKind::Keep { remove: true } => "remove: ",
             PromptKind::GlobalSearch => "search workspace: ",
+            PromptKind::Rename => "rename to: ",
         }
     }
 
     fn history_key(self) -> char {
         match self {
             PromptKind::Command => ':',
+            PromptKind::Rename => 'n',
             _ => '/',
         }
     }
@@ -233,6 +237,7 @@ fn finish(editor: &mut Editor, p: Prompt) {
                 editor.set_status(Severity::Error, e);
             }
         }
+        PromptKind::Rename => crate::lsp::actions::rename_prompt_done(editor, &p.input),
         PromptKind::SelectRegex | PromptKind::SplitRegex | PromptKind::Keep { .. } => {
             if let Some(f) = p.feedback {
                 editor.set_status(Severity::Error, f);
@@ -245,7 +250,7 @@ fn finish(editor: &mut Editor, p: Prompt) {
 /// Recomputes the live preview for regex prompts.
 fn preview(editor: &mut Editor, p: &mut Prompt) {
     p.feedback = None;
-    if p.kind == PromptKind::Command {
+    if matches!(p.kind, PromptKind::Command | PromptKind::Rename) {
         return;
     }
     // The document may have changed since the prompt opened (an automatic
@@ -321,7 +326,7 @@ fn preview(editor: &mut Editor, p: &mut Prompt) {
                 None => p.feedback = Some("no selections would remain".into()),
             }
         }
-        PromptKind::Command | PromptKind::GlobalSearch => {}
+        PromptKind::Command | PromptKind::GlobalSearch | PromptKind::Rename => {}
     }
 }
 
