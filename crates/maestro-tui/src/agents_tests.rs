@@ -111,6 +111,9 @@ fn record(id: u64, status: &str) -> maestro_editor::agents::persist::AgentRecord
         load_session: false,
         created: 0,
         contract: None,
+        origin: None,
+        composition: None,
+        parts: vec![],
     }
 }
 
@@ -231,11 +234,8 @@ fn contracts_and_conflicts_are_shown_in_words() {
     assert!(text.contains("overlaps sh-1 in notes.txt"), "{text}");
     // The review marks the file outside the contract with ! and words.
     ed.agents.panel.review = Some(ReviewView {
-        agent: one,
         file: 1,
-        cursor: 0,
-        top: 0,
-        side_by_side: false,
+        ..ReviewView::new(one)
     });
     let rows = screen(&ed);
     let text = rows.join("\n");
@@ -290,11 +290,8 @@ fn side_by_side_numbers_each_side_from_its_own_file() {
     ed.handle_key(KeyEvent::char(' '));
     ed.handle_key(KeyEvent::char('a'));
     ed.agents.panel.review = Some(ReviewView {
-        agent: id,
-        file: 0,
-        cursor: 0,
-        top: 0,
         side_by_side: true,
+        ..ReviewView::new(id)
     });
     let rows = screen(&ed);
     let text = rows.join("\n");
