@@ -73,8 +73,21 @@ status = "in-progress"
 # Done: protocol 1.0 types, server (snapshot, open, text, save, apply_edit
 # with version check, history, selections, command.run/list, execute, quit,
 # events), --headless, --listen (Unix socket), --remote. See docs/automation.md.
-# Open: edit proposals with review, persistent provenance, Windows named
-# pipe, a wake-up for the interactive loop.
+# Open: persistent provenance, Windows named pipe, a wake-up for the
+# interactive loop.
+
+[[task]]
+id = "m3-proposals"
+title = "Edit proposals: review, approval, verification, attributable results"
+crates = ["maestro-protocol", "maestro-automation", "maestro-editor", "maestro-tui", "maestro-cli"]
+branch = "feat/proposals"
+owner = "agent"
+status = "done"
+# Protocol 1.1: proposal.create/status/list/withdraw, proposal.resolved,
+# review overlay (space e, :proposals), apply_at_version on approval,
+# verification through maestro-tasks, records in document.history.
+# Headless refuses proposals. Not built: rebase of stale proposals,
+# multi-file proposals, persistence.
 
 [[task]]
 id = "m1-vim"

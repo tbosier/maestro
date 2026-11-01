@@ -2,7 +2,10 @@
 //!
 //! The [`Server`] holds what outlives a single request and is shared by
 //! every connection: the per-buffer log of API edits (the first slice of
-//! provenance) and the last state reported to subscribers. A [`Session`]
+//! provenance), whether a person is there to review proposals, and the last
+//! state reported to subscribers. Proposals themselves live in the editor
+//! ([`maestro_editor::proposals`]), where the review overlay decides them.
+//! A [`Session`]
 //! holds what belongs to one connection: whether it has initialized and
 //! whether it subscribed to events.
 //!
@@ -12,13 +15,13 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use maestro_core::Transaction;
 use maestro_core::document::{EditError, SaveError};
 use maestro_core::pos::{LspPosition as CoreLsp, char_to_lsp, lsp_to_char};
 use maestro_core::text::line_end_excluding_terminator;
 use maestro_core::{Change, ChangeSet, Document, DocumentVersion, Range, Rope, Selection};
+use maestro_editor::proposals::{self as props, ProposalId};
 use maestro_editor::{DocumentId, Editor, KeyCode, KeyEvent, ViewId};
 use maestro_protocol::{self as p, ErrorCode, Request, RequestId, Response, RpcError, methods};
 use serde::Serialize;
@@ -34,6 +37,14 @@ pub const CAPABILITIES: &[&str] = &[
     "events.document_changed",
     "events.editor_status",
 ];
+
+/// Reported by `initialize` only when a person can review proposals (the
+/// interactive editor behind `--listen`), not headless.
+pub const REVIEW_CAPABILITY: &str = "proposal.review";
+
+/// Reported with [`REVIEW_CAPABILITY`]: approved proposals can run a
+/// verification command.
+pub const VERIFY_CAPABILITY: &str = "proposal.verification";
 
 /// Most API edits remembered per buffer; older records are dropped first.
 pub const HISTORY_LIMIT: usize = 10_000;
@@ -59,6 +70,10 @@ pub struct Server {
     log: HashMap<DocumentId, Vec<p::EditRecord>>,
     seen_versions: HashMap<DocumentId, u64>,
     seen_status: Option<p::Status>,
+    /// The last proposal resolution reported to subscribers.
+    seen_resolved: u64,
+    /// A person can answer proposals (the interactive editor).
+    reviewer: bool,
 }
 
 type Res<T> = Result<T, RpcError>;
@@ -215,36 +230,151 @@ fn view_id(ed: &Editor, view: u64) -> Res<ViewId> {
     }
 }
 
-/// The selection that best describes "where the user is" in a document:
-/// the focused view if it shows it, else any view that does, else the
-/// selection remembered for when it is shown again.
 fn reference_selection(ed: &Editor, id: DocumentId) -> Selection {
-    if ed.view().doc == id {
-        return ed.view().selection.clone();
+    props::reference_selection(ed, id)
+}
+
+fn stale_error(expected: u64, current: u64) -> RpcError {
+    err(
+        ErrorCode::StaleVersion,
+        format!(
+            "edit was computed against version {expected} but the document is at {current}; nothing was changed"
+        ),
+    )
+    .with_data(p::StaleData { expected, current })
+}
+
+/// Checks that document `id` is writable and at `base_version`, and turns
+/// `edits` into one change set against its text. Shared by
+/// `document.apply_edit` and `proposal.create`, so both refuse the same
+/// things the same way.
+fn build_changes(
+    ed: &Editor,
+    id: DocumentId,
+    base_version: u64,
+    encoding: p::Encoding,
+    edits: &[p::TextEdit],
+) -> Res<ChangeSet> {
+    if edits.is_empty() {
+        return Err(invalid("edits must not be empty"));
     }
-    ed.views
-        .values()
-        .find(|v| v.doc == id)
-        .map(|v| v.selection.clone())
-        .unwrap_or_else(|| ed.buffers[&id].last_selection.clone())
+    let doc = &ed.buffers[&id].doc;
+    if let Some(r) = doc.read_only() {
+        return Err(err(
+            ErrorCode::ReadOnly,
+            format!("document is read-only: {}", r.describe()),
+        ));
+    }
+    let current = doc.version().0;
+    if current != base_version {
+        return Err(stale_error(base_version, current));
+    }
+    let text = doc.text();
+    let mut changes = Vec::with_capacity(edits.len());
+    for (i, e) in edits.iter().enumerate() {
+        let from = to_char(
+            text,
+            encoding,
+            e.range.start,
+            &format!("edits[{i}].range.start"),
+        )?;
+        let to = to_char(
+            text,
+            encoding,
+            e.range.end,
+            &format!("edits[{i}].range.end"),
+        )?;
+        if from > to {
+            return Err(invalid(format!(
+                "edits[{i}]: start ({from}) is after end ({to})"
+            )));
+        }
+        changes.push((from, to, i, e.text.as_str()));
+    }
+    // Stable sort: insertions at the same point keep request order.
+    changes.sort_by_key(|&(from, to, _, _)| (from, to));
+    for w in changes.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if b.0 < a.1 {
+            return Err(invalid(format!(
+                "edits[{}] ({}..{}) and edits[{}] ({}..{}) overlap",
+                a.2, a.0, a.1, b.2, b.0, b.1
+            )));
+        }
+    }
+    let cs = ChangeSet::from_changes(
+        text.len_chars(),
+        changes
+            .iter()
+            .map(|&(from, to, _, t)| Change::replace(from, to, t)),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    if cs.is_empty() {
+        // The version would not move, so there would be no undo step and
+        // nothing to attribute.
+        return Err(invalid("the edits change nothing"));
+    }
+    Ok(cs)
+}
+
+fn edit_error(e: EditError) -> RpcError {
+    match e {
+        EditError::ReadOnly(r) => err(
+            ErrorCode::ReadOnly,
+            format!("document is read-only: {}", r.describe()),
+        ),
+        EditError::Stale { expected, actual } => stale_error(expected.0, actual.0),
+        EditError::Change(c) => invalid(c.to_string()),
+    }
 }
 
 impl Server {
     /// A server whose event baseline is the editor's current state, so the
     /// first `collect_events` reports only what changed after this call.
+    /// Nobody reviews proposals for it: `proposal.create` is refused, as
+    /// `maestro --headless` needs.
     pub fn new(ed: &Editor) -> Self {
         let mut s = Self {
             log: HashMap::new(),
             seen_versions: HashMap::new(),
             seen_status: None,
+            seen_resolved: ed.proposals.last_seq(),
+            reviewer: false,
         };
         let _ = s.collect_events(ed);
         s
     }
 
-    /// The API edits recorded for a document, oldest first.
-    pub fn history(&self, doc: DocumentId) -> &[p::EditRecord] {
-        self.log.get(&doc).map(Vec::as_slice).unwrap_or_default()
+    /// A server for an editor a person is using (`maestro --listen`):
+    /// `proposal.create` queues proposals for them to review.
+    pub fn with_reviewer(ed: &Editor) -> Self {
+        let mut s = Self::new(ed);
+        s.reviewer = true;
+        s
+    }
+
+    /// The edits recorded for a document, oldest first: those made through
+    /// `document.apply_edit` and approved proposals.
+    pub fn history(&self, ed: &Editor, doc: DocumentId) -> Vec<p::EditRecord> {
+        let mut out: Vec<p::EditRecord> = self.log.get(&doc).cloned().unwrap_or_default();
+        out.extend(
+            ed.proposals
+                .items
+                .iter()
+                .filter(|pr| pr.doc == doc)
+                .filter_map(|pr| {
+                    Some(p::EditRecord {
+                        actor: pr.actor.name.clone(),
+                        description: Some(pr.description.clone()),
+                        base_version: pr.base_version.0,
+                        new_version: pr.applied_version?.0,
+                        timestamp_ms: pr.decided_ms.unwrap_or(pr.created_ms),
+                        proposal: Some(pr.id.0),
+                    })
+                }),
+        );
+        out.sort_by_key(|r| r.new_version);
+        out
     }
 
     /// Handles one line of input. Returns the response line, or `None` when
@@ -372,8 +502,47 @@ impl Server {
                 let id = doc_id(ed, p.doc)?;
                 to_value(p::HistoryResult {
                     doc: p.doc,
-                    edits: self.history(id).to_vec(),
+                    edits: self.history(ed, id),
+                    proposals: ed
+                        .proposals
+                        .items
+                        .iter()
+                        .filter(|pr| pr.doc == id && pr.decision.is_some())
+                        .map(proposal_info)
+                        .collect(),
                 })
+            }
+            methods::PROPOSAL_CREATE => to_value(self.proposal_create(ed, params(raw)?)?),
+            methods::PROPOSAL_STATUS => {
+                let p: p::ProposalParams = params(raw)?;
+                to_value(proposal_info(find_proposal(ed, p.proposal)?))
+            }
+            methods::PROPOSAL_LIST => {
+                let p: p::ProposalListParams = params(raw)?;
+                to_value(p::ProposalListResult {
+                    proposals: ed
+                        .proposals
+                        .items
+                        .iter()
+                        .filter(|pr| p.doc.is_none_or(|d| pr.doc.0 == d))
+                        .map(proposal_info)
+                        .collect(),
+                })
+            }
+            methods::PROPOSAL_WITHDRAW => {
+                let p: p::ProposalWithdrawParams = params(raw)?;
+                match props::withdraw(ed, ProposalId(p.proposal), p.reason) {
+                    Ok(()) => to_value(proposal_info(find_proposal(ed, p.proposal)?)),
+                    Err(props::WithdrawError::NotFound) => Err(no_proposal(p.proposal)),
+                    Err(props::WithdrawError::NotPending(state)) => Err(err(
+                        ErrorCode::NotPending,
+                        format!(
+                            "proposal {} is {}, not pending; it cannot be withdrawn",
+                            p.proposal,
+                            state.label()
+                        ),
+                    )),
+                }
             }
             methods::SELECTIONS_GET => {
                 let p: p::ViewParams = params(raw)?;
@@ -439,7 +608,16 @@ impl Server {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            capabilities: CAPABILITIES.iter().map(ToString::to_string).collect(),
+            capabilities: CAPABILITIES
+                .iter()
+                .chain(
+                    self.reviewer
+                        .then_some([REVIEW_CAPABILITY, VERIFY_CAPABILITY])
+                        .iter()
+                        .flatten(),
+                )
+                .map(ToString::to_string)
+                .collect(),
         })
     }
 
@@ -457,126 +635,10 @@ impl Server {
             return Err(invalid("edits must not be empty"));
         }
         let id = doc_id(ed, p.doc)?;
-        let doc = &ed.buffers[&id].doc;
-        if let Some(r) = doc.read_only() {
-            return Err(err(
-                ErrorCode::ReadOnly,
-                format!("document is read-only: {}", r.describe()),
-            ));
-        }
-        let current = doc.version().0;
-        if current != p.base_version {
-            return Err(err(
-                ErrorCode::StaleVersion,
-                format!(
-                    "edit was computed against version {} but the document is at {current}; nothing was changed",
-                    p.base_version
-                ),
-            )
-            .with_data(p::StaleData {
-                expected: p.base_version,
-                current,
-            }));
-        }
-
-        let text = doc.text().clone();
-        let mut changes = Vec::with_capacity(p.edits.len());
-        for (i, e) in p.edits.iter().enumerate() {
-            let from = to_char(
-                &text,
-                p.encoding,
-                e.range.start,
-                &format!("edits[{i}].range.start"),
-            )?;
-            let to = to_char(
-                &text,
-                p.encoding,
-                e.range.end,
-                &format!("edits[{i}].range.end"),
-            )?;
-            if from > to {
-                return Err(invalid(format!(
-                    "edits[{i}]: start ({from}) is after end ({to})"
-                )));
-            }
-            changes.push((from, to, i, e.text.as_str()));
-        }
-        // Stable sort: insertions at the same point keep request order.
-        changes.sort_by_key(|&(from, to, _, _)| (from, to));
-        for w in changes.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            if b.0 < a.1 {
-                return Err(invalid(format!(
-                    "edits[{}] ({}..{}) and edits[{}] ({}..{}) overlap",
-                    a.2, a.0, a.1, b.2, b.0, b.1
-                )));
-            }
-        }
-        let cs = ChangeSet::from_changes(
-            text.len_chars(),
-            changes
-                .iter()
-                .map(|&(from, to, _, t)| Change::replace(from, to, t)),
-        )
-        .map_err(|e| invalid(e.to_string()))?;
-        if cs.is_empty() {
-            // The version would not move, so there would be no undo step and
-            // nothing to attribute.
-            return Err(invalid("the edits change nothing"));
-        }
-
-        let before = reference_selection(ed, id);
-        let focused = ed.focus;
-        let insert_mode = ed.mode == maestro_editor::Mode::Insert;
-        let old_text = ed.buffers[&id].doc.text().clone();
-        let buf = ed.buffers.get_mut(&id).expect("checked above");
-        // Close whatever the user had open so this edit is its own undo step.
-        buf.doc.commit(&before);
-        buf.doc
-            .apply_at_version(
-                &Transaction::new(cs.clone()),
-                DocumentVersion(p.base_version),
-                &before,
-            )
-            .map_err(|e| match e {
-                EditError::ReadOnly(r) => err(
-                    ErrorCode::ReadOnly,
-                    format!("document is read-only: {}", r.describe()),
-                ),
-                EditError::Stale { expected, actual } => err(
-                    ErrorCode::StaleVersion,
-                    format!(
-                        "edit was computed against version {} but the document is at {}",
-                        expected.0, actual.0
-                    ),
-                )
-                .with_data(p::StaleData {
-                    expected: expected.0,
-                    current: actual.0,
-                }),
-                EditError::Change(c) => invalid(c.to_string()),
-            })?;
-        buf.last_edit = Some(Instant::now());
-        let new_text = buf.doc.text().clone();
-        let s = new_text.slice(..);
-        let after = before.map(&cs).normalize(s);
-        buf.doc.commit(&after);
-        let version = buf.doc.version().0;
-        for v in ed.views.values_mut().filter(|v| v.doc == id) {
-            let mapped = v.selection.map(&cs).normalize(s);
-            v.selection = if v.id == focused && insert_mode {
-                mapped
-            } else {
-                mapped.clamp_normal(s)
-            };
-        }
-
-        // Keep the syntax tree, any language server, the buffer's cached
-        // selection, an open prompt's saved selection, marks and jumps in step
-        // with the text, exactly as edits from the keyboard do.
-        ed.on_text_changed(id, &old_text, std::slice::from_ref(&cs));
-        maestro_editor::lsp::document_changed(ed, id, std::slice::from_ref(&cs));
-
+        let cs = build_changes(ed, id, p.base_version, p.encoding, &p.edits)?;
+        let version = props::apply_versioned(ed, id, DocumentVersion(p.base_version), &cs)
+            .map_err(edit_error)?
+            .0;
         let log = self.log.entry(id).or_default();
         log.push(p::EditRecord {
             actor: p.actor,
@@ -584,6 +646,7 @@ impl Server {
             base_version: p.base_version,
             new_version: version,
             timestamp_ms: now_ms(),
+            proposal: None,
         });
         if log.len() > HISTORY_LIMIT {
             let excess = log.len() - HISTORY_LIMIT;
@@ -594,6 +657,82 @@ impl Server {
             base_version: p.base_version,
             version,
         })
+    }
+
+    /// Validates a proposal like `document.apply_edit` validates an edit and
+    /// queues it for the person at the editor. Nothing changes until they
+    /// approve it.
+    pub fn proposal_create(
+        &mut self,
+        ed: &mut Editor,
+        p: p::ProposalCreateParams,
+    ) -> Res<p::ProposalInfo> {
+        if !self.reviewer {
+            return Err(err(
+                ErrorCode::ReviewUnavailable,
+                "nobody can review proposals in this editor: it runs headless. Run the \
+                 interactive editor with --listen, or use document.apply_edit, which applies \
+                 at once",
+            ));
+        }
+        if p.actor.name.trim().is_empty() {
+            return Err(invalid("actor.name must not be empty"));
+        }
+        if p.description.trim().is_empty() {
+            return Err(invalid("description must not be empty"));
+        }
+        if p.edits.is_empty() {
+            return Err(invalid("edits must not be empty"));
+        }
+        if let Some(v) = &p.verification
+            && v.program.trim().is_empty()
+        {
+            return Err(invalid("verification.program must not be empty"));
+        }
+        let pending = ed.proposals.pending_count();
+        if pending >= props::MAX_PENDING {
+            return Err(err(
+                ErrorCode::ReviewUnavailable,
+                format!("{pending} proposals already wait for review; try again later"),
+            ));
+        }
+        let id = match (p.doc, &p.path) {
+            (Some(d), None) => doc_id(ed, d)?,
+            (None, Some(path)) => {
+                let opened = open(
+                    ed,
+                    p::DocumentOpenParams {
+                        path: path.clone(),
+                        focus: false,
+                    },
+                )?;
+                DocumentId(opened.doc)
+            }
+            _ => return Err(invalid("give exactly one of doc and path")),
+        };
+        if p.verification.is_some() && ed.buffers[&id].doc.path().is_none() {
+            return Err(invalid(
+                "a verification command needs the document saved to a file; this document \
+                 has no path",
+            ));
+        }
+        let cs = build_changes(ed, id, p.base_version, p.encoding, &p.edits)?;
+        let pid = props::submit(
+            ed,
+            props::NewProposal {
+                doc: id,
+                base_version: DocumentVersion(p.base_version),
+                changes: cs,
+                edit_count: p.edits.len(),
+                actor: props::Actor {
+                    name: p.actor.name,
+                    agent_id: p.actor.agent_id,
+                },
+                description: p.description,
+                verify: p.verification.map(|v| (v.program, v.args)),
+            },
+        );
+        find_proposal(ed, pid.0).map(proposal_info)
     }
 
     /// Notifications for what changed since the last call: document versions
@@ -612,7 +751,17 @@ impl Server {
                         .get(id)
                         .and_then(|l| l.last())
                         .filter(|r| r.new_version == version)
-                        .map(|r| r.actor.clone());
+                        .map(|r| r.actor.clone())
+                        .or_else(|| {
+                            ed.proposals
+                                .items
+                                .iter()
+                                .find(|pr| {
+                                    pr.doc == *id
+                                        && pr.applied_version.map(|v| v.0) == Some(version)
+                                })
+                                .map(|pr| pr.actor.name.clone())
+                        });
                     out.push(p::Notification::new(
                         p::notifications::DOCUMENT_CHANGED,
                         p::DocumentChanged {
@@ -625,6 +774,13 @@ impl Server {
                 _ => {}
             }
         }
+        for pr in ed.proposals.resolved_since(self.seen_resolved) {
+            self.seen_resolved = self.seen_resolved.max(pr.resolved_seq.unwrap_or(0));
+            out.push(p::Notification::new(
+                p::notifications::PROPOSAL_RESOLVED,
+                proposal_info(pr),
+            ));
+        }
         let st = status(ed);
         if st != self.seen_status {
             self.seen_status = st.clone();
@@ -634,6 +790,85 @@ impl Server {
             ));
         }
         out
+    }
+}
+
+// ----- proposals ---------------------------------------------------------------
+
+fn no_proposal(id: u64) -> RpcError {
+    err(ErrorCode::NotFound, format!("no proposal with id {id}"))
+}
+
+fn find_proposal(ed: &Editor, id: u64) -> Res<&props::Proposal> {
+    ed.proposals
+        .get(ProposalId(id))
+        .ok_or_else(|| no_proposal(id))
+}
+
+/// A proposal as the protocol describes it.
+pub fn proposal_info(pr: &props::Proposal) -> p::ProposalInfo {
+    p::ProposalInfo {
+        id: pr.id.0,
+        doc: pr.doc.0,
+        path: pr.path.as_ref().map(|p| p.display().to_string()),
+        actor: p::Actor {
+            name: pr.actor.name.clone(),
+            agent_id: pr.actor.agent_id.clone(),
+        },
+        description: pr.description.clone(),
+        base_version: pr.base_version.0,
+        edit_count: pr.edit_count as u64,
+        verification: pr.verify.as_ref().map(|v| p::VerificationInfo {
+            program: v.program.clone(),
+            args: v.args.clone(),
+            cwd: v.cwd.display().to_string(),
+        }),
+        state: match pr.state {
+            props::State::Pending => p::ProposalState::Pending,
+            props::State::Verifying => p::ProposalState::Verifying,
+            props::State::Resolved => p::ProposalState::Resolved,
+        },
+        decision: pr.decision.map(|d| match d {
+            props::Decision::Approved => p::Decision::Approved,
+            props::Decision::Rejected => p::Decision::Rejected,
+            props::Decision::Withdrawn => p::Decision::Withdrawn,
+            props::Decision::Stale => p::Decision::Stale,
+            props::Decision::Failed => p::Decision::Failed,
+        }),
+        decided_by: pr.decided_by.as_ref().map(|d| match d {
+            props::DecidedBy::User(name) => p::DecidedBy {
+                kind: p::DeciderKind::User,
+                name: name.clone(),
+            },
+            props::DecidedBy::Client => p::DecidedBy {
+                kind: p::DeciderKind::Client,
+                name: None,
+            },
+            props::DecidedBy::Editor => p::DecidedBy {
+                kind: p::DeciderKind::Editor,
+                name: None,
+            },
+        }),
+        reason: pr.reason.clone(),
+        applied_version: pr.applied_version.map(|v| v.0),
+        saved: pr.saved,
+        verification_result: pr.result.as_ref().map(|r| p::VerificationResult {
+            status: match r.status {
+                props::VerifyStatus::NotRun => p::VerificationStatus::NotRun,
+                props::VerifyStatus::Running => p::VerificationStatus::Running,
+                props::VerifyStatus::Passed => p::VerificationStatus::Passed,
+                props::VerifyStatus::Failed => p::VerificationStatus::Failed,
+                props::VerifyStatus::Error => p::VerificationStatus::Error,
+            },
+            exit_code: r.exit_code,
+            duration_ms: r.duration.map(|d| d.as_millis() as u64),
+            output_tail: r.output_tail.clone(),
+            output_lines_dropped: r.dropped,
+            error: r.error.clone(),
+        }),
+        created_ms: pr.created_ms,
+        decided_ms: pr.decided_ms,
+        resolved_ms: pr.resolved_ms,
     }
 }
 
@@ -826,6 +1061,7 @@ fn quit(ed: &mut Editor, p: p::QuitParams) -> Res<p::QuitResult> {
         .with_data(modified));
     }
     maestro_editor::agents::stop_all(ed);
+    props::stop_all(ed);
     // Quitting through the API saves the session the same way :q does.
     if let Err(e) = maestro_editor::navigation::session::save(ed) {
         ed.set_status(maestro_editor::Severity::Warning, e);

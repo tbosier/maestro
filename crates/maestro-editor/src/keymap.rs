@@ -379,7 +379,10 @@ impl Keymaps {
         for (k, c) in crate::navigation::DEFAULT_KEYS {
             g(&mut normal, k, "space", c);
         }
-        for (k, c) in crate::agents::DEFAULT_KEYS {
+        for (k, c) in crate::agents::DEFAULT_KEYS
+            .iter()
+            .chain(crate::proposals::DEFAULT_KEYS)
+        {
             g(&mut normal, k, "space", c);
         }
 

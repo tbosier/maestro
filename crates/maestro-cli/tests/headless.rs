@@ -77,7 +77,16 @@ fn headless_acceptance_open_edit_stale_save_history() {
         "initialize",
         json!({"protocol_version": "1.0", "client_name": "test"}),
     );
-    assert_eq!(init["protocol_version"], "1.0");
+    // A 1.0 client is accepted; the server says which minor it speaks.
+    assert_eq!(init["protocol_version"], "1.1");
+    // Nobody can review proposals headless, so it does not offer them.
+    assert!(
+        !init["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("proposal.review")),
+        "{init}"
+    );
 
     // Open (relative to the editor's working directory) and read the version.
     let opened = c.ok("document.open", json!({"path": "main.rs"}));
@@ -99,6 +108,25 @@ fn headless_acceptance_open_edit_stale_save_history() {
     );
     let v1 = applied["version"].as_u64().unwrap();
     assert!(v1 > v0);
+
+    // A proposal needs a person to approve it; headless there is none, so
+    // it is refused and nothing is queued or run.
+    let refused = c.call(
+        "proposal.create",
+        json!({
+            "doc": doc, "base_version": v1, "encoding": "char",
+            "edits": [{"range": {"start": 0, "end": 2}, "text": "pub fn"}],
+            "actor": {"name": "agent:proposer"}, "description": "make it public",
+            "verification": {"program": "sh", "args": ["-c", "touch ran"]}
+        }),
+    );
+    assert_eq!(
+        refused.error().expect("refused headless").kind(),
+        Some(ErrorCode::ReviewUnavailable)
+    );
+    assert!(!dir.join("ran").exists());
+    let listed = c.ok("proposal.list", json!({}));
+    assert_eq!(listed["proposals"], json!([]));
 
     // A second change computed against v0 is refused as stale.
     let stale = c.call(

@@ -786,14 +786,17 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
     let rows = review::current_rows(ed);
     for (i, row) in rows.iter().enumerate().skip(v.top).take(c.height as usize) {
         let y = c.y + (i - v.top) as u16;
-        draw_row(ed, s, Rect::new(c.x, y, c.width, 1), row);
+        draw_row(ed, s, Rect::new(c.x, y, c.width, 1), row, 0);
         if i == v.cursor {
             s.put(c.x, y, "▶", ui.border_active, c.x + 1);
         }
     }
 }
 
-fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
+/// Draws one review row. `hscroll` is how many columns of each line's text are
+/// scrolled off to the left (the proposal review scrolls sideways; the
+/// agent review passes 0).
+pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row, hscroll: usize) {
     let ui = &ed.theme.ui;
     let d = &ed.theme.diff;
     match row {
@@ -823,6 +826,7 @@ fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
                 s,
                 Rect::new(x, area.y, area.right().saturating_sub(x), 1),
                 l,
+                hscroll,
             );
         }
         Row::Pair(left, right) => {
@@ -841,6 +845,7 @@ fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
                         s,
                         Rect::new(nx, area.y, (x + w).saturating_sub(nx), 1),
                         l,
+                        hscroll,
                     );
                 }
             }
@@ -850,8 +855,9 @@ fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
 }
 
 /// A sign and a line of text on its add or delete tint, with intraline
-/// marks on the stronger tint.
-fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine) {
+/// marks on the stronger tint. Text cut off at either edge is marked with
+/// `<` or `>` in the edge cell, so a line never looks shorter than it is.
+fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine, left: usize) {
     let ui = &ed.theme.ui;
     let d = &ed.theme.diff;
     if area.width < 2 {
@@ -880,8 +886,10 @@ fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine) {
             base,
         );
     }
+    let edge = ui.text.patch(sign_style).bold();
     let mut x = tx;
     let mut col = 0usize;
+    let mut hidden_left = false;
     for (at, g) in l.text.grapheme_indices(true) {
         let marked = l.marks.iter().any(|m| at >= m.start && at < m.end);
         let style = if marked {
@@ -889,23 +897,43 @@ fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine) {
         } else {
             base
         };
-        if g == "\t" {
-            let n = 4 - col % 4;
-            for _ in 0..n {
-                if s.put(x, area.y, " ", style, area.right()) == 0 {
-                    return;
-                }
-                x += 1;
-            }
-            col += n;
+        // Columns this grapheme takes, as the surface draws it.
+        let w = if g == "\t" {
+            4 - col % 4
+        } else {
+            maestro_editor::agents::panel::cell_width(g)
+        };
+        if col + w <= left {
+            col += w;
+            hidden_left = true;
             continue;
         }
-        let used = s.put(x, area.y, g, style, area.right());
-        if used == 0 {
-            return;
+        // A tab, or a grapheme partly scrolled off, is drawn as blanks.
+        let partial = col < left;
+        hidden_left |= partial;
+        let blanks = g == "\t" || partial;
+        let need = if blanks { col + w - left.max(col) } else { w };
+        if x as usize + need > area.right() as usize {
+            s.put(
+                area.right().saturating_sub(1),
+                area.y,
+                ">",
+                edge,
+                area.right(),
+            );
+            break;
         }
-        x += used;
-        col += used as usize;
+        if blanks {
+            for _ in 0..need {
+                x += s.put(x, area.y, " ", style, area.right());
+            }
+        } else {
+            x += s.put(x, area.y, g, style, area.right());
+        }
+        col += w;
+    }
+    if hidden_left {
+        s.put(tx, area.y, "<", edge, area.right());
     }
 }
 
@@ -973,46 +1001,90 @@ fn draw_overlay(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
             None
         }
         Overlay::Confirm(c) => {
-            // The editor wraps the text, so it knows whether the dialog fits
-            // and refuses to accept one that does not.
-            let mut lines: Vec<(String, Style)> = panel::confirm_lines(area, c)
-                .into_iter()
-                .map(|l| (l, ui.popup))
-                .collect();
-            if !panel::confirm_fits(area, c) {
-                let room = (area.height as usize).saturating_sub(6);
-                lines.truncate(room);
-                lines.push((
-                    "the window is too small to show all of this; enlarge it to confirm".into(),
-                    ui.popup_title,
-                ));
-            }
             let forced = matches!(c.action, ConfirmAction::ForceArchive(_));
-            let h = (lines.len() as u16 + 4)
-                .min(area.height.saturating_sub(1))
-                .max(4);
-            let y = area.y + (area.height.saturating_sub(h)) / 3;
-            let b = Rect::new(x, y, w, h);
             let title = if forced {
                 format!("{}: this deletes files", c.title)
             } else {
                 c.title.clone()
             };
-            draw_box(s, b, &title, ui.popup, ui.popup_border, ui.popup_title);
-            let rows = (h - 4) as usize;
-            for (i, (text, style)) in lines.iter().take(rows).enumerate() {
-                s.print(x + 2, y + 1 + i as u16, text, *style, b.right() - 1);
-            }
-            let ky = b.bottom() - 2;
-            let mut kx = x + 2;
-            for (k, d) in &c.keys {
-                kx = s.print(kx, ky, k, ui.popup_title, b.right() - 1);
-                kx = s.print(kx + 1, ky, d, ui.popup, b.right() - 1);
-                kx += 3;
-            }
+            draw_dialog(ed, s, area, &title, &c.lines, &c.keys);
             None
         }
     }
+}
+
+/// A confirmation dialog: wrapped text and the keys that answer it. The
+/// editor wraps the text the same way, so it knows whether the dialog fits
+/// and refuses to accept one that does not.
+pub(crate) fn draw_dialog(
+    ed: &Editor,
+    s: &mut Surface,
+    area: Rect,
+    title: &str,
+    text: &[String],
+    keys: &[(String, String)],
+) {
+    let ui = &ed.theme.ui;
+    let (w, _) = panel::dialog_width(area);
+    let x = area.x + (area.width - w) / 2;
+    let mut lines: Vec<(String, Style)> = panel::dialog_lines(area, text)
+        .into_iter()
+        .map(|l| (l, ui.popup))
+        .collect();
+    if !panel::dialog_fits(area, text, keys) {
+        let room = (area.height as usize).saturating_sub(6);
+        lines.truncate(room);
+        lines.push((
+            "the window is too small to show all of this; enlarge it to confirm".into(),
+            ui.popup_title,
+        ));
+    }
+    let h = (lines.len() as u16 + 4)
+        .min(area.height.saturating_sub(1))
+        .max(4);
+    let y = area.y + (area.height.saturating_sub(h)) / 3;
+    let b = Rect::new(x, y, w, h);
+    draw_box(s, b, title, ui.popup, ui.popup_border, ui.popup_title);
+    let rows = (h - 4) as usize;
+    for (i, (text, style)) in lines.iter().take(rows).enumerate() {
+        s.print(x + 2, y + 1 + i as u16, text, *style, b.right() - 1);
+    }
+    let ky = b.bottom() - 2;
+    let mut kx = x + 2;
+    for (k, d) in keys {
+        kx = s.print(kx, ky, k, ui.popup_title, b.right() - 1);
+        kx = s.print(kx + 1, ky, d, ui.popup, b.right() - 1);
+        kx += 3;
+    }
+}
+
+/// An input box with a label, drawn like the panel's.
+pub(crate) fn draw_input(
+    ed: &Editor,
+    s: &mut Surface,
+    area: Rect,
+    label: &str,
+    text: &str,
+) -> CursorShape {
+    let ui = &ed.theme.ui;
+    let w = area.width.saturating_sub(4).min(90);
+    let inner = w.saturating_sub(4) as usize;
+    let x = area.x + (area.width - w) / 2;
+    let lines = wrap(text, inner.max(1));
+    let h = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let y = area.y + (area.height.saturating_sub(h)) / 3;
+    let b = Rect::new(x, y, w, h);
+    draw_box(s, b, label, ui.popup, ui.popup_border, ui.popup_title);
+    let rows = (h - 2) as usize;
+    let skip = lines.len().saturating_sub(rows);
+    let mut end = (x + 2, y + 1);
+    for (i, line) in lines.iter().skip(skip).enumerate() {
+        let ex = s.print(x + 2, y + 1 + i as u16, line, ui.popup, b.right() - 1);
+        end = (ex, y + 1 + i as u16);
+    }
+    CursorShape::Bar(end.0.min(b.right() - 2), end.1)
 }
 
 #[cfg(test)]

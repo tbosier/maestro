@@ -217,6 +217,9 @@ pub struct Editor {
     pub navigation: crate::navigation::NavState,
     /// Coding agents and the agent panel (see [`crate::agents`]).
     pub agents: crate::agents::AgentState,
+    /// Edit proposals from automation clients and their review overlay
+    /// (see [`crate::proposals`]).
+    pub proposals: crate::proposals::Proposals,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -267,6 +270,7 @@ impl Editor {
             lsp: Default::default(),
             navigation: Default::default(),
             agents: Default::default(),
+            proposals: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -554,6 +558,7 @@ impl Editor {
         let shown = self.views.values().any(|v| v.doc == id);
         if untouched && !shown && self.buffers.len() > 1 {
             self.buffers.remove(&id);
+            crate::proposals::document_closed(self, id);
             for v in self.views.values_mut() {
                 if v.alternate == Some(id) {
                     v.alternate = None;
@@ -683,6 +688,7 @@ impl Editor {
         }
         self.marks.retain(|_, (d, _)| *d != id);
         self.buffers.remove(&id);
+        crate::proposals::document_closed(self, id);
         if force && let (Some(dir), Some(path)) = (&self.recovery_dir, path) {
             crate::recovery::remove(dir, &path, &self.session_id);
         }
@@ -1054,6 +1060,10 @@ impl Editor {
             self.selected_register = None;
             return;
         }
+        if self.proposals.review_open() {
+            crate::proposals::review::handle_key(self, key);
+            return;
+        }
         if self.agents.panel_open() {
             crate::agents::panel::handle_key(self, key);
             return;
@@ -1164,7 +1174,11 @@ impl Editor {
 
     /// Handles a mouse event at screen cell (x, y).
     pub fn handle_mouse(&mut self, kind: MouseKind, x: u16, y: u16) {
-        if self.picker.is_some() || self.prompt.is_some() || self.agents.panel_open() {
+        if self.picker.is_some()
+            || self.prompt.is_some()
+            || self.agents.panel_open()
+            || self.proposals.review_open()
+        {
             return;
         }
         let Some(view_id) = self
@@ -1236,6 +1250,10 @@ impl Editor {
         }
         if self.prompt.is_some() {
             crate::prompt::insert_text(self, text);
+            return;
+        }
+        if self.proposals.review_open() {
+            crate::proposals::review::paste(self, text);
             return;
         }
         if self.agents.panel_open() {
