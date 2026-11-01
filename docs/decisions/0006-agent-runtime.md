@@ -172,11 +172,11 @@ pub enum TaskEvent { Output(String), Finished { code: Option<i32>, duration: Dur
 pub const MAX_LINE: usize = 64 * 1024;
 /// Dropping the handle does not stop the task.
 pub struct TaskHandle; impl TaskHandle {
-    /// SIGKILL to the task's process group (Unix), then to the child. No-op once finished.
+    /// SIGKILL to the task's process group (Unix), then to the child. No-op once `Finished` was sent.
     pub fn kill(&self);
     pub fn id(&self) -> u32;
 }
-/// stdin is null; on Unix the child leads a new process group. `on_event` runs on a thread of the task's own.
+/// stdin is null; on Unix the child runs in a new process group led by a placeholder. `on_event` runs on a thread of the task's own.
 pub fn start(spec: &TaskSpec, on_event: impl Fn(TaskEvent) + Send + 'static) -> io::Result<TaskHandle>;
 pub struct TestSummary { pub passed: u64, pub failed: u64, pub ignored: u64, pub failures: Vec<String> }
 /// Sums every `test result:` line of `cargo test` output. None if there is none.
@@ -184,7 +184,9 @@ pub struct TestSummary { pub passed: u64, pub failed: u64, pub ignored: u64, pub
 pub fn parse_cargo_test(output: &str) -> Option<TestSummary>;
 ```
 
-Killing a process group needs `killpg`, which the standard library does not offer safely, and the workspace forbids `unsafe`. `TaskHandle::kill` runs `kill -KILL -- -<pgid>` as a program, only while the child is still unreaped (so the id cannot have been reused), and falls back to killing the direct child. Lines go through a queue of 1,024; when `on_event` is slower than the output, the program blocks on its writes instead of the queue growing. After the program exits, `Finished` waits for its output pipes to close, but no longer than half a second with no new line and five seconds in all, so a background process that keeps them open does not hold it back; lines already queued are delivered first. The reader threads of such a task stay blocked until that process closes the pipes.
+Killing a process group needs `killpg`, which the standard library does not offer safely, and the workspace forbids `unsafe`. `TaskHandle::kill` runs `kill -KILL -- -<pgid>` as a program and falls back to killing the direct child. Lines go through a queue of 1,024; when `on_event` is slower than the output, the program blocks on its writes instead of the queue growing.
+
+Amended (feat/hardening): the program no longer leads its process group. A placeholder (`cat` reading a pipe only `maestro-tasks` holds) does, and the program joins its group. The placeholder is reaped only after the group's last signal, so the group id cannot be reused while anything signals it, and the program itself can be reaped as soon as it exits. When it exits, what it left in the group gets SIGHUP; on Linux, `/proc` shows when nothing else is left, and elsewhere the full grace period passes; after at most 200 ms the group gets SIGKILL and the placeholder is reaped. Only then does `Finished` go out, once the output pipes close, or after half a second with no new line (counted from the end of the group) or five seconds after the exit in all, so a process outside the group that keeps them open does not hold it back; lines already queued are delivered first. The reader threads of such a task stay blocked until that process closes the pipes.
 
 ## `maestro-git` additions
 
