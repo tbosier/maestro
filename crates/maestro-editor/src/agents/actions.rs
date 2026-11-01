@@ -1877,7 +1877,15 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
     // Only that commit: `maestro-git` refuses if the branch no longer
     // points at it, and gives git the commit id, not the branch name.
     out.outcome = main
-        .integrate_reviewed(&f.branch, &reviewed, how)
+        .integrate_reviewed(
+            &f.branch,
+            maestro_git::Reviewed {
+                commit: &reviewed,
+                target: &f.target,
+                base: &f.base,
+            },
+            how,
+        )
         .map_err(|e| integrate_words(&e, &f.target));
     // What reached the target is checked against the contract once more,
     // and anything outside it the dialog did not list is reported. It
@@ -1989,6 +1997,14 @@ pub fn integrate_words(e: &IntegrateError, target: &str) -> String {
         }
         IntegrateError::Unexpected(s) => format!("git reported success, but {s}"),
         IntegrateError::SourceMoved { found, .. } => branch_moved(found),
+        IntegrateError::WrongTarget { expected, found } => {
+            format!("the main worktree is now on {found}, not {expected}; nothing was integrated")
+        }
+        IntegrateError::BaseNotOnTarget { base } => format!(
+            "the agent started from {}, which is no longer on {target}; integrating would also \
+             bring in commits the review does not show. Nothing was integrated",
+            super::create::short(base)
+        ),
     }
 }
 

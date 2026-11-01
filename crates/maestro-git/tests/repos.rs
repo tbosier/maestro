@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maestro_git::{
     Base, ChangeKind, ConflictKind, DiffLineKind, DiffSpec, EntryState, FileChange, Git, Head,
-    IntegrateError, IntegrateOutcome, Integration, MergeCheck, RemoveError, RemoveRefusal, Sign,
-    SignMap,
+    IntegrateError, IntegrateOutcome, Integration, MergeCheck, RemoveError, RemoveRefusal,
+    Reviewed, Sign, SignMap,
 };
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -1085,10 +1085,23 @@ fn integrate_fast_forwards() {
     assert_eq!(repo.head().unwrap(), Head::Branch("main".into()));
 }
 
+/// `integrate_reviewed`'s expectations: `commit` on `main`, from `base`.
+fn on_main<'a>(commit: &'a str, base: &'a str) -> Reviewed<'a> {
+    Reviewed {
+        commit,
+        target: "main",
+        base,
+    }
+}
+
 #[test]
 fn integrate_reviewed_takes_only_the_reviewed_commit() {
     let f = Fixture::new();
     let repo = f.repo();
+    // Two commits on main, so main can be moved back behind the base.
+    f.write("pre.txt", "pre\n");
+    f.commit_all("pre");
+    let base = rev(&f, &f.repo, "HEAD");
     let wt = agent_branch(&f, "agent/r", "one.txt", "1\n");
     let reviewed = rev(&f, &wt, "HEAD");
     let both: [&Path; 2] = [&f.repo, &wt];
@@ -1100,7 +1113,7 @@ fn integrate_reviewed_takes_only_the_reviewed_commit() {
         assert_refused(
             &f,
             &both,
-            || repo.integrate_reviewed("agent/r", &reviewed, how),
+            || repo.integrate_reviewed("agent/r", on_main(&reviewed, &base), how),
             |e| {
                 matches!(e, IntegrateError::SourceMoved { expected, found }
                     if *expected == reviewed && *found == late)
@@ -1121,7 +1134,7 @@ fn integrate_reviewed_takes_only_the_reviewed_commit() {
     assert_refused(
         &f,
         &both,
-        || repo.integrate_reviewed("agent/r", &reviewed, Integration::Merge),
+        || repo.integrate_reviewed("agent/r", on_main(&reviewed, &base), Integration::Merge),
         |e| matches!(e, IntegrateError::SourceMoved { found, .. } if *found == amended),
     );
 
@@ -1129,18 +1142,102 @@ fn integrate_reviewed_takes_only_the_reviewed_commit() {
     assert_refused(
         &f,
         &both,
-        || repo.integrate_reviewed("agent/r", "no-such-rev", Integration::Merge),
+        || repo.integrate_reviewed("agent/r", on_main("no-such-rev", &base), Integration::Merge),
         |e| matches!(e, IntegrateError::Git(_)),
     );
-
-    // Back at the reviewed commit, it integrates exactly that.
     f.git_ok(&wt, &["reset", "-q", "--hard", &reviewed]);
+
+    // Another branch checked out in the target worktree.
+    f.git(&["checkout", "-q", "-b", "elsewhere"]);
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate_reviewed("agent/r", on_main(&reviewed, &base), Integration::Merge),
+        |e| {
+            matches!(e, IntegrateError::WrongTarget { expected, found }
+                if expected == "main" && found == "elsewhere")
+        },
+    );
+    f.git(&["checkout", "-q", "main"]);
+
+    // The target moved back behind the base: the range would hold the
+    // base itself, which the review did not show.
+    f.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    for how in ALL {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate_reviewed("agent/r", on_main(&reviewed, &base), how),
+            |e| matches!(e, IntegrateError::BaseNotOnTarget { base: b } if *b == base),
+        );
+    }
+    f.git(&["reset", "-q", "--hard", &base]);
+
+    // As reviewed, it integrates exactly that.
     let out = repo
-        .integrate_reviewed("agent/r", &reviewed[..12], Integration::FastForwardOnly)
+        .integrate_reviewed(
+            "agent/r",
+            on_main(&reviewed[..12], &base),
+            Integration::FastForwardOnly,
+        )
         .unwrap();
     assert_eq!(out.new_head, reviewed);
     assert_eq!(rev(&f, &f.repo, "main"), reviewed);
     assert!(!f.repo.join("late.txt").exists());
+}
+
+/// A replacement object (`git replace`) for the reviewed commit, made
+/// after the review, gives it another history. Maestro's git commands
+/// ignore replacements, so the history that lands is the real one.
+#[test]
+fn integration_ignores_replacement_objects() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let base = rev(&f, &f.repo, "HEAD");
+    let wt = agent_branch(&f, "agent/rep", "one.txt", "1\n");
+    let reviewed = rev(&f, &wt, "HEAD");
+    // A commit on the side that the review never saw, and a stand-in for
+    // the reviewed commit with the same tree whose parent is that commit.
+    commit_in(&f, &wt, "secret.txt", "token\n", "secret");
+    let secret = rev(&f, &wt, "HEAD");
+    f.git_ok(&wt, &["reset", "-q", "--hard", &reviewed]);
+    let tree = rev(&f, &wt, "HEAD^{tree}");
+    let fake = f
+        .git_ok(
+            &wt,
+            &["commit-tree", &tree, "-p", &secret, "-m", "stand-in"],
+        )
+        .trim()
+        .to_string();
+    f.git(&["replace", &reviewed, &fake]);
+
+    let out = repo
+        .integrate_reviewed(
+            "agent/rep",
+            on_main(&reviewed, &base),
+            Integration::CherryPick,
+        )
+        .unwrap();
+    assert_eq!(out.commits.len(), 1, "{:?}", out.commits);
+    let real = f.git_in(
+        &f.repo,
+        &[
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            &secret,
+            "main",
+        ],
+    );
+    assert!(!real.status.success(), "the stand-in's history landed");
+    let files = f.git(&[
+        "--no-replace-objects",
+        "log",
+        "--name-only",
+        "--format=",
+        "main",
+    ]);
+    assert!(!files.contains("secret.txt"), "{files}");
 }
 
 #[test]
