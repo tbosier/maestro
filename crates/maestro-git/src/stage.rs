@@ -171,6 +171,26 @@ impl Repository {
         Ok(())
     }
 
+    /// The bytes `git add` would stage for the working tree file `path`:
+    /// its contents after line-ending conversion and clean filters. The
+    /// blob is written to the object store (unreferenced until staged).
+    pub fn staged_form(&self, path: &Path) -> Result<Vec<u8>> {
+        let rel = self.relative(path).ok_or_else(|| {
+            GitError::InvalidArgument(format!(
+                "{} is outside {}",
+                path.display(),
+                self.root().display()
+            ))
+        })?;
+        let out = self.run(
+            &with_paths(os(&["hash-object", "-w"]), &[rel.as_path()]),
+            Access::Write,
+        )?;
+        let oid = String::from_utf8_lossy(&out).trim().to_string();
+        crate::repo::check_rev(&oid)?;
+        self.run(&["cat-file", "blob", &oid], Access::ReadOnly)
+    }
+
     /// True once the branch has a commit.
     pub fn has_head(&self) -> Result<bool> {
         self.has_pseudo_ref("HEAD")

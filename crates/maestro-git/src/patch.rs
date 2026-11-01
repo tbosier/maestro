@@ -106,7 +106,25 @@ pub struct FilePatch {
 }
 
 /// Splits `git diff` output (with `a/` and `b/` prefixes) into files.
+/// The `* Unmerged path <file>` notes `git diff --cached` prints for files
+/// in conflict are skipped: such a file has no staged diff.
 pub fn parse_patches(out: &[u8]) -> Result<Vec<FilePatch>, String> {
+    let cleaned;
+    let out = if out.starts_with(b"* Unmerged path ")
+        || out
+            .windows(17)
+            .any(|w| w == b"\n* Unmerged path ".as_slice())
+    {
+        cleaned = out
+            .split_inclusive(|c| *c == b'\n')
+            .filter(|l| !l.starts_with(b"* Unmerged path "))
+            .flatten()
+            .copied()
+            .collect::<Vec<u8>>();
+        cleaned.as_slice()
+    } else {
+        out
+    };
     // A file starts at a `diff --git` (or combined `diff --cc`) line. Lines
     // inside hunks start with ' ', '+', '-' or '\', so they never match.
     let mut starts = Vec::new();
@@ -730,6 +748,21 @@ index 1111111..2222222 100644
         assert!(
             nl.ends_with("@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b\n"),
             "{nl}"
+        );
+    }
+
+    #[test]
+    fn unmerged_notes_are_skipped() {
+        let mut out = b"* Unmerged path both.txt\n".to_vec();
+        out.extend_from_slice(DIFF);
+        out.extend_from_slice(b"* Unmerged path zz.txt\n");
+        let v = parse_patches(&out).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].file.hunks.len(), 2);
+        assert!(
+            parse_patches(b"* Unmerged path only.txt\n")
+                .unwrap()
+                .is_empty()
         );
     }
 

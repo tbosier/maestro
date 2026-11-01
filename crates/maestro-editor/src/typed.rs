@@ -61,6 +61,12 @@ static TYPED: &[TypedCommand] = &[
         fun: agents,
     },
     TypedCommand {
+        name: "git",
+        aliases: &[],
+        doc: "Open the Git status screen (also space g)",
+        fun: git_screen,
+    },
+    TypedCommand {
         name: "proposals",
         aliases: &[],
         doc: "Show or hide the review of edit proposals from automation clients",
@@ -581,6 +587,11 @@ fn finish_quit(ed: &mut Editor) {
 
 fn agents(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     ed.run_command("agent_panel");
+    Ok(())
+}
+
+fn git_screen(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    ed.run_command("git_screen");
     Ok(())
 }
 

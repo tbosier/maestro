@@ -3,6 +3,7 @@
 
 mod agents;
 pub mod clipboard;
+mod git;
 mod preview;
 mod proposals;
 pub mod render;
