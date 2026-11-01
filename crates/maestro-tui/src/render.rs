@@ -36,6 +36,12 @@ pub fn sidebar_area(width: u16, height: u16, ed: &Editor) -> Option<Rect> {
     if !ed.workspaces.sidebar.open {
         return None;
     }
+    sidebar_room(width, height, ed)
+}
+
+/// Where the sidebar would go, open or not; `None` when the screen has
+/// no room for it.
+pub fn sidebar_room(width: u16, height: u16, ed: &Editor) -> Option<Rect> {
     let tabline = ed.presentation != Presentation::Focus && height > 3;
     let top = u16::from(tabline);
     let w = ed.config.sidebar.width.min(width / 2);

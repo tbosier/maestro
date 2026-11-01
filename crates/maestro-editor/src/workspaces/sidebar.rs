@@ -32,12 +32,16 @@ pub struct Sidebar {
     pub selected: Option<RowKey>,
     /// Projects shown unfolded, by main worktree.
     pub expanded: HashSet<PathBuf>,
+    /// Set by the front end when the screen is too narrow to draw the
+    /// sidebar: it then takes no keys, so nothing acts on rows you cannot
+    /// see.
+    pub too_narrow: bool,
 }
 
 impl Sidebar {
-    /// Open and taking keys.
+    /// Open, shown and taking keys.
     pub fn has_focus(&self) -> bool {
-        self.open && self.focused
+        self.open && self.focused && !self.too_narrow
     }
 }
 
@@ -167,6 +171,33 @@ pub fn selected_index(ed: &Editor, rows: &[Row]) -> Option<usize> {
     let want = ed.workspaces.sidebar.selected.as_ref();
     want.and_then(|k| rows.iter().position(|r| r.key().as_ref() == Some(k)))
         .or_else(|| rows.iter().position(|r| r.key().is_some()))
+}
+
+/// Remembers a selection when there is none or its row is gone: the
+/// current worktree's row, else the first row. Called when rows can
+/// change (a scan, agent events), so a refresh never moves the
+/// highlight under the cursor without it being stored.
+pub(crate) fn pin_selection(ed: &mut Editor) {
+    if !ed.workspaces.sidebar.open {
+        return;
+    }
+    let rows = rows(ed);
+    let present = ed
+        .workspaces
+        .sidebar
+        .selected
+        .as_ref()
+        .is_some_and(|k| rows.iter().any(|r| r.key().as_ref() == Some(k)));
+    if present {
+        return;
+    }
+    let current = RowKey::Worktree(super::current_root(ed));
+    let pick = rows
+        .iter()
+        .filter_map(Row::key)
+        .find(|k| *k == current)
+        .or_else(|| rows.iter().find_map(Row::key));
+    ed.workspaces.sidebar.selected = pick;
 }
 
 /// Handles a key while the sidebar has focus. Returns false for keys that

@@ -199,6 +199,12 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
     loop {
         // Presentation changes (focus mode) move the view area.
         let (_, views, _) = split_screen(w, h, &editor);
+        // A sidebar the screen has no room for takes no keys.
+        let narrow = render::sidebar_room(w, h, &editor).is_none();
+        if editor.workspaces.sidebar.too_narrow != narrow {
+            editor.workspaces.sidebar.too_narrow = narrow;
+            dirty = true;
+        }
         if editor.area != views {
             editor.resize(views);
             dirty = true;

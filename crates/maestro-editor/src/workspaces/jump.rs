@@ -67,19 +67,25 @@ pub fn items(ed: &Editor) -> Vec<PickerItem> {
         });
     }
     for p in &ed.workspaces.projects {
-        let Some(main) = p.worktrees.iter().find(|w| w.is_main && !w.missing) else {
-            continue;
-        };
-        out.push(PickerItem {
-            label: format!("project {}", p.name),
-            // A short detail: a long path would cover the label.
-            detail: format!(
-                "{} worktree{}",
-                p.worktrees.len(),
-                if p.worktrees.len() == 1 { "" } else { "s" }
-            ),
-            action: PickerAction::Jump(Jump::Worktree(main.path.clone())),
-        });
+        // A bare repository lists no main worktree: the project then goes
+        // to its first linked one.
+        let first = p
+            .worktrees
+            .iter()
+            .filter(|w| !w.missing)
+            .min_by_key(|w| !w.is_main);
+        if let Some(main) = first {
+            out.push(PickerItem {
+                label: format!("project {}", p.name),
+                // A short detail: a long path would cover the label.
+                detail: format!(
+                    "{} worktree{}",
+                    p.worktrees.len(),
+                    if p.worktrees.len() == 1 { "" } else { "s" }
+                ),
+                action: PickerAction::Jump(Jump::Worktree(main.path.clone())),
+            });
+        }
         for w in p.worktrees.iter().filter(|w| !w.missing) {
             let name = if w.is_main { "main" } else { w.name.as_str() };
             let mut detail = Vec::new();
@@ -98,6 +104,23 @@ pub fn items(ed: &Editor) -> Vec<PickerItem> {
     }
     for b in ed.buffers.values() {
         let Some(path) = b.doc.path() else {
+            // Unnamed buffers with text (a kept scratch, a log) are listed
+            // too; an empty one is not worth a row.
+            if b.doc.text().len_chars() > 0 {
+                let first = b.doc.text().line(0).to_string();
+                out.push(PickerItem {
+                    label: format!(
+                        "buffer [scratch] {}",
+                        first.trim().chars().take(60).collect::<String>()
+                    ),
+                    detail: if b.doc.is_modified() {
+                        "unsaved".into()
+                    } else {
+                        String::new()
+                    },
+                    action: PickerAction::Jump(Jump::Buffer(b.id)),
+                });
+            }
             continue;
         };
         let owner = super::owner_of(ed, path);

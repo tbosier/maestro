@@ -70,6 +70,8 @@ pub struct Workspaces {
     /// Sessions of worktrees left in this run, when sessions are not saved
     /// to disk (`--clean`, tests).
     pub(crate) memory_sessions: HashMap<PathBuf, crate::navigation::session::SessionFile>,
+    /// The worktree last switched to.
+    pub active_root: Option<PathBuf>,
 }
 
 impl Workspaces {
@@ -93,7 +95,8 @@ pub enum NeedsYou {
     Permission,
     /// The agent finished and its work waits for review.
     Review,
-    /// The last verification run exited with an error.
+    /// The last verification run did not pass: it exited with an error,
+    /// was killed, or could not start.
     TestsFailed,
     /// The agent could not start, its turn failed, or it exited with an
     /// error.
@@ -173,7 +176,7 @@ impl Attention {
 }
 
 /// The attention state for an agent's status. `tests_failed`: the last
-/// finished verification run exited with a nonzero code.
+/// verification run did not pass (nonzero exit, killed, or not started).
 pub fn attention_of(status: Status, archived: bool, tests_failed: bool) -> Attention {
     if archived {
         return Attention::Done;
@@ -199,8 +202,9 @@ pub fn attention_of(status: Status, archived: bool, tests_failed: bool) -> Atten
 /// One agent as the sidebar and the palette show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEntry {
-    /// Stable across refreshes: `agent:<id>` for agents in this editor,
-    /// `record:<worktree>` for agents only known from saved records.
+    /// Stable across refreshes: `worktree:<path>` once the agent has a
+    /// worktree (the same for its saved record and the loaded agent),
+    /// `agent:<id>` before.
     pub key: String,
     pub name: String,
     pub task: String,
@@ -222,16 +226,24 @@ pub struct AgentEntry {
 pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
     let mut out: Vec<AgentEntry> = Vec::new();
     for a in &ed.agents.agents {
+        // A verification run that finished with an error, was killed or
+        // could not start (code `None`) did not pass.
         let failed = a
             .latest_test()
             .and_then(|t| t.finished.as_ref())
-            .is_some_and(|f| matches!(f.code, Some(c) if c != 0));
+            .is_some_and(|f| f.code != Some(0));
+        // A permission request waits even while a verification run shows
+        // as the agent's status.
+        let status = match a.base_status() {
+            Status::AwaitingApproval => Status::AwaitingApproval,
+            _ => a.status(),
+        };
         out.push(AgentEntry {
-            key: format!("agent:{}", a.id.0),
+            key: agent_key(a.worktree.as_ref().map(|w| w.path.as_path()), a.id.0),
             name: a.name.clone(),
             task: a.task.clone(),
-            status: a.status(),
-            attention: attention_of(a.status(), a.archived, failed),
+            status,
+            attention: attention_of(status, a.archived, failed),
             worktree: a.worktree.as_ref().map(|w| w.path.clone()),
             project: a.worktree.as_ref().map(|w| w.main_root.clone()),
             id: Some(a.id),
@@ -248,7 +260,7 @@ pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
                 continue;
             }
             out.push(AgentEntry {
-                key: format!("record:{}", r.worktree.display()),
+                key: agent_key(Some(&r.worktree), r.id),
                 name: r.name.clone(),
                 task: r.task.clone(),
                 status: r.status,
@@ -267,6 +279,15 @@ pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
     out
 }
 
+/// An agent's key: its worktree once it has one, so a saved record and the
+/// same agent loaded into this editor keep one key; else its id.
+fn agent_key(worktree: Option<&Path>, id: u64) -> String {
+    match worktree {
+        Some(w) => format!("worktree:{}", w.display()),
+        None => format!("agent:{id}"),
+    }
+}
+
 /// Compares every agent's attention state with the last one seen and
 /// announces the agents that just started needing you: once in the status
 /// line, and once to the front end unless `[notify] method = "off"`. An
@@ -277,6 +298,7 @@ pub fn check_attention(ed: &mut Editor) -> bool {
     if ed.agents.agents.is_empty() && ed.workspaces.projects.is_empty() {
         return false;
     }
+    sidebar::pin_selection(ed);
     let entries = agent_entries(ed);
     let mut fresh: Vec<(String, NeedsYou)> = Vec::new();
     for e in &entries {
@@ -330,34 +352,48 @@ pub fn tick(ed: &mut Editor, now: Instant) {
     check_attention(ed);
 }
 
-/// The worktree the editor is in: the deepest scanned worktree that holds
-/// the working directory, else the working directory itself.
+/// The worktree the working directory is in (see [`root_of`]).
 pub fn current_root(ed: &Editor) -> PathBuf {
-    deepest(ed, &ed.cwd).unwrap_or_else(|| ed.cwd.clone())
+    root_of(ed, &ed.cwd)
 }
 
-/// The deepest scanned worktree holding `path`.
-fn deepest(ed: &Editor, path: &Path) -> Option<PathBuf> {
+/// The worktree whose session is open: the one last switched to, else the
+/// worktree of the startup directory. `:cd` does not move it, so a switch
+/// after `:cd` saves the files under the session they came from.
+pub fn session_root(ed: &Editor) -> PathBuf {
+    let dir = ed.navigation.session_cwd.as_deref().unwrap_or(&ed.cwd);
+    root_of(ed, dir)
+}
+
+/// The worktree roots the editor knows: every scanned worktree, plus the
+/// one last switched to (a scan may not list it yet).
+fn known_roots(ed: &Editor) -> impl Iterator<Item = &Path> {
     ed.workspaces
         .projects
         .iter()
         .flat_map(|p| &p.worktrees)
         .map(|w| w.path.as_path())
-        .filter(|w| path.starts_with(w))
+        .chain(ed.workspaces.active_root.as_deref())
+}
+
+/// The deepest known worktree holding `dir`, else `dir` itself.
+pub fn root_of(ed: &Editor, dir: &Path) -> PathBuf {
+    let dir = lexical(dir);
+    known_roots(ed)
+        .filter(|w| dir.starts_with(w))
         .max_by_key(|w| w.as_os_str().len())
-        .map(Path::to_path_buf)
+        .map_or(dir.clone(), Path::to_path_buf)
 }
 
-/// The worktree a file belongs to: the deepest scanned worktree (or the
-/// current root) that holds it. `None` for files outside all of them.
+/// The worktree a file belongs to: the deepest known worktree (or the
+/// session's root) that holds it. `None` for files outside all of them.
+/// Paths are compared after removing `.` and `..`; a file reached through
+/// a symlink belongs to the worktree its spelled path is in.
 pub fn owner_of(ed: &Editor, path: &Path) -> Option<PathBuf> {
-    let current = current_root(ed);
-    ed.workspaces
-        .projects
-        .iter()
-        .flat_map(|p| &p.worktrees)
-        .map(|w| w.path.as_path())
-        .chain(std::iter::once(current.as_path()))
+    let path = lexical(path);
+    let session = session_root(ed);
+    known_roots(ed)
+        .chain(std::iter::once(session.as_path()))
         .filter(|w| path.starts_with(w))
         .max_by_key(|w| w.as_os_str().len())
         .map(Path::to_path_buf)
@@ -366,6 +402,22 @@ pub fn owner_of(ed: &Editor, path: &Path) -> Option<PathBuf> {
 /// `path` belongs to the worktree at `root` (see [`owner_of`]).
 pub fn owned_by(ed: &Editor, path: &Path, root: &Path) -> bool {
     owner_of(ed, path).as_deref() == Some(root)
+}
+
+/// `path` with `.` dropped and `..` taken off the part before it, without
+/// touching the filesystem.
+pub fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The project and worktree names for a worktree path, from the last
@@ -407,7 +459,14 @@ fn toggle_sidebar(ed: &mut Editor) {
     if !s.open {
         s.open = true;
         s.focused = true;
+        if s.too_narrow {
+            ed.set_status(
+                Severity::Warning,
+                "the window is too narrow to show the sidebar ([sidebar] width, or widen it)",
+            );
+        }
         scan::request(ed);
+        sidebar::pin_selection(ed);
     } else if !s.focused {
         s.focused = true;
     } else {

@@ -17,7 +17,10 @@
 //!   counts it on its worktree's row. Quitting still refuses while it is
 //!   unsaved.
 //! * Files outside the worktree you leave (another worktree's kept
-//!   buffers, files outside every worktree) stay open.
+//!   buffers, files outside every worktree) and unnamed buffers with text
+//!   stay open.
+//! * "The worktree you leave" is the one whose session is open: the last
+//!   one switched to, or the startup directory's. `:cd` does not change it.
 //! * The target's saved session is restored: its files open and its
 //!   layout comes back. Without one the editor shows an empty buffer.
 //!
@@ -46,10 +49,18 @@ pub fn switch(ed: &mut Editor, target: &Path) -> bool {
             return false;
         }
     };
-    let old = super::current_root(ed);
+    // The session's worktree, not the working directory's: after `:cd`
+    // the open files still belong to the session they came from.
+    let old = super::session_root(ed);
     if normalize_path(&old) == target {
         let name = label(ed, &target);
-        ed.info(format!("already in {name}"));
+        if ed.cwd != target {
+            // Back from a `:cd`: same session, nothing to save or restore.
+            ed.cwd = target;
+            ed.info(format!("back in {name}"));
+        } else {
+            ed.info(format!("already in {name}"));
+        }
         return true;
     }
     if let Err(e) = save_session(ed, &old) {
@@ -84,6 +95,7 @@ pub fn switch(ed: &mut Editor, target: &Path) -> bool {
     ed.cwd = target.clone();
     ed.navigation.session_cwd = Some(target.clone());
     ed.navigation.scoped = true;
+    ed.workspaces.active_root = Some(target.clone());
     let restored = restore_session(ed, &target);
     crate::lsp::reconcile(ed);
     super::scan::request(ed);

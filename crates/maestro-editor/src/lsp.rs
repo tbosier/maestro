@@ -1316,8 +1316,9 @@ pub fn restart(ed: &mut Editor) {
 /// A server is in use while an open buffer belongs to it: one synced to
 /// it, or a file whose language and root would start it (a server still
 /// starting has no synced buffers yet). Servers in use are never stopped
-/// here, and neither are servers whose root holds the working directory or
-/// lies inside it. The rest stop once unused for
+/// here, and neither are the current worktree's (a root holding the
+/// working directory with no other known worktree between them; a
+/// worktree nested inside it counts as another root). The rest stop once unused for
 /// `[lsp] stop-unused-after-secs`, and, while more roots than
 /// `[lsp] max-live-roots` have servers, whole roots stop, least recently
 /// used first. A stopped server starts again when a file of its root is
@@ -1353,8 +1354,26 @@ pub fn stop_unused(ed: &mut Editor, now: Instant) {
             s.last_used = now;
         }
     }
-    let cwd = ed.cwd.clone();
-    let exempt = |s: &Server| cwd.starts_with(&s.root) || s.root.starts_with(&cwd);
+    // The current worktree's servers: a root that holds the working
+    // directory with no other known worktree between them. A worktree
+    // nested inside the current one is another root, and so is the
+    // worktree around the current one.
+    let here = crate::workspaces::current_root(ed);
+    let between: Vec<PathBuf> = ed
+        .workspaces
+        .projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .map(|w| w.path.clone())
+        .chain(ed.workspaces.active_root.clone())
+        .filter(|w| here.starts_with(w))
+        .collect();
+    let exempt = |s: &Server| {
+        here.starts_with(&s.root)
+            && !between
+                .iter()
+                .any(|w| w.starts_with(&s.root) && *w != s.root)
+    };
     let mut stop: Vec<(ServerId, String)> = Vec::new();
     let idle = Duration::from_secs(ed.config.lsp.stop_unused_after_secs);
     if !idle.is_zero() {
