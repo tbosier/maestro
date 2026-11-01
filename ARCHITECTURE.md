@@ -4,7 +4,8 @@
 
 ```
 maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-core
-     │               │                │  │  └──► maestro-git
+     │               │                │  │  ├──► maestro-git
+     │               │                │  │  └──► maestro-forge ──► maestro-git
      │               │                │  └─────► maestro-lsp ──► maestro-core
      │               └──────► maestro-config ◄───┘
      └──► maestro-automation ──► maestro-editor, maestro-protocol
@@ -14,17 +15,20 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 |---|---|---|
 | `maestro-core` | Rope text, position types, selections, change sets, transactions, undo tree, documents, file IO | ropey, unicode-segmentation, unicode-width, thiserror |
 | `maestro-config` | TOML config, theme tokens, the Duskfox palette | serde, toml |
-| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, Git gutter signs and pickers, language server integration (`lsp.rs`, `lsp_commands.rs`), per-buffer syntax state, coding agents with the agent panel, review screen, task contracts and overlap detection between agents (`agents/`), edit proposals from automation clients with their review overlay and verification runs (`proposals/`) | core, config, git, lsp, syntax, agent, term, tasks, regex |
+| `maestro-editor` | Editor state, modes, keymaps, the command registry, motions, prompts, pickers, registers, search, crash recovery, Git gutter signs and pickers, language server integration (`lsp.rs`, `lsp_commands.rs`), per-buffer syntax state, coding agents with the agent panel, review screen, task contracts and overlap detection between agents (`agents/`), edit proposals from automation clients with their review overlay and verification runs (`proposals/`), the GitHub inbox with its detail view, message buffers and write dialogs (`forge/`) | core, config, git, lsp, syntax, agent, term, tasks, forge, regex |
 | `maestro-git` | Repository discovery, status, line diffs for gutter signs, a unified diff model, worktree lifecycle with safety checks, merge dry runs, the review diff of a worktree against its base, intraline ranges, committing a worktree's work, integrating a branch by fast-forward, merge or cherry-pick with checks before and after, and snapshots of a worktree's uncommitted files as unreferenced commits for merge dry runs between worktrees; all through the `git` CLI (ADR 0005) | similar, thiserror |
 | `maestro-term` | Programs in pseudo-terminals: a VT screen with scrollback, key and paste encoding, resize, exit status, kill (ADR 0006) | portable-pty, vt100 |
 | `maestro-agent` | Agent providers found on `PATH`, the Agent Client Protocol client on plain threads (handshake, prompts, cancel, permission requests, transcript events), file reads and writes for an agent confined to its root by path checks (not a sandbox), and a fake agent for tests behind `fake-agent` (ADR 0006) | agent-client-protocol-schema, serde_json |
 | `maestro-tasks` | Verification commands in their own process group, output streamed by line, `cargo test` summaries (ADR 0006) | std |
+| `maestro-forge` | GitHub through the GitHub CLI (`gh`): searches for review requests, assigned and own pull requests and assigned issues, a repository's open pull requests, a pull request's status (review decision, mergeability, checks), details and diff (parsed with maestro-git's parser), and the write actions as exact command lines (approve, comment, request changes, merge with the head commit pinned). Argument vectors, `--json` output, a timeout per call, errors in plain words (gh missing, logged out, network, rate limit) | git, serde, serde_json, thiserror |
 | `maestro-lsp` | Language server processes on plain threads: framing, JSON-RPC, initialize and shutdown, cancellation, exit detection, a bounded stderr log, server requests handed to the caller (`workspace/applyEdit`), position and change conversions, and parsing of completion, signature help and workspace edit replies. A fake server for tests behind the `fake-server` feature | core, serde_json |
 | `maestro-syntax` | Tree-sitter grammars, incremental parsing from change sets, highlight spans, syntax node ranges | core, tree-sitter and grammar crates |
 | `maestro-tui` | Terminal lifecycle, input conversion, rendering, clipboard providers | editor, crossterm |
 | `maestro-protocol` | Automation API wire types: JSON-RPC messages, params, results, error codes | serde, serde_json |
 | `maestro-automation` | Runs protocol requests against an `Editor`; headless (stdio) and Unix socket transports | core, config, editor, protocol |
 | `maestro-cli` | The `maestro` binary: arguments, config loading, startup | tui, automation |
+
+`maestro-editor` runs `maestro-forge` only on background threads (`forge/`); `maestro-tui` draws the inbox (`src/inbox.rs`) and reuses the agent review's diff rows for pull request diffs.
 
 `maestro-editor` uses the agent crates (`maestro-agent`, `maestro-term`, `maestro-tasks`) for the agent panel in `src/agents/`; `maestro-tui` draws it (`src/agents.rs`). ADR 0006 records how they fit together and `docs/agent-model.md` what the panel does. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 

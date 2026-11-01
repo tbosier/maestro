@@ -323,6 +323,14 @@ fn enter_opens_the_detail_with_checks_reviews_and_the_diff() {
     assert!(v.cursor > 0, "] moves to the next hunk");
     ed.feed_keys(&keys("s"));
     assert!(ed.forge.screen.detail.as_ref().unwrap().side_by_side);
+    // h and l scroll long lines sideways; a new page starts at the left.
+    ed.feed_keys(&keys("l"));
+    let left = ed.forge.screen.detail.as_ref().unwrap().left;
+    assert!(left > 0);
+    ed.feed_keys(&keys("lh"));
+    assert_eq!(ed.forge.screen.detail.as_ref().unwrap().left, left);
+    ed.feed_keys(&keys("<tab><S-tab>"));
+    assert_eq!(ed.forge.screen.detail.as_ref().unwrap().left, 0);
     ed.feed_keys(&keys("<tab><tab>"));
     assert_eq!(ed.forge.screen.detail.as_ref().unwrap().page, 0);
     // Esc goes back to the list, then closes the screen.

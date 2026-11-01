@@ -352,7 +352,7 @@ fn draw_detail(ed: &Editor, s: &mut Surface, v: &DetailView) {
                 }
             }
             DetailRow::Diff(d) => {
-                draw_row(ed, s, Rect::new(c.x, y, c.width, 1), d, 0);
+                draw_row(ed, s, Rect::new(c.x, y, c.width, 1), d, v.left);
             }
         }
         if i == v.cursor {

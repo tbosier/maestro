@@ -314,6 +314,7 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
             ("j/k", "scroll"),
             ("tab", "next file"),
             ("]/[", "hunk"),
+            ("h/l", "sideways"),
             ("s", "side by side"),
             ("a", "approve"),
             ("c", "comment"),
