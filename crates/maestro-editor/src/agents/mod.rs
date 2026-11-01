@@ -34,7 +34,7 @@ pub use maestro_agent::{
     AcpClient, AgentId, PermissionChoice, PermissionRequest, ProviderKind, ProviderSpec,
     TranscriptEntry,
 };
-pub use maestro_git::{DiffFile, DiffLineKind, FileChange, Integration};
+pub use maestro_git::{DiffFile, DiffLine, DiffLineKind, FileChange, Hunk, Integration};
 pub use maestro_tasks::TestSummary;
 pub use maestro_term::{Cell as TermCell, Screen, TermColor, TermSize, Terminal};
 
