@@ -2,7 +2,7 @@
 
 A modal text editor written in Rust, built for a workflow where one person and several coding agents edit the same codebase. The editing core comes first: it has to be good with every agent feature turned off.
 
-Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 (agents in worktrees, review, integration) is done: Claude Code and Codex have been run through the agent panel on a real task, reviewed, one rejected and one merged, and agent records survive a restart. Agents speaking the Agent Client Protocol are tested only against a fake agent so far. [ROADMAP.md](ROADMAP.md) says exactly what works.
+Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 (agents in worktrees, review, integration) is done: Claude Code and Codex have been run through the agent panel on a real task, reviewed, one rejected and one merged, and agent records survive a restart. Agents speaking the Agent Client Protocol are tested only against a fake agent so far. M3 has a first slice of each of its capabilities: edit proposals that an external agent sends and you approve, task contracts and conflict detection between agents, and structural selection pipelines. [ROADMAP.md](ROADMAP.md) says exactly what works.
 
 ## What works today
 
