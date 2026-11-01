@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maestro_config::LanguageServerConfig;
 use maestro_core::{Assoc, ChangeSet, DocumentVersion, Rope};
@@ -152,6 +152,8 @@ struct Server {
     root: PathBuf,
     client: Client,
     capabilities: Option<Value>,
+    /// The last time it had an open buffer (or started).
+    last_used: Instant,
 }
 
 impl Server {
@@ -302,6 +304,14 @@ impl Lsp {
     /// Names of running servers, for display.
     pub fn server_names(&self) -> Vec<String> {
         self.servers.values().map(|s| s.name.clone()).collect()
+    }
+
+    /// Each running server's name and workspace root.
+    pub fn server_roots(&self) -> Vec<(String, PathBuf)> {
+        self.servers
+            .values()
+            .map(|s| (s.name.clone(), s.root.clone()))
+            .collect()
     }
 
     /// True if `doc` is open on a server.
@@ -648,6 +658,7 @@ fn start_server(
             root,
             client,
             capabilities: None,
+            last_used: Instant::now(),
         },
     );
     let spawned = ed.spawn_background("lsp-init", move |jobs| {
@@ -1297,6 +1308,136 @@ pub fn restart(ed: &mut Editor) {
     }
     ed.info("restarting language servers");
     reconcile(ed);
+}
+
+/// Stops the servers of workspace roots you left, so switching between
+/// worktrees does not pile up servers.
+///
+/// A server is in use while an open buffer belongs to it: one synced to
+/// it, or a file whose language and root would start it (a server still
+/// starting has no synced buffers yet). Servers in use are never stopped
+/// here, and neither are servers whose root holds the working directory or
+/// lies inside it. The rest stop once unused for
+/// `[lsp] stop-unused-after-secs`, and, while more roots than
+/// `[lsp] max-live-roots` have servers, whole roots stop, least recently
+/// used first. A stopped server starts again when a file of its root is
+/// opened. Called from [`Editor::tick`].
+pub fn stop_unused(ed: &mut Editor, now: Instant) {
+    if ed.lsp.servers.is_empty() {
+        return;
+    }
+    let mut used: HashSet<ServerId> = ed.lsp.docs.values().map(|d| d.server).collect();
+    for b in ed.buffers.values() {
+        if ed.lsp.docs.contains_key(&b.id) {
+            continue;
+        }
+        let Some(path) = b.doc.path() else {
+            continue;
+        };
+        let Some((language, _)) = language_for(path) else {
+            continue;
+        };
+        let root = find_root(path, language);
+        let candidates = ed.config.language_servers(language);
+        for (id, s) in &ed.lsp.servers {
+            let same = candidates
+                .iter()
+                .any(|c| c.command == s.command && c.args == s.args);
+            if same && s.root == root {
+                used.insert(*id);
+            }
+        }
+    }
+    for (id, s) in ed.lsp.servers.iter_mut() {
+        if used.contains(id) {
+            s.last_used = now;
+        }
+    }
+    let cwd = ed.cwd.clone();
+    let exempt = |s: &Server| cwd.starts_with(&s.root) || s.root.starts_with(&cwd);
+    let mut stop: Vec<(ServerId, String)> = Vec::new();
+    let idle = Duration::from_secs(ed.config.lsp.stop_unused_after_secs);
+    if !idle.is_zero() {
+        for (id, s) in &ed.lsp.servers {
+            if !used.contains(id)
+                && !exempt(s)
+                && now.saturating_duration_since(s.last_used) >= idle
+            {
+                stop.push((*id, format!("unused for {} s", idle.as_secs())));
+            }
+        }
+    }
+    let max = ed.config.lsp.max_live_roots;
+    if max > 0 {
+        // Each root still running after the stops above: when it was last
+        // used, whether all its servers may stop, and its servers.
+        let mut roots: BTreeMap<PathBuf, (Instant, bool, Vec<ServerId>)> = BTreeMap::new();
+        for (id, s) in &ed.lsp.servers {
+            if stop.iter().any(|(x, _)| x == id) {
+                continue;
+            }
+            let e = roots
+                .entry(s.root.clone())
+                .or_insert((s.last_used, true, Vec::new()));
+            e.0 = e.0.max(s.last_used);
+            e.1 &= !used.contains(id) && !exempt(s);
+            e.2.push(*id);
+        }
+        let mut live = roots.len();
+        let mut candidates: Vec<(Instant, Vec<ServerId>)> = roots
+            .into_values()
+            .filter(|(_, stoppable, _)| *stoppable)
+            .map(|(t, _, ids)| (t, ids))
+            .collect();
+        candidates.sort_by_key(|(t, _)| *t);
+        for (_, ids) in candidates {
+            if live <= max {
+                break;
+            }
+            live -= 1;
+            for id in ids {
+                stop.push((id, format!("more than {max} workspace roots had servers")));
+            }
+        }
+    }
+    for (id, why) in stop {
+        retire_server(ed, id, &why);
+    }
+}
+
+/// Stops a server that is no longer needed. Unlike a crash, it is not
+/// kept from starting again.
+fn retire_server(ed: &mut Editor, id: ServerId, why: &str) {
+    let Some(server) = ed.lsp.servers.remove(&id) else {
+        return;
+    };
+    let docs: Vec<DocumentId> = ed
+        .lsp
+        .docs
+        .iter()
+        .filter(|(_, s)| s.server == id)
+        .map(|(d, _)| *d)
+        .collect();
+    for d in docs {
+        ed.lsp.docs.remove(&d);
+        ed.lsp.diagnostics.remove(&d);
+    }
+    ed.lsp.pending.retain(|_, p| p.server != id);
+    completion::server_stopped(ed, id);
+    signature::server_stopped(ed, id);
+    actions::server_stopped(ed, id);
+    let msg = format!(
+        "stopped {} for {}: {why}",
+        server.name,
+        server.root.display()
+    );
+    if ed.status.is_none() {
+        ed.info(msg.clone());
+    }
+    let mut log = server.client.log();
+    log.push(format!("maestro: {msg}"));
+    ed.lsp.stopped_logs.insert(server.name.clone(), log);
+    shut_down_in_background(server);
 }
 
 /// Opens a scratch buffer with each server's captured stderr and log

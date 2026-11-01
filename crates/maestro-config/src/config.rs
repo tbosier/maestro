@@ -199,6 +199,10 @@ pub struct Config {
     /// Language servers that replace the built-in choice for a language.
     pub language_server: BTreeMap<String, LanguageServerConfig>,
     pub agents: AgentsConfig,
+    pub sidebar: SidebarConfig,
+    pub projects: ProjectsConfig,
+    pub notify: NotifyConfig,
+    pub lsp: LspConfig,
 }
 
 impl Default for Config {
@@ -210,6 +214,78 @@ impl Default for Config {
             keys: BTreeMap::new(),
             language_server: BTreeMap::new(),
             agents: AgentsConfig::default(),
+            sidebar: SidebarConfig::default(),
+            projects: ProjectsConfig::default(),
+            notify: NotifyConfig::default(),
+            lsp: LspConfig::default(),
+        }
+    }
+}
+
+/// `[sidebar]`: the projects and worktrees column (`space s`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SidebarConfig {
+    /// Columns the sidebar takes when open. It never takes more than half
+    /// the screen.
+    pub width: u16,
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self { width: 36 }
+    }
+}
+
+/// `[projects]`: Git repositories the sidebar and the jump palette list,
+/// besides the directories of earlier sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ProjectsConfig {
+    /// Directories inside Git repositories. `~` expands to the home
+    /// directory.
+    pub paths: Vec<String>,
+}
+
+/// How Maestro tells the terminal that an agent needs you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotifyMethod {
+    /// The terminal bell (BEL).
+    #[default]
+    Bell,
+    /// An OSC 9 desktop notification, for terminals that show them.
+    Osc,
+    /// Only the status line message.
+    Off,
+}
+
+/// `[notify]`: what happens, besides the status line message, when an
+/// agent starts needing you.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct NotifyConfig {
+    pub method: NotifyMethod,
+}
+
+/// `[lsp]`: when language servers for worktrees you left are stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct LspConfig {
+    /// Seconds a server outside the current worktree may run with no open
+    /// buffer before it is stopped. 0 never stops one for that reason.
+    pub stop_unused_after_secs: u64,
+    /// Most workspace roots with running servers. Beyond it, servers of
+    /// other roots with no open buffer are stopped, least recently used
+    /// first. 0 means no limit.
+    pub max_live_roots: usize,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            stop_unused_after_secs: 300,
+            max_live_roots: 3,
         }
     }
 }
@@ -369,6 +445,36 @@ line-numbers = "relative"
         assert_eq!(c.editor.indent_unit(), "\t");
         assert_eq!(c.keys["normal"]["space w"], "write");
         assert!(Config::parse("[editor]\ntab-widht = 2\n", Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn parses_workspace_settings() {
+        let c = Config::parse(
+            r#"
+[sidebar]
+width = 40
+[projects]
+paths = ["~/src/a", "/work/b"]
+[notify]
+method = "osc"
+[lsp]
+stop-unused-after-secs = 60
+max-live-roots = 2
+"#,
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(c.sidebar.width, 40);
+        assert_eq!(c.projects.paths, ["~/src/a", "/work/b"]);
+        assert_eq!(c.notify.method, NotifyMethod::Osc);
+        assert_eq!(c.lsp.stop_unused_after_secs, 60);
+        assert_eq!(c.lsp.max_live_roots, 2);
+        let d = Config::default();
+        assert_eq!(d.notify.method, NotifyMethod::Bell);
+        assert_eq!(d.lsp.stop_unused_after_secs, 300);
+        assert_eq!(d.sidebar.width, 36);
+        assert!(Config::parse("[notify]\nmethod = \"loud\"\n", Path::new("x")).is_err());
+        assert!(Config::parse("[sidebar]\nwidht = 3\n", Path::new("x")).is_err());
     }
 
     #[test]

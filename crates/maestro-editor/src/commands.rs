@@ -47,6 +47,7 @@ pub static TABLES: &[&[Command]] = &[
     crate::lsp_commands::COMMANDS,
     crate::navigation::COMMANDS,
     crate::syntax_commands::COMMANDS,
+    crate::workspaces::COMMANDS,
 ];
 
 /// Iterates every registered command.
