@@ -10,7 +10,16 @@
 //! ([`review`], `space e` or `:proposals`). On approval the change is
 //! applied with [`Document::apply_at_version`] against the proposal's base
 //! version as one undo step, so a document that moved on is refused as
-//! stale (there is no rebase). A proposal with a verification command then
+//! stale.
+//!
+//! An intent edit ([`submit_intent`]) is a proposal that also carries the
+//! structural pipeline that produced its change ([`Intent`]). When its
+//! document moves on, the pipeline runs again on the current text
+//! ([`refresh`]) and the review shows that new change with a note that it
+//! was rebased; a rerun that fails makes the proposal stale. Approval
+//! applies exactly the change the approval dialog described.
+//!
+//! A proposal with a verification command then
 //! saves the document and runs the command through `maestro-tasks` in the
 //! editor's working directory, on threads of its own; the result arrives as
 //! a job. Everything the decision and the run produce stays on the
@@ -32,6 +41,7 @@ use maestro_git::DiffFile;
 use maestro_tasks::{TaskEvent, TaskHandle, TaskSpec};
 
 use crate::editor::{DocumentId, Editor, Severity};
+use crate::structural::{self, IntentRun, StepCount};
 
 crate::commands! {
     proposal_review => "Review edit proposals from automation clients",
@@ -302,6 +312,63 @@ pub struct NewProposal {
     pub verify: Option<(String, Vec<String>)>,
 }
 
+/// The pipeline behind an intent edit, and where its preview stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Intent {
+    /// The pipeline line as the client sent it.
+    pub pipeline: String,
+    /// The selection count the client expects after the selection steps.
+    pub expect: Option<usize>,
+    /// Selection counts per step of the run that produced the proposal's
+    /// current change.
+    pub counts: Vec<StepCount>,
+    /// The document version the proposal's change applies to: the base
+    /// version, or a newer one after a rebase.
+    pub preview_version: DocumentVersion,
+    /// The latest rerun, against a newer version, failed.
+    pub failed: Option<RerunFailure>,
+    /// The preview version the approval dialog described when it was
+    /// opened. Approval applies only that.
+    pub shown: Option<DocumentVersion>,
+}
+
+/// A rerun of an intent's pipeline that failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerunFailure {
+    pub version: DocumentVersion,
+    pub message: String,
+    pub counts: Vec<StepCount>,
+}
+
+impl Intent {
+    /// The intent for `run`, the first run of `pipeline`.
+    pub fn new(pipeline: String, expect: Option<usize>, run: &IntentRun) -> Self {
+        Self {
+            pipeline,
+            expect,
+            counts: run.counts.clone(),
+            preview_version: run.version,
+            failed: None,
+            shown: None,
+        }
+    }
+}
+
+/// `s` with every character that would hide text (a control character, a
+/// direction override) written as a `\u{...}` escape, for showing a
+/// pipeline the client sent.
+pub fn visible(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if hides_text(c) {
+                format!("\\u{{{:04X}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 pub struct Proposal {
     pub id: ProposalId,
     pub doc: DocumentId,
@@ -330,11 +397,62 @@ pub struct Proposal {
     pub resolved_ms: Option<u64>,
     /// Order of resolution, for `proposal.resolved` notifications.
     pub resolved_seq: Option<u64>,
+    /// The pipeline, for an intent edit.
+    pub intent: Option<Intent>,
     handle: Option<TaskHandle>,
     canceled: bool,
 }
 
 impl Proposal {
+    /// The version the change applies to: the base version, or for a
+    /// rebased intent edit the version its pipeline ran on again.
+    pub fn apply_version(&self) -> DocumentVersion {
+        self.intent
+            .as_ref()
+            .map_or(self.base_version, |i| i.preview_version)
+    }
+
+    /// True for an intent edit whose change was computed against another
+    /// version than the one the client looked at.
+    pub fn rebased(&self) -> bool {
+        self.intent
+            .as_ref()
+            .is_some_and(|i| i.preview_version != self.base_version)
+    }
+
+    /// What the review says about a rebase, in short lines with the
+    /// version first: why it happened, against which version, and whether
+    /// the rerun failed. Empty when there was none.
+    pub fn rebase_notes(&self) -> Vec<String> {
+        let Some(i) = &self.intent else {
+            return Vec::new();
+        };
+        let why = format!(
+            "changed since version {}, which {} looked at",
+            self.base_version.0, self.actor.name
+        );
+        if let Some(f) = &i.failed {
+            return vec![
+                format!("no longer applies: {why}"),
+                format!(
+                    "the pipeline ran again on version {} and failed: {}",
+                    f.version.0, f.message
+                ),
+                "approving resolves it as stale; nothing changes".into(),
+            ];
+        }
+        if !self.rebased() {
+            return Vec::new();
+        }
+        vec![
+            format!("rebased onto version {}: {why}", i.preview_version.0),
+            format!(
+                "the pipeline ran again on version {}; this diff is from that run",
+                i.preview_version.0
+            ),
+        ]
+    }
+
     /// Lines added and removed.
     pub fn counts(&self) -> (usize, usize) {
         self.diff.counts()
@@ -526,6 +644,24 @@ pub fn save_document(ed: &mut Editor, id: DocumentId) -> Result<(), SaveError> {
 /// caller has checked that the document exists, is at `base_version`, and
 /// that the changes fit it.
 pub fn submit(ed: &mut Editor, new: NewProposal) -> ProposalId {
+    queue(ed, new, None)
+}
+
+/// Queues an intent edit: `new.changes` is the result of running
+/// `intent.pipeline` on the document at `intent.preview_version` (its
+/// current version), which may be newer than `new.base_version`.
+pub fn submit_intent(ed: &mut Editor, new: NewProposal, intent: Intent) -> ProposalId {
+    queue(ed, new, Some(intent))
+}
+
+/// The name a diff shows for a proposal's file.
+fn diff_name(path: Option<&PathBuf>) -> PathBuf {
+    path.and_then(|p| p.file_name())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("[scratch]"))
+}
+
+fn queue(ed: &mut Editor, new: NewProposal, intent: Option<Intent>) -> ProposalId {
     let buf = &ed.buffers[&new.doc];
     let path = buf.doc.path().map(PathBuf::from);
     let old_text = buf.doc.text().clone();
@@ -533,11 +669,7 @@ pub fn submit(ed: &mut Editor, new: NewProposal) -> ProposalId {
     // The caller built the change set for this text; a mismatch would be
     // a bug, and the diff then shows no change rather than a wrong one.
     let _ = new.changes.apply(&mut new_text);
-    let name = path
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("[scratch]"));
+    let name = diff_name(path.as_ref());
     let diff = review::text_diff(&old_text.to_string(), &new_text.to_string(), &name);
     let verify = new.verify.map(|(program, args)| VerifySpec {
         program,
@@ -571,6 +703,7 @@ pub fn submit(ed: &mut Editor, new: NewProposal) -> ProposalId {
         decided_ms: None,
         resolved_ms: None,
         resolved_seq: None,
+        intent,
         handle: None,
         canceled: false,
     });
@@ -654,7 +787,8 @@ pub fn approval_blocker(ed: &Editor, id: ProposalId) -> Option<String> {
 pub fn stale_reason(ed: &Editor, p: &Proposal) -> Option<String> {
     match ed.buffers.get(&p.doc) {
         None => Some("the document was closed".into()),
-        Some(b) if b.doc.version() != p.base_version => Some(format!(
+        // An intent edit is rebased instead (`refresh`).
+        Some(b) if p.intent.is_none() && b.doc.version() != p.base_version => Some(format!(
             "the document is at version {}, the proposal was made against version {}",
             b.doc.version().0,
             p.base_version.0
@@ -671,7 +805,95 @@ pub fn stale_reason(ed: &Editor, p: &Proposal) -> Option<String> {
                 p.file_label()
             ))
         }
-        Some(_) => None,
+        Some(b) => {
+            let f = p.intent.as_ref()?.failed.as_ref()?;
+            (f.version == b.doc.version()).then(|| {
+                format!(
+                    "the document moved on from version {} to {}, and the pipeline ran again \
+                     on it and failed: {}",
+                    p.base_version.0, f.version.0, f.message
+                )
+            })
+        }
+    }
+}
+
+/// Runs a pending intent edit's pipeline again when its document has
+/// moved on since its preview was computed, and replaces the preview (the
+/// change, the texts and the diff) with the new run, or records why the
+/// rerun failed. Does nothing for other proposals, and nothing when the
+/// preview is current or already failed at this version.
+pub fn refresh(ed: &mut Editor, id: ProposalId) {
+    let Some(p) = ed.proposals.get(id) else {
+        return;
+    };
+    let Some(intent) = &p.intent else {
+        return;
+    };
+    let Some(buf) = ed.buffers.get(&p.doc) else {
+        return;
+    };
+    let current = buf.doc.version();
+    if p.state != State::Pending
+        || current == intent.preview_version
+        || intent.failed.as_ref().is_some_and(|f| f.version == current)
+    {
+        return;
+    }
+    let result = structural::run_intent(ed, p.doc, &intent.pipeline, intent.expect);
+    let old_text = buf.doc.text().clone();
+    let name = diff_name(p.path.as_ref());
+    let p = ed.proposals.get_mut(id).expect("checked");
+    match result {
+        Ok(run) => {
+            let mut new_text = old_text.clone();
+            let _ = run.changes.apply(&mut new_text);
+            p.diff = review::text_diff(&old_text.to_string(), &new_text.to_string(), &name);
+            p.old_text = old_text;
+            p.new_text = new_text;
+            p.edit_count = run.edit_count;
+            p.changes = run.changes;
+            let intent = p.intent.as_mut().expect("checked");
+            intent.counts = run.counts;
+            intent.preview_version = current;
+            intent.failed = None;
+        }
+        Err(e) => {
+            let counts = match &e {
+                structural::IntentError::Failed { counts, .. } => counts.clone(),
+                structural::IntentError::Invalid(_) => Vec::new(),
+            };
+            let intent = p.intent.as_mut().expect("checked");
+            intent.failed = Some(RerunFailure {
+                version: current,
+                message: e.to_string(),
+                counts,
+            });
+        }
+    }
+}
+
+/// [`refresh`] for every pending intent edit. The front end calls this
+/// before drawing while the review is open, so the diff shown is the one
+/// approval would apply.
+pub fn refresh_all(ed: &mut Editor) {
+    let ids: Vec<ProposalId> = ed
+        .proposals
+        .items
+        .iter()
+        .filter(|p| p.intent.is_some() && p.state == State::Pending)
+        .map(|p| p.id)
+        .collect();
+    for id in ids {
+        refresh(ed, id);
+    }
+}
+
+/// Remembers that the approval dialog for proposal `id` describes its
+/// current preview, so approval may apply it.
+pub fn mark_shown(ed: &mut Editor, id: ProposalId) {
+    if let Some(i) = ed.proposals.get_mut(id).and_then(|p| p.intent.as_mut()) {
+        i.shown = Some(i.preview_version);
     }
 }
 
@@ -680,6 +902,7 @@ pub fn stale_reason(ed: &Editor, p: &Proposal) -> Option<String> {
 /// the document moved on. With a verification command, then saves the
 /// document and starts the command.
 pub fn approve(ed: &mut Editor, id: ProposalId) {
+    refresh(ed, id);
     if let Some(why) = approval_blocker(ed, id) {
         ed.error(why);
         return;
@@ -699,7 +922,23 @@ pub fn approve(ed: &mut Editor, id: ProposalId) {
         review::after_change(ed);
         return;
     }
-    let (doc, base, changes) = (p.doc, p.base_version, p.changes.clone());
+    // An intent edit applies only the change the dialog described: if the
+    // pipeline ran again since (the document moved on while the dialog was
+    // open), the reviewer has to look at the new change first.
+    if let Some(i) = &p.intent
+        && i.shown != Some(i.preview_version)
+    {
+        let msg = format!(
+            "proposal {}: the document changed while the approval dialog was open, so the \
+             pipeline ran again on version {}; nothing was applied. Review the new diff and \
+             press a again",
+            id.0, i.preview_version.0
+        );
+        ed.error(msg);
+        review::after_change(ed);
+        return;
+    }
+    let (doc, base, changes) = (p.doc, p.apply_version(), p.changes.clone());
     let applied = apply_versioned(ed, doc, base, &changes);
     let p = ed.proposals.get_mut(id).expect("checked");
     match applied {
@@ -720,9 +959,14 @@ pub fn approve(ed: &mut Editor, id: ProposalId) {
         }
     }
     if p.verify.is_none() {
+        let rebased = if p.rebased() {
+            format!(" (rebased onto version {})", base.0)
+        } else {
+            String::new()
+        };
         ed.proposals.resolve(id);
         ed.info(format!(
-            "proposal {} applied as one undo step; not saved",
+            "proposal {} applied{rebased} as one undo step; not saved",
             id.0
         ));
         review::after_change(ed);
