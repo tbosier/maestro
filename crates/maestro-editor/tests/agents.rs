@@ -3035,6 +3035,25 @@ fn marked_hunks_integrate_alone_and_the_rest_stays() {
     // The rest can be integrated later: the second hunk of calc.txt.
     run(&mut ed, "] ");
     assert_eq!(marks::counts(agent(&ed, 0)), (1, 2));
+    // A dirty main worktree is refused before anything is committed, as
+    // for a whole agent.
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    std::fs::write(f.repo.join("README.md"), "# dirty\n").unwrap();
+    run(&mut ed, "I");
+    poll_until(&mut ed, "the refusal", |ed| {
+        status_text(ed).contains("not integrated")
+    });
+    assert!(
+        status_text(&ed).contains("the main worktree has uncommitted changes in README.md"),
+        "{:?}",
+        ed.status
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    assert!(
+        !f.git(&f.repo, &["branch", "--list", "maestro/sh-1-part-2"])
+            .contains("part-2")
+    );
+    f.git(&f.repo, &["checkout", "-q", "--", "README.md"]);
     open_integrate(&mut ed);
     let (text, _) = dialog(&ed);
     assert!(text.contains("  calc.txt -25,6 +25,6\n"), "{text}");
