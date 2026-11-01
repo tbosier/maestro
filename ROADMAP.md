@@ -48,7 +48,9 @@ With real agents, on October 30 and 31, 2026, in a scratch Python repository, re
 
 Sessions were checked on October 31, 2026 with editor tests and in tmux with shell-script providers: two agents, quit, restart, both loaded as "not running (from an earlier session)", one integrated and one archived. Not checked for real: `session/load` against a real ACP agent (the fake agent only), because no ACP agent on this machine can finish a prompt without a new login.
 
-## M3: differentiating capabilities (partial)
+## M3: differentiating capabilities (done as initial slices)
+
+The spec asks for "initial versions" of each capability, "a narrow but useful vertical slice of each". Each row below has one, and the acceptance test passes; every row stays marked partial because each is a slice, not the whole capability.
 
 | Item | Status |
 |---|---|
