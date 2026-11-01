@@ -452,6 +452,20 @@ impl Agent {
         self.origin != Origin::New && !self.is_running()
     }
 
+    /// `R` would start the agent again: it has a record, no process, a
+    /// worktree that is still its own, and no decision yet. (The provider
+    /// is checked when `R` is pressed.)
+    pub fn can_relaunch(&self) -> bool {
+        self.origin != Origin::Found
+            && !self.is_running()
+            && !self.archived
+            && !self.base_status().is_decided()
+            && self.worktree.is_some()
+            && self.worktree_note.is_none()
+            && self.git_busy.is_none()
+            && !self.tests_running()
+    }
+
     /// The status to show: tests running take precedence over the agent's
     /// own state until the user has decided.
     pub fn status(&self) -> Status {

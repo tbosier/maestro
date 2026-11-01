@@ -1,6 +1,6 @@
 # Agent model
 
-This describes what is built as of October 30, 2026. Anything marked partial or not built is not there.
+This describes what is built as of October 31, 2026. Anything marked partial or not built is not there.
 
 ## Version-checked edits
 
@@ -23,9 +23,31 @@ An agent is a record in the editor (`maestro_editor::agents::Agent`) with:
 - a history of timestamped events;
 - verification runs with their output (last 20,000 lines each), exit code, duration and parsed `cargo test` totals;
 - errors, and the files changed according to the last review diff;
-- review comments, each on one line of one file, marked once sent.
+- review comments, each on one line of one file, marked once sent;
+- for ACP agents, the session id and whether the agent advertised `loadSession`.
 
-Records live only in memory. Quitting the editor forgets them; the worktrees and branches stay on disk.
+## Records across restarts
+
+When sessions are on (the default; not with `--clean`, headless runs or `restore-session = false`), agent records are saved per repository in the state directory, `$XDG_STATE_HOME/maestro/agents/<hash of the main worktree's canonical path>.json`, next to the editor sessions. A record holds the id, name, group, task, provider name and kind, worktree (path, branch, starting commit, main worktree), status, the archived flag, how the process ended, errors (last 100), history (last 500 events), comments, test runs (last 10, each with its exit code, duration, `cargo test` totals and last 100 output lines) and the ACP session id. It does not hold the provider's command line or environment, the ACP transcript, the agent's stderr or the terminal screen. The file has a version number.
+
+Saving is coalesced. About once a second Maestro checks whether anything a record holds changed (an agent created, a status change, a decision, a test run started or finished, a comment, an archive, a session id) and, if so, writes the file once; a test run's output is saved when the run ends. Quitting saves again with the file synced to disk.
+
+The records of the editor's repository are read when the agent panel first opens, not at startup, on a background thread: finding the main worktree takes Git, and a session that never opens the panel runs no Git for it. Starting an agent waits until they are read, so ids continue after the highest saved one and a new branch never reuses a saved name. A records file that cannot be used (not JSON, another version, written for another repository, a record with an unknown kind, a relative path or a branch outside `maestro/`) is reported in the status line and left as it is, and nothing is saved for that repository in that session, so it is never overwritten.
+
+A loaded agent has no process. A status that needs one (starting, working, planning, editing, awaiting approval, running, running tests, waiting for a prompt) loads as **stopped**, and its history says what it was. Every loaded agent is marked "not running (from an earlier session)" next to its status in the panel, and its live view says the transcript and screen were not saved. Review, tests, comments, drop file, reject, archive and integrate work on it as on any agent. Feedback is refused with a message that says to relaunch it first.
+
+When records load, each one's worktree is checked against `git worktree list`. If Git no longer lists it, its directory is gone, or it is on another branch than the record names, the history says so and relaunch and tests refuse; archive refuses while the directory still exists (when it is gone, archiving only marks the record), and the review shows no diff for a worktree on another branch.
+
+### Relaunch
+
+`R` starts an agent with no process again in its worktree, with the provider of the same name and kind from the current config (the saved record holds no command). It refuses for a found worktree, a running, archived, rejected or integrated agent, one whose worktree changed or is gone, and when no such provider is configured.
+
+- An ACP agent whose saved session id exists, and whose agent advertised `loadSession` when it last ran, is started with `session/load`: the agent replays the conversation into the transcript (not into the history), and the agent then waits for a prompt. If the agent no longer advertises it, or answers `session/load` with an error, a new session starts and the transcript says it has no earlier conversation. Without a saved session id or the capability, a new session starts and the transcript says why. No prompt is sent either way; `f` sends one.
+- A terminal agent runs its provider command with every argument that held `{task}` left out, and nothing is typed in. The status line says so; `C-\` gives it the keys.
+
+### Found worktrees
+
+The same scan lists the repository's worktrees. A worktree on a `maestro/` branch under the agents' worktree directory that no record names (left by an earlier version or a crash) shows in the panel as a found worktree, named `found-<directory>`, with "found worktree" where the status goes. Its review compares it with where it forked from the main worktree's current branch. It can be reviewed (`Enter`), archived (`A`, with the same confirmations as any archive) or adopted (`a`, which asks for a provider and makes it a saved record with status stopped, ready for `R`). Tests, feedback, comments, drop file, compete, reject and integrate refuse until it is adopted. Found worktrees are not saved; an archived one is gone the next time.
 
 ## Providers
 
@@ -53,6 +75,8 @@ Status comes only from these signals:
 | failed | the worktree or process could not start, the turn ended with an error, the ACP process exited mid-turn, or the terminal program exited with a nonzero code |
 | rejected | the user rejected the agent |
 | integrated | the user integrated its work |
+| waiting for a prompt | a relaunched ACP agent's session is up and no turn runs |
+| stopped | no process runs and Maestro did not see the agent finish: a record that was still working when it was saved, an adopted found worktree, or a relaunched ACP agent that exited while waiting for a prompt |
 
 Once rejected or integrated, agent events no longer change the status. `maestro_agent::AgentStatus` has no state for "working" or for a running terminal program, so the editor has its own status type with those two added. Each status is drawn with its name next to its color.
 
@@ -69,14 +93,16 @@ Terminal agents have no structured status. The panel says so ("terminal only") n
 - Feedback (`f`): unsent comments plus typed text. An ACP agent gets them as a new prompt (refused while a turn is running). A terminal agent gets them typed into its terminal, and the input box says that is all Maestro can do.
 - Permission (`p`): lists the choices of the oldest unanswered request (requests queue; the transcript says how many more wait). Choices that allow something ask for confirmation first; rejecting is sent at once.
 - Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree. Rejecting while the worktree is still being made means the agent is never launched.
-- Archive (`A`): removes the worktree with `remove_worktree`, keeping the branch, after the agent's program has exited. Ignored files in it are deleted without a second question, and the dialog says so. If the worktree has uncommitted or untracked files, or commits on no branch, the removal is refused and a second dialog lists what forcing would delete; only `F` there forces it.
+- Relaunch (`R`) and adopt (`a`): see Records across restarts.
+- Archive (`A`): removes the worktree with `remove_worktree`, keeping the branch, after the agent's program has exited. It refuses when Git lists the worktree on another branch than the record names. Ignored files in it are deleted without a second question, and the dialog says so. If the worktree has uncommitted or untracked files, or commits on no branch, the removal is refused and a second dialog lists what forcing would delete; only `F` there forces it.
 - Integrate (`I`): checks first and refuses, changing nothing, if either worktree is gone or on another branch, the main worktree is detached or has uncommitted changes, the agent's starting commit is not on the main worktree's branch, or an open buffer in either worktree has unsaved edits. The dialog says what will be committed and how the branch will be integrated (`tab` cycles merge, fast-forward and cherry-pick). On `y`, the same checks run again; then uncommitted work in the agent's worktree is committed with the task's first line as the subject, and `integrate` runs in the main worktree. `maestro-git` checks again and refuses on its own.
 - A dialog that does not fit the window cannot be accepted.
 - `:q` and `:qa` refuse while Git work for an agent runs (a worktree being made, an integration, an archive). With agents or tests running they ask first, and on `y` stop them and wait up to a second for terminal programs to exit. The automation API's `editor.quit` refuses the same way while Git work runs, and refuses while agents or tests run unless `force` is passed, which stops them first.
 
 ## Not built
 
-- Agent records do not survive a restart, so the "Sessions" item of M2 is not done.
+- Two Maestro instances in one repository each save the records they know; the last to save wins. Worktrees whose record was lost that way show up as found worktrees next time.
+- Relaunch does not send the task again, and a relaunched terminal agent gets no task at all.
 - Agents cannot propose edits to open buffers; there is no edit proposal or review status per buffer edit.
 - No OS sandbox around agent processes (see `docs/security.md`).
 - Terminals show only in the panel, not in splits.

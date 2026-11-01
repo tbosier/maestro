@@ -286,6 +286,12 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
             );
             changed.as_str()
         }
+        (Origin::Loaded, _) if a.archived => {
+            "archived: the worktree was removed; the record stays for its history and decisions"
+        }
+        (Origin::Loaded, _) if a.from_earlier_session() && a.base_status().is_decided() => {
+            "no process, and none is started again: the work was decided on"
+        }
         (Origin::Loaded, _) if a.from_earlier_session() => {
             "no process: R relaunches it; review, tests, comments, integrate and archive work without one"
         }
@@ -470,6 +476,12 @@ fn transcript_lines(ed: &Editor, a: &Agent, width: usize) -> Vec<(String, Style)
         push(
             "",
             "a found worktree with no record: nothing ran here in this session. v shows the history",
+            ui.text_muted,
+        );
+    } else if a.from_earlier_session() && !a.can_relaunch() {
+        push(
+            "",
+            "not running (from an earlier session); the transcript and screen are not saved",
             ui.text_muted,
         );
     } else if a.from_earlier_session() {

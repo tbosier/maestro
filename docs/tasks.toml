@@ -127,4 +127,7 @@ status = "in-progress"
 # (space a, :agents) with C-\ terminal keys, review screen, tests,
 # feedback, permissions, reject, archive, integrate, quit confirmation,
 # M2 acceptance test and a tmux run with shell-script providers.
-# Open: agent sessions across restarts, a real agent run through the panel.
+# Agent sessions across restarts (feat/agent-sessions): records saved per
+# repository, loaded on the panel's first open, relaunch with session/load,
+# found worktrees.
+# Open: a real agent run through the panel.

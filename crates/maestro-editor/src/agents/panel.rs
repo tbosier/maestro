@@ -828,11 +828,7 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     }
     // Relaunch comes first for an agent with no process, where it is the
     // next thing to do, and is listed for any agent it applies to.
-    let relaunchable = !a.is_running()
-        && !a.archived
-        && !a.base_status().is_decided()
-        && a.worktree.is_some()
-        && a.git_busy.is_none();
+    let relaunchable = a.can_relaunch();
     if relaunchable && a.from_earlier_session() {
         out.push(("R", "relaunch"));
     }
