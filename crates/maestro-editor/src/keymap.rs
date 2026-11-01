@@ -382,8 +382,12 @@ impl Keymaps {
         for (k, c) in crate::agents::DEFAULT_KEYS
             .iter()
             .chain(crate::proposals::DEFAULT_KEYS)
+            .chain(crate::git_screen::DEFAULT_KEYS)
         {
             g(&mut normal, k, "space", c);
+        }
+        for (k, group, c) in crate::git_hunks::DEFAULT_KEYS {
+            g(&mut normal, k, group, c);
         }
 
         if profile == Profile::Vim {
