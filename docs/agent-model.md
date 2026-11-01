@@ -1,6 +1,6 @@
 # Agent model
 
-This describes what is built as of October 31, 2026. Anything marked partial or not built is not there.
+This describes what is built as of November 1, 2026. Anything marked partial or not built is not there.
 
 ## Version-checked edits
 
@@ -24,11 +24,70 @@ An agent is a record in the editor (`maestro_editor::agents::Agent`) with:
 - verification runs with their output (last 20,000 lines each), exit code, duration and parsed `cargo test` totals;
 - errors, and the files changed according to the last review diff;
 - review comments, each on one line of one file, marked once sent;
-- for ACP agents, the session id and whether the agent advertised `loadSession`.
+- for ACP agents, the session id and whether the agent advertised `loadSession`;
+- the task contract, when one was attached (below).
+
+## Task contracts
+
+A task can carry a contract: the paths it may change, paths it must not change, a verification command and acceptance criteria for the reviewer. It is attached when the task is created and does not change afterward. `N` starts the competing agent under the same contract.
+
+### Writing one
+
+In the task input (`n`), a line whose first word is one of these is a contract line and is taken out of the task text; every other line stays in the task (a line starting `@decorator` is task text):
+
+| Line | Meaning |
+|---|---|
+| `@allow <pattern> ...` | paths the task may change, separated by spaces; several lines add up |
+| `@forbid <pattern> ...` | paths it must not change, whatever `@allow` says |
+| `@verify <command>` | the verification command; spaces separate words, single or double quotes group them; one per task |
+| `@accept <text>` | one acceptance criterion, plain text for the reviewer |
+| `@contract <path>` | read the contract from a TOML file instead; the path is relative to the editor's working directory |
+
+`A-ret` starts a new line in the input, and pasting multi-line text works. A file and typed lines cannot be combined.
+
+A contract file is read only when the user names it with `@contract`; Maestro never looks for one in the repository. It must be a regular file of at most 64 KiB, and unknown keys are refused:
+
+```toml
+allowed = ["calc.py", "tests/**"]
+forbidden = ["secrets/**"]
+verify = ["python3", "test_calc.py"]   # or one string, split like @verify
+acceptance = ["add(2, 3) returns 5"]   # or one string
+```
+
+Patterns are relative to the repository root and anchored there: `calc.py` is only the top-level file, `*` matches within one directory, `?` one character, `**` any number of directories, and a pattern that names a directory covers everything in it (`src` and `src/` cover `src/a/b.rs`). An empty `allowed` list allows every path that is not forbidden. Matching is case-sensitive, on any file system. Absolute patterns, `..`, `.`, empty segments (one trailing `/` is allowed), `!` negation, backslashes, `**` twice in a row, more than three `**` or eight `*` in one segment, and patterns over 512 bytes are refused; the limits keep matching cheap, since the panel checks every changed file on each redraw. With any pattern, a file name that is not valid UTF-8 counts as outside the contract.
+
+After `ret`, a dialog shows the whole contract (the verification command quoted word by word, with control and direction-changing characters escaped) and says what Maestro enforces; `y` goes on to the provider list, whose title says whether the task has a contract.
+
+### What Maestro does with it
+
+The contract is a request to the agent, plus a few checks Maestro can make itself. It does not confine the agent.
+
+- Sent to the agent: an ACP agent gets the contract after the task in its first prompt; a terminal agent gets it after the task in the `{task}` argument or in the text typed in. A relaunch (`R`) sends neither the task nor the contract.
+- Enforced for ACP file writes through Maestro: `fs/write_text_file` requests outside the allowed paths, or inside a forbidden one, are refused, judged on the file that would actually be written (after symlinks). The agent gets an error, and the refusal goes to the agent's errors and history. The agent's own tools (its shell, its own file writes) and every terminal agent are not stopped.
+- Marked in the review: every changed file outside the contract has `!` before its change letter in the review's file list, a line above its diff that says which rule it breaks, a count in the review summary, and `! N outside contract` in the agent list.
+- Checked at integrate: the dialog names every file outside the contract, computed from Git when the dialog opens: files in the net diff from the agent's starting commit, and files any commit on the agent's branch touched (a file changed and changed back does not show in the net diff, but a cherry-pick applies each commit). `y` is then refused and only `O` integrates; `D` in the review drops a file instead (a file only commits on the branch touched stays listed, because the commits stay). A dialog too long for the window cannot be accepted. After the agent's work is committed, Maestro checks that the branch holds exactly the files the dialog was computed on and that no file outside the contract is there that the dialog did not name; otherwise nothing is integrated (the commit stays on the agent's branch) and `I` shows the new state. A commit that reaches the agent's branch in the moment between that check and the merge is not stopped. After the merge, Maestro compares the target branch before and after against the contract and reports, as an error, any file outside it that the dialog did not name. When Maestro made the commit, its message names the files `O` let in; the agent's history names them either way.
+- Verification: `t` runs the contract's command instead of `[agents] test-command`. Before the command starts, Maestro takes a snapshot of the worktree (see Overlaps and conflicts) on the run's background thread, so it records the files the run started on. The integrate dialog warns, without blocking, when no verification has run (only when some verification command is set), when the last one is still running or did not pass, when the files changed since it started (it names them; files the tests wrote themselves count too), and when the agent's process was running during it.
+- Acceptance criteria are shown in the contract dialog and sent to the agent. Maestro does not check them.
+
+## Overlaps and conflicts between agents
+
+Two agents of the same repository overlap when their last review diffs name the same file (a rename counts for both its paths), or when one names a path that is a directory of a path the other names (one adds the file `assets`, the other `assets/icon.png`). Agents that are found worktrees, archived, rejected or integrated, or whose worktree changed branch, are left out. The panel shows each agent's overlaps in the list (`overlaps beta-2`, or `CONFLICTS beta-2`) and in full on the sixth summary row (`overlaps beta-2 in README.md: CONFLICT in README.md`, `would merge cleanly`, `checking whether they conflict`, or why the dry run failed).
+
+For each overlapping pair, a background thread takes a snapshot of both worktrees and runs a merge dry run between them (`git merge-tree`). A snapshot is the worktree's files as they are on disk (`HEAD` plus staged, unstaged and untracked files, ignored files left out) written as a commit that no branch or ref points at, built in a temporary copy of the index. The snapshot is refused if `HEAD` moves while it is taken. Its id depends only on the files and `HEAD`, so the dry run's result is cached by the repository and the pair of snapshot ids. A change to the repository's merge configuration (merge drivers, `merge.*` settings) does not clear the cache.
+
+What it costs:
+
+- Overlap is found from the review diffs the editor already has, with no Git. Agents whose files overlap nobody else's cost nothing more.
+- The pairs are recomputed only when some agent's review diff or its `HEAD` commit changed, when a review diff holds a binary file (its diff does not show the contents, so every refresh counts), or when an agent was rejected, integrated or archived. Review diffs refresh every three seconds for running agents while the panel is open, and on the events listed under The panel and review screen. One recomputation runs at a time; requests that arrive meanwhile are folded into one rerun.
+- Each recomputation takes one snapshot per agent in an overlapping pair (a `git add` into the index copy, which rehashes only files whose stats changed, then `write-tree` and `commit-tree`), and runs `merge-tree` only for pairs whose snapshot ids are not cached. At most 256 results are kept; when new ones would not fit, the old ones are dropped.
+
+The integrate dialog's check below uses the other agents' last review diffs to pick which of them overlap; an agent whose new file has not reached its review diff yet is not checked.
+
+The integrate dialog for one agent first says, on its own line, when this agent's work conflicts with the target branch now (Git would refuse the merge after committing the work on the agent's branch). It then checks the other overlapping agents against the target branch as it would be afterward: the target's `HEAD` merged in memory with this agent's snapshot, written as an unreferenced commit, then a dry run of that with each other agent's snapshot. The dialog names the agents that would then conflict and the files, the overlapping ones that would still merge cleanly, and any it could not check (all of them when this agent's own work conflicts with the target). The dry runs model a merge, whichever method the dialog is set to.
 
 ## Records across restarts
 
-When sessions are on (the default; not with `--clean`, headless runs or `restore-session = false`), agent records are saved per repository in the state directory, `$XDG_STATE_HOME/maestro/agents/<hash of the main worktree's canonical path>.json`, next to the editor sessions. A record holds the id, name, group, task, provider name and kind, worktree (path, branch, starting commit, main worktree), status, the archived flag, how the process ended, errors (last 100), history (last 500 events), comments, test runs (last 10, each with its exit code, duration, `cargo test` totals and last 100 output lines) and the ACP session id. It does not hold the provider's arguments or environment, the ACP transcript, the agent's stderr or the terminal screen; the history names the program that was started. The file has a version number.
+When sessions are on (the default; not with `--clean`, headless runs or `restore-session = false`), agent records are saved per repository in the state directory, `$XDG_STATE_HOME/maestro/agents/<hash of the main worktree's canonical path>.json`, next to the editor sessions. A record holds the id, name, group, task, provider name and kind, worktree (path, branch, starting commit, main worktree), status, the archived flag, how the process ended, errors (last 100), history (last 500 events), comments, test runs (last 10, each with its exit code, duration, `cargo test` totals, last 100 output lines and the snapshot tree of the files it ran on), the ACP session id and the task contract. A saved contract is checked like a typed one when the file is read. It does not hold the provider's arguments or environment, the ACP transcript, the agent's stderr or the terminal screen; the history names the program that was started. The file has a version number.
 
 Saving is coalesced. About once a second Maestro checks whether anything a record holds changed (an agent created, a status change, a decision, a test run started or finished, a comment, an archive, a session id) and, if so, writes the file once; a test run's output is saved when the run ends. Quitting saves again with the file synced to disk.
 
@@ -88,14 +147,14 @@ Terminal agents have no structured status. The panel says so ("terminal only") n
 
 ## Actions
 
-- Tests (`t`): runs `[agents] test-command`, or `cargo test` when the worktree has a `Cargo.toml`, with `maestro-tasks`. Output streams into the tests view; the totals are parsed from `cargo test` output.
+- Tests (`t`): runs the task contract's verification command if it has one, else `[agents] test-command`, or `cargo test` when the worktree has a `Cargo.toml`, with `maestro-tasks`. Output streams into the tests view; the totals are parsed from `cargo test` output.
 - Drop a file (`D` in the review): discards the agent's change to the file under the cursor in its worktree, after a dialog that says what happens to it (restored to the starting commit's version, or deleted if the agent added it). Refused while that file has unsaved edits in a buffer, while other Git work for the agent runs, when the worktree no longer has the agent's branch checked out or no longer descends from its starting commit, and when the path (or a parent of it) is a directory or a symlink. A file the agent turned into a symlink, or the reverse, is restored whichever half of the change is dropped. This is how to keep stray files (build output, caches) out of an integration; there is no partial staging of hunks.
 - Feedback (`f`): unsent comments plus typed text. An ACP agent gets them as a new prompt (refused while a turn is running). A terminal agent gets them typed into its terminal, and the input box says that is all Maestro can do.
 - Permission (`p`): lists the choices of the oldest unanswered request (requests queue; the transcript says how many more wait). Choices that allow something ask for confirmation first; rejecting is sent at once.
 - Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree. Rejecting while the worktree is still being made means the agent is never launched.
 - Relaunch (`R`) and adopt (`a`): see Records across restarts.
 - Archive (`A`): removes the worktree with `remove_worktree`, keeping the branch, after the agent's program has exited. It refuses when Git lists the worktree on another branch than the record names. Ignored files in it are deleted without a second question, and the dialog says so. If the worktree has uncommitted or untracked files, or commits on no branch, the removal is refused and a second dialog lists what forcing would delete; only `F` there forces it.
-- Integrate (`I`): checks first and refuses, changing nothing, if either worktree is gone or on another branch, the main worktree is detached or has uncommitted changes, the agent's starting commit is not on the main worktree's branch, or an open buffer in either worktree has unsaved edits. The dialog says what will be committed and how the branch will be integrated (`tab` cycles merge, fast-forward and cherry-pick). On `y`, the same checks run again; then uncommitted work in the agent's worktree is committed with the task's first line as the subject, and `integrate` runs in the main worktree. `maestro-git` checks again and refuses on its own.
+- Integrate (`I`): checks first and refuses, changing nothing, if either worktree is gone or on another branch, the main worktree is detached or has uncommitted changes, the agent's starting commit is not on the main worktree's branch, or an open buffer in either worktree has unsaved edits. The dialog says what will be committed and how the branch will be integrated (`tab` cycles merge, fast-forward and cherry-pick). On `y`, the same checks run again; then uncommitted work in the agent's worktree is committed with the task's first line as the subject, and `integrate` runs in the main worktree. `maestro-git` checks again and refuses on its own. With a task contract, files outside it need `O` instead of `y`, and the dialog warns about the last verification and names agents that would conflict afterward (see Task contracts and Overlaps).
 - A dialog that does not fit the window cannot be accepted.
 - `:q` and `:qa` refuse while Git work for an agent runs (a worktree being made, an integration, an archive). With agents or tests running they ask first, and on `y` stop them and wait up to a second for terminal programs to exit. The automation API's `editor.quit` refuses the same way while Git work runs, and refuses while agents or tests run unless `force` is passed, which stops them first.
 
@@ -106,3 +165,5 @@ Terminal agents have no structured status. The panel says so ("terminal only") n
 - Agents started from the panel cannot propose edits to open buffers. An automation client can (`proposal.create`, see `docs/automation.md`), and an agent that speaks the automation protocol could do so as a client, but the panel does not connect its agents to it.
 - No OS sandbox around agent processes (see `docs/security.md`).
 - Terminals show only in the panel, not in splits.
+- A task contract cannot be edited after the task starts, and nothing checks the acceptance criteria. Contracts do not confine terminal agents or an ACP agent's own tools; only writes through Maestro are refused.
+- Conflict detection covers agents of one repository against each other and, in the integrate dialog, against the target branch. It does not watch the target branch on its own, and the panel does not show which agents already conflict with it.

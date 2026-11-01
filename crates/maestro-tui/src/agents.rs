@@ -10,6 +10,7 @@ use maestro_editor::agents::{
     Agent, DiffLineKind, FileChange, Origin, ProviderKind, Runtime, Screen, Status, TermColor,
     TranscriptEntry,
 };
+use maestro_editor::agents::{conflicts, contract::Contract};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::render::{CursorShape, draw_box, wrap};
@@ -48,7 +49,7 @@ pub(crate) fn draw(ed: &Editor, s: &mut Surface) -> CursorShape {
         );
         return CursorShape::Hidden;
     }
-    let l = panel::layout(area);
+    let l = panel::agent_layout(area);
     let ui = &ed.theme.ui;
     s.fill(area, ui.text);
     draw_header(ed, s, &l);
@@ -159,7 +160,23 @@ fn list_status(a: &Agent) -> &'static str {
 pub const EARLIER: &str = "not running (from an earlier session)";
 
 /// One-line facts for the list: `#1 acp  3 files +12 -4  ok 40`.
-fn list_detail(a: &Agent) -> String {
+/// The list's second line. What needs the reviewer's attention comes
+/// first, so a narrow list does not cut it off: files outside the task
+/// contract, then overlaps and conflicts with other agents.
+fn list_detail(ed: &Editor, a: &Agent) -> String {
+    let mut d = String::new();
+    let outside = a.out_of_scope().len();
+    if outside > 0 && !a.archived {
+        d.push_str(&format!("! {outside} outside contract  "));
+    }
+    if let Some(c) = conflicts::brief(ed, a.id) {
+        d.push_str(&format!("{c}  "));
+    }
+    d.push_str(&list_facts(a));
+    d
+}
+
+fn list_facts(a: &Agent) -> String {
     let mut d = match a.origin {
         Origin::Found => "no record".to_string(),
         _ if a.from_earlier_session() => format!(
@@ -235,7 +252,7 @@ fn draw_list(ed: &Editor, s: &mut Surface, area: Rect) {
         } else {
             ui.text_muted
         };
-        s.print(area.x + 2, y + 1, &list_detail(a), muted, area.right());
+        s.print(area.x + 2, y + 1, &list_detail(ed, a), muted, area.right());
     }
 }
 
@@ -331,6 +348,56 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     let x = s.print(x0, y, "task: ", ui.text_muted, task_r);
     s.print(x, y, first, ui.text, task_r);
     s.print(task_r, y, &view, ui.text_muted, r);
+    y += 1;
+    if y >= area.bottom() {
+        return;
+    }
+    // Row 5: the task contract, and what is outside it.
+    draw_contract_row(ed, s, x0, y, r, a);
+    y += 1;
+    if y >= area.bottom() {
+        return;
+    }
+    // Row 6: overlaps with other agents.
+    draw_overlap_row(ed, s, x0, y, r, a);
+}
+
+/// `contract: ...`, led by a warning when changed files are outside it.
+fn draw_contract_row(ed: &Editor, s: &mut Surface, x0: u16, y: u16, r: u16, a: &Agent) {
+    let ui = &ed.theme.ui;
+    let Some(c) = &a.contract else {
+        s.print(x0, y, "no task contract", ui.text_muted, r);
+        return;
+    };
+    let mut x = x0;
+    let outside = a.out_of_scope();
+    if !outside.is_empty() && !a.archived {
+        let warn = format!("! {} changed file(s) outside the contract  ", outside.len());
+        x = s.print(x, y, &warn, ui.message_warning.bold(), r);
+    }
+    s.print(x, y, &contract_line(c), ui.text_muted, r);
+}
+
+fn contract_line(c: &Contract) -> String {
+    format!("contract: {}", c.brief())
+}
+
+fn draw_overlap_row(ed: &Editor, s: &mut Surface, x0: u16, y: u16, r: u16, a: &Agent) {
+    let ui = &ed.theme.ui;
+    let lines = conflicts::describe(ed, a.id);
+    if lines.is_empty() {
+        s.print(x0, y, "no overlap with other agents", ui.text_muted, r);
+        return;
+    }
+    let conflict = conflicts::for_agent(ed, a.id)
+        .iter()
+        .any(|(_, p)| matches!(p.merge, conflicts::Merge::Conflicts(_)));
+    let style = if conflict {
+        ui.message_warning.bold()
+    } else {
+        ui.text
+    };
+    s.print(x0, y, &lines.join("; "), style, r);
 }
 
 /// The end of `text` in at most `width` columns, with `…` when cut.
@@ -691,7 +758,25 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
         let counts = format!(" +{add} -{rem}");
         let cw = counts.chars().count() as u16;
         let name_r = list.right().saturating_sub(cw);
-        let x = s.print(list.x + 2, y, kind_letter(&f.change), bg.bold(), name_r);
+        // A file outside the task contract is marked with `!` before its
+        // change letter; the summary says what the mark means.
+        let outside = a.contract.as_ref().is_some_and(|c| {
+            maestro_editor::agents::file_paths(f)
+                .iter()
+                .any(|p| c.violation(p).is_some())
+        });
+        let x = if outside {
+            s.print(
+                list.x + 1,
+                y,
+                "!",
+                bg.patch(ui.message_warning).bold(),
+                name_r,
+            )
+        } else {
+            list.x + 2
+        };
+        let x = s.print(x, y, kind_letter(&f.change), bg.bold(), name_r);
         let path = f
             .path()
             .map(|p| p.display().to_string())
@@ -780,6 +865,28 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
             ui.message_error,
             r,
         );
+    }
+    if sm.height > 4 {
+        let outside = a.out_of_scope();
+        match &a.contract {
+            Some(_) if !outside.is_empty() => {
+                let text = format!(
+                    "! {} file(s) {} (marked !): integrating them needs O; D drops one",
+                    outside.len(),
+                    review::OUT_OF_SCOPE
+                );
+                s.print(sm.x + 1, sm.y + 4, &text, ui.message_warning.bold(), r);
+            }
+            Some(c) => {
+                s.print(sm.x + 1, sm.y + 4, &contract_line(c), ui.text_muted, r);
+            }
+            None => {
+                s.print(sm.x + 1, sm.y + 4, "no task contract", ui.text_muted, r);
+            }
+        }
+    }
+    if sm.height > 5 {
+        draw_overlap_row(ed, s, sm.x + 1, sm.y + 5, r, a);
     }
     // Diff.
     let c = l.content;

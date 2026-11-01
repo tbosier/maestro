@@ -1453,3 +1453,149 @@ fn drop_change_undoes_a_file_turned_into_a_symlink() {
     );
     assert!(inner.review_diff("main").unwrap().is_empty());
 }
+
+/// Git trusts an index entry's cached stats only when the file is older
+/// than the index. A file rewritten with the same size in the same second
+/// as the index was written is "racily clean" and must be read again; a
+/// copy of the index must keep the original's time for that to work.
+#[test]
+fn index_copies_keep_racy_git_protection() {
+    use std::time::{Duration, SystemTime};
+    let f = Fixture::new();
+    let wt = f.tmp.join("racy");
+    f.repo().add_worktree(&wt, "maestro/racy", "main").unwrap();
+    let past = SystemTime::now() - Duration::from_secs(30);
+    let set = |p: &Path| {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(past)
+            .unwrap()
+    };
+    // The entry caches `past`, and the index is from the same second.
+    set(&wt.join("a.txt"));
+    f.git_ok(&wt, &["update-index", "--refresh"]);
+    let index = wt.join(f.git_ok(&wt, &["rev-parse", "--git-path", "index"]).trim());
+    set(&index);
+    // Same size, same time: only the contents say it changed.
+    std::fs::write(wt.join("a.txt"), "ONE\ntwo\nthree\n").unwrap();
+    set(&wt.join("a.txt"));
+    // An untracked file makes the review diff use its index copy.
+    write_in(&wt, "new.txt", "new\n");
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let files = repo.review_diff("main").unwrap();
+    assert_eq!(by_path(&files, "a.txt").change, FileChange::Modified);
+    let snap = repo.work_snapshot().unwrap();
+    assert_eq!(
+        f.git_ok(&wt, &["show", &format!("{}:a.txt", snap.commit)]),
+        "ONE\ntwo\nthree\n"
+    );
+}
+
+#[test]
+fn paths_touched_sees_changes_a_net_diff_hides() {
+    let f = Fixture::new();
+    let wt = agent_branch(&f, "maestro/t", "keep.txt", "k\n");
+    // Changed and changed back: the net diff does not name a.txt.
+    commit_in(&f, &wt, "a.txt", "changed\n", "change a");
+    commit_in(&f, &wt, "a.txt", "one\ntwo\nthree\n", "restore a");
+    f.git_ok(&wt, &["mv", "keep.txt", "moved name.txt"]);
+    f.git_ok(&wt, &["commit", "-q", "-m", "move"]);
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let net: Vec<_> = repo
+        .review_diff("main")
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.path().cloned())
+        .collect();
+    assert_eq!(net, [PathBuf::from("moved name.txt")]);
+    assert_eq!(
+        repo.paths_touched("main", "HEAD").unwrap(),
+        [
+            PathBuf::from("a.txt"),
+            PathBuf::from("keep.txt"),
+            PathBuf::from("moved name.txt")
+        ]
+    );
+    assert!(repo.paths_touched("HEAD", "HEAD").unwrap().is_empty());
+    assert!(repo.paths_touched("-x", "HEAD").is_err());
+}
+
+#[test]
+fn work_snapshots_hold_uncommitted_work_and_change_nothing() {
+    let f = Fixture::new();
+    f.write(".gitignore", "build/\n");
+    f.commit_all("ignore build");
+    let wt_a = agent_branch(&f, "maestro/a", "only-a.txt", "a\n");
+    let wt_b = f.tmp.join("maestro-b");
+    f.repo().add_worktree(&wt_b, "maestro/b", "main").unwrap();
+    let api = f.api();
+    let a = api.discover(&wt_a).unwrap().unwrap();
+    let b = api.discover(&wt_b).unwrap().unwrap();
+
+    // Uncommitted, untracked and ignored files in a.
+    write_in(&wt_a, "a.txt", "one\nTWO from a\nthree\n");
+    write_in(&wt_a, "new.txt", "untracked\n");
+    write_in(&wt_a, "build/out.o", "ignored\n");
+    let before = snapshot(&f, &wt_a);
+    let snap = a.work_snapshot().unwrap();
+    assert_eq!(
+        snapshot(&f, &wt_a),
+        before,
+        "nothing in the worktree changes"
+    );
+    assert_eq!(
+        f.git_ok(&wt_a, &["status", "--porcelain"]),
+        " M a.txt\n?? new.txt\n"
+    );
+    let files = f.git_ok(&wt_a, &["ls-tree", "-r", "--name-only", &snap.commit]);
+    assert_eq!(files, ".gitignore\na.txt\nnew.txt\nonly-a.txt\n");
+    assert_eq!(
+        f.git_ok(&wt_a, &["show", &format!("{}:a.txt", snap.commit)]),
+        "one\nTWO from a\nthree\n"
+    );
+    assert_eq!(
+        f.git_ok(&wt_a, &["rev-parse", &format!("{}^", snap.commit)])
+            .trim(),
+        rev(&f, &wt_a, "HEAD")
+    );
+    assert_eq!(
+        f.git_ok(&wt_a, &["rev-parse", &format!("{}^{{tree}}", snap.commit)])
+            .trim(),
+        snap.tree
+    );
+    // No ref names it.
+    assert_eq!(f.git(&["for-each-ref", "--contains", &snap.commit]), "");
+    // The same state gives the same commit; a change gives another.
+    assert_eq!(a.work_snapshot().unwrap(), snap);
+    write_in(&wt_a, "new.txt", "changed\n");
+    assert_ne!(a.work_snapshot().unwrap(), snap);
+    write_in(&wt_a, "new.txt", "untracked\n");
+    assert_eq!(a.work_snapshot().unwrap(), snap);
+
+    // Dry runs between two worktrees' uncommitted states: compatible
+    // edits merge, edits to the same line conflict.
+    write_in(&wt_b, "a.txt", "one\ntwo\nthree\nfour from b\n");
+    let sb = b.work_snapshot().unwrap();
+    let main = f.repo();
+    assert!(
+        main.merge_check(&snap.commit, &sb.commit)
+            .unwrap()
+            .is_clean()
+    );
+    write_in(&wt_b, "a.txt", "one\nTWO from b\nthree\n");
+    let sb = b.work_snapshot().unwrap();
+    match main.merge_check(&snap.commit, &sb.commit).unwrap() {
+        MergeCheck::Conflicts { files, .. } => assert_eq!(files, [PathBuf::from("a.txt")]),
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+
+    // commit_tree is deterministic and moves nothing.
+    let head = rev(&f, &f.repo, "HEAD");
+    let c1 = main.commit_tree(&snap.tree, &[&head], "x").unwrap();
+    let c2 = main.commit_tree(&snap.tree, &[&head], "x").unwrap();
+    assert_eq!(c1, c2);
+    assert_eq!(rev(&f, &f.repo, "HEAD"), head);
+    assert!(main.commit_tree("-x", &[], "x").is_err());
+}

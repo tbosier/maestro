@@ -23,7 +23,7 @@ pub mod fake;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-pub use client::AcpClient;
+pub use client::{AcpClient, ClientRules, WriteRule};
 pub use files::{AccessError, FileAccess};
 
 /// Identifies an agent within one editor session.

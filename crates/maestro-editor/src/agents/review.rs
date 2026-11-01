@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use maestro_git::{DiffFile, DiffLineKind, FileChange, intraline};
 
-use super::panel::{InputPurpose, Overlay, layout};
+use super::panel::{InputPurpose, Overlay, agent_layout};
 use super::{AgentId, Comment, Status};
 use crate::editor::Editor;
 use crate::key::{KeyCode, KeyEvent};
@@ -291,7 +291,13 @@ pub fn request(ed: &mut Editor, id: AgentId) {
             // was switched to other work shows that instead of its diff.
             Ok(Some(repo)) if canon(repo.root()) == canon(&w.path) => match repo.head() {
                 Ok(maestro_git::Head::Branch(b)) if b == w.branch => {
-                    repo.review_diff(&w.base).map_err(|e| e.to_string())
+                    // The commit too: the same diff on another history
+                    // (a merge resolved back to the same text) can merge
+                    // differently with other agents' work.
+                    let head = repo.resolve("HEAD").ok();
+                    repo.review_diff(&w.base)
+                        .map(|files| (files, head))
+                        .map_err(|e| e.to_string())
                 }
                 Ok(other) => Err(format!(
                     "the worktree is on {} now, not {}; no diff shown",
@@ -312,14 +318,29 @@ pub fn request(ed: &mut Editor, id: AgentId) {
     }
 }
 
-fn applied(ed: &mut Editor, id: AgentId, result: Result<Vec<DiffFile>, String>) {
+fn applied(ed: &mut Editor, id: AgentId, result: Result<(Vec<DiffFile>, Option<String>), String>) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
     a.review.running = false;
+    // Overlaps and conflicts with other agents follow every change to
+    // what the diff says (files, an error, the first result) and to the
+    // commit it is on. A binary file's diff does not show its contents,
+    // so a diff with one always counts as changed.
+    let changed = match &result {
+        Ok((files, head)) => {
+            a.review.computed.is_none()
+                || a.review.error.is_some()
+                || *files != a.review.files
+                || *head != a.review.head
+                || files.iter().any(|f| f.binary)
+        }
+        Err(e) => a.review.error.as_ref() != Some(e),
+    };
     match result {
-        Ok(files) => {
+        Ok((files, head)) => {
             a.review.files = files;
+            a.review.head = head;
             a.review.error = None;
             a.review.computed = Some(Instant::now());
             // A finished agent with nothing to review says so, judged
@@ -342,6 +363,9 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<Vec<DiffFile>, String>) 
     let again = a.review.again && !a.archived;
     if again {
         request(ed, id);
+    }
+    if changed {
+        super::conflicts::refresh(ed);
     }
     let n = ed.agents.get(id).map(|a| a.review.files.len()).unwrap_or(0);
     if let Some(v) = &mut ed.agents.panel.review
@@ -385,8 +409,20 @@ pub fn current_rows(ed: &Editor) -> Vec<Row> {
     let Some(f) = a.review.files.get(v.file) else {
         return Vec::new();
     };
-    rows(f, v.side_by_side, &file_comments(&a.comments, f))
+    let mut out = Vec::new();
+    if let Some(c) = &a.contract {
+        for (_, why) in super::out_of_scope(c, std::slice::from_ref(f)) {
+            out.push(Row::Note(format!(
+                "{OUT_OF_SCOPE}: {why}; integrating it needs O, D drops it"
+            )));
+        }
+    }
+    out.extend(rows(f, v.side_by_side, &file_comments(&a.comments, f)));
+    out
 }
+
+/// The words the review puts on a file the task contract does not allow.
+pub const OUT_OF_SCOPE: &str = "outside the task contract";
 
 pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     let Some(mut v) = ed.agents.panel.review.clone() else {
@@ -395,7 +431,7 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     let id = v.agent;
     let nfiles = ed.agents.get(id).map(|a| a.review.files.len()).unwrap_or(0);
     let rows = current_rows(ed);
-    let height = layout(ed.area).content.height.max(1) as usize;
+    let height = agent_layout(ed.area).content.height.max(1) as usize;
     let last = rows.len().saturating_sub(1);
     let ctrl = key.mods.ctrl;
     match key.code {
