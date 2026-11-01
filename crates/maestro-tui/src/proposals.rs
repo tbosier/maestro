@@ -133,7 +133,7 @@ pub(crate) fn draw(ed: &Editor, s: &mut Surface) -> CursorShape {
     let rows = review::current_rows(ed);
     for (i, row) in rows.iter().enumerate().skip(v.top).take(c.height as usize) {
         let y = c.y + (i - v.top) as u16;
-        draw_row(ed, s, Rect::new(c.x, y, c.width, 1), row);
+        draw_row(ed, s, Rect::new(c.x, y, c.width, 1), row, v.left);
         if i == v.cursor {
             s.put(c.x, y, "▶", ui.border_active, c.x + 1);
         }

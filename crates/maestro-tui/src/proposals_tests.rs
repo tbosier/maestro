@@ -105,3 +105,56 @@ fn review_never_panics_at_small_sizes() {
         crate::render::render(&ed, &mut s);
     }
 }
+
+#[test]
+fn text_past_the_right_edge_is_marked_and_reachable() {
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 100, 28));
+    let id = ed.add_document(Document::from_text("x\n"));
+    ed.switch_to(id);
+    let long = format!("y{}touch marker", " ".repeat(300));
+    let changes = ChangeSet::from_changes(2, [Change::replace(0, 1, long.as_str())]).unwrap();
+    proposals::submit(
+        &mut ed,
+        NewProposal {
+            doc: id,
+            base_version: DocumentVersion(0),
+            changes,
+            edit_count: 1,
+            actor: Actor {
+                name: "agent:wide".into(),
+                agent_id: None,
+            },
+            description: "looks small".into(),
+            verify: None,
+        },
+    );
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('e'));
+    let mut s = Surface::new(100, 30, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let rows = screen(&s);
+    let added = rows
+        .iter()
+        .find(|r| r.contains("+y"))
+        .expect("the added line is drawn");
+    assert!(added.trim_end().ends_with('>'), "{added:?}");
+    assert!(!rows.join("\n").contains("touch marker"));
+    // The dialog warns before approval.
+    ed.handle_key(KeyEvent::char('a'));
+    let mut s = Surface::new(100, 30, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let text = screen(&s).join("\n");
+    assert!(text.contains("wider than the review shows"), "{text}");
+    ed.handle_key(KeyEvent::char('n'));
+    // Scrolling right brings the rest into view, marked as scrolled.
+    for _ in 0..12 {
+        ed.handle_key(KeyEvent::char('l'));
+        let mut s = Surface::new(100, 30, ed.theme.ui.text);
+        crate::render::render(&ed, &mut s);
+        if let Some(row) = screen(&s).into_iter().find(|r| r.contains("touch marker")) {
+            assert!(row.contains('<'), "{row:?}");
+            return;
+        }
+    }
+    panic!("scrolling right never showed the end of the line");
+}

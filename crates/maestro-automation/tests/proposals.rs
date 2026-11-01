@@ -887,6 +887,34 @@ fn a_buffer_saved_under_another_name_makes_its_proposals_stale() {
 }
 
 #[test]
+fn the_newest_resolution_survives_pruning() {
+    // One proposal waits while 500 newer ones are made and withdrawn;
+    // resolving the old one must keep its record and notification.
+    let mut h = Harness::new("prune");
+    let doc = h.file("p.txt", "abc\n");
+    let old = create(&mut h, edit(doc, 0, 0, 1, "A"))["id"]
+        .as_u64()
+        .unwrap();
+    for _ in 0..maestro_editor::proposals::MAX_RESOLVED {
+        let id = create(&mut h, edit(doc, 0, 1, 2, "B"))["id"].clone();
+        h.ok("proposal.withdraw", json!({"proposal": id}));
+    }
+    h.events();
+    let st = h.ok("proposal.withdraw", json!({"proposal": old}));
+    assert_eq!(st["decision"], "withdrawn");
+    let notes = h.resolved();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], old);
+    let hist = h.ok("document.history", json!({"doc": doc}));
+    let kept = hist["proposals"].as_array().unwrap();
+    assert_eq!(kept.len(), maestro_editor::proposals::MAX_RESOLVED);
+    assert!(
+        kept.iter().any(|p| p["id"] == old),
+        "the newest resolution was dropped"
+    );
+}
+
+#[test]
 fn closing_the_document_resolves_its_pending_proposals() {
     let mut h = Harness::new("close");
     let doc = h.file("c.txt", "abc\n");

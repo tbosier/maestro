@@ -786,14 +786,17 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
     let rows = review::current_rows(ed);
     for (i, row) in rows.iter().enumerate().skip(v.top).take(c.height as usize) {
         let y = c.y + (i - v.top) as u16;
-        draw_row(ed, s, Rect::new(c.x, y, c.width, 1), row);
+        draw_row(ed, s, Rect::new(c.x, y, c.width, 1), row, 0);
         if i == v.cursor {
             s.put(c.x, y, "▶", ui.border_active, c.x + 1);
         }
     }
 }
 
-pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
+/// Draws one review row. `hscroll` is how many columns of each line's text are
+/// scrolled off to the left (the proposal review scrolls sideways; the
+/// agent review passes 0).
+pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row, hscroll: usize) {
     let ui = &ed.theme.ui;
     let d = &ed.theme.diff;
     match row {
@@ -823,6 +826,7 @@ pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
                 s,
                 Rect::new(x, area.y, area.right().saturating_sub(x), 1),
                 l,
+                hscroll,
             );
         }
         Row::Pair(left, right) => {
@@ -841,6 +845,7 @@ pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
                         s,
                         Rect::new(nx, area.y, (x + w).saturating_sub(nx), 1),
                         l,
+                        hscroll,
                     );
                 }
             }
@@ -850,8 +855,9 @@ pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
 }
 
 /// A sign and a line of text on its add or delete tint, with intraline
-/// marks on the stronger tint.
-fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine) {
+/// marks on the stronger tint. Text cut off at either edge is marked with
+/// `<` or `>` in the edge cell, so a line never looks shorter than it is.
+fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine, left: usize) {
     let ui = &ed.theme.ui;
     let d = &ed.theme.diff;
     if area.width < 2 {
@@ -880,8 +886,10 @@ fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine) {
             base,
         );
     }
+    let edge = ui.text.patch(sign_style).bold();
     let mut x = tx;
     let mut col = 0usize;
+    let mut hidden_left = false;
     for (at, g) in l.text.grapheme_indices(true) {
         let marked = l.marks.iter().any(|m| at >= m.start && at < m.end);
         let style = if marked {
@@ -889,23 +897,43 @@ fn draw_side(ed: &Editor, s: &mut Surface, area: Rect, l: &RowLine) {
         } else {
             base
         };
-        if g == "\t" {
-            let n = 4 - col % 4;
-            for _ in 0..n {
-                if s.put(x, area.y, " ", style, area.right()) == 0 {
-                    return;
-                }
-                x += 1;
-            }
-            col += n;
+        // Columns this grapheme takes, as the surface draws it.
+        let w = if g == "\t" {
+            4 - col % 4
+        } else {
+            maestro_editor::agents::panel::cell_width(g)
+        };
+        if col + w <= left {
+            col += w;
+            hidden_left = true;
             continue;
         }
-        let used = s.put(x, area.y, g, style, area.right());
-        if used == 0 {
-            return;
+        // A tab, or a grapheme partly scrolled off, is drawn as blanks.
+        let partial = col < left;
+        hidden_left |= partial;
+        let blanks = g == "\t" || partial;
+        let need = if blanks { col + w - left.max(col) } else { w };
+        if x as usize + need > area.right() as usize {
+            s.put(
+                area.right().saturating_sub(1),
+                area.y,
+                ">",
+                edge,
+                area.right(),
+            );
+            break;
         }
-        x += used;
-        col += used as usize;
+        if blanks {
+            for _ in 0..need {
+                x += s.put(x, area.y, " ", style, area.right());
+            }
+        } else {
+            x += s.put(x, area.y, g, style, area.right());
+        }
+        col += w;
+    }
+    if hidden_left {
+        s.put(tx, area.y, "<", edge, area.right());
     }
 }
 
