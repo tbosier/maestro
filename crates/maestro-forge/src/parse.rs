@@ -181,15 +181,52 @@ pub fn parse_pr_list(out: &[u8], repo: &str) -> Result<Vec<Item>, String> {
 #[serde(rename_all = "camelCase")]
 struct RepoView {
     name_with_owner: String,
+    url: Option<String>,
 }
 
-/// `gh repo view --json nameWithOwner`.
+/// `gh repo view --json nameWithOwner,url`: `owner/name`, with the host in
+/// front (`host/owner/name`) when it is not github.com, so later calls go
+/// to the same host.
 pub fn parse_repo_view(out: &[u8]) -> Result<String, String> {
     let raw: RepoView = json(out)?;
     if raw.name_with_owner.is_empty() {
         return Err("no repository name".into());
     }
-    Ok(raw.name_with_owner)
+    let host = raw
+        .url
+        .as_deref()
+        .and_then(|u| u.split_once("://"))
+        .and_then(|(_, rest)| rest.split('/').next())
+        .unwrap_or("github.com")
+        .to_ascii_lowercase();
+    Ok(if host == "github.com" || host.is_empty() {
+        raw.name_with_owner
+    } else {
+        format!("{host}/{}", raw.name_with_owner)
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeadView {
+    head_ref_oid: Option<String>,
+    state: Option<String>,
+}
+
+/// `headRefOid` from `gh pr view --json headRefOid`.
+pub fn parse_head(out: &[u8]) -> Result<String, String> {
+    let raw: HeadView = json(out)?;
+    raw.head_ref_oid
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| "no head commit".into())
+}
+
+/// `state` from `gh pr view --json state`.
+pub fn parse_state(out: &[u8]) -> Result<String, String> {
+    let raw: HeadView = json(out)?;
+    raw.state
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "no state".into())
 }
 
 #[derive(Deserialize)]
@@ -442,6 +479,19 @@ mod tests {
         assert_eq!(items[0].reference, PrRef::new("a/b", 3));
         assert_eq!(items[0].author, "");
         assert_eq!(items[0].created_at, None);
+        assert_eq!(
+            parse_repo_view(br#"{"nameWithOwner":"o/r","url":"https://GHE.example.com/o/r"}"#),
+            Ok("ghe.example.com/o/r".into())
+        );
+        assert_eq!(
+            parse_repo_view(br#"{"nameWithOwner":"o/r","url":"https://github.com/o/r"}"#),
+            Ok("o/r".into())
+        );
+        assert_eq!(
+            PrRef::new("h.x/o/r", 1).host_and_name(),
+            (Some("h.x"), "o/r")
+        );
+        assert_eq!(PrRef::new("o/r", 1).host_and_name(), (None, "o/r"));
         let s = parse_status(br#"{"statusCheckRollup":null,"reviewDecision":""}"#).unwrap();
         assert_eq!(s.review_decision, ReviewDecision::None);
         assert!(s.checks.is_empty());

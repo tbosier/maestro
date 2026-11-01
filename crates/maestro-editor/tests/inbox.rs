@@ -48,17 +48,29 @@ case "$*" in
   "search prs --assignee=@me"*) echo '[]' ;;
   "search prs --author=@me"*) echo '[]' ;;
   "search issues --assignee=@me"*) cat "$f/search_issues.json" ;;
-  "repo view"*) cat "$f/repo_view.json" ;;
+  "repo view"*)
+    case "$(pwd)" in
+      */other) echo '{"nameWithOwner":"octo/other","url":"https://github.com/octo/other"}' ;;
+      *) cat "$f/repo_view.json" ;;
+    esac ;;
   "pr list"*) cat "$f/pr_list.json" ;;
-  "pr view 14716 --repo cli/cli --json"*) cat "$f/pr_detail.json" ;;
   "pr view 14846 --repo cli/cli --json number,title,body"*)
-    sed 's/"number":14716/"number":14846/' "$f/pr_detail.json" ;;
+    # The first answer is slow and stale when the test asks for it.
+    if [ -e "$d/slow-first" ] && [ ! -e "$d/slow-done" ]; then
+      touch "$d/slow-done"; sleep 1
+      sed -e 's/"number":14716/"number":14846/' -e 's/"title":"chore(deps)/"title":"OLD chore(deps)/' \
+        -e 's/936921fa9e67cdbf78fb25abc6252afabafef056/aaf296326df06cbafd523c12efa0112cdc53c10c/' "$f/pr_detail.json"
+    else
+      sed -e 's/"number":14716/"number":14846/' \
+        -e 's/936921fa9e67cdbf78fb25abc6252afabafef056/aaf296326df06cbafd523c12efa0112cdc53c10c/' "$f/pr_detail.json"
+    fi ;;
   "pr view"*"--web") exit 0 ;;
+  "pr view"*"--json state") echo '{"state":"MERGED"}' ;;
   "pr view"*) cat "$f/pr_status_checkruns.json" ;;
   "issue view"*"--web") exit 0 ;;
   "pr diff"*) cat "$f/pr_diff.patch" ;;
   "pr checkout"*) git worktree add -q -b "$7" "$9" >/dev/null 2>&1 || exit 1 ;;
-  "pr review"*|"pr comment"*|"pr merge"*) echo done ;;
+  "api"*|"pr comment"*|"pr merge"*) echo done ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
 "#;
@@ -144,9 +156,10 @@ impl Fake {
         self.calls()
             .into_iter()
             .filter(|(a, _)| {
-                a.len() > 1
-                    && a[0] == "pr"
-                    && ["review", "comment", "merge"].contains(&a[1].as_str())
+                a[0] == "api"
+                    || (a.len() > 1
+                        && a[0] == "pr"
+                        && ["comment", "merge"].contains(&a[1].as_str()))
             })
             .collect()
     }
@@ -385,10 +398,15 @@ fn a_shows_the_exact_command_and_only_y_approves() {
     let Some(Dialog::Confirm { lines, .. }) = &ed.forge.screen.dialog else {
         panic!("no dialog: {}", status(&ed));
     };
-    assert!(
-        lines.contains(&"  gh pr review 14846 --repo cli/cli --approve".to_string()),
-        "{lines:?}"
-    );
+    for want in [
+        "The review is on commit aaf296326df0, the head shown here. If newer commits were \
+         pushed since, nothing is sent.",
+        "  gh api --method POST repos/cli/cli/pulls/14846/reviews --input -",
+        "with this on its standard input (1 line):",
+        "  │ {\"commit_id\":\"aaf296326df06cbafd523c12efa0112cdc53c10c\",\"event\":\"APPROVE\"}",
+    ] {
+        assert!(lines.contains(&want.to_string()), "{want} in {lines:?}");
+    }
     // n cancels: nothing is sent.
     ed.feed_keys(&keys("n"));
     assert!(ed.forge.screen.dialog.is_none());
@@ -404,9 +422,31 @@ fn a_shows_the_exact_command_and_only_y_approves() {
     assert_eq!(
         f.writes(),
         vec![(
-            args(&["pr", "review", "14846", "--repo", "cli/cli", "--approve"]),
-            String::new()
+            args(&[
+                "api",
+                "--method",
+                "POST",
+                "repos/cli/cli/pulls/14846/reviews",
+                "--input",
+                "-"
+            ]),
+            r#"{"commit_id":"aaf296326df06cbafd523c12efa0112cdc53c10c","event":"APPROVE"}"#
+                .to_string()
         )]
+    );
+    // The head was checked just before.
+    assert_eq!(
+        f.calls_to(&[
+            "pr",
+            "view",
+            "14846",
+            "--repo",
+            "cli/cli",
+            "--json",
+            "headRefOid"
+        ])
+        .len(),
+        1
     );
     assert_eq!(status(&ed), "approved cli/cli#14846");
 }
@@ -428,7 +468,7 @@ fn c_writes_a_comment_in_a_buffer_and_pr_send_sends_what_was_shown() {
         panic!("no dialog: {}", status(&ed));
     };
     assert!(lines.contains(&"  gh pr comment 14845 --repo cli/cli --body-file -".to_string()));
-    assert!(lines.contains(&"with this text on its standard input (2 lines):".to_string()));
+    assert!(lines.contains(&"with this on its standard input (2 lines):".to_string()));
     assert!(lines.contains(&"  │ Looks right.".to_string()));
     assert!(lines.contains(&"  │ One nit: 'quotes' and $HOME".to_string()));
     let draft = ed.forge.drafts[0].doc;
@@ -458,7 +498,7 @@ fn c_writes_a_comment_in_a_buffer_and_pr_send_sends_what_was_shown() {
 #[test]
 fn text_typed_while_sending_is_not_thrown_away() {
     let slow = ANSWERS.replace(
-        r#""pr review"*|"pr comment"*|"pr merge"*) echo done ;;"#,
+        r#""api"*|"pr comment"*|"pr merge"*) echo done ;;"#,
         r#""pr comment"*) sleep 1; echo done ;;"#,
     );
     let f = Fake::new(&slow);
@@ -484,8 +524,8 @@ y",
 #[test]
 fn request_changes_needs_text_and_a_failed_send_keeps_the_buffer() {
     let failing = ANSWERS.replace(
-        r#""pr review"*|"pr comment"*|"pr merge"*) echo done ;;"#,
-        r#""pr review"*) echo 'GraphQL: Review cannot be requested from pull request author.' >&2; exit 1 ;;"#,
+        r#""api"*|"pr comment"*|"pr merge"*) echo done ;;"#,
+        r#""api"*) echo 'gh: Can not request changes on your own pull request (HTTP 422)' >&2; exit 1 ;;"#,
     );
     let f = Fake::new(&failing);
     let mut ed = f.editor();
@@ -497,18 +537,27 @@ fn request_changes_needs_text_and_a_failed_send_keeps_the_buffer() {
     let Some(Dialog::Confirm { lines, .. }) = &ed.forge.screen.dialog else {
         panic!("no dialog: {}", status(&ed));
     };
-    assert!(lines.contains(
-        &"  gh pr review 14846 --repo cli/cli --request-changes --body-file -".to_string()
-    ));
+    for want in [
+        "The text (1 line):",
+        "  │ Please add a test.",
+        "  gh api --method POST repos/cli/cli/pulls/14846/reviews --input -",
+        "  │ {\"body\":\"Please add a test.\",\"commit_id\":\"aaf296326df06cbafd523c12efa0112cdc53c10c\",\"event\":\"REQUEST_CHANGES\"}",
+    ] {
+        assert!(lines.contains(&want.to_string()), "{want} in {lines:?}");
+    }
     let draft = ed.forge.drafts[0].doc;
     ed.feed_keys(&keys("y"));
     settle(&mut ed);
-    let w = f.calls_to(&["pr", "review"]);
+    let w = f.calls_to(&["api"]);
     assert_eq!(w.len(), 1);
-    assert_eq!(w[0].1, "Please add a test.");
+    assert!(
+        w[0].1.contains(r#""body":"Please add a test.""#),
+        "{}",
+        w[0].1
+    );
     let s = status(&ed);
     assert!(
-        s.starts_with("could not request changes on cli/cli#14846: gh pr review failed: GraphQL")
+        s.starts_with("could not request changes on cli/cli#14846: gh api failed: gh: Can not")
             && s.ends_with("the message buffer is kept"),
         "{s}"
     );
@@ -693,8 +742,8 @@ fn w_checks_the_pull_request_out_next_to_the_repository_and_opens_a_file() {
 #[test]
 fn w_refuses_outside_a_github_repository() {
     let f = Fake::new(&ANSWERS.replace(
-        r#""repo view"*) cat "$f/repo_view.json" ;;"#,
-        r#""repo view"*) echo 'failed to run git: fatal: not a git repository' >&2; exit 1 ;;"#,
+        r#"*) cat "$f/repo_view.json" ;;"#,
+        r#"*) echo 'failed to run git: fatal: not a git repository' >&2; exit 1 ;;"#,
     ));
     let mut ed = f.editor();
     open_inbox(&mut ed);
@@ -792,4 +841,58 @@ fn a_replayed_macro_cannot_approve() {
     );
     assert!(ed.forge.screen.dialog.is_none());
     assert_eq!(f.writes().len(), 1);
+}
+
+#[test]
+fn a_detail_reopened_while_loading_keeps_the_newer_answer() {
+    let f = Fake::new(ANSWERS);
+    std::fs::write(f.dir.join("slow-first"), "").unwrap();
+    let mut ed = f.editor();
+    open_inbox(&mut ed);
+    // The first load is slow and would answer with an old title.
+    ed.feed_keys(&keys("\n"));
+    // Wait until the first load is inside its slow answer, then reopen.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f.dir.join("slow-done").exists() {
+        assert!(Instant::now() < deadline, "the first load never asked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ed.feed_keys(&keys("<esc>\n"));
+    settle(&mut ed);
+    let title = ed
+        .forge
+        .screen
+        .detail
+        .as_ref()
+        .unwrap()
+        .detail()
+        .unwrap()
+        .title
+        .clone();
+    assert!(!title.starts_with("OLD"), "{title}");
+}
+
+#[test]
+fn w_checks_the_repository_on_disk_not_the_one_the_inbox_loaded_in() {
+    let f = Fake::new(ANSWERS);
+    let other = f.dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    std::fs::write(other.join("README.md"), "x\n").unwrap();
+    git(&other, &["add", "README.md"]);
+    git(&other, &["commit", "-q", "-m", "init"]);
+    let mut ed = f.editor();
+    open_inbox(&mut ed);
+    // The inbox loaded in cli/cli; the working directory moves to another
+    // repository.
+    ed.cwd = other.clone();
+    ed.feed_keys(&keys("w"));
+    settle(&mut ed);
+    assert!(f.calls_to(&["pr", "checkout"]).is_empty());
+    let s = status(&ed);
+    assert!(
+        s.contains("is a clone of octo/other, not of cli/cli"),
+        "{s}"
+    );
+    assert!(!f.dir.join("other-pr-14846").exists());
 }

@@ -17,7 +17,7 @@ pub struct DetailView {
     pub detail: Option<Result<PrDetail, ForgeError>>,
     pub diff: Option<Result<Vec<DiffFile>, ForgeError>>,
     pub loading: bool,
-    /// Numbers loads, so a slow answer for an earlier one is dropped.
+    /// The load whose answer is awaited (see `Forge::detail_seq`).
     seq: u64,
     /// 0 is the overview; `n` is diff file `n - 1`.
     pub page: usize,
@@ -86,18 +86,14 @@ pub fn load(ed: &mut Editor, pr: PrRef) {
     let Some(v) = ed.forge.screen.detail.as_mut().filter(|v| v.pr == pr) else {
         return;
     };
-    v.seq += 1;
+    ed.forge.detail_seq += 1;
+    let seq = ed.forge.detail_seq;
+    v.seq = seq;
     v.loading = true;
-    let seq = v.seq;
     let spawned = ed.spawn_background("github-pr", move |tx| {
-        let (detail, diff) = std::thread::scope(|s| {
-            let d = s.spawn(|| maestro_forge::pr_detail(&gh, &pr));
-            let f = maestro_forge::pr_diff(&gh, &pr);
-            let d = d
-                .join()
-                .unwrap_or_else(|_| Err(ForgeError::Io("the detail thread panicked".into())));
-            (d, f)
-        });
+        // Checked to be of one head commit, so the diff shown is of the
+        // commit a review or merge from this view is pinned to.
+        let (detail, diff) = maestro_forge::pr_detail_and_diff(&gh, &pr);
         tx.send(move |ed| loaded(ed, pr, seq, detail, diff));
     });
     if let Err(e) = spawned

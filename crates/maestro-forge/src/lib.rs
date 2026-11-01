@@ -24,8 +24,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub use inbox::{
-    DEFAULT_LIMIT, Inbox, Section, SectionKind, current_repo, load_inbox, pr_detail, pr_diff,
-    pr_status, repo_prs, search_issues, search_prs,
+    DEFAULT_LIMIT, Inbox, Section, SectionKind, current_repo, load_inbox, pr_detail,
+    pr_detail_and_diff, pr_diff, pr_head, pr_state, pr_status, repo_prs, search_issues, search_prs,
 };
 pub use model::{
     Check, CheckState, ChecksSummary, FileStat, Item, ItemKind, Mergeable, Overall, PrDetail,
@@ -41,7 +41,7 @@ pub use time::{age_label, parse_time, utc_clock};
 pub fn parse_diff(out: &[u8]) -> std::result::Result<Vec<maestro_git::DiffFile>, String> {
     maestro_git::parse_unified_diff(out)
 }
-pub use write::{MergeMethod, WriteAction, browse_command, checkout_command};
+pub use write::{MergeMethod, Outcome, WriteAction, browse_command, checkout_command};
 
 /// How long a `gh` call may take before it is stopped.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,6 +68,19 @@ pub enum ForgeError {
     Parse { command: String, detail: String },
     #[error("could not run gh: {0}")]
     Io(String),
+    /// The pull request got new commits after it was shown.
+    #[error(
+        "the pull request's head moved from {} to {} since it was shown; nothing was sent, \
+         r reloads it",
+        short(shown),
+        short(now)
+    )]
+    HeadMoved { shown: String, now: String },
+}
+
+/// The first 12 characters of a commit id.
+pub fn short(oid: &str) -> String {
+    oid.chars().take(12).collect()
 }
 
 impl ForgeError {

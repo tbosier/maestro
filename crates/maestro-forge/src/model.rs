@@ -8,7 +8,8 @@ use crate::ForgeError;
 /// A pull request or issue: `owner/repo` and its number.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PrRef {
-    /// `owner/name`.
+    /// `owner/name`, or `host/owner/name` for a host other than github.com
+    /// (the form `gh --repo` takes).
     pub repo: String,
     pub number: u64,
 }
@@ -18,6 +19,15 @@ impl PrRef {
         Self {
             repo: repo.into(),
             number,
+        }
+    }
+
+    /// `ghe.example.com/owner/name` splits into the host and
+    /// `owner/name`; a plain `owner/name` is on gh's default host.
+    pub fn host_and_name(&self) -> (Option<&str>, &str) {
+        match self.repo.split_once('/') {
+            Some((host, rest)) if rest.contains('/') => (Some(host), rest),
+            _ => (None, self.repo.as_str()),
         }
     }
 }
