@@ -53,6 +53,13 @@
 //! `session/new` with an authentication error, [`SLOW_SESSION_ARG`]
 //! answers it after 300 ms, and [`PROTOCOL_ARG`] followed by a number
 //! answers `initialize` with that protocol version.
+//!
+//! With [`LOAD_SESSION_ARG`] the agent advertises `loadSession` and answers
+//! `session/load`. Only [`SESSION_ID`] can be loaded: the agent first
+//! replays a `user_message_chunk` saying `earlier prompt` and an
+//! `agent_message_chunk` saying `replayed <session id>`, then answers with
+//! an empty result. Any other session id gets a `-32002` "session not
+//! found" error. Without the argument, `session/load` is method not found.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -63,6 +70,7 @@ pub const FAKE_ARG: &str = "--maestro-fake-acp";
 pub const FAIL_SESSION_ARG: &str = "--fake-fail-session";
 pub const SLOW_SESSION_ARG: &str = "--fake-slow-session";
 pub const PROTOCOL_ARG: &str = "--fake-protocol";
+pub const LOAD_SESSION_ARG: &str = "--fake-load-session";
 pub const SESSION_ID: &str = "fake-session";
 
 /// If this process was started with [`FAKE_ARG`], serves stdio and exits.
@@ -92,6 +100,7 @@ pub fn serve() -> i32 {
         protocol,
         fail_session: args.iter().any(|a| a == FAIL_SESSION_ARG),
         slow_session: args.iter().any(|a| a == SLOW_SESSION_ARG),
+        load_session: args.iter().any(|a| a == LOAD_SESSION_ARG),
     };
     eprintln!("fake-acp-agent: started");
     agent.run()
@@ -125,6 +134,7 @@ struct Agent {
     protocol: u64,
     fail_session: bool,
     slow_session: bool,
+    load_session: bool,
 }
 
 /// How a script ended.
@@ -221,7 +231,7 @@ impl Agent {
                     id,
                     json!({
                         "protocolVersion": self.protocol,
-                        "agentCapabilities": {"loadSession": false},
+                        "agentCapabilities": {"loadSession": self.load_session},
                         "agentInfo": {"name": "fake-acp-agent", "version": "0.0.0"},
                         "authMethods": [],
                     }),
@@ -246,6 +256,30 @@ impl Agent {
                 }
                 self.session = Some(SESSION_ID.to_string());
                 reply(id, json!({"sessionId": SESSION_ID}));
+            }
+            "session/load" if self.load_session => {
+                let Some(cwd) = params["cwd"].as_str() else {
+                    return reply_error(id, -32602, "session/load without cwd");
+                };
+                if !params["mcpServers"].is_array() {
+                    return reply_error(id, -32602, "session/load without mcpServers");
+                }
+                if params["sessionId"].as_str() != Some(SESSION_ID) {
+                    return reply_error(id, -32002, "session not found");
+                }
+                self.cwd = PathBuf::from(cwd);
+                if !self.cwd.is_absolute() {
+                    return reply_error(id, -32602, "cwd must be absolute");
+                }
+                self.session = Some(SESSION_ID.to_string());
+                // The conversation so far comes back as updates before the
+                // answer.
+                self.update(json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "earlier prompt"},
+                }));
+                self.say(&format!("replayed {SESSION_ID}"));
+                reply(id, json!({}));
             }
             "session/prompt" => {
                 if params["sessionId"].as_str() != self.session.as_deref() {

@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use maestro_agent::fake::{FAIL_SESSION_ARG, PROTOCOL_ARG, SESSION_ID, SLOW_SESSION_ARG};
+use maestro_agent::fake::{
+    FAIL_SESSION_ARG, LOAD_SESSION_ARG, PROTOCOL_ARG, SESSION_ID, SLOW_SESSION_ARG,
+};
 use maestro_agent::{AcpClient, AcpEvent, ProviderKind, ProviderSpec, TranscriptEntry};
 use serde_json::Value;
 
@@ -782,4 +784,88 @@ fn dropping_the_client_stops_the_agent() {
         }
     }
     fs::remove_dir_all(base).unwrap();
+}
+
+/// Started with `load_session` for `session`.
+fn loading(name: &str, extra: &[&str], session: &str) -> Harness {
+    let (base, root, outside) = dirs(name);
+    let (tx, events) = mpsc::channel();
+    let client =
+        AcpClient::load_session(&spec(extra), &root, session, move |e| drop(tx.send(e))).unwrap();
+    Harness {
+        client,
+        events,
+        root,
+        outside,
+        base,
+    }
+}
+
+#[test]
+fn a_saved_session_is_loaded_when_the_agent_supports_it() {
+    let h = loading("load", &[LOAD_SESSION_ARG], SESSION_ID);
+    // Sent before the load is answered: it waits for the session.
+    h.client.prompt("say after the load").unwrap();
+    let events = h.wait_for(|e| matches!(e, AcpEvent::SessionLoaded { .. }));
+    assert_eq!(
+        events,
+        [
+            AcpEvent::Initialized {
+                agent_name: Some("fake-acp-agent".to_string()),
+                load_session: true,
+            },
+            AcpEvent::Update(TranscriptEntry::User("earlier prompt".to_string())),
+            AcpEvent::Update(TranscriptEntry::Agent(format!("replayed {SESSION_ID}"))),
+            AcpEvent::SessionLoaded {
+                session_id: SESSION_ID.to_string()
+            },
+        ]
+    );
+    assert_eq!(h.client.session_id().as_deref(), Some(SESSION_ID));
+    let events = h.until_turn_end();
+    assert_eq!(said(&events), ["after the load"]);
+    assert_eq!(stop_reason(&events), "end_turn");
+    // File requests naming the loaded session are served.
+    let events = h.turn("write src/new.rs x");
+    assert_eq!(said(&events), ["wrote src/new.rs"]);
+}
+
+#[test]
+fn without_load_support_a_new_session_starts() {
+    let h = loading("no-load", &[], SESSION_ID);
+    let events = h.wait_for(|e| matches!(e, AcpEvent::SessionStarted { .. }));
+    assert_eq!(
+        events,
+        [
+            AcpEvent::Initialized {
+                agent_name: Some("fake-acp-agent".to_string()),
+                load_session: false,
+            },
+            AcpEvent::SessionStarted {
+                session_id: SESSION_ID.to_string()
+            },
+        ]
+    );
+    assert_eq!(said(&h.turn("say fresh")), ["fresh"]);
+}
+
+#[test]
+fn a_failed_load_is_reported_and_a_new_session_starts() {
+    let h = loading("bad-load", &[LOAD_SESSION_ARG], "gone-session");
+    let events = h.wait_for(|e| matches!(e, AcpEvent::SessionStarted { .. }));
+    let errors = errors(&events);
+    assert_eq!(errors.len(), 1, "{events:?}");
+    assert!(
+        errors[0].contains("session/load failed") && errors[0].contains("session not found"),
+        "{errors:?}"
+    );
+    assert!(errors[0].contains("starting a new session instead"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AcpEvent::SessionLoaded { .. })),
+        "{events:?}"
+    );
+    assert_eq!(h.client.session_id().as_deref(), Some(SESSION_ID));
+    assert_eq!(said(&h.turn("say fresh")), ["fresh"]);
 }

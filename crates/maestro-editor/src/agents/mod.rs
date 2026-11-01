@@ -19,6 +19,7 @@
 pub mod actions;
 pub mod create;
 pub mod panel;
+pub mod persist;
 pub mod review;
 
 use std::collections::VecDeque;
@@ -85,6 +86,14 @@ pub enum Status {
     Rejected,
     /// The work was integrated into the main worktree's branch.
     Integrated,
+    /// A relaunched ACP agent's session is up and no turn runs: it waits
+    /// for a prompt (`f`).
+    Idle,
+    /// No process runs for the agent and Maestro did not see it finish: a
+    /// record from an earlier session whose agent was still working when it
+    /// was saved, an adopted found worktree, or an idle ACP agent whose
+    /// process exited.
+    Stopped,
 }
 
 impl Status {
@@ -103,13 +112,91 @@ impl Status {
             Status::Failed => "failed",
             Status::Rejected => "rejected",
             Status::Integrated => "integrated",
+            Status::Idle => "waiting for a prompt",
+            Status::Stopped => "stopped",
         }
+    }
+
+    /// The stable name saved in agent records.
+    pub fn key(self) -> &'static str {
+        match self {
+            Status::Starting => "starting",
+            Status::Working => "working",
+            Status::Planning => "planning",
+            Status::Editing => "editing",
+            Status::AwaitingApproval => "awaiting-approval",
+            Status::Running => "running",
+            Status::RunningTests => "running-tests",
+            Status::ReadyForReview => "ready-for-review",
+            Status::Completed => "completed",
+            Status::Blocked => "blocked",
+            Status::Failed => "failed",
+            Status::Rejected => "rejected",
+            Status::Integrated => "integrated",
+            Status::Idle => "idle",
+            Status::Stopped => "stopped",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Status> {
+        use Status::*;
+        [
+            Starting,
+            Working,
+            Planning,
+            Editing,
+            AwaitingApproval,
+            Running,
+            RunningTests,
+            ReadyForReview,
+            Completed,
+            Blocked,
+            Failed,
+            Rejected,
+            Integrated,
+            Idle,
+            Stopped,
+        ]
+        .into_iter()
+        .find(|s| s.key() == key)
+    }
+
+    /// The status says a process is doing something. A record loaded from
+    /// an earlier session never shows one of these.
+    pub fn needs_process(self) -> bool {
+        matches!(
+            self,
+            Status::Starting
+                | Status::Working
+                | Status::Planning
+                | Status::Editing
+                | Status::AwaitingApproval
+                | Status::Running
+                | Status::RunningTests
+                | Status::Idle
+        )
     }
 
     /// The user decided; agent events no longer change the status.
     pub fn is_decided(self) -> bool {
         matches!(self, Status::Rejected | Status::Integrated)
     }
+}
+
+/// Where an agent's record came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Origin {
+    /// Started (or relaunched) in this session.
+    #[default]
+    New,
+    /// Loaded from the saved records of an earlier session, or adopted
+    /// from a found worktree. No process runs for it until it is
+    /// relaunched.
+    Loaded,
+    /// A worktree on a `maestro/` branch under the agents' worktree
+    /// directory that no record names. Its task and provider are unknown;
+    /// it can be reviewed, archived or adopted, nothing else. Not saved.
+    Found,
 }
 
 /// The worktree an agent works in.
@@ -305,6 +392,19 @@ pub struct Agent {
     pending_input: Option<String>,
     spawned: Instant,
     term_size: Option<TermSize>,
+    /// Where the record came from.
+    pub origin: Origin,
+    /// The ACP session, once one started.
+    pub session_id: Option<String>,
+    /// The ACP agent advertised `loadSession` when it last started.
+    pub load_session: bool,
+    /// What changed about a loaded record's worktree since it was saved
+    /// (gone, or on another branch). Relaunch, tests and archive refuse
+    /// while it is set.
+    pub worktree_note: Option<String>,
+    /// `session/load` is replaying the saved conversation: updates go to
+    /// the transcript only.
+    replaying: bool,
 }
 
 impl Agent {
@@ -337,7 +437,19 @@ impl Agent {
             pending_input: None,
             spawned: Instant::now(),
             term_size: None,
+            origin: Origin::New,
+            session_id: None,
+            load_session: false,
+            worktree_note: None,
+            replaying: false,
         }
+    }
+
+    /// The record is from an earlier session (or adopted, or found) and no
+    /// process runs for it: the panel says "not running (from an earlier
+    /// session)" next to its status.
+    pub fn from_earlier_session(&self) -> bool {
+        self.origin != Origin::New && !self.is_running()
     }
 
     /// The status to show: tests running take precedence over the agent's
@@ -434,6 +546,8 @@ pub struct AgentState {
     next_id: u64,
     next_group: u64,
     last_refresh: Option<Instant>,
+    /// Saved records: which repositories were read, and what was written.
+    pub persist: persist::PersistState,
 }
 
 impl AgentState {
@@ -580,18 +694,51 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
     };
     let mut refresh = false;
     match event {
-        E::Initialized { agent_name, .. } => {
+        E::Initialized {
+            agent_name,
+            load_session,
+        } => {
+            a.load_session = load_session;
             a.log(match agent_name {
                 Some(n) => format!("initialized: {n}"),
                 None => "initialized".to_string(),
             });
-        }
-        E::SessionStarted { session_id } => {
-            a.log(format!("session {session_id} started"));
-            if a.turn_running {
-                a.set_status(Status::Working);
+            if a.replaying && !load_session {
+                a.log("the agent does not advertise session loading; starting a new session");
             }
         }
+        E::SessionStarted { session_id } => {
+            if a.replaying {
+                a.replaying = false;
+                a.transcript.push(TranscriptEntry::System(format!(
+                    "the saved session was not loaded; this is a new session ({session_id}) \
+                     without the earlier conversation"
+                )));
+            }
+            a.log(format!("session {session_id} started"));
+            a.session_id = Some(session_id);
+            if a.turn_running {
+                a.set_status(Status::Working);
+            } else if a.status == Status::Starting {
+                a.set_status(Status::Idle);
+            }
+        }
+        E::SessionLoaded { session_id } => {
+            a.replaying = false;
+            a.log(format!(
+                "loaded the saved session {session_id}; the agent replayed its conversation"
+            ));
+            a.session_id = Some(session_id);
+            if a.turn_running {
+                a.set_status(Status::Working);
+            } else if a.status == Status::Starting {
+                a.set_status(Status::Idle);
+            }
+        }
+        // The saved conversation coming back: transcript only, so the
+        // history and status are not rewritten by old events.
+        E::Update(entry) if a.replaying => a.push_transcript(entry),
+        E::ToolUpdate { .. } if a.replaying => {}
         E::Update(entry) => {
             match &entry {
                 TranscriptEntry::Plan(_) if a.turn_running && a.permissions.is_empty() => {
@@ -690,9 +837,12 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
             let unfinished = a.turn_running || a.status == Status::Starting;
             a.exited = Some(desc);
             a.turn_running = false;
+            a.replaying = false;
             a.permissions.clear();
             if unfinished {
                 a.set_status(Status::Failed);
+            } else if a.status == Status::Idle {
+                a.set_status(Status::Stopped);
             }
             refresh = true;
         }
@@ -777,6 +927,9 @@ pub fn poll(ed: &mut Editor) -> bool {
 /// panel is open, so file counts follow terminal agents, whose edits send
 /// no event. Called from [`Editor::tick`].
 pub fn tick(ed: &mut Editor, now: Instant) {
+    // Saved records follow changes within about a second; unchanged
+    // records are not written.
+    persist::save(ed, false);
     if !ed.agents.panel.open {
         return;
     }
@@ -820,6 +973,7 @@ pub fn stop_all(ed: &mut Editor) {
     {
         std::thread::sleep(Duration::from_millis(10));
     }
+    persist::save(ed, true);
 }
 
 /// The Git work for this agent that runs in the background while its

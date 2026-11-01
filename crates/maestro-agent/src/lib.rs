@@ -175,7 +175,14 @@ pub enum AcpEvent {
         agent_name: Option<String>,
         load_session: bool,
     },
+    /// A new session (`session/new`) is up.
     SessionStarted {
+        session_id: String,
+    },
+    /// A saved session was loaded with `session/load` (see
+    /// [`AcpClient::load_session`]). The conversation it replayed arrived
+    /// as [`AcpEvent::Update`]s before this.
+    SessionLoaded {
         session_id: String,
     },
     Update(TranscriptEntry),

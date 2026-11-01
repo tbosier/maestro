@@ -65,6 +65,11 @@ pub enum ChoicePurpose {
         providers: Vec<ProviderSpec>,
     },
     Permission(AgentId),
+    /// The provider a found worktree is adopted with.
+    Adopt {
+        agent: AgentId,
+        providers: Vec<ProviderSpec>,
+    },
 }
 
 /// What a confirmation dialog does when accepted.
@@ -214,7 +219,10 @@ pub fn open(ed: &mut Editor) {
     for id in ids {
         super::review::request(ed, id);
     }
-    if n == 0 {
+    // Records saved by an earlier session, and found worktrees, arrive
+    // from a background scan (when sessions are on).
+    super::persist::load_for_cwd(ed);
+    if n == 0 && !ed.agents.persist.loading {
         ed.info("no agents yet: n starts a task");
     }
 }
@@ -395,6 +403,16 @@ fn list_key(ed: &mut Editor, key: KeyEvent) {
                 super::actions::confirm_archive(ed, id);
             }
         }
+        (KeyCode::Char('R'), false) => {
+            if let Some(id) = selected_id(ed) {
+                super::create::relaunch(ed, id);
+            }
+        }
+        (KeyCode::Char('a'), false) => {
+            if let Some(id) = selected_id(ed) {
+                super::actions::ask_adopt(ed, id);
+            }
+        }
         _ => {}
     }
 }
@@ -438,6 +456,10 @@ fn compete(ed: &mut Editor) {
         ed.error("select an agent first; N starts another provider on its task");
         return;
     };
+    if let Some(why) = super::actions::found_refusal(a) {
+        ed.error(why);
+        return;
+    }
     let task = a.task.clone();
     let group = Some(a.group);
     let base = a.worktree.as_ref().map(|w| w.base.clone());
@@ -615,6 +637,15 @@ fn choose(ed: &mut Editor, purpose: ChoicePurpose, index: usize) {
             let Some(provider) = providers.get(index).cloned() else {
                 return;
             };
+            if ed.agents.persist.loading {
+                // Ids of new agents continue after the saved ones; wait
+                // for them so a new branch never reuses a saved name.
+                ed.error(
+                    "still reading the agent records saved for this repository; \
+                     try again in a moment",
+                );
+                return;
+            }
             super::create::create(
                 ed,
                 NewAgent {
@@ -628,6 +659,11 @@ fn choose(ed: &mut Editor, purpose: ChoicePurpose, index: usize) {
             ed.agents.panel.scroll = 0;
         }
         ChoicePurpose::Permission(id) => super::actions::permission_chosen(ed, id, index),
+        ChoicePurpose::Adopt { agent, providers } => {
+            if let Some(p) = providers.get(index).cloned() {
+                super::actions::adopt(ed, agent, p);
+            }
+        }
     }
 }
 
@@ -774,23 +810,48 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         out.push(("esc", "close"));
         return out;
     };
+    if a.origin == super::Origin::Found {
+        out.extend([
+            ("ret", "review"),
+            ("a", "adopt"),
+            ("A", "archive"),
+            ("v", "view"),
+            ("esc", "close"),
+        ]);
+        return out;
+    }
     if a.kind() == ProviderKind::Terminal && a.is_running() {
         out.push(("C-\\", "keys to terminal"));
     }
     if !a.permissions.is_empty() {
         out.push(("p", "answer permission"));
     }
+    // Relaunch comes first for an agent with no process, where it is the
+    // next thing to do, and is listed for any agent it applies to.
+    let relaunchable = !a.is_running()
+        && !a.archived
+        && !a.base_status().is_decided()
+        && a.worktree.is_some()
+        && a.git_busy.is_none();
+    if relaunchable && a.from_earlier_session() {
+        out.push(("R", "relaunch"));
+    }
+    out.extend([("ret", "review"), ("t", "test")]);
+    // Feedback cannot reach an agent with no process; R comes first instead.
+    if !a.from_earlier_session() {
+        out.push(("f", "feedback"));
+    }
     out.extend([
-        ("ret", "review"),
-        ("t", "test"),
-        ("f", "feedback"),
         ("N", "compete"),
         ("v", "view"),
         ("I", "integrate"),
         ("X", "reject"),
         ("A", "archive"),
-        ("esc", "close"),
     ]);
+    if relaunchable && !a.from_earlier_session() {
+        out.push(("R", "relaunch"));
+    }
+    out.push(("esc", "close"));
     out
 }
 

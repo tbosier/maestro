@@ -287,9 +287,19 @@ pub fn request(ed: &mut Editor, id: AgentId) {
         // directory is gone; only the worktree itself counts.
         let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
         let result = match git.discover(&w.path) {
-            Ok(Some(repo)) if canon(repo.root()) == canon(&w.path) => {
-                repo.review_diff(&w.base).map_err(|e| e.to_string())
-            }
+            // The diff is of the branch the record names; a worktree that
+            // was switched to other work shows that instead of its diff.
+            Ok(Some(repo)) if canon(repo.root()) == canon(&w.path) => match repo.head() {
+                Ok(maestro_git::Head::Branch(b)) if b == w.branch => {
+                    repo.review_diff(&w.base).map_err(|e| e.to_string())
+                }
+                Ok(other) => Err(format!(
+                    "the worktree is on {} now, not {}; no diff shown",
+                    other.label(),
+                    w.branch
+                )),
+                Err(e) => Err(e.to_string()),
+            },
             Ok(_) => Err(format!("{} is no longer a worktree", w.path.display())),
             Err(e) => Err(e.to_string()),
         };
@@ -438,6 +448,16 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
                 .unwrap_or(0);
         }
         KeyCode::Char('r') if !ctrl => request(ed, id),
+        KeyCode::Char('c')
+            if !ctrl
+                && ed
+                    .agents
+                    .get(id)
+                    .is_some_and(|a| a.origin == super::Origin::Found) =>
+        {
+            let why = ed.agents.get(id).and_then(super::actions::found_refusal);
+            ed.error(why.unwrap_or_default());
+        }
         KeyCode::Char('c') if !ctrl => {
             let file = ed
                 .agents

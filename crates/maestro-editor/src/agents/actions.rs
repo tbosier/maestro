@@ -15,7 +15,7 @@ use maestro_git::{Head, IntegrateError, Integration, RemoveError, RemoveRefusal}
 use maestro_tasks::TaskEvent;
 
 use super::panel::{ChoicePurpose, Confirm, ConfirmAction, DetailView, InputPurpose, Overlay};
-use super::{AgentId, ProviderKind, Runtime, Status, TestFinish, TestRun};
+use super::{AgentId, Origin, ProviderKind, ProviderSpec, Runtime, Status, TestFinish, TestRun};
 use crate::editor::{Editor, normalize_path};
 
 /// Lists at most five paths, then how many more.
@@ -46,6 +46,16 @@ fn unsaved_under(ed: &Editor, root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// A found worktree has no record: only review, archive and adopt apply.
+pub(crate) fn found_refusal(a: &super::Agent) -> Option<String> {
+    (a.origin == Origin::Found).then(|| {
+        format!(
+            "{} is a found worktree with no record; a adopts it first (ret reviews it, A archives it)",
+            a.name
+        )
+    })
+}
+
 // ----- verification ------------------------------------------------------
 
 /// The verification command for a worktree: `[agents] test-command`, or
@@ -72,6 +82,14 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
     };
     if a.archived {
         ed.error("the agent's worktree was archived");
+        return;
+    }
+    if let Some(why) = found_refusal(a) {
+        ed.error(why);
+        return;
+    }
+    if let Some(note) = &a.worktree_note {
+        ed.error(format!("tests not run: {note}"));
         return;
     }
     if a.tests_running() {
@@ -200,7 +218,22 @@ fn on_test_event(ed: &mut Editor, id: AgentId, event: TaskEvent) {
 
 /// Why feedback cannot reach the agent now, if it cannot.
 fn feedback_blocker(a: &super::Agent) -> Option<String> {
+    if let Some(why) = found_refusal(a) {
+        return Some(why);
+    }
     match &a.runtime {
+        Runtime::None if a.origin == Origin::Loaded => Some(match a.kind() {
+            ProviderKind::Terminal => format!(
+                "{} is from an earlier session and its program is not running, so feedback cannot \
+                 reach it. R relaunches it without its task; then type into it with C-\\",
+                a.name
+            ),
+            ProviderKind::Acp => format!(
+                "{} is from an earlier session and not running, so feedback cannot reach it. \
+                 R relaunches it; then f sends the feedback",
+                a.name
+            ),
+        }),
         Runtime::None => Some("the agent is not running; feedback cannot reach it".into()),
         Runtime::Acp(_) if a.exited.is_some() => {
             Some("the agent process has exited; feedback cannot reach it".into())
@@ -421,6 +454,10 @@ pub fn confirm_reject(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
+    if let Some(why) = found_refusal(a) {
+        ed.error(why);
+        return;
+    }
     if a.base_status() == Status::Rejected {
         ed.error("the agent is already rejected; A archives its worktree");
         return;
@@ -480,6 +517,10 @@ pub fn ask_drop_file(ed: &mut Editor, id: AgentId, file: &maestro_git::DiffFile)
     let Some(a) = ed.agents.get(id) else {
         return;
     };
+    if let Some(why) = found_refusal(a) {
+        ed.error(why);
+        return;
+    }
     let Some(w) = a.worktree.clone() else {
         return;
     };
@@ -615,7 +656,22 @@ pub fn confirm_archive(ed: &mut Editor, id: AgentId) {
         ed.error(why);
         return;
     }
+    // A directory that is gone has nothing left to delete: archiving only
+    // marks the record (or lets Git drop its stale entry).
+    if let Some(note) = a.worktree_note.as_ref().filter(|_| w.path.exists()) {
+        ed.error(format!(
+            "not archived: {note}. Maestro does not remove a worktree that changed since it was \
+             recorded; look at it with `git worktree list`"
+        ));
+        return;
+    }
     let mut lines = vec![];
+    if a.origin == Origin::Found {
+        lines.push(format!(
+            "{} has no record in Maestro: its task and provider are unknown.",
+            w.path.display()
+        ));
+    }
     if a.is_running() || a.tests_running() {
         lines.push(format!("Stops {} first.", a.name));
     }
@@ -648,6 +704,8 @@ struct Removal {
     result: Result<(), RemoveError>,
     /// The branch the worktree had checked out when it was checked.
     branch_now: Option<String>,
+    /// The directory was gone and Git did not list it: nothing to remove.
+    already_gone: bool,
 }
 
 /// Removes the agent's worktree on a background thread. Without `force`,
@@ -690,6 +748,7 @@ pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
                             "the agent's program is still running after being stopped".into(),
                         ))),
                         branch_now: None,
+                        already_gone: false,
                     };
                 }
             }
@@ -701,24 +760,70 @@ pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
                             w.main_root.clone(),
                         ))),
                         branch_now: None,
+                        already_gone: false,
                     };
                 }
                 Err(e) => {
                     return Removal {
                         result: Err(RemoveError::Git(e)),
                         branch_now: None,
+                        already_gone: false,
                     };
                 }
             };
             let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            let branch_now = repo.worktrees().ok().and_then(|list| {
-                list.into_iter()
-                    .find(|x| canon(&x.path) == canon(&w.path))
-                    .and_then(|x| x.branch)
-            });
+            let list = match repo.worktrees() {
+                Ok(list) => list,
+                Err(e) => {
+                    return Removal {
+                        result: Err(RemoveError::Git(e)),
+                        branch_now: None,
+                        already_gone: false,
+                    };
+                }
+            };
+            let entry = list.into_iter().find(|x| canon(&x.path) == canon(&w.path));
+            let refuse = |msg: String| Removal {
+                result: Err(RemoveError::Git(maestro_git::GitError::InvalidArgument(
+                    msg,
+                ))),
+                branch_now: None,
+                already_gone: false,
+            };
+            let branch_now = match entry {
+                // Removed already (by hand, or by another Maestro): there
+                // is nothing left to delete, so the record is only marked.
+                None if !w.path.exists() => {
+                    return Removal {
+                        result: Ok(()),
+                        branch_now: None,
+                        already_gone: true,
+                    };
+                }
+                None => {
+                    return refuse(format!(
+                        "{} is not a worktree of this repository; nothing was removed",
+                        w.path.display()
+                    ));
+                }
+                // The path now holds other work than the record says: a
+                // removal would delete what the dialog did not name.
+                Some(x) if x.branch.as_deref() != Some(w.branch.as_str()) => {
+                    return refuse(format!(
+                        "the worktree {} is on {} now, not {}; nothing was removed",
+                        w.path.display(),
+                        x.branch
+                            .as_deref()
+                            .map_or("a detached HEAD".to_string(), |b| format!("branch {b}")),
+                        w.branch
+                    ));
+                }
+                Some(x) => x.branch,
+            };
             Removal {
                 result: repo.remove_worktree(&w.path, force),
                 branch_now,
+                already_gone: false,
             }
         })();
         tx.send(move |ed| archived(ed, id, force, removal));
@@ -740,6 +845,24 @@ fn archived(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) {
         return;
     };
     match removal.result {
+        Ok(()) if removal.already_gone => {
+            a.archived = true;
+            a.review = Default::default();
+            a.log(format!(
+                "the worktree {} was already gone; marked archived, branch {} kept",
+                w.path.display(),
+                w.branch
+            ));
+            if let Some(v) = &ed.agents.panel.review
+                && v.agent == id
+            {
+                ed.agents.panel.review = None;
+            }
+            ed.info(format!(
+                "{} was already gone; marked archived, nothing removed",
+                w.path.display()
+            ));
+        }
         Ok(()) => {
             a.archived = true;
             a.review = Default::default();
@@ -936,6 +1059,10 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
     }
     if a.base_status() == Status::Rejected {
         ed.error("the agent was rejected; its work is not integrated");
+        return;
+    }
+    if let Some(why) = found_refusal(a) {
+        ed.error(why);
         return;
     }
     if let Some(why) = busy(a) {
@@ -1249,4 +1376,71 @@ fn integrated(ed: &mut Editor, id: AgentId, how: Integration, r: Integrated) {
         }
     }
     super::review::request(ed, id);
+}
+
+// ----- found worktrees ---------------------------------------------------------
+
+/// `a` on a found worktree: asks which provider the adopted agent uses, for
+/// relaunching it later.
+pub fn ask_adopt(ed: &mut Editor, id: AgentId) {
+    let Some(a) = ed.agents.get(id) else {
+        return;
+    };
+    if a.origin != Origin::Found {
+        ed.error("a adopts a found worktree; this agent already has a record");
+        return;
+    }
+    if a.archived {
+        ed.error("the worktree was archived");
+        return;
+    }
+    if let Some(why) = busy(a) {
+        ed.error(why);
+        return;
+    }
+    let providers = super::providers(ed);
+    if providers.is_empty() {
+        ed.error("no agent providers are configured; adopting needs one to relaunch with");
+        return;
+    }
+    let items = providers
+        .iter()
+        .map(|p| (p.name.clone(), super::kind_label(p.kind).to_string()))
+        .collect();
+    ed.agents.panel.overlay = Some(Overlay::Choice {
+        purpose: ChoicePurpose::Adopt {
+            agent: id,
+            providers,
+        },
+        title: "adopt with provider (nothing starts now)".into(),
+        items,
+        selected: 0,
+    });
+}
+
+/// Turns a found worktree into an agent record with `provider`, saved from
+/// now on. Nothing starts; `R` relaunches it.
+pub fn adopt(ed: &mut Editor, id: AgentId, provider: ProviderSpec) {
+    let Some(a) = ed.agents.get_mut(id) else {
+        return;
+    };
+    if a.origin != Origin::Found {
+        return;
+    }
+    let Some(branch) = a.worktree.as_ref().map(|w| w.branch.clone()) else {
+        return;
+    };
+    a.origin = Origin::Loaded;
+    a.name = format!("{}-{}", provider.name, id.0);
+    a.task = format!("Work found on branch {branch}; Maestro has no record of its task");
+    a.log(format!(
+        "adopted with provider {}; its earlier status and task are unknown",
+        provider.name
+    ));
+    a.provider = provider;
+    a.decide(Status::Stopped);
+    let name = a.name.clone();
+    ed.info(format!(
+        "adopted {branch} as {name}: it is saved from now on; R relaunches it"
+    ));
 }

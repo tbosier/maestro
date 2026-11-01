@@ -63,6 +63,34 @@ fn main() {
             "an_agent_that_changes_nothing_says_so",
             an_agent_that_changes_nothing_says_so,
         ),
+        (
+            "records_survive_a_restart_and_loaded_agents_can_be_finished",
+            records_survive_a_restart_and_loaded_agents_can_be_finished,
+        ),
+        (
+            "found_worktrees_are_offered_archived_and_adopted",
+            found_worktrees_are_offered_archived_and_adopted,
+        ),
+        (
+            "an_unusable_records_file_is_reported_and_left_alone",
+            an_unusable_records_file_is_reported_and_left_alone,
+        ),
+        (
+            "without_sessions_no_records_are_read_or_written",
+            without_sessions_no_records_are_read_or_written,
+        ),
+        (
+            "a_loaded_terminal_agent_relaunches_without_its_task",
+            a_loaded_terminal_agent_relaunches_without_its_task,
+        ),
+        (
+            "a_loaded_acp_agent_relaunches_into_its_saved_session",
+            a_loaded_acp_agent_relaunches_into_its_saved_session,
+        ),
+        (
+            "a_loaded_record_whose_worktree_changed_is_not_archived",
+            a_loaded_record_whose_worktree_changed_is_not_archived,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -182,6 +210,71 @@ impl Fixture {
         ed.cwd = self.repo.clone();
         ed
     }
+
+    /// The state directory editors of this fixture save into.
+    fn state(&self) -> PathBuf {
+        self.tmp.join("state")
+    }
+
+    /// An editor with sessions on, as the terminal front end configures
+    /// it: agent records are read from and written to [`Self::state`].
+    fn session_editor(&self, config: Config) -> Editor {
+        let mut ed = self.editor(config);
+        maestro_editor::navigation::configure(&mut ed, Some(self.state()), true);
+        ed
+    }
+
+    fn records(&self) -> PathBuf {
+        maestro_editor::agents::persist::records_path(&self.state(), &self.repo)
+    }
+}
+
+/// Opens the panel and waits for the saved records and found worktrees.
+fn open_and_load(ed: &mut Editor, expect: usize) {
+    run(ed, " a");
+    poll_until(ed, "the saved records", |ed| {
+        !ed.agents.persist.loading && ed.agents.agents.len() == expect
+    });
+}
+
+fn status_text(ed: &Editor) -> String {
+    ed.status
+        .as_ref()
+        .map(|(_, m)| m.clone())
+        .unwrap_or_default()
+}
+
+fn hint_keys(ed: &Editor) -> Vec<(&'static str, &'static str)> {
+    maestro_editor::agents::panel::hints(ed)
+}
+
+/// Moves the panel's selection to agent `i` with `j`/`k`.
+fn select(ed: &mut Editor, i: usize) {
+    while ed.agents.panel.selected > i {
+        run(ed, "k");
+    }
+    while ed.agents.panel.selected < i {
+        run(ed, "j");
+    }
+}
+
+fn index_of(ed: &Editor, name: &str) -> usize {
+    ed.agents
+        .agents
+        .iter()
+        .position(|a| a.name == name)
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = ed.agents.agents.iter().map(|a| a.name.as_str()).collect();
+            panic!("no agent {name} in {names:?}")
+        })
+}
+
+fn quit(ed: &mut Editor) {
+    run(ed, ":qa\n");
+    if !ed.should_quit && ed.pending_char_label().is_some() {
+        run(ed, "y");
+    }
+    assert!(ed.should_quit, "status {:?}", ed.status);
 }
 
 fn provider(kind: AgentProviderKind, command: &str, args: &[&str]) -> AgentProviderConfig {
@@ -1032,4 +1125,640 @@ fn an_agent_that_changes_nothing_says_so() {
     poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
     assert_eq!(status(&ed, 0), Status::Rejected);
     assert!(!worktree(&ed, 0).exists());
+}
+
+fn two_writers() -> Config {
+    let alpha = "printf 'alpha\\n' > notes.txt";
+    let beta = "printf 'beta was here\\n' >> README.md";
+    let mut c = config(&[
+        (
+            "alpha",
+            provider(
+                AgentProviderKind::Terminal,
+                "sh",
+                &["-c", alpha, "sh", "{task}"],
+            ),
+        ),
+        (
+            "beta",
+            provider(
+                AgentProviderKind::Terminal,
+                "sh",
+                &["-c", beta, "sh", "{task}"],
+            ),
+        ),
+    ]);
+    c.agents.test_command = vec![
+        "sh".into(),
+        "-c".into(),
+        "echo 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'".into(),
+    ];
+    c
+}
+
+/// Save on quit, load in a new editor: records, comments, test summaries
+/// and status come back with no process and say so; review, tests,
+/// integrate and archive work on them; new ids continue after theirs.
+fn records_survive_a_restart_and_loaded_agents_can_be_finished() {
+    let f = Fixture::new();
+    let c = two_writers();
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write release notes", 0);
+    poll_until(&mut ed, "the first worktree", |ed| {
+        agent(ed, 0).worktree.is_some()
+    });
+    start_task(&mut ed, "touch the readme", 1);
+    poll_until(&mut ed, "both programs and diffs", |ed| {
+        ed.agents.agents.len() == 2
+            && ed.agents.agents.iter().all(|a| {
+                a.exited.is_some() && a.review.computed.is_some() && !a.review.files.is_empty()
+            })
+    });
+    // A comment on alpha's change and a test run.
+    select(&mut ed, 0);
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "alpha's review", |ed| {
+        maestro_editor::agents::review::current_rows(ed)
+            .iter()
+            .any(|r| matches!(r, Row::Line(l) if l.text == "alpha"))
+    });
+    let at = maestro_editor::agents::review::current_rows(&ed)
+        .iter()
+        .position(|r| matches!(r, Row::Line(l) if l.text == "alpha"))
+        .unwrap();
+    for _ in 0..at {
+        run(&mut ed, "j");
+    }
+    run(&mut ed, "c");
+    ed.paste_text("keep this");
+    run(&mut ed, "\n<esc>t");
+    poll_until(&mut ed, "the test run", |ed| {
+        agent(ed, 0)
+            .latest_test()
+            .is_some_and(|t| t.finished.is_some())
+    });
+    let (wt_a, wt_b) = (worktree(&ed, 0), worktree(&ed, 1));
+    let names: Vec<String> = ed.agents.agents.iter().map(|a| a.name.clone()).collect();
+    assert_eq!(names, ["alpha-1", "beta-2"]);
+    quit(&mut ed);
+    drop(ed);
+    let path = f.records();
+    assert!(path.is_file(), "{path:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("keep this") && saved.contains("3 passed"));
+    assert!(
+        !saved.contains("printf"),
+        "no provider command line is saved"
+    );
+
+    // A new editor in the same directory: nothing is read until the
+    // panel opens.
+    let mut ed = f.session_editor(c.clone());
+    assert!(ed.agents.agents.is_empty());
+    open_and_load(&mut ed, 2);
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("2 agent record(s) from an earlier session, not running"),
+        "{msg}"
+    );
+    for a in &ed.agents.agents {
+        assert_eq!(a.origin, maestro_editor::agents::Origin::Loaded);
+        assert!(!a.is_running());
+        assert!(a.from_earlier_session());
+        assert_eq!(a.status(), Status::ReadyForReview);
+        assert!(
+            a.history
+                .iter()
+                .any(|h| h.text.contains("loaded from an earlier session"))
+        );
+    }
+    let alpha = agent(&ed, 0);
+    assert_eq!(alpha.name, "alpha-1");
+    assert_eq!(alpha.worktree.as_ref().unwrap().path, wt_a);
+    assert_eq!(alpha.comments.len(), 1);
+    assert_eq!(alpha.comments[0].text, "keep this");
+    assert!(
+        alpha
+            .latest_test()
+            .unwrap()
+            .describe()
+            .contains("passed: 3 passed"),
+        "{}",
+        alpha.latest_test().unwrap().describe()
+    );
+    assert!(hint_keys(&ed).contains(&("R", "relaunch")));
+    // Feedback cannot reach a program that is not running.
+    run(&mut ed, "f");
+    assert!(ed.agents.panel.overlay.is_none());
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("from an earlier session") && msg.contains("R relaunches it"),
+        "{msg}"
+    );
+    // Tests run on a loaded agent.
+    run(&mut ed, "t");
+    poll_until(&mut ed, "the second test run", |ed| {
+        agent(ed, 0).tests.len() == 2 && agent(ed, 0).tests[1].finished.is_some()
+    });
+
+    // Review and integrate alpha, comment and all.
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "alpha's review with its comment", |ed| {
+        maestro_editor::agents::review::current_rows(ed)
+            .iter()
+            .any(|r| matches!(r, Row::Comment { text, .. } if text == "keep this"))
+    });
+    run(&mut ed, "<esc>I");
+    poll_until(&mut ed, "the integrate dialog", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Integrate { .. }))
+    });
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("notes.txt")).unwrap(),
+        "alpha\n"
+    );
+
+    // Archive beta: its change is uncommitted, so forcing asks again.
+    select(&mut ed, 1);
+    run(&mut ed, "A");
+    assert!(matches!(&ed.agents.panel.overlay,
+        Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Archive(_))));
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the force confirmation", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::ForceArchive(_)))
+    });
+    assert!(wt_b.exists());
+    run(&mut ed, "F");
+    poll_until(&mut ed, "the archive", |ed| agent(ed, 1).archived);
+    let list = f.git(&f.repo, &["worktree", "list", "--porcelain"]);
+    assert!(!list.contains(wt_b.to_str().unwrap()), "{list}");
+    assert!(list.contains(wt_a.to_str().unwrap()), "{list}");
+
+    // A new agent continues after the loaded ids: no branch is reused.
+    start_task(&mut ed, "third", 0);
+    poll_until(&mut ed, "the third agent", |ed| {
+        ed.agents.agents.len() == 3 && agent(ed, 2).exited.is_some()
+    });
+    assert_eq!(id(&ed, 2), AgentId(3));
+    assert_eq!(agent(&ed, 2).name, "alpha-3");
+    assert!(
+        agent(&ed, 2)
+            .worktree
+            .as_ref()
+            .unwrap()
+            .branch
+            .ends_with("third-3")
+    );
+    quit(&mut ed);
+    drop(ed);
+
+    // A third start shows the decisions.
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 3);
+    assert_eq!(status(&ed, 0), Status::Integrated);
+    assert!(agent(&ed, 1).archived);
+    assert_eq!(agent(&ed, 2).name, "alpha-3");
+    assert_eq!(agent(&ed, 0).tests.len(), 2);
+}
+
+/// Worktrees on maestro/ branches with no record are offered; they can be
+/// reviewed, archived (with the usual confirmation) or adopted, and
+/// nothing else.
+fn found_worktrees_are_offered_archived_and_adopted() {
+    let f = Fixture::new();
+    let wts = f.tmp.join("repo-worktrees");
+    std::fs::create_dir_all(&wts).unwrap();
+    let orphan = wts.join("orphan-7");
+    let kept = wts.join("kept-8");
+    let add = |path: &Path, branch: &str| {
+        f.git(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+            ],
+        );
+    };
+    add(&orphan, "maestro/orphan-7");
+    std::fs::write(orphan.join("left.txt"), "left behind\n").unwrap();
+    f.git(&orphan, &["add", "-A"]);
+    f.git(&orphan, &["commit", "-q", "-m", "orphaned work"]);
+    add(&kept, "maestro/kept-8");
+    // Not offered: another branch, and a maestro/ branch elsewhere.
+    add(&f.tmp.join("feature"), "feature");
+    add(&f.tmp.join("elsewhere"), "maestro/elsewhere-1");
+
+    let mut ed = f.session_editor(config(&[(
+        "sh",
+        provider(AgentProviderKind::Terminal, "sh", &["-c", "true"]),
+    )]));
+    open_and_load(&mut ed, 2);
+    let msg = status_text(&ed);
+    assert!(msg.contains("2 found worktree(s) with no record"), "{msg}");
+    let o = index_of(&ed, "found-orphan-7");
+    let k = index_of(&ed, "found-kept-8");
+    assert_eq!(agent(&ed, o).origin, maestro_editor::agents::Origin::Found);
+    assert!(!agent(&ed, o).is_running());
+    select(&mut ed, o);
+    let hints = hint_keys(&ed);
+    assert!(hints.contains(&("a", "adopt")) && hints.contains(&("A", "archive")));
+    assert!(!hints.iter().any(|(k, _)| *k == "I" || *k == "R"));
+    for key in ["t", "I", "f", "X", "N"] {
+        run(&mut ed, key);
+        let msg = status_text(&ed);
+        assert!(
+            msg.contains("found worktree with no record"),
+            "{key}: {msg}"
+        );
+        assert!(ed.agents.panel.overlay.is_none());
+    }
+    // The review shows its committed work against the fork point.
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "the found worktree's review", |ed| {
+        maestro_editor::agents::review::current_rows(ed)
+            .iter()
+            .any(|r| matches!(r, Row::Line(l) if l.text == "left behind"))
+    });
+    run(&mut ed, "c");
+    assert!(
+        ed.agents.panel.overlay.is_none(),
+        "no comments on a found worktree"
+    );
+    // Archive it: the dialog says it has no record; the branch is kept.
+    run(&mut ed, "<esc>A");
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Confirm(c)) => {
+            assert!(matches!(c.action, ConfirmAction::Archive(_)));
+            assert!(
+                c.lines.iter().any(|l| l.contains("has no record")),
+                "{:?}",
+                c.lines
+            );
+        }
+        other => panic!("expected the archive dialog, got {other:?}"),
+    }
+    assert!(orphan.exists(), "nothing removed before y");
+    run(&mut ed, "y");
+    // Its commits are on no other branch, so removal is refused and the
+    // second dialog asks, saying the branch keeps them.
+    poll_until(&mut ed, "the force confirmation", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::ForceArchive(_)))
+    });
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Confirm(c)) => assert!(
+            c.lines
+                .iter()
+                .any(|l| l.contains("only on branch maestro/orphan-7, which is kept")),
+            "{:?}",
+            c.lines
+        ),
+        _ => unreachable!(),
+    }
+    assert!(orphan.exists(), "nothing removed before F");
+    run(&mut ed, "F");
+    poll_until(&mut ed, "the archive", |ed| agent(ed, o).archived);
+    assert!(!orphan.exists());
+    let tip = f.git(&f.repo, &["log", "-1", "--format=%s", "maestro/orphan-7"]);
+    assert_eq!(tip.trim(), "orphaned work", "the branch is kept");
+
+    // Adopt the other: it becomes a saved record with a provider.
+    select(&mut ed, k);
+    run(&mut ed, "a");
+    assert!(matches!(
+        &ed.agents.panel.overlay,
+        Some(Overlay::Choice { .. })
+    ));
+    run(&mut ed, "\n");
+    let a = agent(&ed, k);
+    assert_eq!(a.origin, maestro_editor::agents::Origin::Loaded);
+    assert_eq!(a.provider.name, "sh");
+    assert_eq!(a.status(), Status::Stopped);
+    assert!(a.name.starts_with("sh-"), "{}", a.name);
+    assert!(hint_keys(&ed).contains(&("R", "relaunch")));
+    quit(&mut ed);
+    drop(ed);
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(f.records()).unwrap()).unwrap();
+    let agents = saved["agents"].as_array().unwrap();
+    assert_eq!(
+        agents.len(),
+        1,
+        "only the adopted worktree is saved: {saved}"
+    );
+    assert_eq!(agents[0]["worktree"]["branch"], "maestro/kept-8");
+    assert_eq!(agents[0]["status"], "stopped");
+}
+
+/// A records file that cannot be read is reported, left as it is, and
+/// never overwritten in that session.
+fn an_unusable_records_file_is_reported_and_left_alone() {
+    let f = Fixture::new();
+    let path = f.records();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{ this is not json").unwrap();
+    let mut ed = f.session_editor(config(&[(
+        "sh",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf x > x.txt", "sh", "{task}"],
+        ),
+    )]));
+    open_and_load(&mut ed, 0);
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("agent records not loaded")
+            && msg.contains("not valid JSON")
+            && msg.contains("left as it is"),
+        "{msg}"
+    );
+    start_task(&mut ed, "write x", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    ed.tick(Instant::now());
+    quit(&mut ed);
+    drop(ed);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "{ this is not json"
+    );
+    let dir: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(dir.len(), 1, "no temp file or other file: {dir:?}");
+}
+
+/// `restore-session = false` and `--clean` (no state directory) read and
+/// write no agent records.
+fn without_sessions_no_records_are_read_or_written() {
+    let f = Fixture::new();
+    let c = config(&[(
+        "sh",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf x > x.txt", "sh", "{task}"],
+        ),
+    )]);
+    // One record saved with sessions on.
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "first", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    quit(&mut ed);
+    drop(ed);
+    let saved = std::fs::read_to_string(f.records()).unwrap();
+
+    // restore-session = false: the state directory is set, sessions off.
+    let mut ed = f.editor(c.clone());
+    maestro_editor::navigation::configure(&mut ed, Some(f.state()), false);
+    run(&mut ed, " a");
+    assert!(!ed.agents.persist.loading, "no scan is started");
+    for _ in 0..20 {
+        ed.poll_background();
+    }
+    assert!(ed.agents.agents.is_empty(), "nothing is loaded");
+    start_task(&mut ed, "second", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    assert_eq!(id(&ed, 0), AgentId(1));
+    ed.tick(Instant::now());
+    quit(&mut ed);
+    drop(ed);
+    assert_eq!(std::fs::read_to_string(f.records()).unwrap(), saved);
+
+    // --clean: no state directory at all.
+    let mut ed = f.editor(c);
+    run(&mut ed, " a");
+    assert!(ed.agents.agents.is_empty());
+    start_task(&mut ed, "third", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    ed.tick(Instant::now());
+    quit(&mut ed);
+    drop(ed);
+    assert_eq!(std::fs::read_to_string(f.records()).unwrap(), saved);
+    let files = std::fs::read_dir(f.records().parent().unwrap())
+        .unwrap()
+        .count();
+    assert_eq!(files, 1);
+}
+
+/// `R` on a loaded terminal agent runs its provider command again in the
+/// same worktree, with the `{task}` argument left out.
+fn a_loaded_terminal_agent_relaunches_without_its_task() {
+    let f = Fixture::new();
+    let script = "printf '%s\\n' \"${1:-no task}\" >> runs.txt";
+    let c = config(&[(
+        "sh",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", script, "sh", "{task}"],
+        ),
+    )]);
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "first run", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    let wt = worktree(&ed, 0);
+    quit(&mut ed);
+    drop(ed);
+
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    assert!(agent(&ed, 0).from_earlier_session());
+    run(&mut ed, "R");
+    let msg = status_text(&ed);
+    assert!(msg.contains("without its task"), "{msg}");
+    poll_until(&mut ed, "the relaunched program", |ed| {
+        agent(ed, 0).exited.is_some()
+    });
+    let a = agent(&ed, 0);
+    assert_eq!(a.origin, maestro_editor::agents::Origin::New);
+    assert!(!a.from_earlier_session());
+    assert_eq!(a.status(), Status::ReadyForReview);
+    assert!(
+        a.history.iter().any(|h| h
+            .text
+            .contains("relaunched sh in a terminal without the task")),
+        "{:?}",
+        a.history
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("runs.txt")).unwrap(),
+        "first run\nno task\n"
+    );
+}
+
+/// `R` on a loaded ACP agent loads its saved session when the agent
+/// advertises `loadSession`, and starts a new one (saying so) when not.
+fn a_loaded_acp_agent_relaunches_into_its_saved_session() {
+    use maestro_agent::fake::LOAD_SESSION_ARG;
+    let f = Fixture::new();
+    let exe = std::env::current_exe().unwrap();
+    let exe = exe.to_str().unwrap();
+    let c = config(&[
+        (
+            "loader",
+            provider(AgentProviderKind::Acp, exe, &[FAKE_ARG, LOAD_SESSION_ARG]),
+        ),
+        ("plain", provider(AgentProviderKind::Acp, exe, &[FAKE_ARG])),
+    ]);
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "say first answer", 0);
+    start_task(&mut ed, "say plain answer", 1);
+    poll_until(&mut ed, "both turns", |ed| {
+        ed.agents.agents.len() == 2
+            && ed
+                .agents
+                .agents
+                .iter()
+                .all(|a| matches!(a.status(), Status::ReadyForReview | Status::Completed))
+    });
+    assert_eq!(
+        agent(&ed, 0).session_id.as_deref(),
+        Some(maestro_agent::fake::SESSION_ID)
+    );
+    assert!(agent(&ed, 0).load_session);
+    assert!(!agent(&ed, 1).load_session);
+    quit(&mut ed);
+    drop(ed);
+
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 2);
+    assert!(
+        agent(&ed, 0).transcript.is_empty(),
+        "transcripts are not saved"
+    );
+    run(&mut ed, "f");
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("R relaunches it; then f sends the feedback"),
+        "{msg}"
+    );
+    run(&mut ed, "R");
+    assert!(
+        status_text(&ed).contains("loading its saved session"),
+        "{}",
+        status_text(&ed)
+    );
+    poll_until(&mut ed, "the loaded session", |ed| {
+        status(ed, 0) == Status::Idle
+    });
+    let a = agent(&ed, 0);
+    assert!(a.is_running());
+    assert!(
+        a.transcript
+            .iter()
+            .any(|e| matches!(e, TranscriptEntry::Agent(t) if t == "replayed fake-session")),
+        "{:?}",
+        a.transcript
+    );
+    assert!(
+        a.history
+            .iter()
+            .any(|h| h.text.contains("loaded the saved session fake-session"))
+    );
+    run(&mut ed, "f");
+    ed.paste_text("say after the relaunch");
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "the feedback turn", |ed| {
+        matches!(status(ed, 0), Status::ReadyForReview | Status::Completed)
+            && agent(ed, 0)
+                .transcript
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::Agent(t) if t.contains("after the relaunch")))
+    });
+
+    // An agent that does not advertise loadSession gets a new session.
+    select(&mut ed, 1);
+    run(&mut ed, "R");
+    assert!(
+        status_text(&ed).contains("in a new session without the earlier conversation"),
+        "{}",
+        status_text(&ed)
+    );
+    poll_until(&mut ed, "the new session", |ed| {
+        status(ed, 1) == Status::Idle
+    });
+    assert!(
+        agent(&ed, 1).transcript.iter().any(|e| matches!(e,
+            TranscriptEntry::System(t) if t.contains("did not advertise session loading"))),
+        "{:?}",
+        agent(&ed, 1).transcript
+    );
+    quit(&mut ed);
+}
+
+/// A loaded record whose worktree was switched to another branch is not
+/// reviewed, tested, relaunched or archived as if it were the agent's.
+fn a_loaded_record_whose_worktree_changed_is_not_archived() {
+    let f = Fixture::new();
+    let c = config(&[(
+        "sh",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf x > x.txt", "sh", "{task}"],
+        ),
+    )]);
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write x", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    let wt = worktree(&ed, 0);
+    quit(&mut ed);
+    drop(ed);
+    // Someone else's work now lives in that directory.
+    f.git(&wt, &["checkout", "-q", "-b", "other"]);
+
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    let msg = status_text(&ed);
+    assert!(msg.contains("1 record(s) whose worktree changed"), "{msg}");
+    let note = agent(&ed, 0).worktree_note.clone().unwrap();
+    assert!(note.contains("now on branch other"), "{note}");
+    poll_until(&mut ed, "the refused review", |ed| {
+        agent(ed, 0)
+            .review
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("on other now"))
+    });
+    for key in ["A", "R", "t"] {
+        run(&mut ed, key);
+        assert!(ed.agents.panel.overlay.is_none(), "{key}");
+        let msg = status_text(&ed);
+        assert!(msg.contains("now on branch other"), "{key}: {msg}");
+    }
+    assert!(wt.join("x.txt").exists(), "nothing was removed");
 }
