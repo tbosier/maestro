@@ -456,6 +456,32 @@ fn c_writes_a_comment_in_a_buffer_and_pr_send_sends_what_was_shown() {
 }
 
 #[test]
+fn text_typed_while_sending_is_not_thrown_away() {
+    let slow = ANSWERS.replace(
+        r#""pr review"*|"pr comment"*|"pr merge"*) echo done ;;"#,
+        r#""pr comment"*) sleep 1; echo done ;;"#,
+    );
+    let f = Fake::new(&slow);
+    let mut ed = f.editor();
+    open_inbox(&mut ed);
+    ed.feed_keys(&keys(
+        "cfirst<esc>:pr-send
+y",
+    ));
+    let draft = ed.view().doc;
+    // While gh runs, the user adds to the buffer.
+    ed.feed_keys(&keys("<esc>Ao more<esc>"));
+    settle(&mut ed);
+    assert_eq!(f.writes()[0].1, "first");
+    assert!(ed.buffers.contains_key(&draft), "the new text is kept");
+    assert!(
+        status(&ed).contains("changed after it was sent"),
+        "{}",
+        status(&ed)
+    );
+}
+
+#[test]
 fn request_changes_needs_text_and_a_failed_send_keeps_the_buffer() {
     let failing = ANSWERS.replace(
         r#""pr review"*|"pr comment"*|"pr merge"*) echo done ;;"#,
