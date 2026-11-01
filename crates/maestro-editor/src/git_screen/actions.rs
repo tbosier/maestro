@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use maestro_git::{ApplyTo, DiffSpec, FileChange, FilePatch, Picks, RemoteOp, Repository, Side};
 
-use super::{BranchPicker, CommitMessage, Dialog, Page, Pending, Row, Screen, Section};
+use super::{BranchPicker, CommitMessage, Dialog, Page, Pending, Prepared, Row, Screen, Section};
 use crate::editor::{Editor, Severity};
 use crate::key::{KeyCode, KeyEvent};
 
@@ -175,13 +175,11 @@ fn paths_of(f: &FilePatch) -> Vec<PathBuf> {
 }
 
 /// True when a partial patch cannot express the change, so a whole-file
-/// action stands in when every line is picked: an added, deleted or
-/// renamed file, or a mode change.
+/// action stands in when every line is picked: an added or deleted file.
 fn whole_file_only(f: &FilePatch) -> bool {
-    !matches!(f.file.change, FileChange::Modified)
-        || (f.file.old_mode.is_some()
-            && f.file.new_mode.is_some()
-            && f.file.old_mode != f.file.new_mode)
+    // Renames, copies and mode changes are never undone by a hunk action:
+    // their patches change only the contents of the file at its new path.
+    matches!(f.file.change, FileChange::Added | FileChange::Deleted)
 }
 
 /// The picks for a hunk or line target.
@@ -263,6 +261,18 @@ pub(super) fn stage(ed: &mut Editor) {
             });
         }
         Target::Section(Section::Unstaged) => {
+            if let Some(f) = data
+                .unstaged
+                .iter()
+                .find(|f| f.file.unmerged && has_markers(&root, f))
+            {
+                return ed.error(format!(
+                    "{} still has conflict markers (<<<<<<<); resolve them before staging",
+                    f.target_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ));
+            }
             let paths: Vec<PathBuf> = data.unstaged.iter().flat_map(paths_of).collect();
             run_job(ed, "staging", root, move || {
                 let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
@@ -429,6 +439,7 @@ fn patch_job(
         check_unchanged(&repo, &spec_of(section), &f)?;
         if op == Op::DiscardStaged {
             check_no_unstaged(&repo, &f)?;
+            check_no_untracked(&repo, &f)?;
         }
         let e = |e: maestro_git::GitError| e.to_string();
         let paths = paths_of(&f);
@@ -463,6 +474,24 @@ fn check_no_unstaged(repo: &Repository, f: &FilePatch) -> Result<(), String> {
                 .unwrap_or_default()
         ))
     }
+}
+
+/// Fails when a path a staged discard would restore from `HEAD` now holds
+/// an untracked file (say, a file recreated after its deletion was
+/// staged): restoring would overwrite it.
+fn check_no_untracked(repo: &Repository, f: &FilePatch) -> Result<(), String> {
+    for p in paths_of(f) {
+        let full = repo.root().join(&p);
+        if std::fs::symlink_metadata(&full).is_ok()
+            && repo.is_untracked(&full).map_err(|e| e.to_string())?
+        {
+            return Err(format!(
+                "{} is an untracked file now and discarding would overwrite it; nothing was changed",
+                p.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ----- discard ----------------------------------------------------------
@@ -631,6 +660,23 @@ pub(super) fn discard(ed: &mut Editor) {
                     "in the working tree"
                 }
             )];
+            if whole_file_only(&f) && f.covers_all(&picks) {
+                lines.push(match f.file.change {
+                    FileChange::Added => format!(
+                        "That is every line of the new file, so {} itself is removed{}.",
+                        name.display(),
+                        if section == Section::Staged {
+                            " from the index and the working tree"
+                        } else {
+                            ""
+                        }
+                    ),
+                    _ => format!(
+                        "That is every line of the deleted file, so {} comes back whole.",
+                        name.display()
+                    ),
+                });
+            }
             lines.push(if section == Section::Staged {
                 "The staged text stays in Git's object store only until garbage collection; git fsck --lost-found can find it until then.".into()
             } else {
@@ -738,6 +784,7 @@ fn run_discard(ed: &mut Editor, d: Discard) {
                 let e = |e: maestro_git::GitError| e.to_string();
                 if section == Section::Staged {
                     check_no_unstaged(&repo, &f)?;
+                    check_no_untracked(&repo, &f)?;
                     repo.discard_staged_paths(&refs).map_err(e)?;
                 } else {
                     repo.discard_paths(&refs).map_err(e)?;
@@ -792,7 +839,7 @@ pub(super) fn dialog_key(ed: &mut Editor, key: KeyEvent) {
     }
     match d.pending {
         Pending::Discard(x) => run_discard(ed, x),
-        Pending::Amend { message, stat } => open_message(ed, true, message, stat),
+        Pending::Amend(prepared) => open_message(ed, true, prepared),
         Pending::Remote(cmd) => run_remote(ed, cmd),
     }
 }
@@ -830,13 +877,30 @@ pub(super) fn commit(ed: &mut Editor, amend: bool) {
     let spawned = ed.spawn_background("git-commit-prepare", move |tx| {
         let result = (|| {
             let e = |e: maestro_git::GitError| e.to_string();
-            let stat = repo.staged_stat().map_err(e)?;
+            let mut p = Prepared {
+                stat: repo.staged_stat().map_err(e)?,
+                head: if repo.has_head().map_err(e)? {
+                    Some(repo.resolve("HEAD").map_err(e)?)
+                } else {
+                    None
+                },
+                branch: repo.head().map_err(e)?.branch().map(str::to_string),
+                operation: repo.operation().map_err(e)?,
+                ..Default::default()
+            };
             if !amend {
-                return Ok((String::new(), stat, Vec::new()));
+                return Ok((p, Vec::new()));
             }
-            let message = repo.head_message().map_err(e)?;
+            if let Some(op) = p.operation {
+                return Err(format!(
+                    "not amending: a {} is in progress; finish it first ({})",
+                    op.label(),
+                    op.way_out()
+                ));
+            }
+            p.message = repo.head_message().map_err(e)?;
             let remotes = repo.head_on_remotes().map_err(e)?;
-            Ok::<_, String>((message, stat, remotes))
+            Ok::<_, String>((p, remotes))
         })();
         tx.send(move |ed| {
             let Some(sc) = &mut ed.git.screen else {
@@ -848,7 +912,7 @@ pub(super) fn commit(ed: &mut Editor, amend: bool) {
             sc.busy = None;
             match result {
                 Err(e) => ed.error(e),
-                Ok((message, stat, remotes)) if !remotes.is_empty() => {
+                Ok((prepared, remotes)) if !remotes.is_empty() => {
                     let head = sc
                         .data
                         .as_ref()
@@ -868,10 +932,10 @@ pub(super) fn commit(ed: &mut Editor, amend: bool) {
                             ("y".into(), "amend anyway".into()),
                             ("n".into(), "cancel".into()),
                         ],
-                        pending: Pending::Amend { message, stat },
+                        pending: Pending::Amend(prepared),
                     });
                 }
-                Ok((message, stat, _)) => open_message(ed, amend, message, stat),
+                Ok((prepared, _)) => open_message(ed, amend, prepared),
             }
         });
     });
@@ -943,20 +1007,52 @@ pub fn clean_message(text: &str) -> String {
     s
 }
 
-fn open_message(ed: &mut Editor, amend: bool, message: String, stat: String) {
+/// A new file for one commit message in the Git directory, so two
+/// editors (or two messages) never share one.
+fn message_file(git_dir: &Path, text: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = git_dir.join(format!("MAESTRO_EDITMSG-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(text.as_bytes())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn open_message(ed: &mut Editor, amend: bool, prepared: Prepared) {
     let Some(repo) = ed.git.screen.as_ref().and_then(|s| s.repo.clone()) else {
         return;
     };
-    let path = repo.git_dir().join("MAESTRO_EDITMSG");
-    if let Err(e) = std::fs::write(&path, template(amend, &message, &stat)) {
-        return ed.error(format!("could not write {}: {e}", path.display()));
-    }
+    let text = template(amend, &prepared.message, &prepared.stat);
+    let path = match message_file(repo.git_dir(), &text) {
+        Ok(p) => p,
+        Err(e) => {
+            return ed.error(format!(
+                "could not write a message file in {}: {e}",
+                repo.git_dir().display()
+            ));
+        }
+    };
+    let written = maestro_core::io::DiskState::read(&path);
     ed.git.screen = None;
     ed.split(crate::layout::Direction::Horizontal);
     let doc = match ed.open(&path) {
         Ok(d) => d,
         Err(e) => {
             ed.close_view();
+            let _ = std::fs::remove_file(&path);
             return ed.error(e);
         }
     };
@@ -966,34 +1062,46 @@ fn open_message(ed: &mut Editor, amend: bool, message: String, stat: String) {
         path,
         repo,
         amend,
+        written,
+        dirty: false,
+        prepared,
     });
     ed.info(if amend {
-        "edit the message, then :wq amends; closing without saving or with an empty message aborts"
+        "edit the message, then :wq amends; closing without saving, or with an empty message, aborts"
     } else {
-        "write the message, then :wq commits; closing without saving or with an empty message aborts"
+        "write the message, then :wq commits; closing without saving, or with an empty message, aborts"
     });
 }
 
-/// Commits once the message buffer is no longer shown in any view: with
-/// the saved text, or not at all when it has unsaved edits or the message
-/// is empty. Called from [`crate::git::refresh`].
+/// Commits once the message buffer is no longer shown in any view, with
+/// the text saved to its file. Nothing is committed when the buffer was
+/// never saved, had unsaved edits when it went away, or holds an empty
+/// message, or when `HEAD`, the branch or the operation in progress
+/// changed since the message was opened. Called from
+/// [`crate::git::refresh`].
 pub fn check_commit_message(ed: &mut Editor) {
-    let Some(cm) = &ed.git.commit_message else {
+    let Some(cm) = &mut ed.git.commit_message else {
         return;
     };
-    let exists = ed.buffers.contains_key(&cm.doc);
-    if exists && ed.views.values().any(|v| v.doc == cm.doc) {
-        return;
+    let buffer = ed.buffers.get(&cm.doc);
+    if let Some(b) = buffer {
+        cm.dirty = b.doc.is_modified();
+        if ed.views.values().any(|v| v.doc == cm.doc) {
+            return;
+        }
     }
     let Some(cm) = ed.git.commit_message.take() else {
         return;
     };
-    let modified = exists && ed.buffers[&cm.doc].doc.is_modified();
-    if exists {
+    if ed.buffers.contains_key(&cm.doc) {
         let _ = ed.close_buffer(cm.doc, true);
     }
     let what = if cm.amend { "amend" } else { "commit" };
-    if modified {
+    let saved = match (cm.written, maestro_core::io::DiskState::read(&cm.path)) {
+        (Some(w), Some(now)) => w.metadata_differs(&now),
+        _ => false,
+    };
+    if cm.dirty || !saved {
         let _ = std::fs::remove_file(&cm.path);
         ed.set_status(
             Severity::Warning,
@@ -1012,8 +1120,28 @@ pub fn check_commit_message(ed: &mut Editor) {
     let repo = cm.repo.clone();
     let path = cm.path.clone();
     let amend = cm.amend;
+    let prepared = cm.prepared.clone();
     let spawned = ed.spawn_background("git-commit", move |tx| {
-        let result = repo.commit(&message, amend);
+        let result = (|| {
+            let e = |e: maestro_git::GitError| e.to_string();
+            let head = if repo.has_head().map_err(e)? {
+                Some(repo.resolve("HEAD").map_err(e)?)
+            } else {
+                None
+            };
+            let branch = repo.head().map_err(e)?.branch().map(str::to_string);
+            let operation = repo.operation().map_err(e)?;
+            if head != prepared.head || branch != prepared.branch {
+                return Err("HEAD moved (a commit, or another branch checked out) since the message was opened".to_string());
+            }
+            if operation != prepared.operation {
+                return Err(match operation {
+                    Some(op) => format!("a {} started since the message was opened", op.label()),
+                    None => "the operation in progress ended since the message was opened".into(),
+                });
+            }
+            repo.commit(&message, amend).map_err(e)
+        })();
         let subject = message.lines().next().unwrap_or_default().to_string();
         tx.send(move |ed| {
             crate::git::repository_changed(ed, &root);
@@ -1030,8 +1158,8 @@ pub fn check_commit_message(ed: &mut Editor) {
                     }
                 }
                 Err(e) => ed.error(format!(
-                    "{} failed: {e}; the message is kept in {}",
-                    if amend { "amend" } else { "commit" },
+                    "not {}: {e}; the message is kept in {}",
+                    if amend { "amended" } else { "committed" },
                     path.display()
                 )),
             }

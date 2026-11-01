@@ -40,8 +40,11 @@ impl RemoteOp {
 pub struct RemoteCommand {
     pub op: RemoteOp,
     pub remote: String,
-    /// The remote's URL, for showing.
+    /// The URL git will use: the push URL for a push.
     pub url: String,
+    /// The branch checked out when the command was worked out. It runs
+    /// only while that branch is still checked out.
+    pub branch: Option<String>,
     /// The arguments after `git`.
     pub args: Vec<String>,
 }
@@ -233,14 +236,20 @@ impl Repository {
                 "remote {remote:?} is not configured"
             )));
         }
-        let url = self
-            .config_get(&format!("remote.{remote}.url"))?
-            .unwrap_or_default();
+        let mut get_url = vec!["remote", "get-url"];
+        if op == RemoteOp::Push {
+            get_url.push("--push");
+        }
+        get_url.push(&remote);
+        let url = String::from_utf8_lossy(&self.run(&get_url, Access::ReadOnly)?)
+            .trim()
+            .to_string();
         Ok(RemoteCommand {
             op,
             remote,
             url,
             args,
+            branch,
         })
     }
 
@@ -263,6 +272,14 @@ impl Repository {
         };
         if first != Some(expected) {
             return Err(GitError::InvalidArgument("not a remote command".into()));
+        }
+        let now = self.head()?.branch().map(str::to_string);
+        if now != cmd.branch {
+            return Err(GitError::InvalidArgument(format!(
+                "{} is checked out now, not {}; nothing was run",
+                now.as_deref().unwrap_or("a detached HEAD"),
+                cmd.branch.as_deref().unwrap_or("a detached HEAD")
+            )));
         }
         let mut git = self.git().clone();
         let ssh_set = std::env::var_os("GIT_SSH_COMMAND").is_some()

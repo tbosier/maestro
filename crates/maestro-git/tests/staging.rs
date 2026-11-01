@@ -223,6 +223,71 @@ fn line_staging_with_additions_next_to_deletions_leaves_the_file_alone() {
 }
 
 #[test]
+fn picking_one_of_two_replaced_lines_keeps_the_order() {
+    let f = Fixture::new();
+    f.write("r.txt", "one\ntwo\nthree\nfour\n");
+    f.commit_all("init");
+    f.write("r.txt", "one\nTWO\nTHREE\nfour\n");
+    let repo = f.repo();
+    // The first replacement only.
+    let p = f.unstaged("r.txt");
+    let picks = Picks::new().lines(
+        0,
+        [
+            line(&p, 0, DiffLineKind::Removed, "two"),
+            line(&p, 0, DiffLineKind::Added, "TWO"),
+        ],
+    );
+    repo.apply_patch(
+        &p.build(&picks, Side::Forward).unwrap(),
+        ApplyTo::Index,
+        false,
+    )
+    .unwrap();
+    assert_eq!(f.index("r.txt"), b"one\nTWO\nthree\nfour\n");
+    // Unstage it again, then stage the second replacement only.
+    let s = f.staged("r.txt");
+    repo.apply_patch(
+        &s.build(&Picks::new().hunk(0), Side::Reverse).unwrap(),
+        ApplyTo::Index,
+        true,
+    )
+    .unwrap();
+    let p = f.unstaged("r.txt");
+    let picks = Picks::new().lines(
+        0,
+        [
+            line(&p, 0, DiffLineKind::Removed, "three"),
+            line(&p, 0, DiffLineKind::Added, "THREE"),
+        ],
+    );
+    repo.apply_patch(
+        &p.build(&picks, Side::Forward).unwrap(),
+        ApplyTo::Index,
+        false,
+    )
+    .unwrap();
+    assert_eq!(f.index("r.txt"), b"one\ntwo\nTHREE\nfour\n");
+    // Unstaging the first of two staged replacements keeps the second.
+    f.git(&["add", "r.txt"]);
+    let s = f.staged("r.txt");
+    let picks = Picks::new().lines(
+        0,
+        [
+            line(&s, 0, DiffLineKind::Removed, "two"),
+            line(&s, 0, DiffLineKind::Added, "TWO"),
+        ],
+    );
+    repo.apply_patch(
+        &s.build(&picks, Side::Reverse).unwrap(),
+        ApplyTo::Index,
+        true,
+    )
+    .unwrap();
+    assert_eq!(f.index("r.txt"), b"one\ntwo\nTHREE\nfour\n");
+}
+
+#[test]
 fn a_file_without_a_trailing_newline() {
     let f = Fixture::new();
     f.write("n.txt", "a\nb\nc");
@@ -474,6 +539,35 @@ fn commit_amend_and_remote_containment() {
         repo.remote_command(RemoteOp::Pull).unwrap().display(),
         "git pull --no-rebase --ff-only origin refs/heads/main"
     );
+    // A push shows the push URL when one is set.
+    assert_eq!(push.url, bare.to_str().unwrap());
+    let elsewhere = f.tmp.join("push-target.git");
+    f.git(&[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        elsewhere.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        repo.remote_command(RemoteOp::Push).unwrap().url,
+        elsewhere.to_str().unwrap()
+    );
+    assert_eq!(
+        repo.remote_command(RemoteOp::Fetch).unwrap().url,
+        bare.to_str().unwrap()
+    );
+    f.git(&["config", "--unset", "remote.origin.pushurl"]);
+    // A command planned on main does not run once another branch is out.
+    let pull = repo.remote_command(RemoteOp::Pull).unwrap();
+    assert_eq!(pull.branch.as_deref(), Some("main"));
+    f.git(&["switch", "-q", "-c", "elsewhere"]);
+    let err = repo.run_remote(&pull).unwrap_err().to_string();
+    assert!(
+        err.contains("elsewhere is checked out now, not main"),
+        "{err}"
+    );
+    f.git(&["switch", "-q", "main"]);
     // A hand-made forcing command is refused before git runs.
     let mut forced = push.clone();
     forced.args.insert(1, "--force".into());

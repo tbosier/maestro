@@ -244,10 +244,9 @@ impl FilePatch {
             let hunk = &self.file.hunks[h];
             let mut rows: Vec<(u8, &[u8], bool)> = Vec::new();
             let mut changed = false;
-            for (i, l) in hunk.lines.iter().enumerate() {
-                let bytes = self.bytes[h][i].as_slice();
+            let marker = |i: usize| -> Option<u8> {
                 let picked = picks.picked(h, i);
-                let marker = match (l.kind, picked, side) {
+                match (hunk.lines[i].kind, picked, side) {
                     (DiffLineKind::Context, _, _) => Some(b' '),
                     (DiffLineKind::Added, true, _) => Some(b'+'),
                     (DiffLineKind::Removed, true, _) => Some(b'-'),
@@ -255,10 +254,42 @@ impl FilePatch {
                     (DiffLineKind::Removed, false, Side::Forward) => Some(b' '),
                     (DiffLineKind::Added, false, Side::Reverse) => Some(b' '),
                     (DiffLineKind::Removed, false, Side::Reverse) => None,
-                };
-                if let Some(m) = marker {
+                }
+            };
+            // Line indices in the order they are written.
+            let mut order: Vec<usize> = Vec::with_capacity(hunk.lines.len());
+            // A change block (removed lines, then added ones) is written
+            // position by position: the k-th removed line, then the k-th
+            // added line. A line that stays (as context) keeps its place
+            // next to its partner, so picking the second of two replaced
+            // lines never moves the first one below it.
+            let lines = &hunk.lines;
+            let mut i = 0;
+            while i < lines.len() {
+                if lines[i].kind == DiffLineKind::Context {
+                    order.push(i);
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < lines.len() && lines[i].kind == DiffLineKind::Removed {
+                    i += 1;
+                }
+                let removed: Vec<usize> = (start..i).collect();
+                let added_start = i;
+                while i < lines.len() && lines[i].kind == DiffLineKind::Added {
+                    i += 1;
+                }
+                let added: Vec<usize> = (added_start..i).collect();
+                for k in 0..removed.len().max(added.len()) {
+                    order.extend(removed.get(k));
+                    order.extend(added.get(k));
+                }
+            }
+            for i in order {
+                if let Some(m) = marker(i) {
                     changed |= m != b' ';
-                    rows.push((m, bytes, l.no_newline));
+                    rows.push((m, self.bytes[h][i].as_slice(), hunk.lines[i].no_newline));
                 }
             }
             if !changed {
@@ -661,7 +692,9 @@ index 1111111..2222222 100644
                 .unwrap(),
         );
         assert!(
-            fwd.ends_with("@@ -1,4 +1,4 @@\n one\n-two\n three\n+TWO\n four\n"),
+            // "three" stays after "TWO", where it was: the new side reads
+            // one, TWO, three, four.
+            fwd.ends_with("@@ -1,4 +1,4 @@\n one\n-two\n+TWO\n three\n four\n"),
             "{fwd}"
         );
         // Both hunks, second whole: the second's new start follows the
@@ -671,7 +704,7 @@ index 1111111..2222222 100644
                 .unwrap(),
         );
         assert!(
-            fwd.contains("@@ -1,4 +1,5 @@\n one\n two\n three\n+TWO\n four\n@@ -10,3 +11,4 @@"),
+            fwd.contains("@@ -1,4 +1,5 @@\n one\n two\n+TWO\n three\n four\n@@ -10,3 +11,4 @@"),
             "{fwd}"
         );
     }
@@ -686,7 +719,7 @@ index 1111111..2222222 100644
         // New side unchanged (4 lines: one TWO THREE four); old side drops
         // "-two" (unpicked removal) and keeps "-three".
         assert!(
-            rev.ends_with("@@ -1,4 +1,4 @@\n one\n-three\n TWO\n+THREE\n four\n"),
+            rev.ends_with("@@ -1,4 +1,4 @@\n one\n TWO\n-three\n+THREE\n four\n"),
             "{rev}"
         );
         // Reverse with an earlier hunk that adds a net line: the later

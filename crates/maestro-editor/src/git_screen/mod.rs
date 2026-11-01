@@ -161,10 +161,7 @@ pub enum DetailRow {
 pub enum Pending {
     Discard(actions::Discard),
     /// Amend after being told `HEAD` is already on a remote.
-    Amend {
-        message: String,
-        stat: String,
-    },
+    Amend(Prepared),
     Remote(maestro_git::RemoteCommand),
 }
 
@@ -251,9 +248,30 @@ pub struct Screen {
 #[derive(Debug, Clone)]
 pub struct CommitMessage {
     pub doc: DocumentId,
+    /// A file of this message's own in the Git directory.
     pub path: PathBuf,
     pub repo: Repository,
     pub amend: bool,
+    /// The file as written before the buffer opened: a commit needs a save
+    /// after that.
+    pub written: Option<maestro_core::io::DiskState>,
+    /// Whether the buffer had unsaved edits when last seen, for a buffer
+    /// closed by force.
+    pub dirty: bool,
+    /// `HEAD`, its branch and the operation in progress when the message
+    /// was opened; the commit is refused if any of them changed.
+    pub prepared: Prepared,
+}
+
+/// What a commit message is written against, read when it is opened.
+#[derive(Debug, Clone, Default)]
+pub struct Prepared {
+    /// The amended commit's message (empty for a new commit).
+    pub message: String,
+    pub stat: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub operation: Option<Operation>,
 }
 
 fn git_screen(ed: &mut Editor) {
