@@ -110,6 +110,7 @@ fn record(id: u64, status: &str) -> maestro_editor::agents::persist::AgentRecord
         session_id: None,
         load_session: false,
         created: 0,
+        contract: None,
     }
 }
 
@@ -158,4 +159,94 @@ fn loaded_agents_say_they_are_not_running_and_found_worktrees_have_no_status() {
     );
     assert!(text.contains("a adopt"), "{text}");
     assert!(!text.contains("R relaunch"), "{text}");
+}
+
+fn added(path: &str) -> maestro_editor::agents::DiffFile {
+    maestro_editor::agents::DiffFile {
+        old_path: None,
+        new_path: Some(path.into()),
+        change: FileChange::Added,
+        old_mode: None,
+        new_mode: None,
+        binary: false,
+        unmerged: false,
+        hunks: vec![],
+    }
+}
+
+#[test]
+fn contracts_and_conflicts_are_shown_in_words() {
+    use maestro_editor::agents::conflicts::{Merge, Pair};
+    use maestro_editor::agents::persist::from_record;
+    use maestro_editor::agents::review::ReviewView;
+    let screen = |ed: &Editor| -> Vec<String> {
+        let mut s = Surface::new(160, 30, ed.theme.ui.text);
+        crate::render::render(ed, &mut s);
+        (0..30).map(|y| row(&s, y)).collect()
+    };
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 160, 28));
+    let mut a = from_record(&record(1, "ready-for-review"), &[]);
+    a.contract = Some(Contract {
+        allowed: vec!["notes.txt".into()],
+        verify: Some(vec!["sh".into(), "-c".into(), "test -f notes.txt".into()]),
+        ..Default::default()
+    });
+    a.review.files = vec![added("notes.txt"), added("stray.txt")];
+    a.review.computed = Some(std::time::Instant::now());
+    ed.agents.agents.push(a);
+    ed.agents
+        .agents
+        .push(from_record(&record(2, "ready-for-review"), &[]));
+    let (one, two) = (ed.agents.agents[0].id, ed.agents.agents[1].id);
+    ed.agents.conflicts.pairs = vec![Pair {
+        a: one,
+        b: two,
+        files: vec!["notes.txt".into()],
+        merge: Merge::Conflicts(vec!["notes.txt".into()]),
+    }];
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    let text = screen(&ed).join("\n");
+    assert!(
+        text.contains("! 1 outside contract  CONFLICTS sh-2"),
+        "{text}"
+    );
+    assert!(text.contains("CONFLICTS sh-2"), "{text}");
+    assert!(
+        text.contains("! 1 changed file(s) outside the contract"),
+        "{text}"
+    );
+    assert!(
+        text.contains("contract: allowed notes.txt; verify: sh -c 'test -f notes.txt'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("overlaps sh-2 in notes.txt: CONFLICT in notes.txt"),
+        "{text}"
+    );
+    // The other agent says the same from its side, with no contract.
+    ed.handle_key(KeyEvent::char('j'));
+    let text = screen(&ed).join("\n");
+    assert!(text.contains("no task contract"), "{text}");
+    assert!(text.contains("overlaps sh-1 in notes.txt"), "{text}");
+    // The review marks the file outside the contract with ! and words.
+    ed.agents.panel.review = Some(ReviewView {
+        agent: one,
+        file: 1,
+        cursor: 0,
+        top: 0,
+        side_by_side: false,
+    });
+    let rows = screen(&ed);
+    let text = rows.join("\n");
+    assert!(rows.iter().any(|r| r.contains("!A stray.txt")), "{text}");
+    assert!(rows.iter().any(|r| r.contains("  A notes.txt")), "{text}");
+    assert!(
+        text.contains("! 1 file(s) outside the task contract (marked !)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("outside the task contract: stray.txt matches no allowed pattern"),
+        "{text}"
+    );
 }

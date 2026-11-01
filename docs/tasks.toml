@@ -90,6 +90,20 @@ status = "done"
 # multi-file proposals, persistence.
 
 [[task]]
+id = "m3-contracts"
+title = "Agent task contracts and conflict detection between agents"
+crates = ["maestro-editor", "maestro-tui", "maestro-git", "maestro-agent"]
+branch = "feat/contracts"
+owner = "agent"
+status = "done"
+# Contracts (@allow/@forbid/@verify/@accept/@contract): sent to the agent,
+# ACP writes outside refused, review marks, O to integrate, t runs the
+# contract command, stale/failed verification warnings, saved in records.
+# Overlap and merge dry runs between agents' worktree snapshots, shown in
+# the panel and the integrate dialog. Not built: editing contracts,
+# checking acceptance criteria, watching the target branch.
+
+[[task]]
 id = "m1-vim"
 title = "Vim operator-pending grammar"
 crates = ["maestro-editor"]

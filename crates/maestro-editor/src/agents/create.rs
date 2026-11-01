@@ -19,6 +19,8 @@ pub struct NewAgent {
     pub group: Option<u64>,
     /// Start from this commit instead of the repository's current `HEAD`.
     pub base: Option<String>,
+    /// The task contract, sent with the task and checked by Maestro.
+    pub contract: Option<super::contract::Contract>,
 }
 
 /// Creates the agent record and starts making its worktree in the
@@ -30,6 +32,10 @@ pub fn create(ed: &mut Editor, new: NewAgent) -> AgentId {
         None => ed.agents.fresh_group(),
     };
     let mut agent = Agent::new(id, new.task.clone(), group, new.provider);
+    if let Some(c) = &new.contract {
+        agent.log(format!("task contract: {}", c.brief()));
+    }
+    agent.contract = new.contract;
     agent.log("creating a worktree");
     agent.git_busy = Some(super::CREATING);
     ed.agents.agents.push(agent);
@@ -305,18 +311,27 @@ fn launch(ed: &mut Editor, id: AgentId, how: Launch) {
     let Some(root) = a.worktree.as_ref().map(|w| w.path.clone()) else {
         return;
     };
+    // File writes the agent asks Maestro to make must stay inside the
+    // contract's paths, on a relaunch too.
+    let rules = a.client_rules();
+    let task = a.task_for_agent();
     let result = match a.provider.kind {
         ProviderKind::Acp if how == Launch::Relaunch => {
             let on_event = move |event| {
                 tx.send(move |ed| super::on_acp_event(ed, id, event));
             };
             let started = match (&a.session_id, a.load_session) {
-                (Some(session), true) => {
-                    maestro_agent::AcpClient::load_session(&a.provider, &root, session, on_event)
-                        .map(|c| (c, Some(session.clone())))
-                }
+                (Some(session), true) => maestro_agent::AcpClient::load_session_with_rules(
+                    &a.provider,
+                    &root,
+                    session,
+                    rules,
+                    on_event,
+                )
+                .map(|c| (c, Some(session.clone()))),
                 _ => {
-                    maestro_agent::AcpClient::start(&a.provider, &root, on_event).map(|c| (c, None))
+                    maestro_agent::AcpClient::start_with_rules(&a.provider, &root, rules, on_event)
+                        .map(|c| (c, None))
                 }
             };
             started.map(|(client, loading)| {
@@ -336,15 +351,28 @@ fn launch(ed: &mut Editor, id: AgentId, how: Launch) {
             })
         }
         ProviderKind::Acp => {
-            let started = maestro_agent::AcpClient::start(&a.provider, &root, move |event| {
-                tx.send(move |ed| super::on_acp_event(ed, id, event));
-            });
+            let started = maestro_agent::AcpClient::start_with_rules(
+                &a.provider,
+                &root,
+                rules,
+                move |event| {
+                    tx.send(move |ed| super::on_acp_event(ed, id, event));
+                },
+            );
             started.and_then(|client| {
-                client.prompt(&a.task)?;
+                client.prompt(&task)?;
                 a.turn_running = true;
                 a.transcript
-                    .push(maestro_agent::TranscriptEntry::User(a.task.clone()));
-                a.log(format!("started {}; sent the task", a.provider.program));
+                    .push(maestro_agent::TranscriptEntry::User(task.clone()));
+                let with = if a.contract.is_some() {
+                    " with its contract"
+                } else {
+                    ""
+                };
+                a.log(format!(
+                    "started {}; sent the task{with}",
+                    a.provider.program
+                ));
                 Ok(Runtime::Acp(client))
             })
         }
@@ -366,7 +394,7 @@ fn launch(ed: &mut Editor, id: AgentId, how: Launch) {
                 a.provider
                     .args
                     .iter()
-                    .map(|x| x.replace(maestro_agent::TASK_PLACEHOLDER, &a.task))
+                    .map(|x| x.replace(maestro_agent::TASK_PLACEHOLDER, &task))
                     .collect()
             };
             let spec = maestro_term::CommandSpec {
@@ -399,7 +427,7 @@ fn launch(ed: &mut Editor, id: AgentId, how: Launch) {
                         a.provider.program
                     ));
                 } else {
-                    a.pending_input = Some(a.task.clone());
+                    a.pending_input = Some(task.clone());
                     a.log(format!(
                         "started {} in a terminal; the task will be typed in",
                         a.provider.program

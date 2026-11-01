@@ -5,6 +5,7 @@
 
 use maestro_git::Integration;
 
+use super::contract::Contract;
 use super::create::NewAgent;
 use super::review::ReviewView;
 use super::{AgentId, ProviderKind, ProviderSpec};
@@ -62,6 +63,7 @@ pub enum ChoicePurpose {
         task: String,
         group: Option<u64>,
         base: Option<String>,
+        contract: Option<Contract>,
         providers: Vec<ProviderSpec>,
     },
     Permission(AgentId),
@@ -77,11 +79,19 @@ pub enum ChoicePurpose {
 pub enum ConfirmAction {
     /// `y` rejects, `a` rejects and archives the worktree.
     Reject(AgentId),
-    /// `y` integrates with `how`; `tab` changes it.
+    /// `y` goes on to the provider list for a task with this contract,
+    /// which the dialog shows in full.
+    StartTask {
+        task: String,
+        contract: Box<Contract>,
+    },
+    /// `y` integrates with `how`; `tab` changes it. When files outside the
+    /// task contract would be integrated, `y` is refused and only `O`
+    /// integrates.
     Integrate {
         agent: AgentId,
         how: Integration,
-        facts: super::actions::IntegrateFacts,
+        facts: Box<super::actions::IntegrateFacts>,
     },
     /// `y` removes the worktree (refused if it has work in it).
     Archive(AgentId),
@@ -162,8 +172,22 @@ pub struct PanelLayout {
 
 /// Rows of facts above the content.
 pub const SUMMARY_ROWS: u16 = 4;
+/// Rows of facts above the content in the agent panel and its review:
+/// two more than [`SUMMARY_ROWS`], for the task contract and the overlaps
+/// with other agents.
+pub const AGENT_SUMMARY_ROWS: u16 = 6;
 
+/// The panel's parts with [`SUMMARY_ROWS`] of facts (the proposal review).
 pub fn layout(area: Rect) -> PanelLayout {
+    layout_rows(area, SUMMARY_ROWS)
+}
+
+/// The agent panel's parts, with [`AGENT_SUMMARY_ROWS`] of facts.
+pub fn agent_layout(area: Rect) -> PanelLayout {
+    layout_rows(area, AGENT_SUMMARY_ROWS)
+}
+
+fn layout_rows(area: Rect, summary_rows: u16) -> PanelLayout {
     let header = Rect::new(area.x, area.y, area.width, 1.min(area.height));
     let hints_y = area.bottom().saturating_sub(1).max(header.bottom());
     let hints = Rect::new(area.x, hints_y, area.width, u16::from(area.height >= 2));
@@ -178,7 +202,7 @@ pub fn layout(area: Rect) -> PanelLayout {
     let divider = Rect::new(list.right(), body_y, u16::from(area.width > list_w), body_h);
     let dx = divider.right();
     let dw = area.right().saturating_sub(dx);
-    let summary_h = SUMMARY_ROWS.min(body_h);
+    let summary_h = summary_rows.min(body_h);
     let summary = Rect::new(dx, body_y, dw, summary_h);
     let content = Rect::new(dx, body_y + summary_h, dw, body_h - summary_h);
     PanelLayout {
@@ -193,7 +217,7 @@ pub fn layout(area: Rect) -> PanelLayout {
 
 /// The size agent terminals get: the panel's content area.
 pub fn terminal_size(area: Rect) -> maestro_term::TermSize {
-    let c = layout(area).content;
+    let c = agent_layout(area).content;
     maestro_term::TermSize {
         rows: c.height.max(1),
         cols: c.width.max(2),
@@ -335,7 +359,7 @@ fn selected_id(ed: &Editor) -> Option<AgentId> {
 
 fn list_key(ed: &mut Editor, key: KeyEvent) {
     let n = ed.agents.agents.len();
-    let page = (layout(ed.area).content.height as usize / 2).max(1);
+    let page = (agent_layout(ed.area).content.height as usize / 2).max(1);
     match (key.code, key.mods.ctrl) {
         (KeyCode::Esc, _) | (KeyCode::Char('q'), false) => close(ed),
         (KeyCode::Char('c'), true) => close(ed),
@@ -478,7 +502,9 @@ fn compete(ed: &mut Editor) {
         ed.error("every configured provider already works on this task");
         return;
     }
-    choose_provider(ed, task, group, base, providers);
+    // A competing implementation works under the same contract.
+    let contract = a.contract.clone();
+    choose_provider(ed, task, group, base, contract, providers);
 }
 
 pub(crate) fn choose_provider(
@@ -486,6 +512,7 @@ pub(crate) fn choose_provider(
     task: String,
     group: Option<u64>,
     base: Option<String>,
+    contract: Option<Contract>,
     providers: Vec<ProviderSpec>,
 ) {
     if providers.is_empty() {
@@ -505,14 +532,19 @@ pub(crate) fn choose_provider(
             (p.name.clone(), detail)
         })
         .collect();
+    let title = match &contract {
+        Some(_) => "provider (task with a contract)",
+        None => "provider (no task contract)",
+    };
     ed.agents.panel.overlay = Some(Overlay::Choice {
         purpose: ChoicePurpose::Provider {
             task,
             group,
             base,
+            contract,
             providers,
         },
-        title: "provider".into(),
+        title: title.into(),
         items,
         selected: 0,
     });
@@ -592,13 +624,53 @@ fn overlay_key(ed: &mut Editor, key: KeyEvent) {
 fn submit_input(ed: &mut Editor, purpose: InputPurpose, text: String) {
     match purpose {
         InputPurpose::NewTask => {
-            let task = text.trim().to_string();
-            if task.is_empty() {
+            let parsed = match super::contract::parse_task(&text, &ed.cwd) {
+                Ok(p) => p,
+                Err(e) => {
+                    // The text stays, so the mistake can be fixed.
+                    ed.error(format!("task contract: {e}"));
+                    ed.agents.panel.overlay = Some(Overlay::Input {
+                        purpose: InputPurpose::NewTask,
+                        label: "task".into(),
+                        text,
+                    });
+                    return;
+                }
+            };
+            if parsed.task.is_empty() {
                 ed.error("the task is empty");
                 return;
             }
-            let providers = super::providers(ed);
-            choose_provider(ed, task, None, None, providers);
+            match parsed.contract {
+                // The whole contract is shown before anything starts: it
+                // may come from a file, and `t` runs its command.
+                Some(contract) => {
+                    let mut lines = contract.describe();
+                    lines.push(
+                        "It is sent to the agent with the task as a request. Maestro refuses \
+                         file writes the agent asks it to make outside the allowed paths, marks \
+                         changed files outside them in the review and asks again before \
+                         integrating them; the agent's own tools are not stopped."
+                            .into(),
+                    );
+                    ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
+                        title: "task contract".into(),
+                        lines,
+                        keys: vec![
+                            ("y".into(), "choose a provider".into()),
+                            ("n".into(), "cancel".into()),
+                        ],
+                        action: ConfirmAction::StartTask {
+                            task: parsed.task,
+                            contract: Box::new(contract),
+                        },
+                    }));
+                }
+                None => {
+                    let providers = super::providers(ed);
+                    choose_provider(ed, parsed.task, None, None, None, providers);
+                }
+            }
         }
         InputPurpose::Feedback(id) => super::actions::send_feedback(ed, id, text.trim()),
         InputPurpose::Comment {
@@ -632,6 +704,7 @@ fn choose(ed: &mut Editor, purpose: ChoicePurpose, index: usize) {
             task,
             group,
             base,
+            contract,
             providers,
         } => {
             let Some(provider) = providers.get(index).cloned() else {
@@ -653,6 +726,7 @@ fn choose(ed: &mut Editor, purpose: ChoicePurpose, index: usize) {
                     provider,
                     group,
                     base,
+                    contract,
                 },
             );
             ed.agents.panel.view = DetailView::Live;
@@ -796,11 +870,37 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
             ed.agents.panel.overlay = Some(Overlay::Confirm(super::actions::integrate_dialog(
                 *agent,
                 how,
-                facts.clone(),
+                (**facts).clone(),
             )));
         }
+        (ConfirmAction::Integrate { facts, .. }, Some('y'), _)
+            if !facts.out_of_scope.is_empty() =>
+        {
+            ed.error(format!(
+                "{} file(s) are outside the task contract: O integrates them anyway; \
+                 D in the review drops one",
+                facts.out_of_scope.len()
+            ));
+            ed.agents.panel.overlay = Some(Overlay::Confirm(c));
+        }
         (ConfirmAction::Integrate { agent, how, facts }, Some('y'), _) => {
-            super::actions::integrate(ed, *agent, *how, facts.clone())
+            super::actions::integrate(ed, *agent, *how, (**facts).clone())
+        }
+        (ConfirmAction::Integrate { agent, how, facts }, Some('O'), _)
+            if !facts.out_of_scope.is_empty() =>
+        {
+            super::actions::integrate(ed, *agent, *how, (**facts).clone())
+        }
+        (ConfirmAction::StartTask { task, contract }, Some('y'), _) => {
+            let providers = super::providers(ed);
+            choose_provider(
+                ed,
+                task.clone(),
+                None,
+                None,
+                Some((**contract).clone()),
+                providers,
+            );
         }
         (ConfirmAction::Archive(id), Some('y'), _) => super::actions::archive(ed, *id, false),
         (ConfirmAction::ForceArchive(id), Some('F'), _) => super::actions::archive(ed, *id, true),
