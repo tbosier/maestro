@@ -138,6 +138,90 @@ fn main() {
             "completion_keys_pass_through_when_the_popup_cannot_be_drawn",
             completion_keys_pass_through_when_the_popup_cannot_be_drawn,
         ),
+        (
+            "rename_prompt_is_prefilled_and_renames_across_files",
+            rename_prompt_is_prefilled_and_renames_across_files,
+        ),
+        (
+            "rename_without_prepare_and_as_a_typed_command",
+            rename_without_prepare_and_as_a_typed_command,
+        ),
+        (
+            "rename_refuses_bad_edits_and_changes_nothing",
+            rename_refuses_bad_edits_and_changes_nothing,
+        ),
+        (
+            "rename_reports_server_errors_and_unrenamable_spots",
+            rename_reports_server_errors_and_unrenamable_spots,
+        ),
+        (
+            "rename_reply_dropped_after_typing",
+            rename_reply_dropped_after_typing,
+        ),
+        (
+            "rename_accepts_the_changes_form",
+            rename_accepts_the_changes_form,
+        ),
+        (
+            "format_is_one_undo_step_and_keeps_the_cursor",
+            format_is_one_undo_step_and_keeps_the_cursor,
+        ),
+        (
+            "format_whole_text_reply_keeps_the_cursor_line",
+            format_whole_text_reply_keeps_the_cursor_line,
+        ),
+        (
+            "format_selection_formats_only_the_selected_lines",
+            format_selection_formats_only_the_selected_lines,
+        ),
+        (
+            "format_errors_and_stale_replies_change_nothing",
+            format_errors_and_stale_replies_change_nothing,
+        ),
+        (
+            "code_action_quick_fix_sends_diagnostics_and_runs_its_command",
+            code_action_quick_fix_sends_diagnostics_and_runs_its_command,
+        ),
+        (
+            "code_action_resolve_and_server_edit_request",
+            code_action_resolve_and_server_edit_request,
+        ),
+        (
+            "code_action_failures_and_refused_server_edit",
+            code_action_failures_and_refused_server_edit,
+        ),
+        (
+            "code_action_stale_list_and_stale_choice_change_nothing",
+            code_action_stale_list_and_stale_choice_change_nothing,
+        ),
+        (
+            "signature_help_follows_the_parameter_and_closes",
+            signature_help_follows_the_parameter_and_closes,
+        ),
+        (
+            "signature_help_on_demand_and_leaving_insert_mode",
+            signature_help_on_demand_and_leaving_insert_mode,
+        ),
+        (
+            "signature_help_stale_replies_are_not_shown",
+            signature_help_stale_replies_are_not_shown,
+        ),
+        (
+            "rename_reply_dropped_when_a_file_is_opened_while_waiting",
+            rename_reply_dropped_when_a_file_is_opened_while_waiting,
+        ),
+        (
+            "rename_prepare_dropped_when_the_cursor_moves",
+            rename_prepare_dropped_when_the_cursor_moves,
+        ),
+        (
+            "command_edit_refused_after_typing",
+            command_edit_refused_after_typing,
+        ),
+        (
+            "code_action_is_not_repeated_or_recorded",
+            code_action_is_not_repeated_or_recorded,
+        ),
     ]);
 }
 
@@ -1134,4 +1218,666 @@ fn completion_keys_pass_through_when_the_popup_cannot_be_drawn() {
     run(ed, "<ret><esc>");
     assert!(!ed.doc().text().to_string().contains("collections"));
     assert_eq!(ed.doc().text().len_lines(), 5, "Enter made a new line");
+}
+
+// ----- rename, formatting, code actions, signature help ---------------------
+
+/// Everything `fake/stats` returns.
+fn fake_stats(ed: &Editor) -> Value {
+    let rx = ed
+        .lsp
+        .raw_request(ed.view().doc, "fake/stats", json!({}))
+        .expect("synced");
+    maestro_lsp::client::recv_reply(&rx, WAIT).unwrap().unwrap()
+}
+
+fn text(ed: &Editor) -> String {
+    ed.doc().text().to_string()
+}
+
+fn wait_status(ed: &mut Editor, needle: &str) {
+    assert!(
+        wait_until(ed, |ed| status(ed).contains(needle)),
+        "wanted {needle:?} in the status; got {:?}",
+        ed.status
+    );
+}
+
+fn wait_picker(ed: &mut Editor) {
+    assert!(
+        wait_until(ed, |ed| ed.picker.is_some()),
+        "no picker; status {:?}, dropped {:?}",
+        ed.status,
+        ed.lsp.actions.last_dropped
+    );
+}
+
+fn rename_prompt_is_prefilled_and_renames_across_files() {
+    use maestro_editor::prompt::PromptKind;
+    let original = "fn helper() {}\nfn main() {\n    helper();\n}\n";
+    let mut f = open_synced("rename", original);
+    let util = f.dir.join("util.rs");
+    let util_text = "pub fn twice() {\n    helper();\n    helper();\n}\n";
+    std::fs::write(&util, util_text).unwrap();
+    let ed = &mut f.ed;
+    let main_doc = ed.view().doc;
+    run(ed, "3G^<space>n");
+    assert!(
+        wait_until(ed, |ed| ed.prompt.is_some()),
+        "no prompt; status {:?}",
+        ed.status
+    );
+    let p = ed.prompt.as_ref().unwrap();
+    assert_eq!(p.kind, PromptKind::Rename);
+    assert_eq!(p.input, "helper", "prefilled from prepareRename");
+    run(ed, "<C-u>assist\n");
+    assert!(
+        wait_until(ed, |ed| text(ed).contains("assist")),
+        "status {:?}",
+        ed.status
+    );
+    assert_eq!(text(ed), "fn assist() {}\nfn main() {\n    assist();\n}\n");
+    // The file that was not open is a buffer now, edited but not saved,
+    // and the view did not move to it.
+    let util_id = ed
+        .find_buffer_by_path(&util)
+        .expect("util.rs opened as a buffer");
+    let util_doc = &ed.buffers[&util_id].doc;
+    assert_eq!(
+        util_doc.text().to_string(),
+        "pub fn twice() {\n    assist();\n    assist();\n}\n"
+    );
+    assert!(util_doc.is_modified());
+    assert_eq!(std::fs::read_to_string(&util).unwrap(), util_text);
+    assert_eq!(ed.view().doc, main_doc);
+    let st = status(ed);
+    assert!(
+        st.contains("renamed to assist: 4 edits in 2 files changed, not saved")
+            && st.contains("1 file opened in the background"),
+        "{st}"
+    );
+    // The server now has util.rs open with the edited text.
+    assert!(wait_until(ed, |ed| ed.lsp.is_synced(util_id)));
+    // One undo step per buffer.
+    run(ed, "u");
+    assert_eq!(text(ed), original);
+    assert_server_matches(ed, "undo after rename");
+}
+
+fn rename_without_prepare_and_as_a_typed_command() {
+    let config = fake_config_with(&[fake::NO_PREPARE_RENAME_ARG]);
+    let mut f = open_synced_with("rename-noprep", "fn helper() {}\nhelper();\n", config);
+    let ed = &mut f.ed;
+    run(ed, "2G<space>n");
+    // No request: the prompt opens at once with the word at the cursor.
+    let p = ed.prompt.as_ref().expect("prompt");
+    assert_eq!(p.input, "helper");
+    run(ed, "<esc>");
+    assert!(ed.prompt.is_none());
+    run(ed, ":rename other\n");
+    assert!(
+        wait_until(ed, |ed| text(ed) == "fn other() {}\nother();\n"),
+        "status {:?}",
+        ed.status
+    );
+    assert!(
+        status(ed).contains("1 file changed, not saved"),
+        "{:?}",
+        ed.status
+    );
+}
+
+/// A version mismatch, overlapping edits (in a file other than the open
+/// one), a range past the end and a file operation each refuse the whole
+/// edit: no buffer changes and no file is opened.
+fn rename_refuses_bad_edits_and_changes_nothing() {
+    for (name, needle) in [
+        ("badversion", "changed since the server made the edit"),
+        ("overlap", "two edits overlap at line 1"),
+        ("outofbounds", "past the end of the text"),
+        (
+            "createfile",
+            "create a file, which Maestro does not support",
+        ),
+    ] {
+        let original = format!("// @{name}\nfn helper() {{}}\nhelper();\n");
+        let mut f = open_synced(&format!("rename-{name}"), &original);
+        let other = f.dir.join("other.rs");
+        std::fs::write(&other, "fn x() { helper(); }\n").unwrap();
+        let ed = &mut f.ed;
+        run(ed, "3G:rename renamed\n");
+        wait_status(ed, needle);
+        assert!(
+            status(ed).contains("nothing was changed"),
+            "{name}: {:?}",
+            ed.status
+        );
+        assert_eq!(text(ed), original, "{name}");
+        assert!(!ed.doc().is_modified(), "{name}");
+        assert!(ed.find_buffer_by_path(&other).is_none(), "{name}");
+        assert_eq!(ed.buffers.len(), 1, "{name}");
+    }
+}
+
+fn rename_reports_server_errors_and_unrenamable_spots() {
+    let original = "fn builtin() {}\nfn helper() {}\n\n";
+    let mut f = open_synced("rename-errors", original);
+    let ed = &mut f.ed;
+    run(ed, "gg:rename error\n");
+    wait_status(ed, "rename: the fake rename failed");
+    // prepareRename answers null on an empty line ...
+    run(ed, "3G<space>n");
+    wait_status(ed, "nothing here can be renamed");
+    assert!(ed.prompt.is_none());
+    // ... and an error on `builtin`.
+    run(ed, "ggfb<space>n");
+    wait_status(ed, "cannot rename a builtin");
+    assert!(ed.prompt.is_none());
+    assert_eq!(text(ed), original);
+}
+
+fn rename_reply_dropped_after_typing() {
+    let mut f = open_synced("rename-stale", "// @slow\nfn helper() {}\nhelper();\n");
+    let ed = &mut f.ed;
+    run(ed, "3G:rename other\n");
+    assert!(ed.lsp.actions.is_pending());
+    run(ed, "ix<esc>");
+    let edited = text(ed);
+    assert!(
+        wait_until(ed, |ed| ed.lsp.actions.last_dropped.as_deref()
+            == Some("a buffer changed while waiting")),
+        "dropped {:?}",
+        ed.lsp.actions.last_dropped
+    );
+    assert_eq!(text(ed), edited);
+    assert!(!text(ed).contains("other"));
+    assert!(
+        status(ed).contains("rename result dropped"),
+        "{:?}",
+        ed.status
+    );
+}
+
+fn rename_accepts_the_changes_form() {
+    let mut f = open_synced("rename-changes", "// @changes\nfn helper() {}\nhelper();\n");
+    let ed = &mut f.ed;
+    run(ed, "3G:rename other\n");
+    assert!(
+        wait_until(ed, |ed| text(ed)
+            == "// @changes\nfn other() {}\nother();\n"),
+        "status {:?}",
+        ed.status
+    );
+}
+
+fn format_is_one_undo_step_and_keeps_the_cursor() {
+    let original = "fn main() {   \n    let x = 1;  \n    x;\t\n}\n";
+    let mut f = open_synced("format", original);
+    let ed = &mut f.ed;
+    run(ed, "3G^");
+    run(ed, ":format\n");
+    let formatted = "fn main() {\n    let x = 1;\n    x;\n}\n";
+    assert!(
+        wait_until(ed, |ed| text(ed) == formatted),
+        "status {:?}",
+        ed.status
+    );
+    let t = ed.doc().text().clone();
+    assert_eq!(head(ed), t.line_to_char(2) + 4, "still on the `x`");
+    assert!(
+        status(ed).contains("formatted: 3 edits, not saved"),
+        "{:?}",
+        ed.status
+    );
+    assert_server_matches(ed, "format");
+    run(ed, "u");
+    assert_eq!(text(ed), original, "one undo step");
+    run(ed, "U<space>=");
+    wait_status(ed, "already formatted");
+    assert_eq!(text(ed), formatted);
+}
+
+/// A server that answers with one edit replacing the whole text: only the
+/// lines that differ change, so the cursor keeps its place.
+fn format_whole_text_reply_keeps_the_cursor_line() {
+    let original = "// @formatwhole\nfn main() {  \n    let x = 1;\n    x;  \n}\n";
+    let mut f = open_synced("format-whole", original);
+    let ed = &mut f.ed;
+    run(ed, "3G^4l");
+    let before = head(ed);
+    assert_eq!(ed.doc().text().char(before), 'x');
+    run(ed, ":format\n");
+    let formatted = "// @formatwhole\nfn main() {\n    let x = 1;\n    x;\n}\n";
+    assert!(
+        wait_until(ed, |ed| text(ed) == formatted),
+        "status {:?}",
+        ed.status
+    );
+    assert_eq!(ed.doc().text().char(head(ed)), 'x', "head {}", head(ed));
+    assert_eq!(ed.doc().text().char_to_line(head(ed)), 2);
+    run(ed, "u");
+    assert_eq!(text(ed), original);
+}
+
+fn format_selection_formats_only_the_selected_lines() {
+    let mut f = open_synced("format-range", "a  \nb  \nc  \n");
+    let ed = &mut f.ed;
+    run(ed, "2Gx:format-selection\n");
+    assert!(
+        wait_until(ed, |ed| text(ed) == "a  \nb\nc  \n"),
+        "text {:?}, status {:?}",
+        text(ed),
+        ed.status
+    );
+}
+
+fn format_errors_and_stale_replies_change_nothing() {
+    let original = "// @formaterror\nx  \n";
+    let mut f = open_synced("format-error", original);
+    let ed = &mut f.ed;
+    run(ed, ":format\n");
+    wait_status(ed, "format: the fake formatter failed");
+    assert_eq!(text(ed), original);
+    drop(f);
+
+    let mut f = open_synced("format-stale", "// @slow\nx  \n");
+    let ed = &mut f.ed;
+    run(ed, ":format\n");
+    run(ed, "2GAy<esc>");
+    let edited = text(ed);
+    assert!(
+        wait_until(ed, |ed| ed.lsp.actions.last_dropped.as_deref()
+            == Some("a buffer changed while waiting")),
+        "dropped {:?}",
+        ed.lsp.actions.last_dropped
+    );
+    assert_eq!(text(ed), edited);
+    assert!(text(ed).contains("x  y"));
+}
+
+fn picker_labels(ed: &Editor) -> Vec<(String, String)> {
+    ed.picker
+        .as_ref()
+        .unwrap()
+        .items()
+        .iter()
+        .map(|i| (i.label.clone(), i.detail.clone()))
+        .collect()
+}
+
+fn code_action_quick_fix_sends_diagnostics_and_runs_its_command() {
+    let original = "fn main() {\n    let x = ERROR;\n}\n";
+    let mut f = open_synced("action-fix", original);
+    let ed = &mut f.ed;
+    let doc = ed.view().doc;
+    assert!(wait_until(ed, |ed| ed.lsp.diagnostics(doc).len() == 1));
+    // Move the diagnostic: the request must send its current range.
+    run(ed, "ggO// moved<esc>");
+    assert!(wait_until(ed, |ed| ed.lsp.diagnostics(doc).len() == 1));
+    run(ed, "3G^fE<space>c");
+    wait_picker(ed);
+    let items = picker_labels(ed);
+    assert_eq!(
+        items[0],
+        ("Replace ERROR with OK".into(), "quickfix, preferred".into())
+    );
+    assert!(items.contains(&(
+        "Unavailable action".into(),
+        "refactor, unavailable: not available here".into()
+    )));
+    assert_eq!(items.len(), 5, "{items:?}");
+    run(ed, "<ret>");
+    assert!(
+        wait_until(ed, |ed| text(ed).contains("let x = OK;")),
+        "status {:?}",
+        ed.status
+    );
+    // Its command ran after the edit: the server saw the edited text when
+    // the command arrived.
+    assert!(wait_until(ed, |ed| {
+        fake_stats(ed)["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["command"] == "fake.record" && c["arguments"] == json!(["quickfix"]))
+    }));
+    let commands = fake_stats(ed)["commands"].clone();
+    let record = commands
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["command"] == "fake.record")
+        .unwrap();
+    assert!(
+        record["openTexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str().unwrap().contains("let x = OK;")),
+        "{record}"
+    );
+    run(ed, "u");
+    assert_eq!(text(ed), format!("// moved\n{original}"));
+}
+
+fn code_action_resolve_and_server_edit_request() {
+    let mut f = open_synced("action-resolve", "fn main() {\n    hello();\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2G^<space>c");
+    wait_picker(ed);
+    // No edit in the list: it comes from codeAction/resolve.
+    run(ed, "Uppercase<ret>");
+    assert!(
+        wait_until(ed, |ed| text(ed).contains("    HELLO();")),
+        "status {:?}",
+        ed.status
+    );
+    // A bare command; the server answers it with workspace/applyEdit.
+    run(ed, "<space>c");
+    wait_picker(ed);
+    run(ed, "header<ret>");
+    assert!(
+        wait_until(ed, |ed| text(ed).starts_with("// header\nfn main()")),
+        "status {:?}",
+        ed.status
+    );
+    assert!(
+        status(ed).contains("fake edit: 1 file changed"),
+        "{:?}",
+        ed.status
+    );
+    assert!(wait_until(ed, |ed| {
+        fake_stats(ed)["responses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["result"] == json!({"applied": true}))
+    }));
+    assert_server_matches(ed, "server edit");
+}
+
+fn code_action_failures_and_refused_server_edit() {
+    let original = "// @badheader\nfn main() {}\n";
+    let mut f = open_synced("action-fail", original);
+    let ed = &mut f.ed;
+    run(ed, "<space>c");
+    wait_picker(ed);
+    run(ed, "failing<ret>");
+    wait_status(ed, "command: the fake command failed");
+    run(ed, "<space>c");
+    wait_picker(ed);
+    run(ed, "Unavailable<ret>");
+    assert!(
+        status(ed).contains("unavailable: not available here"),
+        "{:?}",
+        ed.status
+    );
+    // The server's edit points past the end: refused, and the server is
+    // told why.
+    run(ed, "<space>c");
+    wait_picker(ed);
+    run(ed, "header<ret>");
+    assert!(
+        wait_until(ed, |ed| {
+            fake_stats(ed)["responses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| {
+                    r["result"]["applied"] == json!(false)
+                        && r["result"]["failureReason"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("past the end"))
+                })
+        }),
+        "status {:?}",
+        ed.status
+    );
+    assert!(
+        status(ed).contains("refused, nothing was changed"),
+        "{:?}",
+        ed.status
+    );
+    assert_eq!(text(ed), original);
+}
+
+fn code_action_stale_list_and_stale_choice_change_nothing() {
+    let mut f = open_synced("action-stale", "// @slow\nfn main() {}\n");
+    let ed = &mut f.ed;
+    run(ed, "2G<space>c");
+    run(ed, "ix<esc>");
+    assert!(
+        wait_until(ed, |ed| ed.lsp.actions.last_dropped.as_deref()
+            == Some("a buffer changed while waiting")),
+        "dropped {:?}",
+        ed.lsp.actions.last_dropped
+    );
+    assert!(ed.picker.is_none());
+    drop(f);
+
+    // The list is shown, then the buffer changes behind the picker (an
+    // automation client, say): choosing an action is refused.
+    let mut f = open_synced("action-stale-choice", "fn main() {\n    hello();\n}\n");
+    let ed = &mut f.ed;
+    run(ed, "2G^<space>c");
+    wait_picker(ed);
+    let doc = ed.view().doc;
+    let version = ed.doc().version();
+    let cs = maestro_core::ChangeSet::from_changes(
+        ed.doc().text().len_chars(),
+        [maestro_core::Change::insert(0, "// x\n")],
+    )
+    .unwrap();
+    maestro_editor::proposals::apply_versioned(ed, doc, version, &cs).unwrap();
+    let edited = text(ed);
+    run(ed, "Uppercase<ret>");
+    assert!(
+        status(ed).contains("a buffer changed since the list was made"),
+        "{:?}",
+        ed.status
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    ed.poll_background();
+    assert_eq!(text(ed), edited);
+}
+
+/// A file that was not open when the rename went out is opened and edited
+/// before the answer arrives. The answer's unversioned edits for it were
+/// computed from the file on disk, so it is dropped.
+fn rename_reply_dropped_when_a_file_is_opened_while_waiting() {
+    let mut f = open_synced("rename-opened", "// @slow\nfn helper() {}\nhelper();\n");
+    let other = f.dir.join("other.rs");
+    std::fs::write(&other, "fn x() { helper(); }\n").unwrap();
+    let ed = &mut f.ed;
+    run(ed, "3G:rename renamed\n");
+    assert!(ed.lsp.actions.is_pending());
+    run(ed, &format!(":open {}\nixx <esc>", other.display()));
+    assert_eq!(text(ed), "xx fn x() { helper(); }\n");
+    assert!(
+        wait_until(ed, |ed| ed.lsp.actions.last_dropped.as_deref()
+            == Some("a buffer changed while waiting")),
+        "dropped {:?}, status {:?}",
+        ed.lsp.actions.last_dropped,
+        ed.status
+    );
+    assert_eq!(text(ed), "xx fn x() { helper(); }\n");
+}
+
+/// The cursor moves while `prepareRename` is out: no prompt opens, so the
+/// rename cannot go to the symbol the cursor moved to.
+fn rename_prepare_dropped_when_the_cursor_moves() {
+    let original = "// @slow\nfn foo() {}\nfn bar() {}\n";
+    let mut f = open_synced("rename-moved", original);
+    let ed = &mut f.ed;
+    run(ed, "2Gw<space>n");
+    assert!(ed.lsp.actions.is_pending());
+    run(ed, "j");
+    assert!(
+        wait_until(ed, |ed| ed.lsp.actions.last_dropped.as_deref()
+            == Some("the cursor moved")),
+        "dropped {:?}",
+        ed.lsp.actions.last_dropped
+    );
+    assert!(ed.prompt.is_none());
+    assert_eq!(text(ed), original);
+}
+
+/// A command's edit comes back as `workspace/applyEdit` after the user
+/// typed: it was computed from the old text and is refused.
+fn command_edit_refused_after_typing() {
+    let original = "// @slow\nfn main() {}\n";
+    let mut f = open_synced("command-stale", original);
+    let ed = &mut f.ed;
+    run(ed, "2G<space>c");
+    wait_picker(ed);
+    run(ed, "header<ret>");
+    run(ed, "ix<esc>");
+    let edited = text(ed);
+    assert!(
+        wait_until(ed, |ed| {
+            fake_stats(ed)["responses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| {
+                    r["result"]["applied"] == json!(false)
+                        && r["result"]["failureReason"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("changed since the command was sent"))
+                })
+        }),
+        "status {:?}",
+        ed.status
+    );
+    assert_eq!(text(ed), edited);
+    assert!(!text(ed).contains("// header"));
+}
+
+/// `.` after a code action does not replay the picker keys (which would
+/// run as normal-mode commands before the next picker arrives), and a
+/// macro being recorded stops at the picker.
+fn code_action_is_not_repeated_or_recorded() {
+    let mut f = open_synced("action-repeat", "fn main() {\n    let x = ERROR;\n}\n");
+    let ed = &mut f.ed;
+    let doc = ed.view().doc;
+    assert!(wait_until(ed, |ed| ed.lsp.diagnostics(doc).len() == 1));
+    run(ed, "2G^fE<space>c");
+    wait_picker(ed);
+    run(ed, "OK<ret>");
+    assert!(wait_until(ed, |ed| text(ed).contains("let x = OK;")));
+    let after = text(ed);
+    run(ed, ".");
+    std::thread::sleep(Duration::from_millis(200));
+    ed.poll_background();
+    assert_eq!(ed.mode, Mode::Normal);
+    assert_eq!(text(ed), after, "`.` replayed nothing");
+    run(ed, "<esc>");
+    ed.picker = None;
+    // Recording a macro stops when the picker is asked for.
+    let before = text(ed);
+    run(ed, "Q");
+    assert!(ed.recording.is_some());
+    run(ed, "<space>c");
+    assert!(ed.recording.is_none());
+    assert!(
+        status(ed).contains("recording into register @ stopped"),
+        "{:?}",
+        ed.status
+    );
+    assert_eq!(text(ed), before);
+    wait_picker(ed);
+    run(ed, "<esc>");
+}
+
+fn signature_active(ed: &Editor) -> Option<Option<(usize, usize)>> {
+    let p = lsp::signature::visible(ed)?;
+    Some(p.help.signatures[p.help.active].active)
+}
+
+fn signature_help_follows_the_parameter_and_closes() {
+    let mut f = open_synced("sig", "fn add(a: u32, b: u32) -> u32 { a + b }\n\n");
+    let ed = &mut f.ed;
+    run(ed, "2Giadd(");
+    assert!(
+        wait_until(ed, |ed| signature_active(ed) == Some(Some((7, 13)))),
+        "popup {:?}, dropped {:?}",
+        ed.lsp.signature.popup,
+        ed.lsp.signature.last_dropped
+    );
+    let p = lsp::signature::visible(ed).unwrap();
+    assert_eq!(p.help.signatures[0].label, "fn add(a: u32, b: u32)");
+    run(ed, "1, ");
+    assert!(
+        wait_until(ed, |ed| signature_active(ed) == Some(Some((15, 21)))),
+        "popup {:?}",
+        ed.lsp.signature.popup
+    );
+    // Past the closing parenthesis the server answers null: closed.
+    run(ed, "2)");
+    assert!(
+        wait_until(ed, |ed| lsp::signature::visible(ed).is_none()
+            && !ed.lsp.signature.is_pending()),
+        "popup {:?}",
+        ed.lsp.signature.popup
+    );
+    run(ed, "<esc>");
+}
+
+fn signature_help_on_demand_and_leaving_insert_mode() {
+    let mut f = open_synced("sig-demand", "fn add(a: u32, b: u32) {}\nadd(1, 2);\n");
+    let ed = &mut f.ed;
+    run(ed, "2G7li<C-k>");
+    assert!(
+        wait_until(ed, |ed| signature_active(ed) == Some(Some((15, 21)))),
+        "popup {:?}, status {:?}",
+        ed.lsp.signature.popup,
+        ed.status
+    );
+    run(ed, "<esc>");
+    assert!(
+        ed.lsp.signature.popup.is_none(),
+        "closed on leaving insert mode"
+    );
+    // Outside a call, asking says so.
+    run(ed, "ggi<C-k>");
+    wait_status(ed, "no signature help here");
+    assert!(lsp::signature::visible(ed).is_none());
+    run(ed, "<esc>");
+}
+
+fn signature_help_stale_replies_are_not_shown() {
+    use maestro_editor::MouseKind;
+    let mut f = open_synced("sig-stale", "// @slow\nfn add(a: u32, b: u32) {}\n\n");
+    let ed = &mut f.ed;
+    // Leaving insert mode cancels the request.
+    run(ed, "3Giadd(<esc>");
+    assert!(!ed.lsp.signature.is_pending());
+    std::thread::sleep(Duration::from_millis(fake::SLOW_MS + 200));
+    ed.poll_background();
+    assert!(ed.lsp.signature.popup.is_none());
+    // Typing on while a request is out asks again; only the answer for
+    // the latest text is shown.
+    run(ed, "A1,x");
+    assert!(
+        wait_until(ed, |ed| signature_active(ed) == Some(Some((15, 21)))),
+        "popup {:?}",
+        ed.lsp.signature.popup
+    );
+    // A click moves the cursor without a key: the help on screen no longer
+    // fits and is hidden at once, and the reply in flight is dropped.
+    run(ed, "<C-k>");
+    assert!(lsp::signature::visible(ed).is_some());
+    let area = ed.view().area;
+    ed.handle_mouse(MouseKind::Down, area.x + 10, area.y);
+    assert!(
+        lsp::signature::visible(ed).is_none(),
+        "hidden after the click"
+    );
+    assert!(
+        wait_until(ed, |ed| ed.lsp.signature.last_dropped.as_deref()
+            == Some("the cursor moved")),
+        "dropped {:?}",
+        ed.lsp.signature.last_dropped
+    );
+    run(ed, "<esc>");
 }

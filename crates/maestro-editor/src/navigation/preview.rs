@@ -63,7 +63,10 @@ pub fn location(action: &PickerAction) -> Option<(&Path, Option<usize>)> {
     match action {
         PickerAction::OpenFile(p) => Some((p.as_path(), None)),
         PickerAction::Goto { path, line, .. } => Some((path.as_path(), Some(*line))),
-        PickerAction::Buffer(_) | PickerAction::Command(_) | PickerAction::ChangeDir(_) => None,
+        PickerAction::Buffer(_)
+        | PickerAction::Command(_)
+        | PickerAction::ChangeDir(_)
+        | PickerAction::CodeAction(_) => None,
     }
 }
 

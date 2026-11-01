@@ -499,6 +499,48 @@ mod tests {
         }
     }
 
+    /// Rename, code actions, formatting and signature help each have one
+    /// key of their own in both profiles, in normal and select mode, and
+    /// the keys next to them keep their old commands.
+    #[test]
+    fn lsp_action_keys_are_bound_once() {
+        for profile in [Profile::Maestro, Profile::Vim] {
+            let maps = Keymaps::defaults(profile);
+            let key = |s: &str| parse_sequence(s).unwrap();
+            for mode in [Mode::Normal, Mode::Select] {
+                for (keys, command) in [
+                    ("space n", "rename_symbol"),
+                    ("space c", "code_action"),
+                    ("space =", "format_document"),
+                    ("space a", "agent_panel"),
+                    ("space r", "recent_files"),
+                    ("space e", "proposal_review"),
+                    ("space k", "hover"),
+                    ("g d", "goto_definition"),
+                    ("g r", "goto_references"),
+                ] {
+                    assert_eq!(
+                        maps.lookup(mode, &key(keys)),
+                        Lookup::Command(command.into()),
+                        "{profile:?} {mode:?} {keys}"
+                    );
+                }
+                for command in ["rename_symbol", "code_action", "format_document"] {
+                    let n = maps
+                        .bindings(mode)
+                        .iter()
+                        .filter(|(_, c)| c == command)
+                        .count();
+                    assert_eq!(n, 1, "{profile:?} {mode:?} {command}");
+                }
+            }
+            assert_eq!(
+                maps.lookup(Mode::Insert, &key("C-k")),
+                Lookup::Command("signature_help".into())
+            );
+        }
+    }
+
     #[test]
     fn lookup_pending_and_user_overrides() {
         let mut config = Config::default();

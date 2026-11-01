@@ -39,6 +39,7 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     }
     draw_dividers(ed, surface, &placements);
     draw_hover(ed, surface);
+    draw_signature(ed, surface);
     draw_completion(ed, surface);
     let mut cursor = CursorShape::Hidden;
     if ed.proposals.review_open() {
@@ -497,6 +498,98 @@ fn draw_hover(ed: &Editor, s: &mut Surface) {
         let truncated = i + 1 == visible && rows.len() > visible;
         let shown = if truncated { "…" } else { row.as_str() };
         s.print(x + 2, y + 1 + i as u16, shown, ui.popup, area.right() - 1);
+    }
+}
+
+/// Signature help: the active signature on one row in a box above the
+/// cursor line (below it when there is no room above), so it does not
+/// cover the completion popup, which opens below. The active parameter is
+/// bold and underlined as well as colored. A label too long for the box is
+/// cut with `…`, from the left if that keeps the active parameter visible.
+fn draw_signature(ed: &Editor, s: &mut Surface) {
+    use maestro_editor::lsp::signature;
+    use unicode_width::UnicodeWidthChar;
+    let Some(popup) = signature::visible(ed) else {
+        return;
+    };
+    let Some(sig) = popup.help.signatures.get(popup.help.active) else {
+        return;
+    };
+    let view = ed.view();
+    let ui = &ed.theme.ui;
+    let text = ed.doc().text().slice(..);
+    let head = view.selection.primary().head.min(text.len_chars());
+    let line = text.char_to_line(head);
+    if line < view.top_line || line >= view.top_line + view.text_height() {
+        return;
+    }
+    let cursor_y = view.area.y + (line - view.top_line) as u16;
+    let col = maestro_editor::motion::display_col(text, head, ed.tab_width());
+    let cursor_x = (view.area.x + ed.gutter_width(view) + col.saturating_sub(view.left_col) as u16)
+        .min(s.width.saturating_sub(1));
+    let max_w = s.width as usize;
+    if max_w < 10 || s.height < 3 {
+        return;
+    }
+    let chars: Vec<char> = sig.label.chars().collect();
+    let width_of = |cs: &[char]| cs.iter().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+    let inner = max_w - 4;
+    // Which chars to show: all of them, or a window that ends at the
+    // active parameter when it would fall off the right edge.
+    let mut start = 0;
+    if width_of(&chars) > inner
+        && let Some((_, end)) = sig.active
+        && width_of(&chars[..end.min(chars.len())]) > inner - 1
+    {
+        while start < chars.len() && 1 + width_of(&chars[start..end.min(chars.len())]) > inner - 1 {
+            start += 1;
+        }
+    }
+    let title = if popup.help.signatures.len() > 1 {
+        format!(
+            "signature {}/{}",
+            popup.help.active + 1,
+            popup.help.signatures.len()
+        )
+    } else {
+        "signature".to_string()
+    };
+    let shown = width_of(&chars[start..]) + usize::from(start > 0);
+    let w = (shown.min(inner) + 4).max(title.len() + 6).min(max_w) as u16;
+    let y = if cursor_y >= 3 {
+        cursor_y - 3
+    } else if cursor_y + 4 <= s.height.saturating_sub(1) {
+        cursor_y + 1
+    } else {
+        return;
+    };
+    let x = cursor_x.saturating_sub(2).min(s.width - w);
+    let area = Rect::new(x, y, w, 3);
+    draw_box(s, area, &title, ui.popup, ui.popup_border, ui.popup_title);
+    let right = area.right() - 1;
+    let mut cx = x + 2;
+    if start > 0 {
+        cx += s.put(cx, y + 1, "…", ui.popup_muted, right);
+    }
+    let active = ui.popup.patch(ui.popup_match).bold().underline();
+    for (i, ch) in chars.iter().enumerate().skip(start) {
+        let style = match sig.active {
+            Some((a, b)) if a <= i && i < b => active,
+            _ => ui.popup,
+        };
+        // Leave the last column for `…` when the label goes on.
+        let last = i + 1 == chars.len();
+        let room = right.saturating_sub(cx);
+        let cw = ch.width().unwrap_or(0) as u16;
+        if !last && room <= cw {
+            s.put(cx, y + 1, "…", ui.popup_muted, right);
+            break;
+        }
+        let used = s.put(cx, y + 1, &ch.to_string(), style, right);
+        if used == 0 && cw > 0 {
+            break;
+        }
+        cx += used;
     }
 }
 
@@ -1166,6 +1259,7 @@ mod tests {
                 severity: DiagnosticSeverity::Error,
                 message: "cannot find value `bad`\nsecond line".into(),
                 source: None,
+                raw: Default::default(),
             }],
         );
         let mut s = Surface::new(60, 20, ed.theme.ui.text);
@@ -1312,6 +1406,105 @@ mod tests {
         }
     }
 
+    fn signature_reply(
+        label: &str,
+        params: &[(usize, usize)],
+        active: usize,
+    ) -> maestro_editor::lsp::completion::Value {
+        let params: Vec<maestro_editor::lsp::completion::Value> = params
+            .iter()
+            .map(|(a, b)| maestro_editor::lsp::completion::json!({"label": [a, b]}))
+            .collect();
+        maestro_editor::lsp::completion::json!({
+            "signatures": [{"label": label, "parameters": params}],
+            "activeParameter": active,
+        })
+    }
+
+    /// The signature sits in a box above the cursor line; the active
+    /// parameter is bold and underlined, the others are not.
+    #[test]
+    fn signature_popup_marks_the_active_parameter_above_the_cursor() {
+        use maestro_editor::lsp::signature;
+        let mut ed = editor("fn f(a: u32, b: u32) {}\n\n\n\nf(1, \n");
+        ed.mode = Mode::Insert;
+        let at = ed.doc().text().line_to_char(4) + 5;
+        ed.set_selection(maestro_core::Selection::point(at));
+        let label = "fn f(a: u32, b: u32)";
+        assert!(signature::show(
+            &mut ed,
+            &signature_reply(label, &[(5, 11), (13, 19)], 1)
+        ));
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        // Line 4 is screen row 5; the box is rows 2 to 4.
+        assert!(row(&s, 2).contains("signature"), "{:?}", row(&s, 2));
+        let text_row = row(&s, 3);
+        // Columns, not bytes: the border glyph is three bytes wide.
+        let byte = text_row.find(label).expect("label drawn");
+        let x = text_row[..byte].chars().count() as u16;
+        let style = |i: u16| s.cell(x + i, 3).unwrap().style;
+        for i in 13..19 {
+            assert!(style(i).underline && style(i).bold, "b: u32 at {i}");
+        }
+        for i in 5..11 {
+            assert!(!style(i).underline, "a: u32 at {i}");
+        }
+        assert!(
+            row(&s, 5).contains("f(1,"),
+            "the cursor line is not covered"
+        );
+        // Outside insert mode nothing is drawn.
+        ed.mode = Mode::Normal;
+        let mut s = Surface::new(60, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        assert!(!row(&s, 3).contains(label));
+    }
+
+    /// A label wider than the screen is cut so the active parameter stays
+    /// in view, with `…` marking what is left out.
+    #[test]
+    fn signature_popup_keeps_a_late_active_parameter_visible() {
+        use maestro_editor::lsp::signature;
+        let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 30, 18));
+        let id = ed.add_document(Document::from_text("\n\n\n\ncall(1, 2, 3\n"));
+        ed.switch_to(id);
+        ed.mode = Mode::Insert;
+        let at = ed.doc().text().line_to_char(4) + 12;
+        ed.set_selection(maestro_core::Selection::point(at));
+        let label = "fn call(first: u32, second: u32, third_parameter: u32)";
+        let third = label.find("third").unwrap();
+        assert!(signature::show(
+            &mut ed,
+            &signature_reply(label, &[(8, 18), (20, 31), (third, third + 20)], 2)
+        ));
+        let mut s = Surface::new(30, 20, ed.theme.ui.text);
+        render(&ed, &mut s);
+        let text_row = row(&s, 3);
+        assert!(text_row.contains('…'), "{text_row:?}");
+        assert!(text_row.contains("third_parameter: u32"), "{text_row:?}");
+        assert!(!text_row.contains("fn call"), "{text_row:?}");
+    }
+
+    #[test]
+    fn signature_popup_never_panics_at_small_sizes() {
+        use maestro_editor::lsp::signature;
+        for (w, h) in (1..=40u16).flat_map(|w| (1..=12u16).map(move |h| (w, h))) {
+            let mut ed = Editor::new(Config::default(), Rect::new(0, 1, w, h.saturating_sub(2)));
+            let id = ed.add_document(Document::from_text("x\nf(日本, \n"));
+            ed.switch_to(id);
+            ed.mode = Mode::Insert;
+            ed.set_selection(maestro_core::Selection::point(8));
+            ed.ensure_cursor_visible();
+            signature::show(
+                &mut ed,
+                &signature_reply("fn f(日本: u8, 😀: u8, c: u8)", &[(5, 10), (12, 18)], 1),
+            );
+            let mut s = Surface::new(w, h, ed.theme.ui.text);
+            render(&ed, &mut s);
+        }
+    }
+
     #[test]
     fn wrap_breaks_at_spaces_and_inside_long_words() {
         assert_eq!(wrap("aa bb cc", 5), ["aa bb", "cc"]);
@@ -1333,6 +1526,7 @@ mod tests {
             severity,
             message: "m".into(),
             source: None,
+            raw: Default::default(),
         };
         ed.lsp.set_diagnostics(
             doc,

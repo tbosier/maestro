@@ -168,6 +168,44 @@ In a view smaller than 8 columns or 8 rows the popup is not shown and its keys d
 
 Repeat and macros: the popup's own keys are not recorded. An accepted item is recorded as the keys that type the same edit (backspaces over the replaced text, the new text, Left to the cursor stop), so `.` and macros repeat it without a server. When typing cannot reproduce the edit (it has additional edits, it skipped a cursor, its new text has line breaks or tabs, or it replaces text after the cursor or text with whitespace in it), `.` repeats nothing for that insert session and a macro being recorded stops with a warning.
 
+## Signature help
+
+In insert mode, typing one of the server's signature trigger characters (rust-analyzer uses `(`, `,` and `<`) or pressing `C-k` asks for the signature of the call around the cursor. It shows in a one-line box above the cursor line (below it when there is no room), so it does not cover the completion popup. The parameter the cursor is in is bold and underlined as well as colored. When the server offers several signatures, the title says which one is shown (`signature 1/2`); there is no key to switch.
+
+While the box is showing or a request is out, every key that edits or moves a cursor asks again, so the marked parameter follows typing. A change without a key (a mouse click, a paste) hides the box until the next key asks again. Each request cancels the one before it. A reply is dropped unless the buffer version, every cursor, the focused view and insert mode are what they were when it was sent. An empty answer closes the box, and so does leaving insert mode. `C-k` outside a call says "no signature help here".
+
+## Rename
+
+`space n` (or `:rename`) renames the symbol under the cursor. When the server supports `textDocument/prepareRename`, it is asked first: an answer of nothing or an error is shown in the status line and no prompt opens. Otherwise a `rename to:` prompt opens with the current name filled in. `:rename <name>` skips the prompt.
+
+The server's answer is a workspace edit, applied as described under [Edits from language servers](#edits-from-language-servers). The status line says how many edits went into how many files, that they are not saved, and how many files were opened for the edit. Each buffer's change is one undo step of its own.
+
+## Formatting
+
+`space =` or `:format` formats the buffer; `:format-selection` sends only the primary selection, for servers that support range formatting. The indent settings (`indent`, `indent-width`) go along as the formatting options. The result is one undo step. An edit that replaces whole runs of lines (a formatter that answers with the full text, say) is split into the lines that really differ, so cursors on unchanged lines stay put, and each view keeps the cursor's line on the same screen row. There is no format on save.
+
+## Code actions
+
+`space c` (or `:code-action`) asks for the code actions at the cursor, or for the primary selection when it covers more than one character. The diagnostics that overlap that range are sent along, as the server published them with their ranges moved to where the text is now. The actions open in a picker: each row has the title, the kind (`quickfix`, `refactor.extract`), `preferred` when the server marks one, and the reason when an action is unavailable.
+
+Choosing an action applies its edit, then runs its command with `workspace/executeCommand`. An action that comes without either is first completed with `codeAction/resolve` when the server supports it. A command's own changes come back as a `workspace/applyEdit` request. If any buffer changed, opened or closed between listing the actions and choosing one, nothing is applied and the status line says to ask again.
+
+## Edits from language servers
+
+Rename, code actions, formatting and the server's `workspace/applyEdit` requests all go through one path, and an edit is applied whole or not at all. Before any buffer changes:
+
+- an edit that names the document version it was made for must match the open buffer's version;
+- the edit may not create, rename or delete files, and may not name the same file twice;
+- every range must lie inside the text (a character past the end of a line counts as the line end, as the protocol says; a line past the end of the file is refused), and no two edits in a file may overlap. Edits that only insert at the same spot go in in the order the server gave;
+- no file may be read-only;
+- no file may contain a form feed, vertical tab, NEL (U+0085) or Unicode line or paragraph separator. The editor counts those as line breaks and the protocol does not, so the server's line numbers would point at the wrong lines.
+
+A file the edit touches that is not open is read into a new buffer, without a view, and edited there. Nothing is written to disk: the changed buffers are marked modified and `:wa` saves them. A file that is not open must be a regular file of at most 16 MiB. An edit that does not name versions (the protocol's `changes` form) cannot be checked against a version. For answers to Maestro's own requests, the answer is dropped if any buffer changed, opened or closed while waiting, and a `workspace/applyEdit` that arrives while a command Maestro sent to that server is still running is refused under the same rule. An edit a server sends on its own, unversioned, is applied to the text as it is.
+
+The server is answered `applied: true`, or `applied: false` with the reason, and the status line shows the same reason.
+
+Rename, formatting and code actions are not repeated by `.`; after a code action, `.` still repeats the change before it. Asking for code actions or opening the rename prompt with `space n` stops a macro being recorded, with a warning, since the picker or prompt only opens once the server answers and a replay would send the keys meant for it to the buffer instead.
+
 ## The sign column
 
 The first gutter cell holds one sign. An error or warning diagnostic letter (`E`, `W`) takes it first; otherwise a Git change (`+`, `~`, `-`); otherwise an info or hint letter (`I`, `H`). The diagnostic message for the cursor line is in the status line either way.

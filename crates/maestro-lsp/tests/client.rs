@@ -44,6 +44,14 @@ fn main() {
             "exit_is_seen_while_a_child_holds_stdout",
             exit_is_seen_while_a_child_holds_stdout,
         ),
+        (
+            "initialize_offers_edit_capabilities",
+            initialize_offers_edit_capabilities,
+        ),
+        (
+            "server_requests_reach_the_sink_and_answers_go_back",
+            server_requests_reach_the_sink_and_answers_go_back,
+        ),
     ]);
 }
 
@@ -305,4 +313,85 @@ fn exit_is_seen_while_a_child_holds_stdout() {
         t.elapsed()
     );
     assert!(!client.is_alive());
+}
+
+fn stats(client: &Client) -> Value {
+    let (_, rx) = client.request("fake/stats", Value::Null);
+    recv_reply(&rx, WAIT).unwrap().unwrap()
+}
+
+/// The client tells servers it applies workspace edits (all or nothing,
+/// no file operations) and supports rename, formatting, code actions with
+/// resolve, and signature help.
+fn initialize_offers_edit_capabilities() {
+    let (client, init, _events) = start();
+    init.recv_timeout(WAIT).expect("initialize result");
+    let caps = &stats(&client)["initialize"]["capabilities"];
+    let ws = &caps["workspace"];
+    assert_eq!(ws["applyEdit"], true);
+    assert_eq!(ws["workspaceEdit"]["documentChanges"], true);
+    assert_eq!(ws["workspaceEdit"]["failureHandling"], "transactional");
+    assert!(ws["workspaceEdit"].get("resourceOperations").is_none());
+    let td = &caps["textDocument"];
+    assert_eq!(td["rename"]["prepareSupport"], true);
+    assert!(td["formatting"].is_object() && td["rangeFormatting"].is_object());
+    assert_eq!(
+        td["codeAction"]["resolveSupport"]["properties"],
+        json!(["edit"])
+    );
+    assert!(td["codeAction"]["codeActionLiteralSupport"].is_object());
+    assert_eq!(
+        td["signatureHelp"]["signatureInformation"]["parameterInformation"]["labelOffsetSupport"],
+        true
+    );
+}
+
+/// `workspace/applyEdit` from the server reaches the sink as a request,
+/// and the answer given with `respond` reaches the server with its id.
+fn server_requests_reach_the_sink_and_answers_go_back() {
+    let (client, init, events) = start();
+    init.recv_timeout(WAIT).expect("initialize result");
+    let edit = json!({"changes": {}});
+    let (_, rx) = client.request(
+        "workspace/executeCommand",
+        json!({"command": "fake.applyEdit", "arguments": [edit]}),
+    );
+    let deadline = Instant::now() + WAIT;
+    let (id, params) = loop {
+        match events.recv_timeout(deadline - Instant::now()) {
+            Ok(Event::Request { id, method, params }) => {
+                assert_eq!(method, "workspace/applyEdit");
+                break (id, params);
+            }
+            Ok(_) => {}
+            Err(_) => panic!("no request event"),
+        }
+    };
+    assert_eq!(params["edit"], edit);
+    assert_eq!(params["label"], "fake edit");
+    recv_reply(&rx, WAIT).expect("command reply").expect("ok");
+    client.respond(
+        id.clone(),
+        Ok(json!({"applied": false, "failureReason": "test"})),
+    );
+    // An error answer goes back as an error.
+    client.respond(
+        json!("other"),
+        Err(maestro_lsp::RpcError {
+            code: -32603,
+            message: "nope".into(),
+        }),
+    );
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let responses = stats(&client)["responses"].clone();
+        if responses.as_array().is_some_and(|r| r.len() == 2) {
+            assert_eq!(responses[0]["id"], id);
+            assert_eq!(responses[0]["result"]["failureReason"], "test");
+            assert_eq!(responses[1], json!({"id": "other", "error": "nope"}));
+            break;
+        }
+        assert!(Instant::now() < deadline, "{responses}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
