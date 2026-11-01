@@ -29,7 +29,7 @@ pub fn status_style(theme: &Theme, s: Status) -> Style {
         Status::Blocked => a.blocked,
         Status::Failed => a.failed,
         Status::Rejected => a.rejected,
-        Status::Integrated => a.completed,
+        Status::Completed | Status::Integrated => a.completed,
     }
 }
 

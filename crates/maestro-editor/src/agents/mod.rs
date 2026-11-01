@@ -71,6 +71,10 @@ pub enum Status {
     /// The ACP turn ended normally, or the terminal program exited with
     /// code 0.
     ReadyForReview,
+    /// Finished like `ReadyForReview`, but the worktree has no changes
+    /// against its starting commit. Goes back to `ReadyForReview` if a
+    /// later review diff finds changes.
+    Completed,
     /// The ACP turn ended without finishing (refused, cancelled, out of
     /// tokens or turns).
     Blocked,
@@ -94,6 +98,7 @@ impl Status {
             Status::Running => "running",
             Status::RunningTests => "running tests",
             Status::ReadyForReview => "ready for review",
+            Status::Completed => "finished, no changes",
             Status::Blocked => "blocked",
             Status::Failed => "failed",
             Status::Rejected => "rejected",
@@ -839,18 +844,32 @@ pub fn slug(text: &str) -> String {
     if out.is_empty() { "task".into() } else { out }
 }
 
-/// The first line of the task, shortened to fit a commit subject.
+/// A commit subject from the task: its first sentence when that fits in
+/// 72 characters, else its first line cut at the last word that fits.
+/// No ellipsis; the whole task goes in the commit body.
 pub fn task_summary(task: &str) -> String {
-    let first = task.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let first = first.trim();
-    if first.chars().count() > 72 {
-        let cut: String = first.chars().take(71).collect();
-        format!("{cut}…")
-    } else if first.is_empty() {
-        "Agent task".to_string()
-    } else {
-        first.to_string()
+    const MAX: usize = 72;
+    let first = task
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if first.is_empty() {
+        return "Agent task".to_string();
     }
+    let sentence = first
+        .find(". ")
+        .map_or(first, |i| &first[..i])
+        .trim_end_matches('.');
+    if sentence.chars().count() <= MAX {
+        return sentence.to_string();
+    }
+    let cut: String = first.chars().take(MAX + 1).collect();
+    let cut = match cut.rfind(char::is_whitespace) {
+        Some(i) if i > 0 => &cut[..i],
+        _ => &cut[..cut.char_indices().nth(MAX).map_or(cut.len(), |(i, _)| i)],
+    };
+    cut.trim_end_matches([',', ';', ':', ' ']).to_string()
 }
 
 #[cfg(test)]
@@ -903,5 +922,17 @@ mod tests {
         assert_eq!(task_summary("\n  Add a flag  \nmore"), "Add a flag");
         assert_eq!(task_summary(""), "Agent task");
         assert_eq!(task_summary(&"x".repeat(100)).chars().count(), 72);
+        assert_eq!(
+            task_summary(
+                "Add a function add(a, b) to calc.py that returns a + b, and an assertion \
+                 for it in test_calc.py. Keep the change minimal."
+            ),
+            "Add a function add(a, b) to calc.py that returns a + b, and an assertion"
+        );
+        assert_eq!(
+            task_summary("Fix the parser. Then add tests for it."),
+            "Fix the parser"
+        );
+        assert!(!task_summary(&"word ".repeat(30)).contains('…'));
     }
 }

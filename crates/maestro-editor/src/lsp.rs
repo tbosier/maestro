@@ -936,10 +936,7 @@ fn on_reply(ed: &mut Editor, kind: RequestKind, token: u64, reply: Reply, files:
                 RpcError::REQUEST_CANCELLED | RpcError::CONTENT_MODIFIED
             ) =>
         {
-            ed.info(format!(
-                "{}: the server canceled the request",
-                kind.label()
-            ));
+            ed.info(format!("{}: the server canceled the request", kind.label()));
             return;
         }
         Err(e) => {

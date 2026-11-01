@@ -9,7 +9,7 @@ use std::time::Instant;
 use maestro_git::{DiffFile, DiffLineKind, FileChange, intraline};
 
 use super::panel::{InputPurpose, Overlay, layout};
-use super::{AgentId, Comment};
+use super::{AgentId, Comment, Status};
 use crate::editor::Editor;
 use crate::key::{KeyCode, KeyEvent};
 
@@ -312,6 +312,15 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<Vec<DiffFile>, String>) 
             a.review.files = files;
             a.review.error = None;
             a.review.computed = Some(Instant::now());
+            // A finished agent with nothing to review says so.
+            match (a.base_status(), a.review.files.is_empty()) {
+                (Status::ReadyForReview, true) => {
+                    a.set_status(Status::Completed);
+                    a.log("finished with no changes to review");
+                }
+                (Status::Completed, false) => a.set_status(Status::ReadyForReview),
+                _ => {}
+            }
         }
         Err(e) => a.review.error = Some(e),
     }

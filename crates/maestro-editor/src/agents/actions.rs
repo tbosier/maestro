@@ -493,8 +493,8 @@ pub fn ask_drop_file(ed: &mut Editor, id: AgentId, file: &maestro_git::DiffFile)
         (Some(o), Some(n)) => {
             format!("{n} is deleted and {o} comes back as it was at {base}.")
         }
-        (None, Some(n)) => format!("{n} is deleted; the agent added it."),
-        (Some(o), None) => format!("{o} comes back as it was at {base}; the agent deleted it."),
+        (None, Some(n)) => format!("{n} is deleted; it did not exist at {base}."),
+        (Some(o), None) => format!("{o} comes back as it was at {base}."),
         (None, None) => return,
     };
     let mut lines = vec![

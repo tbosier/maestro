@@ -59,6 +59,10 @@ fn main() {
             "a_dropped_file_leaves_the_review_and_the_integration",
             a_dropped_file_leaves_the_review_and_the_integration,
         ),
+        (
+            "an_agent_that_changes_nothing_says_so",
+            an_agent_that_changes_nothing_says_so,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -954,7 +958,10 @@ fn a_dropped_file_leaves_the_review_and_the_integration() {
     match &ed.agents.panel.overlay {
         Some(Overlay::Confirm(c)) => {
             let text = c.lines.join(" ");
-            assert!(text.contains("junk.pyc is deleted"), "{text}");
+            assert!(
+                text.contains("junk.pyc is deleted; it did not exist at"),
+                "{text}"
+            );
         }
         other => panic!("expected a confirmation, got {other:?}"),
     }
@@ -987,4 +994,42 @@ fn a_dropped_file_leaves_the_review_and_the_integration() {
     let tree = f.git(&f.repo, &["ls-tree", "-r", "--name-only", "HEAD"]);
     assert!(tree.lines().any(|l| l == "notes.txt"), "{tree}");
     assert!(!tree.lines().any(|l| l == "junk.pyc"), "{tree}");
+}
+
+/// Exit code 0 with an empty review diff is "finished, no changes", not
+/// "ready for review"; a change made afterward flips it back.
+fn an_agent_that_changes_nothing_says_so() {
+    let f = Fixture::new();
+    let mut ed = f.editor(config(&[(
+        "idle",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "true", "sh", "{task}"],
+        ),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "do nothing", 0);
+    poll_until(&mut ed, "the empty review", |ed| {
+        status(ed, 0) == Status::Completed
+    });
+    assert_eq!(Status::Completed.label(), "finished, no changes");
+    std::fs::write(worktree(&ed, 0).join("later.txt"), "x\n").unwrap();
+    run(&mut ed, "\nr");
+    poll_until(&mut ed, "the changed review", |ed| {
+        status(ed, 0) == Status::ReadyForReview
+    });
+    // Reject and archive from the list, as for any finished agent.
+    std::fs::remove_file(worktree(&ed, 0).join("later.txt")).unwrap();
+    run(&mut ed, "<esc>X");
+    assert!(
+        matches!(&ed.agents.panel.overlay, Some(Overlay::Confirm(c))
+            if matches!(c.action, ConfirmAction::Reject(_))),
+        "{:?}",
+        ed.agents.panel.overlay
+    );
+    run(&mut ed, "a");
+    poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
+    assert_eq!(status(&ed, 0), Status::Rejected);
+    assert!(!worktree(&ed, 0).exists());
 }

@@ -47,7 +47,8 @@ Status comes only from these signals:
 | awaiting approval | the ACP agent asked for permission |
 | running | a terminal agent's program is running; Maestro cannot see what it is doing |
 | running tests | Maestro's verification command runs in the worktree (shown over the agent's own status) |
-| ready for review | the ACP turn ended with `end_turn`, or the terminal program exited with code 0 |
+| ready for review | the ACP turn ended with `end_turn`, or the terminal program exited with code 0, and the review diff has changes (or has not been computed yet) |
+| finished, no changes | as above, but the review diff of the worktree against its starting commit is empty |
 | blocked | the ACP turn ended any other way (`refusal`, `cancelled`, `max_tokens`, `max_turn_requests`) |
 | failed | the worktree or process could not start, the turn ended with an error, the ACP process exited mid-turn, or the terminal program exited with a nonzero code |
 | rejected | the user rejected the agent |
