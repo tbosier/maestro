@@ -120,57 +120,126 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
         cwd: root,
     };
     let shown = cmd.join(" ");
-    // Lines collect here and one job drains them, so a chatty test run
-    // cannot queue unbounded jobs: the buffer keeps at most
-    // MAX_TEST_LINES lines and counts the rest as dropped.
-    let buffer: Arc<Mutex<OutputBuffer>> = Default::default();
-    let started = maestro_tasks::start(&spec, move |event| match event {
-        TaskEvent::Output(line) => {
-            let mut b = buffer.lock().unwrap_or_else(|e| e.into_inner());
-            b.lines.push_back(line);
-            if b.lines.len() > super::MAX_TEST_LINES {
-                b.lines.pop_front();
-                b.dropped += 1;
-            }
-            if !b.scheduled {
-                b.scheduled = true;
-                let buffer = buffer.clone();
-                tx.send(move |ed| drain_output(ed, id, &buffer));
-            }
-        }
-        finished => {
-            let buffer = buffer.clone();
-            tx.send(move |ed| {
-                drain_output(ed, id, &buffer);
-                on_test_event(ed, id, finished);
-            });
-        }
-    });
+    let worktree = a.worktree.clone();
+    let git = ed.git.git().clone();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
-    match started {
-        Ok(handle) => {
-            a.tests.push(TestRun {
-                command: shown.clone(),
-                started: Instant::now(),
-                output: VecDeque::new(),
-                dropped: 0,
-                finished: None,
-                tree: None,
-                agent_was_running: agent_running,
-            });
-            a.test_handle = Some(handle);
-            a.log(format!("tests started{source}: {shown}"));
-            ed.agents.panel.view = DetailView::Tests;
-            ed.agents.panel.scroll = 0;
-            ed.info(format!("running {shown}{source}"));
+    let started = Instant::now();
+    a.tests.push(TestRun {
+        command: shown.clone(),
+        started,
+        output: VecDeque::new(),
+        dropped: 0,
+        finished: None,
+        tree: None,
+        agent_was_running: agent_running,
+    });
+    a.test_cancel = cancel.clone();
+    a.log(format!("tests started{source}: {shown}"));
+    ed.agents.panel.view = DetailView::Tests;
+    ed.agents.panel.scroll = 0;
+    ed.info(format!("running {shown}{source}"));
+    // On a background thread: first a snapshot of the files the run
+    // starts on (what integrate later compares against), then the run.
+    let spawned = ed.spawn_background("agent-tests", move |job| {
+        let tree = match &worktree {
+            Some(w) => open_agent_worktree(&git, w)
+                .and_then(|repo| repo.work_snapshot().map_err(|e| e.to_string()))
+                .map(|s| s.tree),
+            None => Err("no worktree".into()),
+        };
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            job.send(move |ed| test_not_started(ed, id, started, "stopped before it started"));
+            return;
         }
-        Err(e) => {
-            let msg = format!("could not run {shown}: {e}");
-            a.log(msg.clone());
-            ed.error(msg);
+        // Lines collect here and one job drains them, so a chatty test
+        // run cannot queue unbounded jobs: the buffer keeps at most
+        // MAX_TEST_LINES lines and counts the rest as dropped.
+        let buffer: Arc<Mutex<OutputBuffer>> = Default::default();
+        let result = maestro_tasks::start(&spec, move |event| match event {
+            TaskEvent::Output(line) => {
+                let mut b = buffer.lock().unwrap_or_else(|e| e.into_inner());
+                b.lines.push_back(line);
+                if b.lines.len() > super::MAX_TEST_LINES {
+                    b.lines.pop_front();
+                    b.dropped += 1;
+                }
+                if !b.scheduled {
+                    b.scheduled = true;
+                    let buffer = buffer.clone();
+                    tx.send(move |ed| drain_output(ed, id, &buffer));
+                }
+            }
+            finished => {
+                let buffer = buffer.clone();
+                tx.send(move |ed| {
+                    drain_output(ed, id, &buffer);
+                    on_test_event(ed, id, finished);
+                });
+            }
+        });
+        job.send(move |ed| test_started(ed, id, started, tree, result));
+    });
+    if let Err(e) = spawned {
+        test_not_started(ed, id, started, &format!("could not start: {e}"));
+    }
+}
+
+/// The run's process started (or failed to): keep its handle, or kill it
+/// at once if the agent was stopped in the meantime.
+fn test_started(
+    ed: &mut Editor,
+    id: AgentId,
+    started: Instant,
+    tree: Result<String, String>,
+    result: std::io::Result<maestro_tasks::TaskHandle>,
+) {
+    let handle = match result {
+        Ok(h) => h,
+        Err(e) => return test_not_started(ed, id, started, &e.to_string()),
+    };
+    let Some(a) = ed.agents.get_mut(id) else {
+        handle.kill();
+        return;
+    };
+    if a.test_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        handle.kill();
+    }
+    match tree {
+        Ok(t) => {
+            if let Some(run) = a.tests.iter_mut().rev().find(|r| r.started == started) {
+                run.tree = Some(t);
+            }
         }
+        Err(e) => a.log(format!(
+            "could not record which files the tests ran on: {e}"
+        )),
+    }
+    a.test_handle = Some(handle);
+}
+
+/// The run never started: it is marked finished, killed, with the reason.
+fn test_not_started(ed: &mut Editor, id: AgentId, started: Instant, why: &str) {
+    let Some(a) = ed.agents.get_mut(id) else {
+        return;
+    };
+    if let Some(run) = a
+        .tests
+        .iter_mut()
+        .rev()
+        .find(|r| r.started == started && r.finished.is_none())
+    {
+        let msg = format!("could not run {}: {why}", run.command);
+        run.output.push_back(msg.clone());
+        run.finished = Some(TestFinish {
+            code: None,
+            duration: Duration::ZERO,
+            summary: None,
+        });
+        a.log(msg.clone());
+        ed.error(msg);
     }
 }
 
@@ -230,49 +299,7 @@ fn on_test_event(ed: &mut Editor, id: AgentId, event: TaskEvent) {
             }
             a.test_handle = None;
             a.log(format!("tests {desc}"));
-            record_tested_tree(ed, id);
         }
-    }
-}
-
-/// Records which files the run that just finished was judged on: a
-/// snapshot of the worktree, taken on a background thread. Integrate
-/// compares it with the files at that time.
-fn record_tested_tree(ed: &mut Editor, id: AgentId) {
-    let git = ed.git.git().clone();
-    let Some(a) = ed.agents.get(id) else {
-        return;
-    };
-    let Some(w) = a.worktree.clone() else {
-        return;
-    };
-    let index = a.tests.len() - 1;
-    let started = a.tests[index].started;
-    let spawned = ed.spawn_background("agent-test-tree", move |tx| {
-        let tree = open_agent_worktree(&git, &w)
-            .and_then(|repo| repo.work_snapshot().map_err(|e| e.to_string()));
-        tx.send(move |ed| {
-            let Some(a) = ed.agents.get_mut(id) else {
-                return;
-            };
-            match tree {
-                Ok(s) => {
-                    if let Some(run) = a.tests.get_mut(index).filter(|r| r.started == started) {
-                        run.tree = Some(s.tree);
-                    }
-                }
-                Err(e) => a.log(format!(
-                    "could not record which files the tests ran on: {e}"
-                )),
-            }
-        });
-    });
-    if let Err(e) = spawned
-        && let Some(a) = ed.agents.get_mut(id)
-    {
-        a.log(format!(
-            "could not record which files the tests ran on: {e}"
-        ));
     }
 }
 
@@ -1095,6 +1122,32 @@ pub struct IntegrateFacts {
     /// Files in which this agent's own work conflicts with the target
     /// branch now, from a dry run; `maestro-git` refuses such a merge.
     pub own_conflicts: Vec<PathBuf>,
+    /// The tree of the agent's files when the dialog was checked. After
+    /// the commit, the branch must hold exactly this, or nothing is
+    /// integrated: the dialog's lists and warnings were about these files.
+    pub checked_tree: Option<String>,
+}
+
+/// Paths outside the contract that integrating the agent's branch could
+/// bring: those of the net diff from its fork point (committed and
+/// uncommitted work) and those any commit on the branch touches, since a
+/// file changed and changed back is invisible in the net diff but a
+/// cherry-pick applies each commit.
+fn contract_violations(
+    c: &super::contract::Contract,
+    wt: &maestro_git::Repository,
+    base: &str,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let files = wt.review_diff(base).map_err(|e| e.to_string())?;
+    let mut out = super::out_of_scope(c, &files);
+    for p in wt.paths_touched(base, "HEAD").map_err(|e| e.to_string())? {
+        if !out.iter().any(|(q, _)| *q == p)
+            && let Some(why) = c.violation(&p)
+        {
+            out.push((p, format!("{why} (changed by a commit on the branch)")));
+        }
+    }
+    Ok(out)
 }
 
 /// What the integrate check needs to know about another agent.
@@ -1375,6 +1428,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 clean_after: Vec::new(),
                 unchecked: Vec::new(),
                 own_conflicts: Vec::new(),
+                checked_tree: None,
             };
             let (wt, main) = check_before_commit(&git, &facts)?;
             let st = wt.status().map_err(|e| e.to_string())?;
@@ -1387,13 +1441,14 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
             // review's last refresh.
             let files = wt.review_diff(&w.base).map_err(|e| e.to_string())?;
             if let Some(c) = &facts.contract {
-                facts.out_of_scope = super::out_of_scope(c, &files);
+                facts.out_of_scope = contract_violations(c, &wt, &w.base)?;
             }
             let mine: std::collections::BTreeSet<PathBuf> =
                 files.iter().flat_map(super::file_paths).cloned().collect();
             let snap = wt.work_snapshot().map_err(|e| e.to_string());
             // The files now against the files the last verification ran on.
             let tree = snap.as_ref().ok().map(|s| s.tree.clone());
+            facts.checked_tree = tree.clone();
             let changed = match (last_test.as_ref().and_then(|t| t.tree.clone()), &tree) {
                 (Some(from), Some(to)) if from != *to => main
                     .diff(
@@ -1411,7 +1466,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 verification_warnings(last_test.as_ref(), has_command, tree.as_deref(), &changed);
             let overlapping: Vec<&Other> = others
                 .iter()
-                .filter(|o| !o.paths.is_disjoint(&mine))
+                .filter(|o| super::conflicts::paths_overlap(&o.paths, &mine))
                 .collect();
             conflicts_after(&git, &main, snap, &overlapping, &mut facts);
             Ok(facts)
@@ -1531,10 +1586,12 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
             .iter()
             .map(|(_, why)| why.clone())
             .collect();
+        // Every file is named, never "and N more": `O` lets in exactly
+        // these, and a dialog too long for the window cannot be accepted.
         lines.push(format!(
             "OUTSIDE THE TASK CONTRACT: {} changed file(s) would be integrated: {}. y is refused; O integrates them anyway, D in the review drops one.",
             facts.out_of_scope.len(),
-            first_of(&names, 8)
+            names.join("; ")
         ));
     }
     if !facts.own_conflicts.is_empty() {
@@ -1690,9 +1747,13 @@ struct Integrated {
     committed: Option<String>,
     target: String,
     outcome: Result<maestro_git::IntegrateOutcome, String>,
-    /// Files outside the task contract found on the branch after a
-    /// successful integration that the dialog did not list.
+    /// Files outside the task contract that a successful integration
+    /// changed on the target and the dialog did not list.
     late_out_of_scope: Vec<PathBuf>,
+    /// Why that check of the target could not run, if it could not.
+    audit_error: Option<String>,
+    /// Files outside the contract the user let in with `O`.
+    accepted: Vec<PathBuf>,
 }
 
 fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration) -> Integrated {
@@ -1701,6 +1762,8 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
         target: f.target.clone(),
         outcome: Err(String::new()),
         late_out_of_scope: Vec::new(),
+        audit_error: None,
+        accepted: f.out_of_scope.iter().map(|(p, _)| p.clone()).collect(),
     };
     let (wt, main) = match check_before_commit(git, f) {
         Ok(r) => r,
@@ -1735,47 +1798,86 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             return out;
         }
     }
-    // What the branch brings now, after the commit, judged against the
-    // contract again: a file outside it that the dialog did not list
-    // (written after the dialog was checked) stops the integration.
-    let unseen = |wt: &maestro_git::Repository| -> Result<Vec<PathBuf>, String> {
-        let Some(c) = &f.contract else {
-            return Ok(Vec::new());
-        };
-        let files = wt.review_diff(&f.base).map_err(|e| e.to_string())?;
-        Ok(super::out_of_scope(c, &files)
-            .into_iter()
-            .map(|(p, _)| p)
-            .filter(|p| !f.out_of_scope.iter().any(|(q, _)| q == p))
-            .collect())
-    };
-    match unseen(&wt) {
-        Ok(new) if new.is_empty() => {}
-        Ok(new) => {
-            out.outcome = Err(format!(
-                "files outside the task contract appeared after the dialog was checked: {}; \
-                 nothing was integrated. Press I again to see them",
-                list_paths(&new)
-            ));
-            return out;
-        }
-        Err(e) => {
-            out.outcome = Err(format!(
-                "could not check the work against the task contract ({e}); nothing was integrated"
-            ));
-            return out;
+    // The dialog's lists and warnings were about the files as they were
+    // then. If the committed branch holds anything else (the agent wrote
+    // while the dialog was up), nothing is integrated.
+    if let Some(checked) = &f.checked_tree {
+        match wt.work_snapshot().map(|s| s.tree) {
+            Ok(now) if now == *checked => {}
+            Ok(_) => {
+                out.outcome = Err(
+                    "the agent's files changed after the dialog was checked; nothing was \
+                     integrated. Press I again to see what it would bring now"
+                        .into(),
+                );
+                return out;
+            }
+            Err(e) => {
+                out.outcome = Err(format!("could not read the committed work ({e})"));
+                return out;
+            }
         }
     }
+    // Judged against the contract again, history included: a file outside
+    // it that the dialog did not list stops the integration.
+    let accepted = |p: &PathBuf| f.out_of_scope.iter().any(|(q, _)| q == p);
+    if let Some(c) = &f.contract {
+        match contract_violations(c, &wt, &f.base) {
+            Ok(v) => {
+                let new: Vec<PathBuf> = v
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .filter(|p| !accepted(p))
+                    .collect();
+                if !new.is_empty() {
+                    out.outcome = Err(format!(
+                        "files outside the task contract appeared after the dialog was checked: \
+                         {}; nothing was integrated. Press I again to see them",
+                        list_paths(&new)
+                    ));
+                    return out;
+                }
+            }
+            Err(e) => {
+                out.outcome = Err(format!(
+                    "could not check the work against the task contract ({e}); nothing was \
+                     integrated"
+                ));
+                return out;
+            }
+        }
+    }
+    let old_head = match main.resolve("HEAD") {
+        Ok(h) => h,
+        Err(e) => {
+            out.outcome = Err(format!("could not read {} ({e})", f.target));
+            return out;
+        }
+    };
     out.outcome = main
         .integrate(&f.branch, how)
         .map_err(|e| integrate_words(&e, &f.target));
-    // The branch could still move in the moment between that check and
-    // the merge; say so loudly if it did.
-    if out.outcome.is_ok()
-        && let Ok(new) = unseen(&wt)
-        && !new.is_empty()
-    {
-        out.late_out_of_scope = new;
+    // The branch could still move in the moment between those checks and
+    // the merge. What reached the target is checked against the contract,
+    // and anything outside it the dialog did not list is reported.
+    if let (Some(c), Ok(o)) = (&f.contract, &out.outcome) {
+        let landed = main.diff(
+            &maestro_git::DiffSpec::Revisions {
+                from: old_head,
+                to: o.new_head.clone(),
+            },
+            &[],
+        );
+        match landed {
+            Ok(files) => {
+                out.late_out_of_scope = super::out_of_scope(c, &files)
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .filter(|p| !accepted(p))
+                    .collect();
+            }
+            Err(e) => out.audit_error = Some(e.to_string()),
+        }
     }
     out
 }
@@ -1845,14 +1947,30 @@ fn integrated(ed: &mut Editor, id: AgentId, how: Integration, r: Integrated) {
                 o.commits.len(),
                 super::create::short(&o.new_head)
             );
-            if !o.commits.is_empty() && !r.late_out_of_scope.is_empty() {
-                let warn = format!(
-                    "{msg}. WARNING: the agent's branch now also has files outside the task \
-                     contract that the dialog did not list: {}. They changed in the moment \
-                     before the merge and may have been integrated; check {} with git log",
-                    list_paths(&r.late_out_of_scope),
-                    r.target
-                );
+            if !r.accepted.is_empty() {
+                a.log(format!(
+                    "integrated with files outside the task contract, after O: {}",
+                    r.accepted
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !r.late_out_of_scope.is_empty() || r.audit_error.is_some() {
+                let what = match &r.audit_error {
+                    Some(e) => format!(
+                        "Maestro could not check what reached {} against the task contract ({e})",
+                        r.target
+                    ),
+                    None => format!(
+                        "{} now has changes outside the task contract that the dialog did not \
+                         list: {}. The agent's branch moved in the moment before the merge",
+                        r.target,
+                        list_paths(&r.late_out_of_scope)
+                    ),
+                };
+                let warn = format!("{msg}. WARNING: {what}; check {} with git log", r.target);
                 a.log(warn.clone());
                 ed.error(warn);
             } else {

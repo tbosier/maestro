@@ -81,6 +81,14 @@ impl Contract {
     /// contract, or `None` when the task may change it.
     pub fn violation(&self, path: &Path) -> Option<String> {
         let shown = path.display();
+        // Patterns are text. A name that is not valid UTF-8 could only be
+        // matched through a lossy conversion that makes different names
+        // equal, so with any pattern it counts as outside.
+        if (!self.allowed.is_empty() || !self.forbidden.is_empty()) && path.to_str().is_none() {
+            return Some(format!(
+                "{shown} is not a valid UTF-8 path, which no pattern can name"
+            ));
+        }
         if let Some(p) = self.forbidden.iter().find(|p| matches_path(p, path)) {
             return Some(format!("{shown} matches the forbidden pattern {p}"));
         }
@@ -241,16 +249,43 @@ fn check_pattern(p: &str) -> Result<(), String> {
     if p.chars().any(char::is_control) {
         return Err("has a control character".into());
     }
-    for seg in p.trim_end_matches('/').split('/') {
+    if p.len() > MAX_PATTERN_BYTES {
+        return Err(format!("longer than {MAX_PATTERN_BYTES} bytes"));
+    }
+    // One trailing slash is allowed (`src/`); anything else empty is not.
+    let mut deep = 0;
+    let mut last = "";
+    for seg in p.strip_suffix('/').unwrap_or(p).split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
             return Err("has an empty, . or .. segment".into());
         }
         if seg.contains("**") && seg != "**" {
             return Err("** must be a whole segment".into());
         }
+        if seg == "**" {
+            // Each ** multiplies the matching work; a few are plenty.
+            if last == "**" {
+                return Err("** twice in a row".into());
+            }
+            deep += 1;
+            if deep > MAX_DEEP {
+                return Err(format!("more than {MAX_DEEP} ** segments"));
+            }
+        }
+        if seg.matches('*').count() > MAX_STARS {
+            return Err(format!("more than {MAX_STARS} * in one segment"));
+        }
+        last = seg;
     }
     Ok(())
 }
+
+/// Longest pattern accepted.
+const MAX_PATTERN_BYTES: usize = 512;
+/// Most `**` segments in one pattern.
+const MAX_DEEP: usize = 3;
+/// Most `*` in one segment.
+const MAX_STARS: usize = 8;
 
 /// True when `pattern` matches `path` or one of its parent directories.
 /// `*` matches within one segment, `?` one character, `**` any number of
@@ -263,7 +298,11 @@ pub fn matches_path(pattern: &str, path: &Path) -> bool {
             _ => None,
         })
         .collect();
-    let pat: Vec<&str> = pattern.trim_end_matches('/').split('/').collect();
+    let pat: Vec<&str> = pattern
+        .strip_suffix('/')
+        .unwrap_or(pattern)
+        .split('/')
+        .collect();
     (1..=segs.len()).any(|n| match_segments(&pat, &segs[..n]))
 }
 
@@ -454,7 +493,25 @@ pub fn load_file(path: &str, cwd: &Path) -> Result<Contract, String> {
         Ok(_) => {}
         Err(e) => return Err(format!("contract {shown}: {e}")),
     }
-    let text = std::fs::read_to_string(&full).map_err(|e| format!("contract {shown}: {e}"))?;
+    // Checked again on the open handle, and read with a limit, so a file
+    // swapped or grown after the check above is still refused.
+    let text = (|| -> std::io::Result<String> {
+        use std::io::Read;
+        let file = std::fs::File::open(&full)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            return Err(std::io::Error::other(
+                "not a regular file of at most 64 KiB when opened",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(std::io::Error::other("grew past 64 KiB while being read"));
+        }
+        String::from_utf8(bytes).map_err(|_| std::io::Error::other("not UTF-8 text"))
+    })()
+    .map_err(|e| format!("contract {shown}: {e}"))?;
     let mut c = parse_toml(&text).map_err(|e| format!("contract {shown}: {e}"))?;
     c.source = Some(path.to_string());
     Ok(c)
@@ -598,5 +655,34 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(c.verify_shown().unwrap(), "sh -c $'echo hi\\nrm x'");
+    }
+
+    #[test]
+    fn costly_and_odd_patterns_are_refused() {
+        let ok = |p: &str| check_pattern(p).is_ok();
+        assert!(ok("src/") && ok("a/**/b/**/c/**/d"));
+        assert!(!ok("src//") && !ok("src////") && !ok("a//b"));
+        assert!(!ok("**/**/x"), "** twice in a row");
+        assert!(!ok("a/**/b/**/c/**/d/**/e"), "four **");
+        assert!(!ok(&"*".repeat(9)));
+        assert!(!ok(&"a".repeat(600)));
+        // The worst accepted pattern against a deep path stays cheap.
+        let deep: String = (0..40).map(|i| format!("d{i}/")).collect::<String>() + "f";
+        let t = std::time::Instant::now();
+        assert!(!m("**/x*y*z/**/q*w/**/nope", &deep));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_that_are_not_utf8_are_outside_any_pattern() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = Path::new(std::ffi::OsStr::from_bytes(b"\xff.txt"));
+        let c = Contract {
+            allowed: vec!["\u{FFFD}.txt".into(), "**".into()],
+            ..Default::default()
+        };
+        assert!(c.violation(raw).is_some());
+        assert!(Contract::default().violation(raw).is_none(), "no patterns");
     }
 }

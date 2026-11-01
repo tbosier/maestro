@@ -120,6 +120,10 @@ fn main() {
             files_outside_the_contract_written_after_the_dialog_stop_the_integration,
         ),
         (
+            "history_outside_the_contract_is_listed_in_full",
+            history_outside_the_contract_is_listed_in_full,
+        ),
+        (
             "overlapping_agents_show_conflicts_only_where_they_conflict",
             overlapping_agents_show_conflicts_only_where_they_conflict,
         ),
@@ -2427,13 +2431,76 @@ fn files_outside_the_contract_written_after_the_dialog_stop_the_integration() {
     let msg = status_text(&ed);
     assert!(
         msg.contains(
-            "files outside the task contract appeared after the dialog was checked: late.txt"
+            "the agent's files changed after the dialog was checked; nothing was integrated"
         ),
         "{msg}"
     );
     assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
     assert!(!f.repo.join("late.txt").exists());
     assert_ne!(status(&ed, 0), Status::Integrated);
+    // Asked again, the dialog lists it.
+    open_integrate(&mut ed);
+    let (text, keys) = dialog(&ed);
+    assert!(
+        text.contains("OUTSIDE THE TASK CONTRACT: 1 changed file(s) would be integrated: late.txt"),
+        "{text}"
+    );
+    assert_eq!(keys[0].0, "O");
+    run(&mut ed, "n");
+    // A change to an allowed file while the dialog is up stops it too, even
+    // with O: the dialog was about the files as they were.
+    open_integrate(&mut ed);
+    std::fs::write(worktree(&ed, 0).join("notes.txt"), "edited later\n").unwrap();
+    run(&mut ed, "O");
+    poll_until(&mut ed, "the second refusal", |ed| {
+        status_text(ed).contains("changed after the dialog")
+    });
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+}
+
+/// Work outside the contract that a commit on the branch made and a later
+/// one undid is invisible in the net diff, but a cherry-pick applies each
+/// commit: the dialog lists it. Every file is named, however many.
+fn history_outside_the_contract_is_listed_in_full() {
+    let f = Fixture::new();
+    let git = "git -c user.name=A -c user.email=a@example.invalid -c commit.gpgSign=false";
+    let script = format!(
+        "printf 'x\\n' > secret.txt && {git} add -A && {git} commit -qm add && \
+         {git} rm -q secret.txt && {git} commit -qm remove && \
+         for i in 1 2 3 4 5 6 7 8 9 10; do printf 's\\n' > stray$i.txt; done && \
+         printf 'notes\\n' > notes.txt"
+    );
+    let mut ed = f.editor(config(&[("writer", sh_provider(&script))]));
+    run(&mut ed, " a");
+    start_contract_task(&mut ed, "write the notes\n@allow notes.txt", 0);
+    poll_until(&mut ed, "the program and its diff", |ed| {
+        ed.agents
+            .agents
+            .first()
+            .is_some_and(|a| a.exited.is_some() && !a.review.running && a.review.files.len() == 11)
+    });
+    assert_eq!(
+        status(&ed, 0),
+        Status::ReadyForReview,
+        "{:?}",
+        agent(&ed, 0).history
+    );
+    assert!(!review_paths(&ed, 0).contains(&"secret.txt".to_string()));
+    ed.resize(Rect::new(0, 1, 160, 60));
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains("OUTSIDE THE TASK CONTRACT: 11 changed file(s)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("secret.txt matches no allowed pattern (changed by a commit on the branch)"),
+        "{text}"
+    );
+    for i in 1..=10 {
+        assert!(text.contains(&format!("stray{i}.txt")), "{text}");
+    }
+    assert!(!text.lines().next().unwrap().contains("more"), "{text}");
 }
 
 fn overlapping_agents_show_conflicts_only_where_they_conflict() {
