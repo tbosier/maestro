@@ -187,7 +187,7 @@ pub fn wide_changed_lines(p: &super::Proposal, cols: usize) -> usize {
 /// Splits text into lines as `maestro_git::diff_lines` numbers them, but
 /// keeps each line's bytes: the line without its `\n`, a `\r` before it
 /// kept, and whether a `\n` ended it.
-fn split_lines(text: &str) -> Vec<(&str, bool)> {
+pub(crate) fn split_lines(text: &str) -> Vec<(&str, bool)> {
     let mut out = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
@@ -210,7 +210,11 @@ fn split_lines(text: &str) -> Vec<(&str, bool)> {
 /// script does. Lines it calls equal whose bytes differ (in a `\r`, or a
 /// final newline) become changes of their own, merged with their
 /// neighbors.
-fn exact_changes(ol: &[(&str, bool)], nl: &[(&str, bool)], loose: Vec<LineHunk>) -> Vec<LineHunk> {
+pub(crate) fn exact_changes(
+    ol: &[(&str, bool)],
+    nl: &[(&str, bool)],
+    loose: Vec<LineHunk>,
+) -> Vec<LineHunk> {
     let mut out: Vec<LineHunk> = Vec::new();
     let mut push = |h: LineHunk| match out.last_mut() {
         Some(last) if last.old.end == h.old.start && last.new.end == h.new.start => {

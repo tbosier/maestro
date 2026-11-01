@@ -7,9 +7,10 @@
 //!   messages back, then sends `initialized` followed by the backlog. If a
 //!   write fails it kills the server, which is then reported as exited;
 //! * the reader owns stdout, routes responses to the channel of the request
-//!   that asked, answers the few server-to-client requests itself, and hands
-//!   notifications to the caller's sink. When stdout closes it reports
-//!   [`Event::Exited`];
+//!   that asked, answers most server-to-client requests itself, and hands
+//!   notifications and the requests in [`FORWARDED_REQUESTS`] to the
+//!   caller's sink. The caller answers those with [`Client::respond`]. When
+//!   stdout closes it reports [`Event::Exited`];
 //! * a watcher reports the exit when the process ends but a descendant
 //!   keeps stdout open;
 //! * a stderr thread keeps the last [`LOG_LINES`] lines in memory, so server
@@ -42,11 +43,22 @@ const LOG_LINE_CHARS: usize = 2000;
 /// The answer to a request.
 pub type Reply = Result<Value, RpcError>;
 
+/// Server-to-client requests the reader hands to the caller instead of
+/// answering itself. The caller must answer each with [`Client::respond`].
+pub const FORWARDED_REQUESTS: &[&str] = &["workspace/applyEdit"];
+
 /// Something the server did that the editor should hear about.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// A notification other than logging and progress.
     Notification { method: String, params: Value },
+    /// A request in [`FORWARDED_REQUESTS`]. `id` is the server's, echoed
+    /// back verbatim by [`Client::respond`].
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     /// The server's stdout closed. `status` describes the exit.
     Exited { status: String },
 }
@@ -246,6 +258,31 @@ impl Client {
                     "hover": {"contentFormat": ["plaintext", "markdown"]},
                     "definition": {"linkSupport": true},
                     "references": {},
+                    "rename": {"prepareSupport": true},
+                    "formatting": {},
+                    "rangeFormatting": {},
+                    // Actions come as literals; an action without an edit
+                    // is resolved with `codeAction/resolve`.
+                    "codeAction": {
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {"valueSet": [
+                                "", "quickfix", "refactor", "refactor.extract",
+                                "refactor.inline", "refactor.rewrite", "source",
+                                "source.organizeImports",
+                            ]},
+                        },
+                        "isPreferredSupport": true,
+                        "disabledSupport": true,
+                        "dataSupport": true,
+                        "resolveSupport": {"properties": ["edit"]},
+                    },
+                    "signatureHelp": {
+                        "signatureInformation": {
+                            "parameterInformation": {"labelOffsetSupport": true},
+                            "activeParameterSupport": true,
+                        },
+                        "contextSupport": true,
+                    },
                     // Snippets are accepted as plain text (placeholders
                     // stripped); no property is resolved lazily, so
                     // servers send `additionalTextEdits` up front.
@@ -257,7 +294,19 @@ impl Client {
                         "contextSupport": true,
                     },
                 },
-                "workspace": {"workspaceFolders": true, "configuration": true},
+                // Edits are all or nothing: any problem refuses the whole
+                // edit. Creating, renaming and deleting files is not
+                // supported, so no resource operations are listed.
+                "workspace": {
+                    "workspaceFolders": true,
+                    "configuration": true,
+                    "applyEdit": true,
+                    "workspaceEdit": {
+                        "documentChanges": true,
+                        "failureHandling": "transactional",
+                    },
+                    "executeCommand": {},
+                },
                 "window": {"workDoneProgress": false},
             },
         });
@@ -295,6 +344,15 @@ impl Client {
         let _ = self
             .out
             .send(Outgoing::Queued(jsonrpc::notification(method, params)));
+    }
+
+    /// Answers a request the server sent ([`Event::Request`]).
+    pub fn respond(&self, id: Value, result: Result<Value, RpcError>) {
+        let msg = match result {
+            Ok(v) => jsonrpc::response(id, v),
+            Err(e) => jsonrpc::error_response(id, e.code, &e.message),
+        };
+        let _ = self.out.send(Outgoing::Now(msg));
     }
 
     /// Abandons a request: its receiver disconnects and the server is sent
@@ -418,6 +476,10 @@ fn route(msg: Message, shared: &Shared, out: &Sender<Outgoing>, sink: &Mutex<Eve
             }
         }
         Message::Request { id, method, params } => {
+            if FORWARDED_REQUESTS.contains(&method.as_str()) {
+                (lock(sink))(Event::Request { id, method, params });
+                return;
+            }
             let reply = match method.as_str() {
                 "workspace/configuration" => {
                     let n = params

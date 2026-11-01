@@ -20,13 +20,41 @@
 //!   list is marked incomplete, filtered here by the typed prefix, and has
 //!   an extra item `<prefix>Echo`, so a client must ask again as the
 //!   prefix grows;
-//! * a document containing `@slow` delays definition, references, hover
-//!   and completion by [`SLOW_MS`]; one containing `@crash` makes the server exit with
-//!   code 3 as soon as it sees it; `@orphan` makes it start a `sleep`
-//!   child that keeps stdout open and exit with code 4;
+//! * rename: every whole-word occurrence of the word at
+//!   the position, in the document, in every other open document, and in
+//!   every `.rs` file on disk next to the document that is not open. Open
+//!   documents get their version, files on disk a `null` one. Markers in
+//!   the requesting document bend the reply for failure tests: `@changes`
+//!   uses the `changes` form, `@badversion` gives open documents a wrong
+//!   version, `@overlap` and `@outofbounds` add a bad edit to the last
+//!   file, `@createfile` adds a create-file operation. The new name
+//!   `error` gets an error reply. `prepareRename` answers the word's range
+//!   and the word as placeholder, `null` off a word, and an error on the
+//!   word `builtin`;
+//! * formatting and range formatting remove trailing spaces and tabs, one
+//!   edit per line (only lines the range touches for range formatting).
+//!   `@formatwhole` answers one edit replacing the whole text instead;
+//!   `@formaterror` an error;
+//! * code actions: a quick fix replacing the range
+//!   of each `found ERROR` diagnostic the request sends with `OK`, plus a
+//!   command run after it; an action without an edit that
+//!   `codeAction/resolve` fills in (uppercase the word); a bare command
+//!   that makes the server send `workspace/applyEdit` (inserting a header
+//!   line, or at line 9999 in a document containing `@badheader`); a
+//!   command that fails; a disabled action;
+//! * signature help: inside the parentheses of a call to a function
+//!   defined in the same document as `fn name(...)`, its signature with
+//!   parameter offsets and the parameter the cursor is in; `null`
+//!   elsewhere. Triggered by `(` and `,`;
+//! * a document containing `@slow` delays every `textDocument/` request
+//!   about it, and `codeAction/resolve`, by [`SLOW_MS`]; one containing
+//!   `@crash` makes the server exit with code 3 as soon as it sees it;
+//!   `@orphan` makes it start a `sleep` child that keeps stdout open and
+//!   exit with code 4;
 //! * `fake/documentText` returns its copy of a document and any protocol
-//!   errors it noticed; `fake/stats` returns the notifications it received
-//!   and the completion requests it answered.
+//!   errors it noticed; `fake/stats` returns the notifications it received,
+//!   the completion requests it answered, the commands it ran, the
+//!   responses to its own requests and the `initialize` params.
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
@@ -42,6 +70,8 @@ pub const SLOW_MS: u64 = 600;
 pub const SLOW_INIT_ARG: &str = "--fake-slow-init";
 /// Extra argument: ask for the text in `didSave`.
 pub const SAVE_TEXT_ARG: &str = "--fake-save-text";
+/// Extra argument: do not offer `prepareRename`.
+pub const NO_PREPARE_RENAME_ARG: &str = "--fake-no-prepare-rename";
 
 /// If this process was started as the fake server, serves stdio and exits.
 pub fn run_if_requested() {
@@ -63,6 +93,12 @@ struct State {
     received: Vec<Value>,
     /// Completion requests, with their params.
     requests: Vec<Value>,
+    /// `workspace/executeCommand` params.
+    commands: Vec<Value>,
+    /// Responses to the server's own requests.
+    responses: Vec<Value>,
+    initialize: Value,
+    next_request: u64,
 }
 
 fn serve() -> i32 {
@@ -86,8 +122,11 @@ fn serve() -> i32 {
         };
         match msg {
             Message::Request { id, method, params } => {
-                let reply = handle_request(&mut st, &method, &params);
-                let _ = write_message(&mut out, &jsonrpc::response(id, reply));
+                let reply = match handle_request(&mut st, &method, &params, &mut out) {
+                    Ok(v) => jsonrpc::response(id, v),
+                    Err((code, msg)) => jsonrpc::error_response(id, code, &msg),
+                };
+                let _ = write_message(&mut out, &reply);
             }
             Message::Notification { method, params } => {
                 if method == "exit" {
@@ -147,7 +186,12 @@ fn serve() -> i32 {
                     _ => {}
                 }
             }
-            Message::Response { .. } => {}
+            Message::Response { id, result } => {
+                st.responses.push(match result {
+                    Ok(v) => json!({"id": id, "result": v}),
+                    Err(e) => json!({"id": id, "error": e.message}),
+                });
+            }
         }
     }
 }
@@ -190,25 +234,37 @@ fn after_change(st: &mut State, uri: &str, out: &mut impl Write) {
     );
 }
 
-fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
+/// An error reply: (code, message).
+type Failure = (i64, String);
+
+fn fail(message: &str) -> Failure {
+    (-32603, message.to_string())
+}
+
+fn handle_request(
+    st: &mut State,
+    method: &str,
+    params: &Value,
+    out: &mut impl Write,
+) -> Result<Value, Failure> {
     let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
-    let doc = st.docs.get(uri);
-    if matches!(
-        method,
-        "textDocument/definition"
-            | "textDocument/references"
-            | "textDocument/hover"
-            | "textDocument/completion"
-    ) && doc.is_some_and(|d| d.text.contains("@slow"))
-    {
+    let slow = st.docs.get(uri).is_some_and(|d| d.text.contains("@slow"));
+    if method.starts_with("textDocument/") && slow {
         std::thread::sleep(std::time::Duration::from_millis(SLOW_MS));
     }
-    match method {
+    let doc = st.docs.get(uri);
+    Ok(match method {
         "initialize" => {
+            st.initialize = params.clone();
             if std::env::args().any(|a| a == SLOW_INIT_ARG) {
                 std::thread::sleep(std::time::Duration::from_millis(400));
             }
             let include_text = std::env::args().any(|a| a == SAVE_TEXT_ARG);
+            let rename = if std::env::args().any(|a| a == NO_PREPARE_RENAME_ARG) {
+                json!(true)
+            } else {
+                json!({"prepareProvider": true})
+            };
             json!({
                 "capabilities": {
                     "positionEncoding": "utf-16",
@@ -221,6 +277,14 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
                     "referencesProvider": true,
                     "hoverProvider": true,
                     "completionProvider": {"triggerCharacters": ["."]},
+                    "renameProvider": rename,
+                    "documentFormattingProvider": true,
+                    "documentRangeFormattingProvider": true,
+                    "codeActionProvider": {"resolveProvider": true},
+                    "executeCommandProvider": {
+                        "commands": ["fake.applyEdit", "fake.record", "fake.fail"],
+                    },
+                    "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
                 },
                 "serverInfo": {"name": "fake-lsp"},
             })
@@ -230,7 +294,93 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
             Some(d) => json!({"text": d.text, "version": d.version, "errors": st.errors}),
             None => json!({"text": null, "errors": st.errors}),
         },
-        "fake/stats" => json!({"received": st.received, "requests": st.requests}),
+        "fake/stats" => json!({
+            "received": st.received,
+            "requests": st.requests,
+            "commands": st.commands,
+            "responses": st.responses,
+            "initialize": st.initialize,
+        }),
+        "textDocument/prepareRename" => {
+            let Some(doc) = doc else {
+                return Ok(Value::Null);
+            };
+            let at = offset(&doc.text, &params["position"]).ok_or(fail("bad position"))?;
+            let (start, end) = word_range(&doc.text, at);
+            match &doc.text[start..end] {
+                "" => Value::Null,
+                "builtin" => return Err(fail("cannot rename a builtin")),
+                word => json!({
+                    "range": range_json(&doc.text, start, end),
+                    "placeholder": word,
+                }),
+            }
+        }
+        "textDocument/rename" => rename(st, uri, params)?,
+        "textDocument/formatting" | "textDocument/rangeFormatting" => {
+            let Some(doc) = doc else {
+                return Ok(Value::Null);
+            };
+            if doc.text.contains("@formaterror") {
+                return Err(fail("the fake formatter failed"));
+            }
+            // A range ending at the start of a line does not touch it.
+            let lines = (method == "textDocument/rangeFormatting").then(|| {
+                let at = |p: &str, k: &str| params["range"][p][k].as_u64().unwrap_or(0) as usize;
+                let (first, mut last) = (at("start", "line"), at("end", "line"));
+                if last > first && at("end", "character") == 0 {
+                    last -= 1;
+                }
+                (first, last)
+            });
+            format(&doc.text, lines)
+        }
+        "textDocument/codeAction" => match doc {
+            Some(doc) => code_actions(uri, doc, params),
+            None => Value::Null,
+        },
+        "codeAction/resolve" => {
+            let data = &params["data"];
+            let uri = data["uri"].as_str().unwrap_or("");
+            let doc = st.docs.get(uri).ok_or(fail("resolve: document not open"))?;
+            if doc.text.contains("@slow") {
+                std::thread::sleep(std::time::Duration::from_millis(SLOW_MS));
+            }
+            let at = offset(&doc.text, &data["position"]).ok_or(fail("bad position"))?;
+            let (start, end) = word_range(&doc.text, at);
+            let mut action = params.clone();
+            action["edit"] = json!({"documentChanges": [{
+                "textDocument": {"uri": uri, "version": doc.version},
+                "edits": [{
+                    "range": range_json(&doc.text, start, end),
+                    "newText": doc.text[start..end].to_uppercase(),
+                }],
+            }]});
+            action
+        }
+        "workspace/executeCommand" => {
+            st.commands.push(params.clone());
+            match params["command"].as_str() {
+                Some("fake.applyEdit") => {
+                    st.next_request += 1;
+                    let request = json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("fake-{}", st.next_request),
+                        "method": "workspace/applyEdit",
+                        "params": {"label": "fake edit", "edit": params["arguments"][0]},
+                    });
+                    let _ = write_message(out, &request);
+                    Value::Null
+                }
+                Some("fake.fail") => return Err(fail("the fake command failed")),
+                _ => Value::Null,
+            }
+        }
+        "textDocument/signatureHelp" => match doc {
+            Some(doc) => offset(&doc.text, &params["position"])
+                .map_or(Value::Null, |at| signature_help(&doc.text, at)),
+            None => Value::Null,
+        },
         "textDocument/completion" => {
             st.requests.push(params.clone());
             let doc = st.docs.get(uri);
@@ -241,14 +391,14 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
         }
         "textDocument/definition" | "textDocument/references" | "textDocument/hover" => {
             let Some(doc) = doc else {
-                return Value::Null;
+                return Ok(Value::Null);
             };
             let Some(at) = offset(&doc.text, &params["position"]) else {
-                return Value::Null;
+                return Ok(Value::Null);
             };
             let word = word_at(&doc.text, at);
             if word.is_empty() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             let loc = |start: usize| {
                 json!({
@@ -282,7 +432,238 @@ fn handle_request(st: &mut State, method: &str, params: &Value) -> Value {
             }
         }
         _ => Value::Null,
+    })
+}
+
+fn range_json(text: &str, start: usize, end: usize) -> Value {
+    json!({"start": position(text, start), "end": position(text, end)})
+}
+
+/// A rename reply. See the module documentation for the markers.
+fn rename(st: &State, uri: &str, params: &Value) -> Result<Value, Failure> {
+    let doc = st.docs.get(uri).ok_or(fail("rename: document not open"))?;
+    let at = offset(&doc.text, &params["position"]).ok_or(fail("bad position"))?;
+    let word = word_at(&doc.text, at).to_string();
+    if word.is_empty() {
+        return Err((-32602, "nothing to rename here".into()));
     }
+    let new = params["newName"].as_str().unwrap_or_default();
+    if new == "error" {
+        return Err(fail("the fake rename failed"));
+    }
+    let marker = |m: &str| doc.text.contains(m);
+    let bump = if marker("@badversion") { 7 } else { 0 };
+    // (uri, text, version): this document, other open ones, then files on
+    // disk next to it.
+    let mut files: Vec<(String, String, Option<i64>)> =
+        vec![(uri.to_string(), doc.text.clone(), Some(doc.version + bump))];
+    let mut others: Vec<_> = st.docs.iter().filter(|(u, _)| *u != uri).collect();
+    others.sort_by(|a, b| a.0.cmp(b.0));
+    for (u, d) in others {
+        files.push((u.clone(), d.text.clone(), Some(d.version + bump)));
+    }
+    let dir = crate::convert::uri_to_path(uri).and_then(|p| Some(p.parent()?.to_path_buf()));
+    if let Some(dir) = &dir {
+        let mut disk: Vec<_> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        disk.sort();
+        for p in disk {
+            let u = crate::convert::path_to_uri(&p);
+            if st.docs.contains_key(&u) {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                files.push((u, text, None));
+            }
+        }
+    }
+    let mut changes: Vec<(String, Option<i64>, Vec<Value>)> = files
+        .into_iter()
+        .filter_map(|(u, text, version)| {
+            let edits: Vec<Value> = word_occurrences(&text, &word)
+                .into_iter()
+                .map(|s| json!({"range": range_json(&text, s, s + word.len()), "newText": new}))
+                .collect();
+            (!edits.is_empty()).then_some((u, version, edits))
+        })
+        .collect();
+    if let Some((_, _, edits)) = changes.last_mut() {
+        if marker("@overlap") {
+            // Starts where the first edit starts and ends inside it.
+            let mut bad = edits[0].clone();
+            let start = bad["range"]["start"]["character"].as_u64().unwrap_or(0);
+            bad["range"]["end"] = bad["range"]["start"].clone();
+            bad["range"]["end"]["character"] = json!(start + 1);
+            bad["newText"] = json!("overlap");
+            edits.push(bad);
+        }
+        if marker("@outofbounds") {
+            let far = json!({"line": 9999, "character": 0});
+            edits.push(json!({"range": {"start": far, "end": far}, "newText": "far"}));
+        }
+    }
+    if marker("@changes") {
+        let map: serde_json::Map<String, Value> = changes
+            .into_iter()
+            .map(|(u, _, edits)| (u, Value::Array(edits)))
+            .collect();
+        return Ok(json!({"changes": map}));
+    }
+    let mut document_changes: Vec<Value> = changes
+        .into_iter()
+        .map(|(u, version, edits)| {
+            json!({"textDocument": {"uri": u, "version": version}, "edits": edits})
+        })
+        .collect();
+    if marker("@createfile")
+        && let Some(dir) = &dir
+    {
+        let new_file = crate::convert::path_to_uri(&dir.join("created.rs"));
+        document_changes.push(json!({"kind": "create", "uri": new_file}));
+    }
+    Ok(json!({"documentChanges": document_changes}))
+}
+
+/// Formatting edits: trailing spaces and tabs removed, one edit per line,
+/// for lines `first..=last` when given.
+fn format(text: &str, lines: Option<(usize, usize)>) -> Value {
+    let mut edits = Vec::new();
+    let mut formatted = String::new();
+    let mut start = 0;
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let kept = body.trim_end_matches([' ', '\t']);
+        let in_range = lines.is_none_or(|(a, b)| a <= i && i <= b);
+        if in_range && kept.len() < body.len() {
+            edits.push(json!({
+                "range": range_json(text, start + kept.len(), start + body.len()),
+                "newText": "",
+            }));
+            formatted.push_str(kept);
+            formatted.push_str(&line[body.len()..]);
+        } else {
+            formatted.push_str(line);
+        }
+        start += line.len();
+    }
+    if text.contains("@formatwhole") {
+        return json!([{"range": range_json(text, 0, text.len()), "newText": formatted}]);
+    }
+    Value::Array(edits)
+}
+
+/// Code actions for a request. See the module documentation.
+fn code_actions(uri: &str, doc: &Doc, params: &Value) -> Value {
+    let mut actions = Vec::new();
+    for d in params["context"]["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if d["message"] == "found ERROR" {
+            actions.push(json!({
+                "title": "Replace ERROR with OK",
+                "kind": "quickfix",
+                "isPreferred": true,
+                "diagnostics": [d],
+                "edit": {"documentChanges": [{
+                    "textDocument": {"uri": uri, "version": doc.version},
+                    "edits": [{"range": d["range"], "newText": "OK"}],
+                }]},
+                "command": {"title": "record", "command": "fake.record", "arguments": ["quickfix"]},
+            }));
+        }
+    }
+    let line = if doc.text.contains("@badheader") {
+        9999
+    } else {
+        0
+    };
+    let origin = json!({"line": line, "character": 0});
+    actions.push(json!({
+        "title": "Uppercase the word",
+        "kind": "refactor.rewrite",
+        "data": {"uri": uri, "position": params["range"]["start"]},
+    }));
+    actions.push(json!({
+        "title": "Insert a header comment",
+        "command": "fake.applyEdit",
+        "arguments": [{"changes": {uri: [
+            {"range": {"start": origin, "end": origin}, "newText": "// header\n"},
+        ]}}],
+    }));
+    actions.push(json!({"title": "Run a failing command", "command": "fake.fail"}));
+    actions.push(json!({
+        "title": "Unavailable action",
+        "kind": "refactor",
+        "disabled": {"reason": "not available here"},
+    }));
+    Value::Array(actions)
+}
+
+/// Signature help for a cursor at byte `at`: the innermost unclosed call
+/// before it, if its function is defined in `text`.
+fn signature_help(text: &str, at: usize) -> Value {
+    let mut depth = 0;
+    let mut open = None;
+    for (i, c) in text[..at].char_indices().rev() {
+        match c {
+            ')' => depth += 1,
+            '(' if depth == 0 => {
+                open = Some(i);
+                break;
+            }
+            '(' => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(open) = open else {
+        return Value::Null;
+    };
+    let (name_start, _) = word_range(text, open);
+    let name = &text[name_start..open];
+    if name.is_empty() {
+        return Value::Null;
+    }
+    let Some(def) = text.find(&format!("fn {name}(")) else {
+        return Value::Null;
+    };
+    let params_start = def + 4 + name.len();
+    let Some(len) = text[params_start..].find(')') else {
+        return Value::Null;
+    };
+    let params_text = &text[params_start..params_start + len];
+    let label = format!("fn {name}({params_text})");
+    let units = |byte: usize| label[..byte].encode_utf16().count();
+    let mut parameters = Vec::new();
+    let mut at_byte = 4 + name.len();
+    for part in params_text.split(',') {
+        let lead = part.len() - part.trim_start().len();
+        let start = at_byte + lead;
+        let end = start + part.trim().len();
+        parameters.push(json!({"label": [units(start), units(end)]}));
+        at_byte += part.len() + 1;
+    }
+    let mut active = 0;
+    let mut depth = 0;
+    for c in text[open + 1..at].chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => active += 1,
+            _ => {}
+        }
+    }
+    json!({
+        "signatures": [{"label": label, "parameters": parameters}],
+        "activeSignature": 0,
+        "activeParameter": active,
+    })
 }
 
 /// The completion list for a cursor at byte `at`. Ranges are computed
@@ -361,6 +742,12 @@ fn word_occurrences(text: &str, needle: &str) -> Vec<usize> {
 }
 
 fn word_at(text: &str, at: usize) -> &str {
+    let (start, end) = word_range(text, at);
+    &text[start..end]
+}
+
+/// Byte range of the word around byte `at`.
+fn word_range(text: &str, at: usize) -> (usize, usize) {
     let bytes = text.as_bytes();
     let mut start = at.min(bytes.len());
     while start > 0 && is_word_byte(bytes[start - 1]) {
@@ -370,7 +757,7 @@ fn word_at(text: &str, at: usize) -> &str {
     while end < bytes.len() && is_word_byte(bytes[end]) {
         end += 1;
     }
-    &text[start..end]
+    (start, end)
 }
 
 /// Byte offset of each line start. Lines end at `\n`, `\r\n` or `\r`.
