@@ -721,6 +721,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "maestro-forge"
+version = "0.1.0"
+dependencies = [
+ "maestro-git",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "maestro-git"
 version = "0.1.0"
 dependencies = [

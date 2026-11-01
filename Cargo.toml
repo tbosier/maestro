@@ -21,6 +21,7 @@ maestro-lsp = { path = "crates/maestro-lsp" }
 maestro-term = { path = "crates/maestro-term" }
 maestro-agent = { path = "crates/maestro-agent" }
 maestro-tasks = { path = "crates/maestro-tasks" }
+maestro-forge = { path = "crates/maestro-forge" }
 
 ropey = "1.6"
 unicode-segmentation = "1.12"
