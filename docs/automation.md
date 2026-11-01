@@ -109,7 +109,7 @@ Params: `protocol_version` (string), `client_name` (optional). Result: `protocol
 <-- {"jsonrpc":"2.0","id":2,"result":{"capabilities":["apply_edit.char_positions","apply_edit.lsp_positions","apply_edit.version_check","document.history","events.document_changed","events.editor_status"],"methods":["initialize","editor.snapshot","editor.execute","editor.quit","document.open","document.text","document.save","document.apply_edit","document.history","selections.get","selections.set","command.run","command.list","events.subscribe"],"notifications":["document.changed","editor.status"],"protocol_version":"1.0","server_name":"maestro","server_version":"0.1.0"}}
 ```
 
-That exchange is from protocol 1.0. A 1.1 server, headless, answered a 1.0 client on October 31, 2026 with:
+That exchange is from protocol 1.0. A 1.1 server, headless, answered a 1.0 client on October 31, 2026 with the block below; on November 1, 2026 a 1.2 server answered a 1.1 client with the same result except `"protocol_version":"1.2"`:
 
 ```
 <-- {"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.1","server_name":"maestro","server_version":"0.1.0","methods":["initialize","editor.snapshot","editor.execute","editor.quit","document.open","document.text","document.save","document.apply_edit","document.history","selections.get","selections.set","command.run","command.list","events.subscribe","proposal.create","proposal.status","proposal.list","proposal.withdraw"],"notifications":["document.changed","editor.status","proposal.resolved"],"capabilities":["apply_edit.char_positions","apply_edit.lsp_positions","apply_edit.version_check","document.history","events.document_changed","events.editor_status"]}}
@@ -277,6 +277,15 @@ The base version and the edits are checked at once, with the same rules and erro
 - `proposal.status` params: `proposal` (the id). Result: the proposal. -32011 if there is no such proposal.
 - `proposal.list` params: `doc` (optional). Result: `proposals`, oldest first, pending and decided, for that document or for all.
 - `proposal.withdraw` params: `proposal`, `reason` (optional). The client takes back a pending proposal; it resolves as `withdrawn` with `decided_by` `client`. Only the connection that created the proposal can withdraw it: any other connection gets -32020, whatever actor name it sends, since actor names are whatever a client says and cannot tell clients apart. The check comes before the state check, so -32019 (already decided) goes only to the creator. A proposal whose connection closed can no longer be withdrawn; a new connection is a different connection. The person at the editor can still reject it. A confirmation dialog the reviewer had open for it is closed.
+
+Two Python clients on the socket of `maestro --clean --listen <path> greet.txt` (release build, November 1, 2026). Client A created proposal 1 with actor `agent:shared-name`; client B, on its own connection, tried to withdraw it:
+
+```
+B --> {"jsonrpc": "2.0", "id": 2, "method": "proposal.withdraw", "params": {"proposal": 1, "reason": "B tries"}}
+B <-- {"jsonrpc": "2.0", "id": 2, "error": {"code": -32020, "message": "proposal 1 was created by another connection; only that connection can withdraw it (the person at the editor can reject it). Nothing changed"}}
+```
+
+`proposal.status` from B still said `"state": "pending"`, and A's own `proposal.withdraw` then returned it with `"decision": "withdrawn"`.
 
 A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edit_count`, `verification` (`{program, args, cwd}` or `null`), `state` (`pending`, `verifying` while its command runs, `resolved`), `decision` (`approved`, `rejected`, `withdrawn`, `stale`, `failed`, or `null` while pending), `decided_by` (`{"kind": "user", "name": $USER}`, `{"kind": "client"}` or `{"kind": "editor"}`), `reason`, `applied_version`, `saved`, `verification_result`, and `created_ms`, `decided_ms`, `resolved_ms`.
 

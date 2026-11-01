@@ -167,3 +167,11 @@ branch = "feat/pipelines"
 owner = "agent"
 status = "done"
 # A narrow slice of the spec's Experiment A; see the M3 row in ROADMAP.md.
+
+[[task]]
+id = "hardening"
+title = "Integrate only the reviewed commit, end leftover verification processes, withdraw by the creating connection only"
+crates = ["maestro-git", "maestro-editor", "maestro-tasks", "maestro-automation", "maestro-protocol"]
+branch = "feat/hardening"
+owner = "agent"
+status = "done"

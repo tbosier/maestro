@@ -1705,7 +1705,8 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
     );
     if facts.agent_running {
         lines.push(
-            "The agent is still running: what it changes after the commit is left out.".into(),
+            "The agent is still running: only what this check saw can be integrated. A commit or file change Maestro sees before the merge stops the integration; a later one is left out."
+                .into(),
         );
     }
     let go = if facts.out_of_scope.is_empty() {
