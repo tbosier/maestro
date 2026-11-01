@@ -23,7 +23,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-CI runs the same commands on Linux and macOS (`.github/workflows/ci.yml`).
+CI (`.github/workflows/ci.yml`) runs the same commands on Linux, checks that the workspace builds with the minimum Rust version (1.88), and runs the tests on macOS as a job that is not required yet: nothing has been checked on macOS by hand.
+
+## Pull requests and releases
+
+Every change reaches `main` through a pull request that fills in the template and passes CI. After a pull request merges, `main` is tagged: a new minor version (`v0.2.0`) for a pull request that adds a feature, a new patch version (`v0.1.1`) for fixes and documentation.
 
 Changes that affect what you see or how input behaves also need an interactive check in a real terminal. The pattern used so far:
 
