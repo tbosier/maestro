@@ -18,6 +18,14 @@
 //! reaped only after the last signal to the group. The command can then be
 //! reaped as soon as it exits, which is how its exit is noticed, without
 //! freeing the group id while something may still signal it.
+//!
+//! Two cases end nothing beyond the program itself. Signals go through the
+//! `kill` program; if it is missing or fails, what the program left keeps
+//! running. And when Maestro was started with SIGCHLD ignored (a
+//! disposition a parent can pass on), the kernel reaps children by itself,
+//! so no pid of a child is safe to signal once it may have exited: on
+//! Linux this is read from `/proc/self/status`, and then there is no
+//! placeholder and no group is ever signaled. Elsewhere it cannot be told.
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -87,7 +95,9 @@ struct Shared {
     /// The placeholder leading the program's process group, until it is
     /// reaped. While it is here, unreaped, its pid (the group id) cannot
     /// belong to anyone else. Only the event thread takes it out and reaps
-    /// it, under the lock, after the group's last signal.
+    /// it, under the lock, after the group's last signal. `None` from the
+    /// start when SIGCHLD is ignored (see the crate docs): then nothing is
+    /// ever signaled by group.
     #[cfg(unix)]
     leader: Option<Child>,
 }
@@ -131,16 +141,60 @@ impl TaskHandle {
 /// group, and the workspace forbids `unsafe` (so no `libc::killpg`). The
 /// `kill` program does it: `kill -<signal> -- -<pgid>`. If `kill` is
 /// missing or fails, the caller still kills the direct child, so at worst
-/// what it started survives. Callers make sure `pgid` is still the task's
-/// group: its leader is not reaped yet.
+/// what it started survives. A `kill` that has not finished after
+/// [`KILL_PROGRAM_LIMIT`] is killed, so this never blocks for longer.
+/// Callers make sure `pgid` is still the task's group: its leader is not
+/// reaped yet.
 #[cfg(unix)]
 fn signal_group(signal: &str, pgid: u32) {
-    let _ = Command::new("kill")
+    let Ok(mut kill) = Command::new("kill")
         .args([format!("-{signal}"), "--".into(), format!("-{pgid}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = Instant::now() + KILL_PROGRAM_LIMIT;
+    loop {
+        match kill.try_wait() {
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            Ok(Some(_)) => return,
+            _ => {
+                let _ = kill.kill();
+                let _ = kill.wait();
+                return;
+            }
+        }
+    }
+}
+
+/// The longest `signal_group` waits for the `kill` program.
+#[cfg(unix)]
+const KILL_PROGRAM_LIMIT: Duration = Duration::from_secs(1);
+
+/// Whether this process ignores SIGCHLD, from `/proc/self/status`. Then
+/// the kernel reaps its children on its own, and a child's pid may belong
+/// to someone else as soon as the child exits. `false` when it cannot be
+/// told.
+#[cfg(target_os = "linux")]
+fn sigchld_ignored() -> bool {
+    // SIGCHLD is signal 17 on Linux: bit 16 of the `SigIgn` mask.
+    const SIGCHLD_BIT: u64 = 1 << 16;
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("SigIgn:"))
+                .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())
+        })
+        .is_some_and(|mask| mask & SIGCHLD_BIT != 0)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn sigchld_ignored() -> bool {
+    false
 }
 
 /// Whether any live process other than the leader `pgid` is in process
@@ -278,27 +332,33 @@ pub fn start(
     #[cfg(unix)]
     let mut leader = {
         use std::os::unix::process::CommandExt;
-        let mut leader = start_leader()?;
-        match i32::try_from(leader.id()) {
-            // The placeholder's group, so `kill` can stop everything the
-            // program starts.
-            Ok(pgid) => {
-                cmd.process_group(pgid);
+        if sigchld_ignored() {
+            // A group of its own still, but nothing will signal it.
+            cmd.process_group(0);
+            None
+        } else {
+            let mut leader = start_leader()?;
+            match i32::try_from(leader.id()) {
+                // The placeholder's group, so `kill` can stop everything the
+                // program starts.
+                Ok(pgid) => {
+                    cmd.process_group(pgid);
+                }
+                Err(_) => {
+                    let _ = leader.kill();
+                    let _ = leader.wait();
+                    return Err(io::Error::other("process id out of range"));
+                }
             }
-            Err(_) => {
-                let _ = leader.kill();
-                let _ = leader.wait();
-                return Err(io::Error::other("process id out of range"));
-            }
+            Some(leader)
         }
-        leader
     };
     let started = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             #[cfg(unix)]
-            {
+            if let Some(leader) = leader.as_mut() {
                 let _ = leader.kill();
                 let _ = leader.wait();
             }
@@ -312,7 +372,7 @@ pub fn start(
         child,
         reaped: false,
         #[cfg(unix)]
-        leader: Some(leader),
+        leader,
     }));
 
     let handle = TaskHandle { pid, shared };
@@ -560,6 +620,8 @@ pub fn parse_cargo_test(output: &str) -> Option<TestSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::path::Path;
 
     #[test]
     fn splits_long_lines_on_char_boundaries() {
@@ -619,19 +681,26 @@ mod tests {
         leader.wait().unwrap();
     }
 
+    /// A path for a ready flag no other test uses.
     #[cfg(unix)]
-    #[test]
-    fn the_leader_is_reaped_before_finished_and_a_hangup_handler_gets_to_run() {
+    fn flag(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "maestro-tasks-{name}-{}-{:?}",
+            std::process::id(),
+            Instant::now()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Runs `script` (with `$1` set to `arg`) and collects its lines and
+    /// exit code.
+    #[cfg(unix)]
+    fn run_script(script: &str, arg: &str) -> (TaskHandle, Vec<String>, Option<i32>) {
         let (tx, rx) = mpsc::channel();
         let spec = TaskSpec {
             program: "sh".into(),
-            // The background loop cleans up on SIGHUP: the grace period
-            // lets its handler run before SIGKILL.
-            args: vec![
-                "-c".into(),
-                "(trap 'echo cleaned; exit 0' HUP; while :; do sleep 0.05; done) & echo started"
-                    .into(),
-            ],
+            args: vec!["-c".into(), script.into(), "sh".into(), arg.into()],
             cwd: std::env::temp_dir(),
         };
         let h = start(&spec, move |e| {
@@ -642,18 +711,107 @@ mod tests {
         loop {
             match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                 TaskEvent::Output(l) => lines.push(l),
+                TaskEvent::Finished { code, .. } => return (h, lines, code),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_leader_is_reaped_before_finished_and_a_hangup_handler_gets_to_run() {
+        let ready = flag("hup");
+        // The background loop cleans up on SIGHUP: the grace period lets
+        // its handler run before SIGKILL. The shell exits only once the
+        // handler is in place.
+        let script = "(trap 'echo cleaned; exit 0' HUP; : > \"$1\"; while :; do sleep 0.05; done) & \
+                      while [ ! -e \"$1\" ]; do sleep 0.01; done; echo started";
+        let (tx, rx) = mpsc::channel();
+        let spec = TaskSpec {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                ready.display().to_string(),
+            ],
+            cwd: std::env::temp_dir(),
+        };
+        let h = start(&spec, move |e| {
+            let _ = tx.send(e);
+        })
+        .unwrap();
+        // The command waits for the flag, so the leader is still here.
+        let leader = lock(&h.shared).leader.as_ref().map(Child::id).unwrap();
+        let mut lines = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                TaskEvent::Output(l) => lines.push(l),
                 TaskEvent::Finished { code, .. } => {
                     assert_eq!(code, Some(0));
                     break;
                 }
             }
         }
+        let _ = std::fs::remove_file(&ready);
         assert_eq!(lines, ["started", "cleaned"]);
+        // Reaped, not just let go of: a zombie would still be in /proc.
+        assert!(lock(&h.shared).leader.is_none());
         assert!(
-            lock(&h.shared).leader.is_none(),
-            "the leader was not reaped"
+            !Path::new(&format!("/proc/{leader}")).exists(),
+            "the leader {leader} was not reaped"
         );
         // Nothing is left to signal.
         h.kill();
+    }
+
+    /// Set in the environment of the copy of this test binary that
+    /// `with_sigchld_ignored_no_group_is_signaled` starts.
+    #[cfg(target_os = "linux")]
+    const SIGCHLD_CHILD: &str = "MAESTRO_TASKS_SIGCHLD_IGNORED_CHILD";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_sigchld_ignored_no_group_is_signaled() {
+        if std::env::var_os(SIGCHLD_CHILD).is_some() {
+            return sigchld_ignored_child();
+        }
+        assert!(!sigchld_ignored());
+        // The same test binary, run with SIGCHLD ignored (which survives
+        // exec), running only the part below.
+        let exe = std::env::current_exe().unwrap();
+        let out = Command::new("sh")
+            .args([
+                "-c",
+                "trap '' CHLD; exec \"$0\" \"$@\"",
+                &exe.display().to_string(),
+                "--exact",
+                "tests::with_sigchld_ignored_no_group_is_signaled",
+                "--nocapture",
+            ])
+            .env(SIGCHLD_CHILD, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("sigchld child ran"), "{text}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sigchld_ignored_child() {
+        assert!(sigchld_ignored(), "the parent did not ignore SIGCHLD");
+        let (h, lines, _code) = run_script("sleep 1000 & echo $!", "");
+        assert!(lock(&h.shared).leader.is_none(), "no placeholder");
+        let pid: u32 = lines[0].trim().parse().unwrap();
+        // Nothing signaled the group, so the leftover still runs.
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+            !s.rsplit_once(')')
+                .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+        });
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+        assert!(alive, "the leftover {pid} was signaled");
+        println!("sigchld child ran");
     }
 }

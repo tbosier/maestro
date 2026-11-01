@@ -280,12 +280,24 @@ fn a_process_that_left_the_group_is_not_signaled_and_does_not_hold_back_finished
     }
     // `setsid` makes the sleep a session (and group) of its own. It keeps
     // stdout open, so Finished waits for the pipe no longer than its
-    // bounds.
+    // bounds. The shell exits only once the sleep has left the group.
+    let ready = std::env::temp_dir().join(format!("maestro-setsid-{}", std::process::id()));
+    let _ = std::fs::remove_file(&ready);
     let t = Instant::now();
-    let (_h, rx) = run(&sh("setsid sleep 1000 & echo $!; echo done"));
+    let (_h, rx) = run(&spec(
+        "sh",
+        &[
+            "-c",
+            "setsid sh -c ': > \"$1\"; exec sleep 1000' sh \"$1\" & \
+             while [ ! -e \"$1\" ]; do sleep 0.01; done; echo $!; echo done",
+            "sh",
+            &ready.display().to_string(),
+        ],
+    ));
     let (lines, code, _) = collect(&rx, Duration::from_secs(8));
     let elapsed = t.elapsed();
     let outside = first_pid(&lines);
+    let _ = std::fs::remove_file(&ready);
     let survived = alive(outside);
     kill_pid(outside);
     assert_eq!(code, Some(0));

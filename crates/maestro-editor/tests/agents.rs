@@ -139,6 +139,10 @@ fn main() {
             "a_branch_that_moved_after_the_dialog_is_not_integrated",
             a_branch_that_moved_after_the_dialog_is_not_integrated,
         ),
+        (
+            "a_target_that_changed_during_the_commit_is_not_integrated_into",
+            a_target_that_changed_during_the_commit_is_not_integrated_into,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -2829,4 +2833,44 @@ fn a_branch_that_moved_after_the_dialog_is_not_integrated() {
         status(ed, 0) == Status::Integrated
     });
     assert!(f.repo.join("notes.txt").exists());
+}
+
+/// The main worktree changes branch while Maestro commits the agent's work
+/// (after its own checks of the main worktree): a pre-commit hook does it,
+/// so the timing is exact. Nothing is integrated into either branch.
+fn a_target_that_changed_during_the_commit_is_not_integrated_into() {
+    let f = Fixture::new();
+    let mut ed = f.editor(config(&[(
+        "writer",
+        sh_provider("printf 'notes\\n' > notes.txt"),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write the notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    // Hooks live in the shared Git directory, so this one runs for the
+    // commit in the agent's worktree. It switches the main worktree.
+    let hook = f.repo.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nenv -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE \
+             git -C '{}' checkout -q -b elsewhere\n",
+            f.repo.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    open_integrate(&mut ed);
+    let msg = confirm_refused(&mut ed, "y");
+    assert!(
+        msg.contains("the main worktree is now on elsewhere, not main"),
+        "{msg}"
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "main"]), main_head);
+    assert_eq!(f.git(&f.repo, &["rev-parse", "elsewhere"]), main_head);
+    assert!(!f.repo.join("notes.txt").exists());
 }

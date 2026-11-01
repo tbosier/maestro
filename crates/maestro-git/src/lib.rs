@@ -28,7 +28,8 @@ pub use linediff::{LineHunk, LineHunkKind, Sign, SignMap, diff_lines};
 pub use merge::MergeCheck;
 pub use repo::{Base, Head, Repository};
 pub use review::{
-    CommitShape, IntegrateError, IntegrateOutcome, Integration, MERGE_TREE_TREES, WorkSnapshot,
+    CommitShape, IntegrateError, IntegrateOutcome, Integration, MERGE_TREE_TREES, Reviewed,
+    WorkSnapshot,
 };
 pub use status::{BranchInfo, ChangeKind, ConflictKind, EntryState, Status, StatusEntry};
 pub use worktree::{RemoveError, RemoveRefusal, Worktree};
@@ -197,6 +198,11 @@ impl Git {
             cmd.arg("-c").arg(c);
         }
         cmd.arg("--no-pager");
+        // Replacement refs (`git replace`), which anyone who can write to
+        // the repository (an agent in a worktree can) may add, would give a
+        // reviewed commit id another history or tree. Every command sees
+        // the real objects instead.
+        cmd.arg("--no-replace-objects");
         cmd.args(args);
         if let Some(d) = dir {
             cmd.current_dir(d);

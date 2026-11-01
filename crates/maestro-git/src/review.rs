@@ -91,6 +91,35 @@ pub enum IntegrateError {
     /// integrated.
     #[error("the branch is at {found}, not at the reviewed commit {expected}")]
     SourceMoved { expected: String, found: String },
+    /// [`Repository::integrate_reviewed`]: this worktree has another branch
+    /// checked out than the one the review was for. Nothing was integrated.
+    #[error("{found} is checked out, not {expected}")]
+    WrongTarget { expected: String, found: String },
+    /// [`Repository::integrate_reviewed`]: the commit the reviewed work
+    /// started from is not on the target branch, so integrating would
+    /// bring commits the review did not show. Nothing was integrated.
+    #[error("{base} is not on the target branch")]
+    BaseNotOnTarget { base: String },
+}
+
+/// What [`Repository::integrate_reviewed`] holds the integration to.
+#[derive(Debug, Clone, Copy)]
+pub struct Reviewed<'a> {
+    /// The source commit the review was about (a commit id or any revision
+    /// naming one).
+    pub commit: &'a str,
+    /// The branch the work must go into: the one checked out here.
+    pub target: &'a str,
+    /// The commit the reviewed work started from. It must be on the target
+    /// branch, so the range integrated holds only commits after it.
+    pub base: &'a str,
+}
+
+/// [`Reviewed`] with the source resolved to a full id.
+struct Pinned<'a> {
+    commit: String,
+    target: &'a str,
+    base: &'a str,
 }
 
 /// A worktree's files as an unreferenced commit, from
@@ -686,43 +715,64 @@ impl Repository {
         self.integrate_inner(branch, None, how)
     }
 
-    /// [`Repository::integrate`], but only the commit `reviewed` (a commit
-    /// id or any revision naming one): refuses with
-    /// [`IntegrateError::SourceMoved`], changing nothing, when `branch`
-    /// does not point at it, both before the checks and again just before
-    /// git runs. Git is given the commit id, never the branch name, so a
-    /// branch that moves after that last check still cannot bring in
-    /// anything but `reviewed` and the commits before it (for a cherry-pick,
-    /// those since the merge base with the target, as the checks listed).
+    /// [`Repository::integrate`], held to what was reviewed. Refuses,
+    /// changing nothing:
+    ///
+    /// - with [`IntegrateError::SourceMoved`] when `branch` does not point
+    ///   at `reviewed.commit`, both before the checks and again just before
+    ///   git runs;
+    /// - with [`IntegrateError::WrongTarget`] when this worktree has another
+    ///   branch than `reviewed.target` checked out;
+    /// - with [`IntegrateError::BaseNotOnTarget`] when `reviewed.base` is
+    ///   not an ancestor of the target's `HEAD`.
+    ///
+    /// The target's branch and `HEAD` are checked again just before git
+    /// runs, as for `integrate`. Git is given the commit id, never the
+    /// branch name, so a branch that moves after that last check still
+    /// cannot bring in anything but the reviewed commit and its history
+    /// since the target's `HEAD` (for a cherry-pick, the commits the checks
+    /// listed).
     pub fn integrate_reviewed(
         &self,
         branch: &str,
-        reviewed: &str,
+        reviewed: Reviewed<'_>,
         how: Integration,
     ) -> Result<IntegrateOutcome, IntegrateError> {
-        let reviewed = self.resolve(reviewed)?;
-        self.integrate_inner(branch, Some(&reviewed), how)
+        let pinned = Pinned {
+            commit: self.resolve(reviewed.commit)?,
+            target: reviewed.target,
+            base: reviewed.base,
+        };
+        self.integrate_inner(branch, Some(&pinned), how)
     }
 
     fn integrate_inner(
         &self,
         branch: &str,
-        reviewed: Option<&str>,
+        pinned: Option<&Pinned<'_>>,
         how: Integration,
     ) -> Result<IntegrateOutcome, IntegrateError> {
         check_branch_name(self, branch)?;
         let Head::Branch(target) = self.head()? else {
             return Err(IntegrateError::DetachedHead);
         };
+        if let Some(p) = pinned
+            && p.target != target
+        {
+            return Err(IntegrateError::WrongTarget {
+                expected: p.target.to_string(),
+                found: target,
+            });
+        }
         if let Some(op) = self.operation_in_progress()? {
             return Err(IntegrateError::InProgress(op));
         }
         let branch_ref = format!("refs/heads/{branch}");
         let source = self.resolve(&branch_ref)?;
         let moved = |found: String| -> Result<(), IntegrateError> {
-            match reviewed {
-                Some(r) if r != found => Err(IntegrateError::SourceMoved {
-                    expected: r.to_string(),
+            match pinned {
+                Some(p) if p.commit != found => Err(IntegrateError::SourceMoved {
+                    expected: p.commit.clone(),
                     found,
                 }),
                 _ => Ok(()),
@@ -730,6 +780,15 @@ impl Repository {
         };
         moved(source.clone())?;
         let old_head = self.resolve("HEAD")?;
+        // `old_head` is checked again before git runs, so this holds for
+        // the `HEAD` git merges into.
+        if let Some(p) = pinned
+            && !self.can_fast_forward(p.base, &old_head)?
+        {
+            return Err(IntegrateError::BaseNotOnTarget {
+                base: p.base.to_string(),
+            });
+        }
 
         let dirty: Vec<PathBuf> = self
             .status()?
