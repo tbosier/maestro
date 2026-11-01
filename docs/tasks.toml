@@ -189,3 +189,17 @@ crates = ["maestro-git", "maestro-editor", "maestro-tasks", "maestro-automation"
 branch = "feat/hardening"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "wave1-git"
+title = "Git status screen (space g) and buffer hunk keys (]h, [h, space h)"
+crates = ["maestro-git", "maestro-editor", "maestro-tui"]
+branch = "feat/git"
+owner = "agent"
+status = "done"
+# Partial patches (maestro-git patch.rs), staging, commit, log, blame,
+# stash, branches and remote commands; the status screen with line
+# staging, commit and amend buffers, branch picker, stash, fetch, pull
+# (fast-forward only), push (never forced), log and commit pages; hunk
+# navigation, stage, reset, preview, blame popup and blame column.
+# Not built: rebase, cherry-pick and revert from the screen.

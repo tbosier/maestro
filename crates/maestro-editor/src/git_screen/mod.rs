@@ -885,6 +885,7 @@ pub fn hints(sc: &Screen) -> Vec<(&'static str, &'static str)> {
             ("x", "discard lines"),
             ("esc", "stop selecting"),
         ],
+        // Most used first: a narrow window drops the end of the list.
         None => vec![
             ("tab", "hunks"),
             ("s", "stage"),
@@ -893,14 +894,12 @@ pub fn hints(sc: &Screen) -> Vec<(&'static str, &'static str)> {
             ("v", "lines"),
             ("cc", "commit"),
             ("ca", "amend"),
+            ("f/F/P", "fetch/pull/push"),
+            ("l", "log"),
+            ("q", "close"),
             ("b", "branch"),
             ("z/Z", "stash/pop"),
-            ("f", "fetch"),
-            ("F", "pull"),
-            ("P", "push"),
-            ("l", "log"),
             ("r", "refresh"),
-            ("q", "close"),
         ],
     }
 }

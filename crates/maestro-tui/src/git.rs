@@ -191,11 +191,15 @@ fn draw_status(ed: &Editor, s: &mut Surface, sc: &Screen, area: Rect) {
         let y = area.y + (i - sc.top) as u16;
         let r = Rect::new(area.x, y, area.width, 1);
         draw_status_row(ed, s, sc, r, row);
+        if i == sc.cursor {
+            s.patch(r, ui.cursorline);
+        }
+        // The selection shows on the cursor row too; the bar marks the
+        // cursor.
         if sel.is_some_and(|(a, b)| i >= a && i <= b) {
             s.patch(r, ui.selection);
         }
         if i == sc.cursor {
-            s.patch(r, ui.cursorline);
             s.put(r.x, y, "▌", ui.border_active, r.x + 1);
         }
     }
