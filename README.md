@@ -34,6 +34,8 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 
 - Overlaps between agents: when two agents change the same file, the panel says so and runs a merge dry run of their work (uncommitted files included) to show whether they would conflict. The integrate dialog says when this agent's own work conflicts with your branch, and names the overlapping agents whose work would conflict with it after this one is merged.
 - Agent records survive a restart: they are saved per repository with the editor sessions and come back when the panel opens, marked "not running (from an earlier session)". Review, tests, integrate and archive work on them; `R` starts one again in its worktree (an ACP agent gets its saved session back when it supports `session/load`; a terminal agent starts without its task). Worktrees on `maestro/` branches that no record names are listed as found worktrees to review, archive or adopt (`a`).
 
+- A GitHub inbox (`space i` or `:inbox`), through the GitHub CLI (`gh`) and the account it is logged in to: pull requests that ask for your review, pull requests assigned to you, your own open pull requests, issues assigned to you, and the open pull requests of the repository you are in. Each row shows `owner/repo#number`, the title, the author, the checks (`✓ passed 6`, `✗ failed 3/13`, `● pending 1/4`) and the age. It loads in the background and shows when it last did; `r` reloads, and `[github] refresh-secs` reloads on an interval (off by default). `Enter` on a pull request shows its checks by name, reviews, description as plain text, labels, and each changed file's diff in the agent review's layout. `o` opens it in the browser, `w` checks a pull request of the current repository out into a new worktree next to it and opens a file there. `a` approves, `c` comments and `R` requests changes (both written in a buffer of their own and sent with `:pr-send`), and `m` merges after you pick merge, squash or rebase. Each of those first shows the exact `gh` command and the text it sends, with warnings for drafts, failed or unfinished checks, conflicts and missing reviews; nothing is sent until you press `y`. When `gh` is missing or logged out, the screen says so and how to fix it (`gh auth login`). The status line shows how many reviews wait for you, as of the last load.
+
 Not built yet: an OS sandbox for agents (a worktree keeps their files apart, not their permissions; see [docs/security.md](docs/security.md)). That is tracked in the roadmap.
 
 ## Build and run
@@ -77,6 +79,9 @@ cargo build --release
 | `space =` / `:format`, `:format-selection` | format the buffer, or the primary selection, with the language server |
 | `space a` | the agent panel: `n` new task (with `@allow`, `@forbid`, `@verify`, `@accept` or `@contract` lines for a task contract), `N` same task with another provider, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate (`O` instead of `y` when files are outside the contract), `X` reject, `A` archive, `R` relaunch, `a` adopt a found worktree, `v` history or test output, `C-\` keys to the agent's terminal and back |
 | in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `D` drop the file's change, `ret` open the file there |
+| `space i` / `:inbox` | the GitHub inbox: `j`/`k` move, `ret` details, `o` browser, `w` worktree, `a` approve, `c` comment, `R` request changes, `m` merge, `r` reload |
+| in a pull request's details | `j`/`k` scroll, `tab` the next file's diff, `]`/`[` hunks, `h`/`l` sideways, `s` side by side, `esc` back to the list; the inbox keys above work here too |
+| `:pr-send` | in a comment or change-request buffer: show exactly what will be sent, then `y` sends it |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
 
@@ -112,6 +117,10 @@ args = ["--prompt", "{task}"]         # without {task}, the task is typed in aft
 kind = "terminal"
 command = "codex"
 enabled = false                       # hides a built-in provider
+
+[github]
+gh = "gh"                             # the GitHub CLI: a path or a name on PATH
+refresh-secs = 0                      # reload the inbox this often; 0 (default) only on open and r
 ```
 
 Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config, and reads and writes neither the session, the recent-files list nor the agent records.

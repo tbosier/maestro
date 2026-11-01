@@ -189,3 +189,13 @@ crates = ["maestro-git", "maestro-editor", "maestro-tasks", "maestro-automation"
 branch = "feat/hardening"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "github-inbox"
+title = "GitHub inbox through gh: review requests, assigned and own PRs, issues, PR detail and diff, approve, comment, request changes, merge, worktree checkout"
+crates = ["maestro-forge", "maestro-editor", "maestro-tui", "maestro-config", "maestro-git"]
+branch = "feat/github"
+owner = "agent"
+status = "done"
+# See the GitHub inbox row in ROADMAP.md. Write actions are tested against
+# a fake gh only; none was run against real GitHub.

@@ -24,6 +24,8 @@ pub struct DetailView {
     /// Row under the cursor and first row shown.
     pub cursor: usize,
     pub top: usize,
+    /// Columns of each diff line scrolled off to the left (`h`, `l`).
+    pub left: usize,
     pub side_by_side: bool,
 }
 
@@ -72,6 +74,7 @@ pub fn open(ed: &mut Editor, pr: PrRef) {
         page: 0,
         cursor: 0,
         top: 0,
+        left: 0,
         side_by_side: false,
     });
     load(ed, pr);
@@ -279,6 +282,7 @@ fn change_letter(change: &str) -> &'static str {
 pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     let rows = rows(ed);
     let height = content_area(ed).height.max(1) as usize;
+    let step = (content_area(ed).width as usize / 2).max(1);
     let Some(v) = ed.forge.screen.detail.as_mut() else {
         return;
     };
@@ -300,12 +304,16 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             v.page = (v.page + 1) % pages;
             v.cursor = 0;
             v.top = 0;
+            v.left = 0;
         }
         KeyCode::BackTab | KeyCode::Char('{') => {
             v.page = (v.page + pages - 1) % pages;
             v.cursor = 0;
             v.top = 0;
+            v.left = 0;
         }
+        KeyCode::Char('l') | KeyCode::Right if !ctrl => v.left += step,
+        KeyCode::Char('h') | KeyCode::Left if !ctrl => v.left = v.left.saturating_sub(step),
         KeyCode::Char(']') if !ctrl => {
             if let Some(i) = rows
                 .iter()
