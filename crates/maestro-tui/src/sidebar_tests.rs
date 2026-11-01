@@ -122,8 +122,11 @@ fn sidebar_lists_agents_by_attention_then_projects_with_facts() {
     // The divider, then the views.
     assert_eq!(s.cell(36, 5).unwrap().symbol, "│");
     assert_eq!(ed.area.x, 37);
-    // The first agent is selected, in the picker's selection colors.
-    assert_eq!(s.cell(4, 3).unwrap().style, ed.theme.ui.popup_selected);
+    // The current worktree starts selected, in the picker's selection
+    // colors on both its lines; the agent above is not.
+    assert_eq!(s.cell(4, 8).unwrap().style, ed.theme.ui.popup_selected);
+    assert_eq!(s.cell(6, 9).unwrap().style, ed.theme.ui.popup_selected);
+    assert_ne!(s.cell(4, 3).unwrap().style, ed.theme.ui.popup_selected);
     // The focused footer, and the status line names the worktree.
     assert!(row(&s, 28).contains("esc editor"), "{:?}", row(&s, 28));
     let status: String = row(&s, 28).chars().skip(37).collect();

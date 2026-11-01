@@ -106,7 +106,8 @@ pub struct RecordAgent {
     /// panel loads the record.
     pub status: Status,
     pub archived: bool,
-    /// The last saved verification run finished with a nonzero code.
+    /// The last saved verification run did not pass: a nonzero exit, or
+    /// it had not finished (as the agent panel shows it: killed).
     pub tests_failed: bool,
     pub worktree: PathBuf,
 }
@@ -196,6 +197,7 @@ fn apply(ed: &mut Editor, projects: Vec<Project>) {
             ed.workspaces.sidebar.expanded.insert(root);
         }
     }
+    super::sidebar::pin_selection(ed);
     super::jump::scan_finished(ed);
     if std::mem::take(&mut ed.workspaces.scan.again) {
         request(ed);
@@ -409,7 +411,7 @@ fn read_records(state: &Path, main: &Path) -> (Vec<RecordAgent>, Option<String>)
                         tests_failed: r
                             .tests
                             .last()
-                            .is_some_and(|t| t.finished && matches!(t.code, Some(c) if c != 0)),
+                            .is_some_and(|t| !(t.finished && t.code == Some(0))),
                         worktree: normalize_path(Path::new(&r.worktree.path)),
                     }
                 })

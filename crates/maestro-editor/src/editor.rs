@@ -1295,6 +1295,11 @@ impl Editor {
             crate::prompt::insert_text(self, text);
             return;
         }
+        if self.workspaces.sidebar.has_focus() {
+            // Never into the document behind the focused sidebar.
+            self.info("paste ignored: the sidebar has the keys (esc returns to the editor)");
+            return;
+        }
         if self.proposals.review_open() {
             crate::proposals::review::paste(self, text);
             return;

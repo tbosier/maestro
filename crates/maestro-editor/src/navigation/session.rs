@@ -338,7 +338,7 @@ pub fn save(ed: &Editor) -> Result<(), String> {
         return Ok(());
     };
     let session = if nav.scoped {
-        let root = cwd.clone();
+        let root = crate::workspaces::session_root(ed);
         capture_where(ed, cwd, &|p| crate::workspaces::owned_by(ed, p, &root))
     } else {
         capture(ed, cwd)

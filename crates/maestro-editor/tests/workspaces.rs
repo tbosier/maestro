@@ -75,6 +75,34 @@ fn main() {
             "servers_beyond_the_root_limit_stop_least_recently_used_first",
             servers_beyond_the_root_limit_stop_least_recently_used_first,
         ),
+        (
+            "a_switch_after_cd_saves_the_session_the_files_came_from",
+            a_switch_after_cd_saves_the_session_the_files_came_from,
+        ),
+        (
+            "a_worktree_the_scan_has_not_listed_keeps_its_own_session",
+            a_worktree_the_scan_has_not_listed_keeps_its_own_session,
+        ),
+        (
+            "a_path_through_dot_dot_belongs_to_the_worktree_it_names",
+            a_path_through_dot_dot_belongs_to_the_worktree_it_names,
+        ),
+        (
+            "paste_and_keys_with_the_sidebar",
+            paste_and_keys_with_the_sidebar,
+        ),
+        (
+            "a_verification_that_cannot_start_needs_you",
+            a_verification_that_cannot_start_needs_you,
+        ),
+        (
+            "the_palette_lists_a_bare_repositorys_worktrees_and_scratch_buffers",
+            the_palette_lists_a_bare_repositorys_worktrees_and_scratch_buffers,
+        ),
+        (
+            "a_nested_worktrees_server_stops_when_you_leave_it",
+            a_nested_worktrees_server_stops_when_you_leave_it,
+        ),
     ]);
 }
 
@@ -779,7 +807,7 @@ fn agents_that_need_you_come_first_and_notify_once_per_change() {
     // Choosing the agent in the sidebar switches to its worktree.
     run(&mut ed, "<esc>");
     open_sidebar(&mut ed);
-    let key = RowKey::Agent(format!("agent:{}", ed.agents.agents[quick].id.0));
+    let key = RowKey::Agent(format!("worktree:{}", agent_wt.display()));
     select_row(&mut ed, &key);
     run(&mut ed, "\n");
     assert_eq!(ed.cwd, agent_wt);
@@ -975,4 +1003,229 @@ fn servers_beyond_the_root_limit_stop_least_recently_used_first() {
     // Without waiting: one root may have servers, and beta is current.
     ed.tick(Instant::now());
     assert_eq!(roots(&ed), std::slice::from_ref(&f.beta));
+}
+
+// ----- regressions from the review ------------------------------------------
+
+/// `:cd` moves the working directory, not the session: a switch afterwards
+/// saves the open files under the worktree they came from and never
+/// replaces the `:cd` target's saved session.
+fn a_switch_after_cd_saves_the_session_the_files_came_from() {
+    let f = Fixture::new();
+    let mut ed = f.editor(f.config(), true);
+    // Beta gets a saved session with beta.txt.
+    switch_with_sidebar(&mut ed, &f.beta);
+    run(&mut ed, ":e beta.txt\n");
+    switch_with_sidebar(&mut ed, &f.alpha);
+    run(&mut ed, ":e a.txt\n");
+    run(&mut ed, &format!(":cd {}\n", f.beta.display()));
+    assert_eq!(ed.cwd, f.beta);
+    switch_with_sidebar(&mut ed, &f.feature);
+    let beta = session::load(&f.state(), &f.beta).unwrap().unwrap();
+    assert_eq!(beta.buffers.len(), 1);
+    assert_eq!(
+        beta.buffers[0].path,
+        f.beta.join("beta.txt").to_str().unwrap()
+    );
+    let alpha = session::load(&f.state(), &f.alpha).unwrap().unwrap();
+    assert_eq!(
+        alpha.buffers[0].path,
+        f.alpha.join("a.txt").to_str().unwrap()
+    );
+    // Back in alpha, then `:cd` away and choose alpha again: the same
+    // session, only the directory comes back.
+    switch_with_sidebar(&mut ed, &f.alpha);
+    run(&mut ed, &format!(":cd {}\n", f.beta.display()));
+    open_sidebar(&mut ed);
+    select_row(&mut ed, &RowKey::Worktree(f.alpha.clone()));
+    run(&mut ed, "\n");
+    assert_eq!(ed.cwd, f.alpha);
+    assert!(
+        status_text(&ed).starts_with("back in alpha:main"),
+        "{}",
+        status_text(&ed)
+    );
+    assert_eq!(open_paths(&ed), [f.alpha.join("a.txt")]);
+}
+
+/// A worktree made after the last scan, nested in another: its files are
+/// its own, not the outer worktree's, even before a scan lists it.
+fn a_worktree_the_scan_has_not_listed_keeps_its_own_session() {
+    let f = Fixture::new();
+    let mut ed = f.editor(f.config(), true);
+    run(&mut ed, ":e a.txt\n");
+    open_sidebar(&mut ed);
+    run(&mut ed, "<esc>");
+    let nested = f.alpha.join("nested");
+    f.git(
+        &f.alpha,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "nested",
+            nested.to_str().unwrap(),
+        ],
+    );
+    // Straight to the switch, as a stale palette or agent row would,
+    // without letting the scan that lists `nested` finish.
+    assert!(maestro_editor::workspaces::switch::switch(&mut ed, &nested));
+    run(&mut ed, ":e b.txt\n");
+    assert!(maestro_editor::workspaces::switch::switch(&mut ed, &f.beta));
+    let alpha = session::load(&f.state(), &f.alpha).unwrap().unwrap();
+    let saved: Vec<String> = alpha.buffers.iter().map(|b| b.path.clone()).collect();
+    assert_eq!(saved, [f.alpha.join("a.txt").to_str().unwrap()]);
+    let inner = session::load(&f.state(), &nested).unwrap().unwrap();
+    assert_eq!(
+        inner.buffers[0].path,
+        nested.join("b.txt").to_str().unwrap()
+    );
+    settle(&mut ed);
+}
+
+fn a_path_through_dot_dot_belongs_to_the_worktree_it_names() {
+    let f = Fixture::new();
+    let mut ed = f.editor(f.config(), true);
+    run(&mut ed, ":e a.txt\n");
+    run(&mut ed, ":e ../beta/beta.txt\n");
+    switch_with_sidebar(&mut ed, &f.feature);
+    // beta.txt is beta's: not saved in alpha's session, not closed.
+    let alpha = session::load(&f.state(), &f.alpha).unwrap().unwrap();
+    assert_eq!(alpha.buffers.len(), 1, "{alpha:?}");
+    let open = open_paths(&ed);
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert!(open[0].ends_with("beta.txt"));
+}
+
+fn paste_and_keys_with_the_sidebar() {
+    let f = Fixture::new();
+    let mut ed = f.editor(f.config(), false);
+    run(&mut ed, ":e a.txt\n");
+    open_sidebar(&mut ed);
+    // The selection starts on the current worktree.
+    assert_eq!(
+        ed.workspaces.sidebar.selected,
+        Some(RowKey::Worktree(f.alpha.clone()))
+    );
+    ed.paste_text("pasted");
+    assert!(!ed.doc().is_modified());
+    assert!(status_text(&ed).contains("paste ignored"));
+    // A sidebar the screen cannot show takes no keys.
+    run(&mut ed, " s");
+    ed.workspaces.sidebar.too_narrow = true;
+    run(&mut ed, " s");
+    assert!(
+        status_text(&ed).contains("too narrow"),
+        "{}",
+        status_text(&ed)
+    );
+    run(&mut ed, "d");
+    assert!(ed.doc().is_modified());
+}
+
+fn a_verification_that_cannot_start_needs_you() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config
+        .agents
+        .provider
+        .insert("quick".into(), sh_provider("true"));
+    config.agents.test_command = vec![f.tmp.join("no-such-program").display().to_string()];
+    let mut ed = f.editor(config, false);
+    run(&mut ed, " a");
+    start_task(&mut ed, "noop", 0);
+    poll_until(&mut ed, "the agent", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    run(&mut ed, "t");
+    poll_until(&mut ed, "the test run", |ed| {
+        ed.agents.agents[0]
+            .latest_test()
+            .is_some_and(|t| t.finished.is_some())
+    });
+    ed.poll_background();
+    let e = &maestro_editor::workspaces::agent_entries(&ed)[0];
+    assert_eq!(e.attention, Attention::NeedsYou(NeedsYou::TestsFailed));
+    assert_eq!(ed.workspaces.notifications.len(), 2, "review, then tests");
+}
+
+fn the_palette_lists_a_bare_repositorys_worktrees_and_scratch_buffers() {
+    let f = Fixture::new();
+    let bare = f.tmp.join("bare.git");
+    let linked = f.tmp.join("linked");
+    f.git(
+        &f.tmp,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            f.alpha.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    f.git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "work",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let mut config = f.config();
+    config.projects.paths.push(linked.display().to_string());
+    let mut ed = f.editor(config, false);
+    run(&mut ed, "iscratch notes<esc>");
+    run(&mut ed, " j");
+    poll_until(&mut ed, "the palette", |ed| {
+        ed.picker.as_ref().is_some_and(|p| !p.loading) && !ed.has_background_work()
+    });
+    let labels: Vec<String> = ed
+        .picker
+        .as_ref()
+        .unwrap()
+        .items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    for want in [
+        "worktree bare.git:linked work",
+        "project bare.git",
+        "buffer [scratch] scratch notes",
+    ] {
+        assert!(labels.iter().any(|l| l == want), "{want} in {labels:?}");
+    }
+    run(&mut ed, "linked work\n");
+    assert_eq!(ed.cwd, linked);
+}
+
+fn a_nested_worktrees_server_stops_when_you_leave_it() {
+    let f = Fixture::new();
+    let nested = f.alpha.join("nested");
+    f.git(
+        &f.alpha,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "nested",
+            nested.to_str().unwrap(),
+        ],
+    );
+    let mut config = lsp_config();
+    config.lsp.max_live_roots = 0;
+    let mut ed = f.editor(config, false);
+    ed.lsp.enabled = true;
+    switch_with_sidebar(&mut ed, &nested);
+    run(&mut ed, ":e src/lib.rs\n");
+    let doc = ed.view().doc;
+    poll_until(&mut ed, "the nested server", |ed| ed.lsp.is_synced(doc));
+    switch_with_sidebar(&mut ed, &f.alpha);
+    assert_eq!(roots(&ed), std::slice::from_ref(&nested));
+    ed.tick(Instant::now() + Duration::from_secs(301));
+    assert_eq!(roots(&ed), Vec::<PathBuf>::new());
 }
