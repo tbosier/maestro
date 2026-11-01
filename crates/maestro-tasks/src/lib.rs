@@ -620,7 +620,7 @@ pub fn parse_cargo_test(output: &str) -> Option<TestSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::path::Path;
 
     #[test]
@@ -682,7 +682,7 @@ mod tests {
     }
 
     /// A path for a ready flag no other test uses.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn flag(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "maestro-tasks-{name}-{}-{:?}",
@@ -695,7 +695,7 @@ mod tests {
 
     /// Runs `script` (with `$1` set to `arg`) and collects its lines and
     /// exit code.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn run_script(script: &str, arg: &str) -> (TaskHandle, Vec<String>, Option<i32>) {
         let (tx, rx) = mpsc::channel();
         let spec = TaskSpec {
