@@ -55,6 +55,67 @@ There is no separate Helix profile yet. The Maestro profile already follows Heli
 - Registers hold one string per selection. Yanking three selections and pasting into three selections puts each piece in its own place. `+` and `*` are the system clipboard. `_` discards.
 - Text ending in a newline pastes linewise: below the line with `p`, above with `P`.
 
+## Structural pipelines
+
+These `:` commands select syntax nodes with tree-sitter queries, filter and grow those selections, and add a line above each one. They work on the multiple selections like any other command, so after a pipeline `c`, `i`, `a` or `d` act on every selection it left. The ones that read the tree need a recognized file type and a finished parse; otherwise the status line says why ("no syntax tree: file type not recognized", "rust syntax tree is still being built").
+
+| Command | Does |
+|---|---|
+| `:select-nodes <query>` | Replaces the selections with every node the query matches in the whole buffer. |
+| `:select-inside <query>` | Replaces each selection with the matching nodes that lie entirely inside it. |
+| `:keep-nodes <query>`, `:remove-nodes <query>` | Keep, or remove, the selections that are exactly a node the query matches (same start and end). |
+| `:keep-containing <query>`, `:remove-containing <query>` | Keep, or remove, the selections that contain a matching node anywhere inside them (the selection itself counts). |
+| `:keep-matching <regex>`, `:remove-matching <regex>` | Keep, or remove, the selections whose text matches a regex, with smart case like `K` and `A-K`. |
+| `:expand-to <kind>...` | Grows each selection to the smallest node of one of the given kinds that contains it (a selection that already is such a node stays). Selections inside no such node are dropped. Kinds are grammar names such as `function_item`. |
+| `:insert-above <text>` | Inserts `<text>` on a new line above the first line of each selection, with that line's indentation and the document's line ending. One transaction, one undo step. Several selections on one line get one new line. If a selection starts after other text on its line (`impl X { pub fn a() {} }`), the line above would belong to other code, so nothing is inserted and the status line names the line. |
+
+`keep-nodes` looks at the selection's own node and `keep-containing` at anything inside it. On a function, `keep-nodes returns-result` asks about that function's return type, while `keep-containing returns-result` is also true when a function nested in its body returns `Result`.
+
+### Queries and shortcuts
+
+A query argument is either a shortcut name or raw tree-sitter query syntax, which starts with `(`, `[`, `"` or `_`. A raw query selects the nodes of its capture named `@select`; without one, of its only capture; and a single pattern with no capture selects the node the whole pattern matches. The predicates `#eq?`, `#match?`, `#any-of?` and their `#not-` forms work. An invalid query changes nothing and reports where it went wrong: `select-nodes: invalid query at column 17: unknown node kind "nope"`.
+
+| Language | Shortcuts |
+|---|---|
+| Rust | `fn` (functions and methods with a body), `pub-fn` (declared `pub`; `pub(crate)` and the like do not count), `async-fn`, `pub-async-fn`, `struct`, `enum`, `impl`, `trait`, `mod`, `call` (function and method calls, not macros), `string` (raw strings included), `returns-result` (functions whose return type is `Result` or a path ending in `Result`, such as `io::Result<()>`), `instrumented` (functions with `#[instrument]` or `#[tracing::instrument]`, with or without arguments, among the attributes and comments right above them) |
+| Python | `fn`, `async-fn`, `class`, `call`, `string` |
+| JavaScript | `fn` (declarations, expressions, arrow functions, methods), `class`, `call`, `string` (template literals included) |
+| TypeScript, TSX | the JavaScript ones plus `interface`; `class` includes abstract classes |
+| C | `fn`, `struct` (with a body), `call`, `string` |
+
+TOML, JSON and Markdown have no shortcuts; raw queries work there.
+
+In Rust, attributes and doc comments are sibling nodes in front of an item, not part of it. A function's selection starts at `pub` or `fn`, so `keep-matching instrument` does not see `#[instrument]`; the `instrumented` shortcut looks at the siblings instead. `insert-above` puts its line between the existing attributes and the function. Code in doc comments, strings and macro bodies is not parsed as items, so it never matches.
+
+Selections are sorted and never overlap, so a match inside another match (a function nested in a function) merges into the outer one. The status line counts the merges: `select-nodes 14 (1 nested or overlapping merged)`. The primary selection becomes the first one that ends after the old cursor.
+
+### Pipelines
+
+Steps chain with `|` on one command line. The spec's example, "select every public async function that returns `Result` and has no tracing instrumentation", then adding the attribute:
+
+```
+:select-nodes pub-async-fn | keep-nodes returns-result | remove-nodes instrumented | insert-above #[tracing::instrument]
+```
+
+The status line shows the selection count after each step: `select-nodes 9 | keep-nodes 8 | remove-nodes 5 | insert-above 5: inserted 5 lines (u undoes)`. One `u` removes all five lines. The same pipeline with raw queries:
+
+```
+:select-nodes (function_item (visibility_modifier) @v (#eq? @v "pub") (function_modifiers "async")) @select | keep-nodes (function_item return_type: [(generic_type type: (type_identifier) @t) (generic_type type: (scoped_type_identifier name: (type_identifier) @t))] (#eq? @t "Result")) @select | remove-nodes ((attribute_item (attribute [(identifier) (scoped_identifier)] @a (#match? @a "^(tracing::)?instrument$"))) . [(attribute_item) (line_comment) (block_comment)]* . (function_item) @select) | insert-above #[tracing::instrument]
+```
+
+Rules:
+
+- A `|` inside double quotes, inside `()`, `[]` or `{}`, or after a backslash does not split. A regex alternation therefore goes in parentheses: `keep-matching (foo|bar)`.
+- The whole line is checked before anything runs: step names, queries, regexes and node kinds. Only the commands in the table above can be steps, and `insert-above` only as the last one.
+- If a step fails or leaves no selections, nothing changes (selections and text stay as they were) and the status line names the step: `step 3 (remove-nodes) left no selections (after select-nodes 9 | keep-nodes 8); nothing changed`.
+- A pipeline is one `:` command, so its edit is one undo step.
+
+Through the automation API, `editor.execute` runs a pipeline line and returns the status message; a failing step returns error `-32016` with the same message. `command.run` with a step's name runs it without an argument, which only reports what argument it needs.
+
+Cost: each query step runs its query over the whole tree. On a generated 10,003-line, 165 KB Rust file with 527 matching functions, the spec's pipeline took a median of 40 ms for the three selection steps and 46 ms with the insertion (21 runs each, release build, timed from Enter to return in `measure_spec_pipeline_on_10k_lines` in `crates/maestro-editor/tests/pipelines.rs`). About 2 to 4 ms of each query step is compiling the query, which is not cached.
+
+Not built: a filter on the text of an enclosing node (use `expand-to` and then `keep-matching`, which changes the selections), other text-changing steps (edit the selections afterward with the usual commands), and key bindings for these commands.
+
 ## Invariants the tests hold
 
 - A change set refuses to apply to a document of a different length.
