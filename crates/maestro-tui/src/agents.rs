@@ -7,7 +7,7 @@ use maestro_editor::Rect;
 use maestro_editor::agents::panel::{self, ConfirmAction, DetailView, Overlay, PanelLayout};
 use maestro_editor::agents::review::{self, Row, RowLine};
 use maestro_editor::agents::{
-    Agent, DiffLineKind, FileChange, ProviderKind, Runtime, Screen, Status, TermColor,
+    Agent, DiffLineKind, FileChange, Origin, ProviderKind, Runtime, Screen, Status, TermColor,
     TranscriptEntry,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -25,6 +25,8 @@ pub fn status_style(theme: &Theme, s: Status) -> Style {
         Status::Editing => a.editing,
         Status::AwaitingApproval => a.awaiting_approval,
         Status::Running | Status::RunningTests => a.running,
+        Status::Idle => a.working,
+        Status::Stopped => a.starting,
         Status::ReadyForReview => a.ready,
         Status::Blocked => a.blocked,
         Status::Failed => a.failed,
@@ -96,6 +98,10 @@ fn draw_header(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
                 .map(|a| a.name.as_str())
                 .unwrap_or("?")
         ),
+        None if ed.agents.persist.loading => format!(
+            " agents: {} total, {running} running; reading saved records… ",
+            ed.agents.agents.len()
+        ),
         None => format!(
             " agents: {} total, {running} running ",
             ed.agents.agents.len()
@@ -139,13 +145,34 @@ fn draw_hints(ed: &Editor, s: &mut Surface, area: Rect) {
     }
 }
 
+/// What the list shows after the name: the status, or for a found
+/// worktree that it has none.
+fn list_status(a: &Agent) -> &'static str {
+    match a.origin {
+        Origin::Found => "found worktree",
+        _ => a.status().label(),
+    }
+}
+
+/// The marker next to the status of an agent with no process from an
+/// earlier session (the summary says it in full).
+pub const EARLIER: &str = "not running (from an earlier session)";
+
 /// One-line facts for the list: `#1 acp  3 files +12 -4  ok 40`.
 fn list_detail(a: &Agent) -> String {
-    let mut d = format!(
-        "#{} {}",
-        a.group,
-        maestro_editor::agents::kind_label(a.kind())
-    );
+    let mut d = match a.origin {
+        Origin::Found => "no record".to_string(),
+        _ if a.from_earlier_session() => format!(
+            "not running, earlier session  #{} {}",
+            a.group,
+            maestro_editor::agents::kind_label(a.kind())
+        ),
+        _ => format!(
+            "#{} {}",
+            a.group,
+            maestro_editor::agents::kind_label(a.kind())
+        ),
+    };
     if a.archived {
         d.push_str("  archived");
     } else if a.review.computed.is_some() {
@@ -199,7 +226,7 @@ fn draw_list(ed: &Editor, s: &mut Surface, area: Rect) {
         s.print(
             x + 2,
             y,
-            status.label(),
+            list_status(a),
             bg.patch(status_style(&ed.theme, status)),
             area.right(),
         );
@@ -223,15 +250,21 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     x = s.print(
         x + 2,
         y,
-        st.label(),
+        list_status(a),
         ui.text.patch(status_style(&ed.theme, st)),
         r,
     );
-    let mut tail = format!(
-        "  {} ({})",
-        a.provider.name,
-        maestro_editor::agents::kind_label(a.kind())
-    );
+    if a.origin != Origin::Found && a.from_earlier_session() {
+        x = s.print(x + 2, y, EARLIER, ui.text.bold(), r);
+    }
+    let mut tail = match a.origin {
+        Origin::Found => "  provider unknown".to_string(),
+        _ => format!(
+            "  {} ({})",
+            a.provider.name,
+            maestro_editor::agents::kind_label(a.kind())
+        ),
+    };
     if let Some(e) = &a.exited {
         tail.push_str(&format!("  process {e}"));
     }
@@ -240,12 +273,32 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     if y >= area.bottom() {
         return;
     }
-    // Row 2: what the status can be based on.
-    let note = match a.kind() {
-        ProviderKind::Acp => {
+    // Row 2: what the status can be based on, or why there is none.
+    let changed;
+    let note = match (a.origin, a.kind()) {
+        (Origin::Found, _) => {
+            "no record: task and provider unknown; ret reviews it, a adopts it, A archives it"
+        }
+        _ if a.worktree_note.is_some() && !a.archived => {
+            changed = format!(
+                "worktree changed: {}",
+                a.worktree_note.as_deref().unwrap_or_default()
+            );
+            changed.as_str()
+        }
+        (Origin::Loaded, _) if a.archived => {
+            "archived: the worktree was removed; the record stays for its history and decisions"
+        }
+        (Origin::Loaded, _) if a.from_earlier_session() && a.base_status().is_decided() => {
+            "no process, and none is started again: the work was decided on"
+        }
+        (Origin::Loaded, _) if a.from_earlier_session() => {
+            "no process: R relaunches it; review, tests, comments, integrate and archive work without one"
+        }
+        (_, ProviderKind::Acp) => {
             "ACP: status comes from the agent's plan, tool, permission and turn messages"
         }
-        ProviderKind::Terminal => {
+        (_, ProviderKind::Terminal) => {
             "terminal only: no structured status; Maestro sees the screen, the exit code and the files"
         }
     };
@@ -419,7 +472,29 @@ fn transcript_lines(ed: &Editor, a: &Agent, width: usize) -> Vec<(String, Style)
             }
         }
     };
-    if a.kind() == ProviderKind::Terminal {
+    if a.origin == Origin::Found {
+        push(
+            "",
+            "a found worktree with no record: nothing ran here in this session. v shows the history",
+            ui.text_muted,
+        );
+    } else if a.from_earlier_session() && !a.can_relaunch() {
+        push(
+            "",
+            "not running (from an earlier session); the transcript and screen are not saved",
+            ui.text_muted,
+        );
+    } else if a.from_earlier_session() {
+        let msg = match a.kind() {
+            ProviderKind::Terminal => {
+                "not running (from an earlier session). R starts its program again in the worktree, without the task"
+            }
+            ProviderKind::Acp => {
+                "not running (from an earlier session); the transcript is not saved. R starts the agent again in the worktree"
+            }
+        };
+        push("", msg, ui.text_muted);
+    } else if a.kind() == ProviderKind::Terminal {
         let msg = match (&a.runtime, a.status()) {
             (_, Status::Starting) => "creating the worktree…",
             _ => "the terminal is not running",

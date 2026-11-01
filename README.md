@@ -2,7 +2,7 @@
 
 A modal text editor written in Rust, built for a workflow where one person and several coding agents edit the same codebase. The editing core comes first: it has to be good with every agent feature turned off.
 
-Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 (agents in worktrees, review, integration) is partly built: the agent panel works, but agents are forgotten on restart and no real agent program has been run through it yet. [ROADMAP.md](ROADMAP.md) says exactly what works.
+Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 (agents in worktrees, review, integration) is done: Claude Code and Codex have been run through the agent panel on a real task, reviewed, one rejected and one merged, and agent records survive a restart. Agents speaking the Agent Client Protocol are tested only against a fake agent so far. [ROADMAP.md](ROADMAP.md) says exactly what works.
 
 ## What works today
 
@@ -28,8 +28,9 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 
 
 - Coding agents in Git worktrees (`space a` or `:agents`). `n` asks for a task and a provider, makes a worktree on a new `maestro/<task>-<id>` branch from the current commit, and starts the agent there: over the Agent Client Protocol (`gemini --acp`, `opencode acp`) or in a terminal (`claude`, `codex`, or any program you configure). `N` starts the same task with another provider, and the list shows each agent's status, files changed, lines added and removed, and last test result side by side. Status comes from what the agent reports, the process exit, test runs and your decisions; a terminal agent says "running" and nothing more, because Maestro cannot see inside it. `C-\` gives your keys to an agent's terminal and takes them back.
 - Review per agent (`Enter` in the panel): changed files, unified or side-by-side diffs with changed words marked, line comments (`c`), `D` to drop one file's change (a stray cache file, say), and `Enter` to open the worktree's file at that line. `t` runs the tests in the worktree, `f` sends your comments and notes back to the agent, `p` answers a permission request, `X` rejects, `A` archives the worktree, and `I` commits the agent's work and merges, fast-forwards or cherry-picks it into your branch. Each of those asks first and says what it will do. Integrating refuses before committing anything when your worktree has uncommitted changes; a conflict is found after the agent's work is committed on its own branch, and then nothing reaches your branch.
+- Agent records survive a restart: they are saved per repository with the editor sessions and come back when the panel opens, marked "not running (from an earlier session)". Review, tests, integrate and archive work on them; `R` starts one again in its worktree (an ACP agent gets its saved session back when it supports `session/load`; a terminal agent starts without its task). Worktrees on `maestro/` branches that no record names are listed as found worktrees to review, archive or adopt (`a`).
 
-Not built yet: agent sessions that survive a restart, and an OS sandbox for agents (a worktree keeps their files apart, not their permissions; see [docs/security.md](docs/security.md)). Those are tracked in the roadmap.
+Not built yet: an OS sandbox for agents (a worktree keeps their files apart, not their permissions; see [docs/security.md](docs/security.md)). That is tracked in the roadmap.
 
 ## Build and run
 
@@ -65,7 +66,7 @@ cargo build --release
 | `space f` / `space /` / `space r` | find a file / search the workspace / recent files |
 | `C-x` (insert mode) | ask the language server for completions |
 | `C-n` `C-p`, Tab or Enter, Escape | in the completion popup: move, accept, close |
-| `space a` | the agent panel: `n` new task, `N` same task with another provider, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate, `X` reject, `A` archive, `v` history or test output, `C-\` keys to the agent's terminal and back |
+| `space a` | the agent panel: `n` new task, `N` same task with another provider, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate, `X` reject, `A` archive, `R` relaunch, `a` adopt a found worktree, `v` history or test output, `C-\` keys to the agent's terminal and back |
 | in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `D` drop the file's change, `ret` open the file there |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
@@ -104,7 +105,7 @@ command = "codex"
 enabled = false                       # hides a built-in provider
 ```
 
-Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config, and reads and writes neither the session nor the recent-files list.
+Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config, and reads and writes neither the session, the recent-files list nor the agent records.
 
 ## Documentation
 

@@ -84,3 +84,78 @@ fn terminal_cells_keep_their_colors() {
     assert_eq!(at(3).style.fg, Some(t.background));
     assert_eq!(at(3).style.bg, Some(t.terminal[2]));
 }
+
+fn record(id: u64, status: &str) -> maestro_editor::agents::persist::AgentRecord {
+    use maestro_editor::agents::persist::{AgentRecord, SavedWorktree};
+    AgentRecord {
+        id,
+        name: format!("sh-{id}"),
+        group: id,
+        task: "write the notes".into(),
+        provider: "sh".into(),
+        kind: "terminal".into(),
+        worktree: SavedWorktree {
+            path: format!("/nonexistent/repo-worktrees/notes-{id}"),
+            branch: format!("maestro/notes-{id}"),
+            base: "0123456789abcdef".into(),
+            main_root: "/nonexistent/repo".into(),
+        },
+        status: status.into(),
+        archived: false,
+        exited: None,
+        errors: vec![],
+        history: vec![],
+        comments: vec![],
+        tests: vec![],
+        session_id: None,
+        load_session: false,
+        created: 0,
+    }
+}
+
+fn screen(ed: &Editor) -> Vec<String> {
+    let mut s = Surface::new(120, 30, ed.theme.ui.text);
+    crate::render::render(ed, &mut s);
+    (0..30).map(|y| row(&s, y)).collect()
+}
+
+#[test]
+fn loaded_agents_say_they_are_not_running_and_found_worktrees_have_no_status() {
+    use maestro_editor::agents::{Origin, persist::from_record};
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 120, 28));
+    // Saved while running: it loads as stopped, never as running.
+    ed.agents
+        .agents
+        .push(from_record(&record(1, "running"), &[]));
+    let mut found = from_record(&record(2, "stopped"), &[]);
+    found.origin = Origin::Found;
+    found.name = "found-notes-2".into();
+    ed.agents.agents.push(found);
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    let rows = screen(&ed);
+    let text = rows.join("\n");
+    let first = rows.iter().find(|r| r.contains("sh-1")).unwrap();
+    assert!(first.starts_with("▌ sh-1  stopped  "), "{first}");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("sh-1  stopped  not running (from an earlier session)")),
+        "{text}"
+    );
+    assert!(text.contains("not running, earlier session"), "{text}");
+    assert!(
+        text.contains("R relaunch") && text.contains("A archive"),
+        "{text}"
+    );
+    assert!(!text.contains("f feedback"), "feedback cannot reach it");
+    // The found worktree shows that it has no record instead of a status.
+    ed.handle_key(KeyEvent::char('j'));
+    let text = screen(&ed).join("\n");
+    assert!(text.contains("found-notes-2  found worktree"), "{text}");
+    assert!(
+        text.contains("no record: task and provider unknown"),
+        "{text}"
+    );
+    assert!(text.contains("a adopt"), "{text}");
+    assert!(!text.contains("R relaunch"), "{text}");
+}

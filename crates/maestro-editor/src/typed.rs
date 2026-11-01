@@ -454,6 +454,7 @@ fn quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
 fn finish_quit(ed: &mut Editor) {
     // Best effort: a session that cannot be written must not block quitting.
     let _ = crate::navigation::session::save(ed);
+    crate::agents::persist::save(ed, true);
     ed.should_quit = true;
 }
 

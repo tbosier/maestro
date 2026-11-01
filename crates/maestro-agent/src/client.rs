@@ -20,7 +20,9 @@
 //! [`AcpClient::start`] returns as soon as the process runs; `initialize`
 //! and `session/new` complete in the background and are reported as
 //! [`AcpEvent::Initialized`] and [`AcpEvent::SessionStarted`]. A prompt
-//! sent before that waits for the session.
+//! sent before that waits for the session. [`AcpClient::load_session`]
+//! does the same with `session/load` for a saved session, when the agent
+//! supports it, and reports [`AcpEvent::SessionLoaded`].
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -35,10 +37,10 @@ use std::time::{Duration, Instant};
 use agent_client_protocol_schema::ProtocolVersion;
 use agent_client_protocol_schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
-    RequestPermissionResponse, SelectedPermissionOutcome, TextContent, WriteTextFileRequest,
-    WriteTextFileResponse,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome, TextContent,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -67,6 +69,7 @@ enum Outgoing {
 enum Pending {
     Initialize,
     NewSession,
+    LoadSession,
     Prompt,
 }
 
@@ -84,6 +87,11 @@ struct State {
     alive: bool,
     pending: HashMap<i64, Pending>,
     session_id: Option<String>,
+    /// The saved session to load after `initialize`, if the agent can.
+    resume: Option<String>,
+    /// The session `session/load` is loading. Its replayed updates are
+    /// accepted; prompts wait until the load is answered.
+    loading: Option<String>,
     queued_prompt: Option<String>,
     turn: Turn,
     /// Unanswered permission requests: the agent's request id and the
@@ -145,6 +153,37 @@ impl AcpClient {
         root: &Path,
         on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
     ) -> io::Result<AcpClient> {
+        Self::start_inner(spec, root, None, on_event)
+    }
+
+    /// Like [`start`](AcpClient::start), but resumes the saved session
+    /// `session_id` with `session/load` when the agent advertises
+    /// `loadSession` in its `initialize` answer. The agent replays the
+    /// conversation as updates ([`AcpEvent::Update`]), then the load is
+    /// reported as [`AcpEvent::SessionLoaded`].
+    ///
+    /// When the agent does not advertise `loadSession`, a new session is
+    /// started with `session/new` and reported as
+    /// [`AcpEvent::SessionStarted`], as [`start`](AcpClient::start) does.
+    /// When it advertises it but answers `session/load` with an error, that
+    /// error is reported as [`AcpEvent::Error`] and a new session is
+    /// started the same way. [`AcpEvent::Initialized`] says whether the
+    /// agent advertised it.
+    pub fn load_session(
+        spec: &ProviderSpec,
+        root: &Path,
+        session_id: &str,
+        on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
+    ) -> io::Result<AcpClient> {
+        Self::start_inner(spec, root, Some(session_id.to_string()), on_event)
+    }
+
+    fn start_inner(
+        spec: &ProviderSpec,
+        root: &Path,
+        resume: Option<String>,
+        on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
+    ) -> io::Result<AcpClient> {
         let files = FileAccess::new(root)?;
         let path_var = spec
             .env
@@ -191,6 +230,8 @@ impl AcpClient {
                 alive: true,
                 pending: HashMap::new(),
                 session_id: None,
+                resume,
+                loading: None,
                 queued_prompt: None,
                 turn: Turn::Idle,
                 permissions: Vec::new(),
@@ -381,7 +422,8 @@ impl AcpClient {
         self.shared.files.root()
     }
 
-    /// The session id once [`AcpEvent::SessionStarted`] was sent.
+    /// The session id once [`AcpEvent::SessionStarted`] or
+    /// [`AcpEvent::SessionLoaded`] was sent.
     pub fn session_id(&self) -> Option<String> {
         lock(&self.shared.state).session_id.clone()
     }
@@ -490,8 +532,30 @@ impl Shared {
         kill_tree(&mut lock(&self.child));
     }
 
+    /// The session is the current one, or the one being loaded.
     fn session_is(&self, session: &str) -> bool {
-        lock(&self.state).session_id.as_deref() == Some(session)
+        let st = lock(&self.state);
+        st.session_id.as_deref() == Some(session) || st.loading.as_deref() == Some(session)
+    }
+
+    fn new_session(&self) {
+        let session = NewSessionRequest::new(self.files.root());
+        self.request(
+            &mut lock(&self.state),
+            Pending::NewSession,
+            "session/new",
+            session,
+        );
+    }
+
+    /// The session is up: sends a prompt queued while it was starting.
+    fn session_ready(&self, session_id: &str) {
+        let mut st = lock(&self.state);
+        st.session_id = Some(session_id.to_string());
+        st.loading = None;
+        if let Some(text) = st.queued_prompt.take() {
+            self.send_prompt(&mut st, session_id, &text);
+        }
     }
 
     fn handle_line(&self, bytes: &[u8]) {
@@ -549,13 +613,20 @@ impl Shared {
                     ));
                 }
                 let agent_name = r.agent_info.map(|i| i.title.unwrap_or(i.name));
-                let session = NewSessionRequest::new(self.files.root());
-                self.request(
-                    &mut lock(&self.state),
-                    Pending::NewSession,
-                    "session/new",
-                    session,
-                );
+                let load = r.agent_capabilities.load_session;
+                let resume = {
+                    let mut st = lock(&self.state);
+                    let resume = st.resume.take().filter(|_| load);
+                    if let Some(id) = &resume {
+                        st.loading = Some(id.clone());
+                        let request = LoadSessionRequest::new(id.clone(), self.files.root());
+                        self.request(&mut st, Pending::LoadSession, "session/load", request);
+                    }
+                    resume
+                };
+                if resume.is_none() {
+                    self.new_session();
+                }
                 self.emit(AcpEvent::Initialized {
                     agent_name,
                     load_session: r.agent_capabilities.load_session,
@@ -571,14 +642,28 @@ impl Shared {
                     Ok(r) => r.session_id.0.to_string(),
                     Err(message) => return self.fail(message),
                 };
-                {
-                    let mut st = lock(&self.state);
-                    st.session_id = Some(session_id.clone());
-                    if let Some(text) = st.queued_prompt.take() {
-                        self.send_prompt(&mut st, &session_id, &text);
+                self.session_ready(&session_id);
+                self.emit(AcpEvent::SessionStarted { session_id });
+            }
+            Pending::LoadSession => {
+                let Some(session_id) = lock(&self.state).loading.clone() else {
+                    return;
+                };
+                // A successful answer carries no session id, only modes
+                // and options, which Maestro does not use.
+                match result {
+                    Ok(_) => {
+                        self.session_ready(&session_id);
+                        self.emit(AcpEvent::SessionLoaded { session_id });
+                    }
+                    Err(e) => {
+                        lock(&self.state).loading = None;
+                        self.emit(AcpEvent::Error(format!(
+                            "session/load failed: {e}; starting a new session instead"
+                        )));
+                        self.new_session();
                     }
                 }
-                self.emit(AcpEvent::SessionStarted { session_id });
             }
             Pending::Prompt => {
                 let stop_reason = match result {

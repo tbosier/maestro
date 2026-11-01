@@ -93,6 +93,8 @@ pub struct PermissionChoice { pub id: String, pub label: String, pub kind: Strin
 pub enum AcpEvent {
     Initialized { agent_name: Option<String>, load_session: bool },
     SessionStarted { session_id: String },
+    /// After `load_session`, once `session/load` was answered.
+    SessionLoaded { session_id: String },
     Update(TranscriptEntry),
     /// A change to an earlier `Tool` entry; `None` fields are unchanged.
     ToolUpdate { id: String, status: Option<String>, title: Option<String>, locations: Option<Vec<PathBuf>> },
@@ -114,6 +116,10 @@ impl AcpClient {
     /// paths outside it, symlinks out of it and the `.git` directory are refused.
     /// `on_event` runs on a dispatcher thread, one event at a time, and may call back into the client.
     pub fn start(spec: &ProviderSpec, root: &Path, on_event: impl Fn(AcpEvent) + Send + Sync + 'static) -> io::Result<AcpClient>;
+    /// Like `start`, but resumes `session_id` with `session/load` when the agent advertises `loadSession`
+    /// (replayed updates arrive as `Update`, then `SessionLoaded`). Without the capability, or when the
+    /// load fails (reported as `Error`), a new session starts and `SessionStarted` is reported.
+    pub fn load_session(spec: &ProviderSpec, root: &Path, session_id: &str, on_event: impl Fn(AcpEvent) + Send + Sync + 'static) -> io::Result<AcpClient>;
     /// Fails when a turn is already running or the agent is gone. Before `SessionStarted` it is queued.
     pub fn prompt(&self, text: &str) -> io::Result<()>;
     /// Sends `session/cancel` and answers pending permission requests as cancelled.
@@ -240,3 +246,6 @@ The glue lives in `crates/maestro-editor/src/agents/` (state, creation, panel ke
 - A review screen per agent: file list with change kind and counts, unified or side-by-side diff with `intraline` marks and the theme's diff colors, comments stored per line on the agent record, `Enter` opens the worktree file in a normal buffer at that line.
 - Actions with consequences (integrate, reject and archive, force-removing a worktree, granting a permission) open a dialog that says what will happen and needs a key to go ahead (`y`, or `F` for forcing). The backend checks again; the dialog is not the enforcement. Integration also refuses, changing nothing, when either worktree is gone or on another branch than the dialog named, the main worktree is dirty or detached, the agent's starting commit is not on the target branch, or a buffer in either worktree has unsaved edits; these are checked when the dialog opens and again just before the commit. A dialog that does not fit the window cannot be accepted.
 - Feedback goes back to the agent that made the change: an ACP agent gets a new prompt; a terminal agent gets the text typed into its terminal, which the UI says is all it can do.
+- Agent records are saved by `agents/persist.rs` per repository (keyed by the canonical main worktree path) to `<state>/agents/<hash>.json` with `navigation::session::write_private`, only when the navigation state has a state directory and sessions on. `agents::tick` saves when a cheap fingerprint of the records changed, and quitting (`finish_quit`, `stop_all`) saves with sync. The panel's first open starts a background scan (`git worktree list`, the main worktree's `HEAD`, the records file); its result adds loaded agents (`Origin::Loaded`, no runtime, active statuses mapped to the new `Status::Stopped`), notes worktrees that changed, and adds found worktrees (`Origin::Found`). Creating an agent waits for the scan. An unusable file blocks saving for that repository for the session.
+- `R` relaunches through `create::relaunch`: `AcpClient::load_session` when the record has a session id and the agent advertised `loadSession`, else `AcpClient::start`, with no prompt (status `Idle` once the session is up); a terminal agent's spec without the arguments that held `{task}`. The editor gained `Status::Idle` and `Status::Stopped`, `Origin`, and the agent fields `origin`, `session_id`, `load_session` and `worktree_note`. `maestro-agent` gained `AcpClient::load_session`, `AcpEvent::SessionLoaded` and the fake agent's `--fake-load-session`.
+- Archive checks, on its background thread, that Git lists the worktree on the recorded branch before removing it, and marks the record archived without removing anything when the directory is gone and Git no longer lists it. The review diff is computed only while the worktree is on the recorded branch.

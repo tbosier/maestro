@@ -167,12 +167,19 @@ fn on_worktree(ed: &mut Editor, id: AgentId, result: Result<WorktreeInfo, String
                 info.branch,
                 short(&info.base)
             ));
+            let main_root = info.main_root.clone();
             a.worktree = Some(info);
+            // Normally read when the panel opened; after `:cd` into
+            // another repository, read now so the next save keeps them.
+            super::persist::ensure_loaded(ed, &main_root);
+            let Some(a) = ed.agents.get_mut(id) else {
+                return;
+            };
             if a.base_status().is_decided() {
                 a.log("rejected before it started; not launched");
                 return;
             }
-            launch(ed, id);
+            launch(ed, id, Launch::New);
         }
         Err(e) => fail(ed, id, e),
     }
@@ -182,8 +189,113 @@ pub(crate) fn short(commit: &str) -> &str {
     &commit[..commit.len().min(8)]
 }
 
+/// How an agent's process starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// A new agent: the task goes to it.
+    New,
+    /// An agent that ran before: an ACP agent gets its saved session back
+    /// when it can, or a new one, and no prompt; a terminal agent gets its
+    /// provider command without the task.
+    Relaunch,
+}
+
+/// `R`: starts an agent that is not running again in its worktree. For an
+/// ACP agent with a saved session that advertised `loadSession`, the
+/// session is loaded; otherwise a new session starts, and the transcript
+/// says so. Nothing is prompted: `f` sends a prompt. A terminal agent runs
+/// its provider command with the arguments that held `{task}` left out,
+/// and nothing is typed in.
+pub fn relaunch(ed: &mut Editor, id: AgentId) {
+    let providers = super::providers(ed);
+    let Some(a) = ed.agents.get(id) else {
+        return;
+    };
+    let refusal = if a.origin == super::Origin::Found {
+        Some("this worktree has no record; a adopts it, then R can start an agent in it".into())
+    } else if a.is_running() {
+        Some(format!("{} is already running", a.name))
+    } else if a.archived {
+        Some("the agent's worktree was archived".into())
+    } else if a.base_status().is_decided() {
+        Some(format!(
+            "{} is {}; it is not relaunched",
+            a.name,
+            a.base_status().label()
+        ))
+    } else if let Some(what) = a.git_busy {
+        Some(format!(
+            "{} is busy ({what}); wait for it to finish",
+            a.name
+        ))
+    } else if a.tests_running() {
+        Some("tests are running for this agent; wait for them to finish".into())
+    } else if let Some(note) = &a.worktree_note {
+        Some(format!("not relaunched: {note}"))
+    } else {
+        match &a.worktree {
+            None => Some("the agent has no worktree".into()),
+            Some(w) if !w.path.is_dir() => Some(format!(
+                "not relaunched: the worktree {} is gone",
+                w.path.display()
+            )),
+            // Checked again now: the worktree may have changed since the
+            // records were loaded.
+            Some(w) => super::worktree_mismatch(w).map(|why| format!("not relaunched: {why}")),
+        }
+    };
+    if let Some(why) = refusal {
+        ed.error(why);
+        return;
+    }
+    let Some(spec) = providers
+        .into_iter()
+        .find(|p| p.name == a.provider.name && p.kind == a.provider.kind)
+    else {
+        ed.error(format!(
+            "not relaunched: no {} provider named {} is configured now",
+            super::kind_label(a.provider.kind),
+            a.provider.name
+        ));
+        return;
+    };
+    let Some(a) = ed.agents.get_mut(id) else {
+        return;
+    };
+    a.provider = spec;
+    a.origin = super::Origin::New;
+    a.runtime = Runtime::None;
+    a.exited = None;
+    a.turn_running = false;
+    a.permissions.clear();
+    a.pending_input = None;
+    a.output = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    a.seen_output = 0;
+    a.set_status(Status::Starting);
+    launch(ed, id, Launch::Relaunch);
+    if let Some(a) = ed.agents.get(id)
+        && a.is_running()
+    {
+        let msg = match (a.kind(), a.replaying) {
+            (ProviderKind::Terminal, _) => format!(
+                "relaunched {} without its task: C-\\ gives it the keys to type what it should do",
+                a.name
+            ),
+            (ProviderKind::Acp, true) => format!(
+                "relaunched {}: loading its saved session; f sends it a prompt",
+                a.name
+            ),
+            (ProviderKind::Acp, false) => format!(
+                "relaunched {} in a new session without the earlier conversation; f sends it a prompt",
+                a.name
+            ),
+        };
+        ed.info(msg);
+    }
+}
+
 /// Starts the agent's process in its worktree.
-fn launch(ed: &mut Editor, id: AgentId) {
+fn launch(ed: &mut Editor, id: AgentId, how: Launch) {
     let size = super::panel::terminal_size(ed.area);
     let tx = ed.idle_job_sender();
     let wake = ed.wake_handle();
@@ -194,6 +306,35 @@ fn launch(ed: &mut Editor, id: AgentId) {
         return;
     };
     let result = match a.provider.kind {
+        ProviderKind::Acp if how == Launch::Relaunch => {
+            let on_event = move |event| {
+                tx.send(move |ed| super::on_acp_event(ed, id, event));
+            };
+            let started = match (&a.session_id, a.load_session) {
+                (Some(session), true) => {
+                    maestro_agent::AcpClient::load_session(&a.provider, &root, session, on_event)
+                        .map(|c| (c, Some(session.clone())))
+                }
+                _ => {
+                    maestro_agent::AcpClient::start(&a.provider, &root, on_event).map(|c| (c, None))
+                }
+            };
+            started.map(|(client, loading)| {
+                let why_new = match (&a.session_id, a.load_session) {
+                    (None, _) => "there is no saved session",
+                    (Some(_), _) => "the agent did not advertise session loading when it last ran",
+                };
+                let note = match &loading {
+                    Some(s) => format!("relaunched; loading the saved session {s}"),
+                    None => format!("relaunched in a new session: {why_new}"),
+                };
+                a.replaying = loading.is_some();
+                a.transcript
+                    .push(maestro_agent::TranscriptEntry::System(note.clone()));
+                a.log(format!("{note}; no prompt sent"));
+                Runtime::Acp(client)
+            })
+        }
         ProviderKind::Acp => {
             let started = maestro_agent::AcpClient::start(&a.provider, &root, move |event| {
                 tx.send(move |ed| super::on_acp_event(ed, id, event));
@@ -213,12 +354,21 @@ fn launch(ed: &mut Editor, id: AgentId) {
                 .args
                 .iter()
                 .any(|x| x.contains(maestro_agent::TASK_PLACEHOLDER));
-            let args = a
-                .provider
-                .args
-                .iter()
-                .map(|x| x.replace(maestro_agent::TASK_PLACEHOLDER, &a.task))
-                .collect();
+            let args = if how == Launch::Relaunch {
+                // No task: arguments that would carry it are left out.
+                a.provider
+                    .args
+                    .iter()
+                    .filter(|x| !x.contains(maestro_agent::TASK_PLACEHOLDER))
+                    .cloned()
+                    .collect()
+            } else {
+                a.provider
+                    .args
+                    .iter()
+                    .map(|x| x.replace(maestro_agent::TASK_PLACEHOLDER, &a.task))
+                    .collect()
+            };
             let spec = maestro_term::CommandSpec {
                 program: a.provider.program.clone(),
                 args,
@@ -233,7 +383,17 @@ fn launch(ed: &mut Editor, id: AgentId) {
             started.map(|t| {
                 a.term_size = Some(size);
                 a.spawned = Instant::now();
-                if has_placeholder {
+                if how == Launch::Relaunch {
+                    let left_out = if has_placeholder {
+                        "; the arguments that held the task were left out"
+                    } else {
+                        ""
+                    };
+                    a.log(format!(
+                        "relaunched {} in a terminal without the task{left_out}; the user types",
+                        a.provider.program
+                    ));
+                } else if has_placeholder {
                     a.log(format!(
                         "started {} in a terminal with the task as an argument",
                         a.provider.program
@@ -253,6 +413,7 @@ fn launch(ed: &mut Editor, id: AgentId) {
     match result {
         Ok(rt) => a.runtime = rt,
         Err(e) => {
+            a.replaying = false;
             let msg = format!("could not start {}: {e}", a.provider.program);
             fail(ed, id, msg);
         }
