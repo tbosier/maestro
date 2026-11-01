@@ -1086,6 +1086,93 @@ fn integrate_fast_forwards() {
 }
 
 #[test]
+fn integrate_reviewed_takes_only_the_reviewed_commit() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let wt = agent_branch(&f, "agent/r", "one.txt", "1\n");
+    let reviewed = rev(&f, &wt, "HEAD");
+    let both: [&Path; 2] = [&f.repo, &wt];
+
+    // A new commit on the branch after the review.
+    commit_in(&f, &wt, "late.txt", "unreviewed\n", "late");
+    let late = rev(&f, &wt, "HEAD");
+    for how in ALL {
+        assert_refused(
+            &f,
+            &both,
+            || repo.integrate_reviewed("agent/r", &reviewed, how),
+            |e| {
+                matches!(e, IntegrateError::SourceMoved { expected, found }
+                    if *expected == reviewed && *found == late)
+            },
+        );
+    }
+
+    // The branch reset to another commit with the same files: still not
+    // what was reviewed.
+    f.git_ok(&wt, &["reset", "-q", "--hard", &reviewed]);
+    f.git_ok(&wt, &["commit", "-q", "--amend", "-m", "same files"]);
+    let amended = rev(&f, &wt, "HEAD");
+    assert_ne!(amended, reviewed);
+    assert_eq!(
+        repo.commit_shape(&amended).unwrap().tree,
+        repo.commit_shape(&reviewed).unwrap().tree
+    );
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate_reviewed("agent/r", &reviewed, Integration::Merge),
+        |e| matches!(e, IntegrateError::SourceMoved { found, .. } if *found == amended),
+    );
+
+    // A revision that names no commit fails without changing anything.
+    assert_refused(
+        &f,
+        &both,
+        || repo.integrate_reviewed("agent/r", "no-such-rev", Integration::Merge),
+        |e| matches!(e, IntegrateError::Git(_)),
+    );
+
+    // Back at the reviewed commit, it integrates exactly that.
+    f.git_ok(&wt, &["reset", "-q", "--hard", &reviewed]);
+    let out = repo
+        .integrate_reviewed("agent/r", &reviewed[..12], Integration::FastForwardOnly)
+        .unwrap();
+    assert_eq!(out.new_head, reviewed);
+    assert_eq!(rev(&f, &f.repo, "main"), reviewed);
+    assert!(!f.repo.join("late.txt").exists());
+}
+
+#[test]
+fn commit_shape_and_snapshot_head() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let head = rev(&f, &f.repo, "HEAD");
+    let shape = repo.commit_shape("HEAD").unwrap();
+    assert_eq!(shape.commit, head);
+    assert_eq!(shape.tree, rev(&f, &f.repo, "HEAD^{tree}"));
+    assert_eq!(shape.parents, Vec::<String>::new());
+
+    f.write("new.txt", "uncommitted\n");
+    let snap = repo.work_snapshot().unwrap();
+    assert_eq!(snap.head, head);
+    let shape = repo.commit_shape(&snap.commit).unwrap();
+    assert_eq!(shape.parents, vec![head.clone()]);
+    assert_eq!(shape.tree, snap.tree);
+
+    // A merge commit lists both parents, in order.
+    let wt = agent_branch(&f, "agent/s", "s.txt", "s\n");
+    let tip = rev(&f, &wt, "HEAD");
+    f.commit_all("main moves");
+    let main_before = rev(&f, &f.repo, "HEAD");
+    let out = repo.integrate("agent/s", Integration::Merge).unwrap();
+    assert_eq!(
+        repo.commit_shape(&out.new_head).unwrap().parents,
+        vec![main_before, tip]
+    );
+}
+
+#[test]
 fn integrate_merges_with_a_merge_commit() {
     let f = Fixture::new();
     let repo = f.repo();
