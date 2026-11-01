@@ -1379,32 +1379,77 @@ fn drop_change_takes_single_files_out_of_the_review() {
     assert!(!wt.join("new name.txt").exists());
     assert!(wt.join("old name.txt").exists());
 
-    // Refusals change nothing.
-    let before = snapshot(&f, &wt);
-    assert!(
-        inner
-            .drop_change("main", None, Some(Path::new("../a.txt")))
-            .is_err()
-    );
-    assert!(
-        inner
-            .drop_change("main", None, Some(&wt.join("wanted.txt")))
-            .is_err()
-    );
-    assert!(
-        inner
-            .drop_change("--all", Some(Path::new("a.txt")), None)
-            .is_err()
-    );
-    assert!(inner.drop_change("main", None, None).is_err());
-    std::fs::create_dir_all(wt.join("somedir")).unwrap();
+    // Each refusal changes nothing.
+    let refused = |old: Option<&str>, new: Option<&str>, base: &str| {
+        let before = snapshot(&f, &wt);
+        let r = inner.drop_change(base, old.map(Path::new), new.map(Path::new));
+        assert!(r.is_err(), "dropping {old:?} -> {new:?} was not refused");
+        assert_eq!(
+            snapshot(&f, &wt),
+            before,
+            "refusing {old:?} -> {new:?} changed files"
+        );
+    };
+    refused(None, Some("../a.txt"), "main");
+    let abs = wt.join("wanted.txt");
+    refused(None, Some(abs.to_str().unwrap()), "main");
+    refused(Some("a.txt"), None, "--all");
+    refused(None, None, "main");
+    // A directory where a file was: as the added path, as a modified file,
+    // and as a deleted file whose name is now a directory.
     write_in(&wt, "somedir/x.txt", "x\n");
-    let before_dir = snapshot(&f, &wt);
-    assert!(
-        inner
-            .drop_change("main", None, Some(Path::new("somedir")))
-            .is_err()
+    refused(None, Some("somedir"), "main");
+    std::fs::remove_file(wt.join("keep.txt")).unwrap();
+    write_in(&wt, "keep.txt/inside.txt", "work\n");
+    refused(Some("keep.txt"), Some("keep.txt"), "main");
+    refused(Some("keep.txt"), None, "main");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("keep.txt/inside.txt")).unwrap(),
+        "work\n"
     );
-    assert_eq!(snapshot(&f, &wt), before_dir);
-    assert_ne!(before, before_dir);
+    // A parent that is a symlink to somewhere outside the worktree.
+    #[cfg(unix)]
+    {
+        let outside = f.tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.txt"), "keep\n").unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("link")).unwrap();
+        refused(None, Some("link/victim.txt"), "main");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+}
+
+/// A file replaced by a symlink shows as a deletion plus an addition of the
+/// same path. Dropping either half brings the file back.
+#[cfg(unix)]
+#[test]
+fn drop_change_undoes_a_file_turned_into_a_symlink() {
+    let f = Fixture::new();
+    f.write("cfg.txt", "real\n");
+    f.commit_all("cfg");
+    let repo = f.repo();
+    let wt = f.tmp.join("typechange");
+    repo.add_worktree(&wt, "agent/typechange", "main").unwrap();
+    let inner = f.api().discover(&wt).unwrap().unwrap();
+    std::fs::remove_file(wt.join("cfg.txt")).unwrap();
+    std::os::unix::fs::symlink("a.txt", wt.join("cfg.txt")).unwrap();
+    let files = inner.review_diff("main").unwrap();
+    let added = files
+        .iter()
+        .find(|d| d.change == FileChange::Added)
+        .unwrap_or_else(|| panic!("no added half in {files:#?}"));
+    assert_eq!(added.old_path, None);
+    inner
+        .drop_change("main", None, added.new_path.as_deref())
+        .unwrap();
+    let meta = std::fs::symlink_metadata(wt.join("cfg.txt")).unwrap();
+    assert!(meta.is_file(), "cfg.txt should be a file again");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("cfg.txt")).unwrap(),
+        "real\n"
+    );
+    assert!(inner.review_diff("main").unwrap().is_empty());
 }

@@ -63,6 +63,10 @@ fn main() {
             "an_agent_that_changes_nothing_says_so",
             an_agent_that_changes_nothing_says_so,
         ),
+        (
+            "dropping_refuses_when_the_worktree_changed_branch",
+            dropping_refuses_when_the_worktree_changed_branch,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -704,7 +708,10 @@ fn m2_acceptance_two_agents_reject_one_integrate_the_other() {
     match &ed.agents.panel.overlay {
         Some(Overlay::Confirm(c)) => {
             let text = c.lines.join("\n");
-            assert!(text.contains("When checked: notes.txt."), "{text}");
+            assert!(
+                text.contains("When checked (1 in all; the review lists every one): notes.txt."),
+                "{text}"
+            );
             assert!(text.contains("Merge maestro/write-release-notes"), "{text}");
             assert!(text.contains("into main"), "{text}");
         }
@@ -968,6 +975,17 @@ fn a_dropped_file_leaves_the_review_and_the_integration() {
     run(&mut ed, "n");
     assert!(wt.join("junk.pyc").exists(), "cancel must change nothing");
     run(&mut ed, "Dy");
+    // The drop is Git work: integrating waits for it, and so does quitting.
+    assert_eq!(agent(&ed, 0).git_busy, Some("dropping a file"));
+    assert_eq!(ed.agents.git_busy().len(), 1);
+    run(&mut ed, "I");
+    assert!(
+        ed.status
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("busy (dropping a file)")),
+        "{:?}",
+        ed.status
+    );
     poll_until(&mut ed, "the file to be dropped", |ed| {
         ed.agents.agents[0].review.files.len() == 1 && !ed.agents.agents[0].review.running
     });
@@ -983,7 +1001,10 @@ fn a_dropped_file_leaves_the_review_and_the_integration() {
     match &ed.agents.panel.overlay {
         Some(Overlay::Confirm(c)) => {
             let text = c.lines.join(" ");
-            assert!(text.contains("When checked: notes.txt."), "{text}");
+            assert!(
+                text.contains("When checked (1 in all; the review lists every one): notes.txt."),
+                "{text}"
+            );
         }
         other => panic!("expected the integrate dialog, got {other:?}"),
     }
@@ -1032,4 +1053,39 @@ fn an_agent_that_changes_nothing_says_so() {
     poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
     assert_eq!(status(&ed, 0), Status::Rejected);
     assert!(!worktree(&ed, 0).exists());
+}
+
+/// A drop is refused, changing nothing, when the worktree no longer has
+/// the agent's branch checked out: the dialog promised that branch's
+/// starting commit.
+fn dropping_refuses_when_the_worktree_changed_branch() {
+    let f = Fixture::new();
+    let mut ed = f.editor(config(&[(
+        "writer",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf 'x\\n' > new.txt", "sh", "{task}"],
+        ),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write", 0);
+    poll_until(&mut ed, "the program and its diff", |ed| {
+        ed.agents
+            .agents
+            .first()
+            .is_some_and(|a| a.exited.is_some() && a.review.files.len() == 1)
+    });
+    let wt = worktree(&ed, 0);
+    run(&mut ed, "\nD");
+    // While the dialog is open, the worktree moves to another branch.
+    f.git(&wt, &["checkout", "-q", "-b", "elsewhere"]);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the refusal", |ed| {
+        ed.status
+            .as_ref()
+            .is_some_and(|(_, m)| m.contains("no longer has branch"))
+    });
+    assert!(wt.join("new.txt").exists(), "nothing may change");
+    assert_eq!(agent(&ed, 0).git_busy, None);
 }

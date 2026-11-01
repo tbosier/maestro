@@ -483,10 +483,24 @@ pub fn ask_drop_file(ed: &mut Editor, id: AgentId, file: &maestro_git::DiffFile)
     let Some(w) = a.worktree.clone() else {
         return;
     };
+    if let Some(why) = busy(a) {
+        ed.error(why);
+        return;
+    }
     let base = &w.base[..w.base.len().min(8)];
     let shown = |p: &Option<PathBuf>| p.as_deref().map(|p| p.display().to_string());
     let (old, new) = (file.old_path.clone(), file.new_path.clone());
+    // Git shows a file replaced by a symlink (or the reverse) as a deletion
+    // and an addition of the same path; dropping either restores it.
+    let type_change = old.is_none()
+        && a.review
+            .files
+            .iter()
+            .any(|f| f.new_path.is_none() && f.old_path == new);
     let what = match (shown(&old), shown(&new)) {
+        (None, Some(n)) if type_change => format!(
+            "{n} goes back to its version at {base}, the commit the agent started from (the agent changed its type)."
+        ),
         (Some(o), Some(n)) if o == n => {
             format!("{n} goes back to its version at {base}, the commit the agent started from.")
         }
@@ -550,12 +564,49 @@ pub fn drop_file(ed: &mut Editor, id: AgentId, old: Option<PathBuf>, new: Option
         .or(old.as_deref())
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    // Drop is Git work: it must not overlap integrating or archiving, and
+    // quitting waits for it.
+    match ed.agents.get_mut(id) {
+        Some(a) if a.git_busy.is_none() => a.git_busy = Some("dropping a file"),
+        Some(a) => {
+            let why = busy(a).unwrap_or_default();
+            ed.error(why);
+            return;
+        }
+        None => return,
+    }
     let spawned = ed.spawn_background("agent-drop", move |tx| {
         let result = open_exact(&git, &w.path).and_then(|repo| {
+            // The dialog promised the version at the agent's starting
+            // commit, on the agent's branch. Check both are still so.
+            match repo.head() {
+                Ok(Head::Branch(b)) if b == w.branch => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "{} no longer has branch {} checked out; nothing changed",
+                        w.path.display(),
+                        w.branch
+                    ));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+            let head = repo.resolve("HEAD").map_err(|e| e.to_string())?;
+            if !repo
+                .can_fast_forward(&w.base, &head)
+                .map_err(|e| e.to_string())?
+            {
+                return Err(format!(
+                    "{} no longer descends from the starting commit {}; nothing changed",
+                    w.branch, w.base
+                ));
+            }
             repo.drop_change(&w.base, old.as_deref(), new.as_deref())
                 .map_err(|e| e.to_string())
         });
         tx.send(move |ed| {
+            if let Some(a) = ed.agents.get_mut(id) {
+                a.git_busy = None;
+            }
             match result {
                 Ok(()) => {
                     if let Some(a) = ed.agents.get_mut(id) {
@@ -569,6 +620,9 @@ pub fn drop_file(ed: &mut Editor, id: AgentId, old: Option<PathBuf>, new: Option
         });
     });
     if let Err(e) = spawned {
+        if let Some(a) = ed.agents.get_mut(id) {
+            a.git_busy = None;
+        }
         ed.error(format!("could not start: {e}"));
     }
 }
@@ -1043,9 +1097,10 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
             names.push(format!("and {} more", facts.uncommitted.len() - SHOWN));
         }
         lines.push(format!(
-            "1. Commit all uncommitted and untracked files in {} to branch {} as \"{subject}\". When checked: {}. (D in the review drops a file you do not want.)",
+            "1. Commit all uncommitted and untracked files in {} to branch {} as \"{subject}\". When checked ({} in all; the review lists every one): {}. D in the review drops a file you do not want.",
             facts.worktree.display(),
             facts.branch,
+            facts.uncommitted.len(),
             names.join(", "),
         ));
     }

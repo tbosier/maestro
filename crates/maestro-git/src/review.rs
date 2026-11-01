@@ -300,11 +300,18 @@ impl Repository {
     /// working tree; `new_path` (the file now, if it exists and differs from
     /// `old_path`) is removed from both. For a modified file both are the
     /// same path; for an added file `old_path` is `None`; for a deleted
-    /// file `new_path` is `None`; for a rename both are given.
+    /// file `new_path` is `None`; for a rename both are given. An "added"
+    /// path that existed at the fork point (git shows a file replaced by a
+    /// symlink as a deletion plus an addition) is restored, not just
+    /// removed.
     ///
     /// This discards the worktree's change to that file. Paths are relative
     /// to this worktree's root; absolute paths and `..` are refused. A
-    /// directory at `new_path` is refused rather than removed.
+    /// directory at either path, or a parent of either that is not a plain
+    /// directory (a symlink, for one), is refused rather than touched. The
+    /// removal target is checked again just before it is removed; another
+    /// process that swaps a parent for a symlink in between can still win
+    /// that race, since std has no `unlinkat`.
     pub fn drop_change(
         &self,
         base: &str,
@@ -330,20 +337,15 @@ impl Repository {
         )?;
         let fork = String::from_utf8_lossy(&out).trim().to_string();
         check_rev(&fork)?;
+        let old_path = match (old_path, new_path) {
+            (None, Some(n)) if self.exists_at(&fork, n)? => Some(n),
+            _ => old_path,
+        };
+        for p in [old_path, new_path].into_iter().flatten() {
+            self.check_drop_target(p)?;
+        }
 
         if let Some(new) = new_path.filter(|n| Some(*n) != old_path) {
-            let full = self.root().join(new);
-            match std::fs::symlink_metadata(&full) {
-                Ok(m) if m.is_dir() => {
-                    return Err(GitError::InvalidArgument(format!(
-                        "{} is a directory; not removing it",
-                        new.display()
-                    )));
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(GitError::Io(e)),
-            }
             let args: Vec<OsString> = vec![
                 "rm".into(),
                 "-q".into(),
@@ -353,7 +355,8 @@ impl Repository {
                 new.into(),
             ];
             self.run(&args, Access::Write)?;
-            match std::fs::remove_file(&full) {
+            self.check_drop_target(new)?;
+            match std::fs::remove_file(self.root().join(new)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(GitError::Io(e)),
@@ -369,6 +372,51 @@ impl Repository {
                 old.into(),
             ];
             self.run(&args, Access::Write)?;
+        }
+        Ok(())
+    }
+
+    /// True when `path` names an entry in commit `rev`.
+    fn exists_at(&self, rev: &str, path: &Path) -> Result<bool> {
+        let args: Vec<OsString> = vec![
+            "ls-tree".into(),
+            "-z".into(),
+            "--name-only".into(),
+            "--end-of-options".into(),
+            rev.into(),
+            "--".into(),
+            path.into(),
+        ];
+        Ok(!self.run(&args, Access::ReadOnly)?.is_empty())
+    }
+
+    /// Refuses a drop target that is a directory, or whose parents inside
+    /// the worktree are not all plain directories. A path that does not
+    /// exist (from some component on) is fine.
+    fn check_drop_target(&self, path: &Path) -> Result<()> {
+        let parts: Vec<_> = path.components().collect();
+        let mut at = self.root().to_path_buf();
+        for (i, part) in parts.iter().enumerate() {
+            at.push(part);
+            let meta = match std::fs::symlink_metadata(&at) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(GitError::Io(e)),
+            };
+            let last = i + 1 == parts.len();
+            if last && meta.is_dir() {
+                return Err(GitError::InvalidArgument(format!(
+                    "{} is a directory; not touching it",
+                    path.display()
+                )));
+            }
+            if !last && !meta.is_dir() {
+                return Err(GitError::InvalidArgument(format!(
+                    "{} is not a plain directory (a symlink or a file); not touching {}",
+                    at.strip_prefix(self.root()).unwrap_or(&at).display(),
+                    path.display()
+                )));
+            }
         }
         Ok(())
     }

@@ -312,8 +312,13 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<Vec<DiffFile>, String>) 
             a.review.files = files;
             a.review.error = None;
             a.review.computed = Some(Instant::now());
-            // A finished agent with nothing to review says so.
-            match (a.base_status(), a.review.files.is_empty()) {
+            // A finished agent with nothing to review says so, judged
+            // only on the newest diff: with a refresh queued this result
+            // may predate the agent's last edits.
+            match (
+                a.base_status(),
+                a.review.files.is_empty() && !a.review.again,
+            ) {
                 (Status::ReadyForReview, true) => {
                     a.set_status(Status::Completed);
                     a.log("finished with no changes to review");
