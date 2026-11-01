@@ -151,6 +151,66 @@ static TYPED: &[TypedCommand] = &[
         fun: substitute_cmd,
     },
     TypedCommand {
+        name: "select-nodes",
+        aliases: &[],
+        doc: "Select every syntax node a tree-sitter query or shortcut matches (steps chain with |)",
+        fun: crate::structural::select_nodes,
+    },
+    TypedCommand {
+        name: "select-inside",
+        aliases: &[],
+        doc: "Select the syntax nodes a query or shortcut matches inside each selection",
+        fun: crate::structural::select_inside,
+    },
+    TypedCommand {
+        name: "keep-nodes",
+        aliases: &[],
+        doc: "Keep selections that are exactly a syntax node the query matches",
+        fun: crate::structural::keep_nodes,
+    },
+    TypedCommand {
+        name: "remove-nodes",
+        aliases: &[],
+        doc: "Remove selections that are exactly a syntax node the query matches",
+        fun: crate::structural::remove_nodes,
+    },
+    TypedCommand {
+        name: "keep-containing",
+        aliases: &[],
+        doc: "Keep selections that contain a syntax node the query matches",
+        fun: crate::structural::keep_containing,
+    },
+    TypedCommand {
+        name: "remove-containing",
+        aliases: &[],
+        doc: "Remove selections that contain a syntax node the query matches",
+        fun: crate::structural::remove_containing,
+    },
+    TypedCommand {
+        name: "keep-matching",
+        aliases: &[],
+        doc: "Keep selections whose text matches a regex",
+        fun: crate::structural::keep_matching,
+    },
+    TypedCommand {
+        name: "remove-matching",
+        aliases: &[],
+        doc: "Remove selections whose text matches a regex",
+        fun: crate::structural::remove_matching,
+    },
+    TypedCommand {
+        name: "expand-to",
+        aliases: &[],
+        doc: "Grow each selection to its enclosing syntax node of a kind (dropping ones with none)",
+        fun: crate::structural::expand_to,
+    },
+    TypedCommand {
+        name: "insert-above",
+        aliases: &[],
+        doc: "Insert a line above each selection with its indentation, as one undo step",
+        fun: crate::structural::insert_above_cmd,
+    },
+    TypedCommand {
         name: "goto",
         aliases: &["g"],
         doc: "Go to a line number",
@@ -277,6 +337,12 @@ pub fn execute_line(editor: &mut Editor, line: &str) {
         if let Err(e) = substitute(editor, spec, whole) {
             editor.error(e);
         }
+        return;
+    }
+    // Structural pipeline steps take the rest of the line (queries and
+    // regexes have spaces) and chain with `|`.
+    if crate::structural::handles(line) {
+        crate::structural::execute(editor, line);
         return;
     }
     // :grep takes the rest of the line as its pattern, spaces included.

@@ -14,8 +14,13 @@
 //! thread use [`Syntax::parse_within`] and [`Syntax::reparse_within`], which
 //! give up after a time budget, and finish the work elsewhere with
 //! [`Syntax::fork`] (a [`Syntax`] is `Send`).
+//!
+//! [`NodeQuery`] and [`Syntax::query_nodes`] select nodes with tree-sitter
+//! queries for structural pipelines; [`shortcuts`] lists the named queries
+//! each language offers.
 
 mod language;
+mod query;
 
 use std::ops::{ControlFlow, Range};
 use std::time::{Duration, Instant};
@@ -27,6 +32,7 @@ use tree_sitter::{
 };
 
 pub use language::Language;
+pub use query::{NodeQuery, QueryError, SELECT_CAPTURE, shortcuts};
 pub use tree_sitter::InputEdit as Edit;
 
 /// A highlighted span: `start..end` in chars, and the theme scope (such as

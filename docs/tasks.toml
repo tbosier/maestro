@@ -144,3 +144,12 @@ status = "in-progress"
 # repository, loaded on the panel's first open, relaunch with session/load,
 # found worktrees.
 # Open: a real agent run through the panel.
+
+[[task]]
+id = "m3-pipelines"
+title = "Structural pipelines: select nodes by query, filter, expand, insert above"
+crates = ["maestro-syntax", "maestro-editor"]
+branch = "feat/pipelines"
+owner = "agent"
+status = "done"
+# A narrow slice of the spec's Experiment A; see the M3 row in ROADMAP.md.
