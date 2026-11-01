@@ -103,6 +103,30 @@ fn main() {
             "records_written_by_another_maestro_are_kept",
             records_written_by_another_maestro_are_kept,
         ),
+        (
+            "contracts_typed_and_from_a_file_are_shown_and_sent",
+            contracts_typed_and_from_a_file_are_shown_and_sent,
+        ),
+        (
+            "acp_writes_outside_the_contract_are_refused",
+            acp_writes_outside_the_contract_are_refused,
+        ),
+        (
+            "out_of_scope_files_need_their_own_key_and_verification_is_checked",
+            out_of_scope_files_need_their_own_key_and_verification_is_checked,
+        ),
+        (
+            "files_outside_the_contract_written_after_the_dialog_stop_the_integration",
+            files_outside_the_contract_written_after_the_dialog_stop_the_integration,
+        ),
+        (
+            "overlapping_agents_show_conflicts_only_where_they_conflict",
+            overlapping_agents_show_conflicts_only_where_they_conflict,
+        ),
+        (
+            "contracts_and_verification_survive_a_restart",
+            contracts_and_verification_survive_a_restart,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -1955,4 +1979,640 @@ fn records_written_by_another_maestro_are_kept() {
     assert!(msg.contains("can no longer be used"), "{msg}");
     quit(&mut ed);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\": 9}");
+}
+
+// ----- task contracts and conflicts ------------------------------------------
+
+/// A terminal provider running `script` in `sh`, with the task as `$1`.
+fn sh_provider(script: &str) -> AgentProviderConfig {
+    provider(
+        AgentProviderKind::Terminal,
+        "sh",
+        &["-c", script, "sh", "{task}"],
+    )
+}
+
+/// The text of the open confirmation dialog, or a panic.
+fn dialog(ed: &Editor) -> (String, Vec<(String, String)>) {
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Confirm(c)) => (c.lines.join("\n"), c.keys.clone()),
+        other => panic!("expected a dialog, got {other:?}; status {:?}", ed.status),
+    }
+}
+
+/// `n`, the task with its contract lines, the contract dialog, `y`, then
+/// the provider at `provider_index`.
+fn start_contract_task(ed: &mut Editor, task: &str, provider_index: usize) -> String {
+    run(ed, "n");
+    ed.paste_text(task);
+    run(ed, "\n");
+    let (text, keys) = dialog(ed);
+    assert!(
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::StartTask { .. })),
+        "{text}"
+    );
+    assert_eq!(keys[0].0, "y");
+    run(ed, "y");
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Choice { title, .. }) => {
+            assert_eq!(title, "provider (task with a contract)")
+        }
+        other => panic!("expected the provider list, got {other:?}"),
+    }
+    for _ in 0..provider_index {
+        run(ed, "j");
+    }
+    run(ed, "\n");
+    text
+}
+
+/// Waits for agent `i`'s program to exit and its diff to show `files`.
+fn wait_files(ed: &mut Editor, i: usize, files: &[&str]) {
+    let want: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+    poll_until(ed, "the program's exit and its diff", |ed| {
+        ed.agents.agents.len() > i
+            && agent(ed, i).exited.is_some()
+            && !agent(ed, i).review.running
+            && {
+                let mut got = review_paths(ed, i);
+                got.sort();
+                got == want
+            }
+    });
+}
+
+/// Opens the integrate dialog for the selected agent and waits for it.
+fn open_integrate(ed: &mut Editor) {
+    run(ed, "I");
+    poll_until(ed, "the integrate dialog", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Integrate { .. }))
+    });
+}
+
+/// Runs `t` on the selected agent and waits until the run finished and
+/// the files it ran on were recorded.
+fn verify(ed: &mut Editor, i: usize) {
+    let before = agent(ed, i).tests.len();
+    run(ed, "t");
+    poll_until(ed, "the verification and its snapshot", |ed| {
+        agent(ed, i).tests.len() == before + 1
+            && agent(ed, i)
+                .latest_test()
+                .is_some_and(|t| t.finished.is_some() && t.tree.is_some())
+    });
+}
+
+fn contracts_typed_and_from_a_file_are_shown_and_sent() {
+    use maestro_editor::agents::contract::Contract;
+    let f = Fixture::new();
+    // The script saves what it was given, so the test sees what was sent.
+    let mut ed = f.editor(config(&[(
+        "echoer",
+        sh_provider("printf '%s' \"$1\" > task.txt"),
+    )]));
+    run(&mut ed, " a");
+
+    // A mistake keeps the text in the box and says what is wrong.
+    run(&mut ed, "n");
+    ed.paste_text("x\n@allow ../up");
+    run(&mut ed, "\n");
+    assert!(
+        status_text(&ed).contains("task contract"),
+        "{:?}",
+        ed.status
+    );
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Input { text, .. }) => assert_eq!(text, "x\n@allow ../up"),
+        other => panic!("the input stays open, got {other:?}"),
+    }
+    run(&mut ed, "<esc>");
+    assert!(ed.agents.agents.is_empty());
+
+    // Typed: the dialog shows all of it before anything starts.
+    let shown = start_contract_task(
+        &mut ed,
+        "write the notes\n@allow task.txt notes.txt\n@forbid secret/**\n\
+         @verify sh -c 'test -f notes.txt'\n@accept the notes exist",
+        0,
+    );
+    assert!(shown.contains("Contract typed with the task."), "{shown}");
+    assert!(
+        shown.contains("Allowed paths: task.txt, notes.txt"),
+        "{shown}"
+    );
+    assert!(shown.contains("Forbidden paths: secret/**"), "{shown}");
+    assert!(shown.contains("sh -c 'test -f notes.txt'"), "{shown}");
+    assert!(shown.contains("Acceptance: the notes exist"), "{shown}");
+    assert!(
+        shown.contains("the agent's own tools are not stopped"),
+        "{shown}"
+    );
+    wait_files(&mut ed, 0, &["task.txt"]);
+    let a = agent(&ed, 0);
+    assert_eq!(a.task, "write the notes");
+    let want = Contract {
+        allowed: vec!["task.txt".into(), "notes.txt".into()],
+        forbidden: vec!["secret/**".into()],
+        verify: Some(vec!["sh".into(), "-c".into(), "test -f notes.txt".into()]),
+        acceptance: vec!["the notes exist".into()],
+        source: None,
+    };
+    assert_eq!(a.contract.as_ref(), Some(&want));
+    let sent = std::fs::read_to_string(worktree(&ed, 0).join("task.txt")).unwrap();
+    assert!(
+        sent.starts_with("write the notes\n\nTask contract from the user"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("- Change only paths matching: task.txt, notes.txt"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("- Do not change paths matching: secret/**"),
+        "{sent}"
+    );
+    assert!(sent.contains("  - the notes exist"), "{sent}");
+    assert!(!sent.contains("@allow"), "{sent}");
+
+    // From a file the user names, read only then.
+    std::fs::create_dir_all(f.repo.join("contracts")).unwrap();
+    std::fs::write(
+        f.repo.join("contracts/notes.toml"),
+        "allowed = [\"task.txt\"]\nverify = \"true\"\nacceptance = \"from the file\"\n",
+    )
+    .unwrap();
+    let shown = start_contract_task(&mut ed, "write it again\n@contract contracts/notes.toml", 0);
+    assert!(
+        shown.contains("Contract from contracts/notes.toml."),
+        "{shown}"
+    );
+    wait_files(&mut ed, 1, &["task.txt"]);
+    let c = agent(&ed, 1).contract.clone().unwrap();
+    assert_eq!(c.allowed, ["task.txt"]);
+    assert_eq!(c.verify.as_deref().unwrap(), ["true"]);
+    assert_eq!(c.acceptance, ["from the file"]);
+    assert_eq!(c.source.as_deref(), Some("contracts/notes.toml"));
+    let sent = std::fs::read_to_string(worktree(&ed, 1).join("task.txt")).unwrap();
+    assert!(sent.contains("  - from the file"), "{sent}");
+
+    // A file with a key the format does not have is refused whole.
+    std::fs::write(
+        f.repo.join("contracts/bad.toml"),
+        "allowed = [\"x\"]\nrun = \"rm -rf .\"\n",
+    )
+    .unwrap();
+    run(&mut ed, "n");
+    ed.paste_text("bad\n@contract contracts/bad.toml");
+    run(&mut ed, "\n");
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("contracts/bad.toml") && msg.contains("run"),
+        "{msg}"
+    );
+    run(&mut ed, "<esc>");
+    // Combining a file and typed lines is refused too.
+    run(&mut ed, "n");
+    ed.paste_text("both\n@contract contracts/notes.toml\n@allow x");
+    run(&mut ed, "\n");
+    assert!(status_text(&ed).contains("not both"), "{:?}", ed.status);
+    run(&mut ed, "<esc>");
+    assert_eq!(ed.agents.agents.len(), 2);
+
+    // A task without contract lines goes straight to the providers.
+    run(&mut ed, "n");
+    ed.paste_text("no contract here");
+    run(&mut ed, "\n");
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Choice { title, .. }) => assert_eq!(title, "provider (no task contract)"),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn acp_writes_outside_the_contract_are_refused() {
+    let f = Fixture::new();
+    let exe = std::env::current_exe().unwrap();
+    let mut ed = f.editor(config(&[(
+        "fake",
+        provider(AgentProviderKind::Acp, exe.to_str().unwrap(), &[FAKE_ARG]),
+    )]));
+    run(&mut ed, " a");
+    // The task is the fake agent's script; the @ lines are the contract.
+    start_contract_task(
+        &mut ed,
+        "write docs/notes.md allowed\\n\n\
+         write src/lib.rs pub fn two() {}\\n\n\
+         write docs/../README.md sneaky\\n\n\
+         say done\n\
+         @allow docs/**",
+        0,
+    );
+    poll_until(&mut ed, "the turn's end", |ed| {
+        ed.agents
+            .agents
+            .first()
+            .is_some_and(|a| a.base_status() == Status::ReadyForReview && !a.review.running)
+    });
+    let wt = worktree(&ed, 0);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("docs/notes.md")).unwrap(),
+        "allowed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(),
+        "pub fn one() {}\n",
+        "refused: not under docs/"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "# demo\n",
+        "refused: the resolved path is what counts"
+    );
+    let a = agent(&ed, 0);
+    let refused: Vec<&String> = a
+        .errors
+        .iter()
+        .filter(|e| e.contains("outside the task contract"))
+        .collect();
+    assert_eq!(refused.len(), 2, "{:?}", a.errors);
+    assert!(
+        refused[0].contains("src/lib.rs matches no allowed pattern"),
+        "{refused:?}"
+    );
+    // The agent was told: its transcript has the refusals.
+    let said: Vec<String> = a
+        .transcript
+        .iter()
+        .filter_map(|e| match e {
+            TranscriptEntry::Agent(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    let said = said.join("\n");
+    assert!(said.contains("write failed"), "{said}");
+    // The contract went with the first prompt.
+    assert!(
+        a.transcript.iter().any(
+            |e| matches!(e, TranscriptEntry::User(t) if t.contains("Change only paths matching: docs/**"))
+        ),
+        "{:?}",
+        a.transcript
+    );
+    assert_eq!(review_paths(&ed, 0), ["docs/notes.md"]);
+}
+
+fn out_of_scope_files_need_their_own_key_and_verification_is_checked() {
+    let f = Fixture::new();
+    let flag = f.tmp.join("verification-passes");
+    let mut ed = f.editor(config(&[(
+        "writer",
+        sh_provider("printf 'notes\\n' > notes.txt; printf 'stray\\n' > stray.txt"),
+    )]));
+    run(&mut ed, " a");
+    start_contract_task(
+        &mut ed,
+        &format!(
+            "write the notes\n@allow notes.txt\n@verify sh -c 'test -f {} && echo verified'",
+            flag.display()
+        ),
+        0,
+    );
+    wait_files(&mut ed, 0, &["notes.txt", "stray.txt"]);
+    let outside = agent(&ed, 0).out_of_scope();
+    assert_eq!(outside.len(), 1, "{outside:?}");
+    assert_eq!(outside[0].0, PathBuf::from("stray.txt"));
+
+    // The review marks it on the file itself.
+    run(&mut ed, "\n");
+    let at = review_paths(&ed, 0)
+        .iter()
+        .position(|p| p == "stray.txt")
+        .unwrap();
+    for _ in 0..at {
+        run(&mut ed, "<tab>");
+    }
+    let rows = maestro_editor::agents::review::current_rows(&ed);
+    assert!(
+        matches!(&rows[0], Row::Note(n)
+            if n.contains("outside the task contract: stray.txt matches no allowed pattern")),
+        "{rows:?}"
+    );
+    run(&mut ed, "<tab>");
+    let rows = maestro_editor::agents::review::current_rows(&ed);
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, Row::Note(n) if n.contains("outside"))),
+        "notes.txt is allowed: {rows:?}"
+    );
+    run(&mut ed, "<esc>");
+
+    // Before any verification, integrate says so.
+    open_integrate(&mut ed);
+    let (text, keys) = dialog(&ed);
+    assert!(
+        text.contains("Warning: No verification has run on this work"),
+        "{text}"
+    );
+    run(&mut ed, "n");
+
+    // `t` runs the contract's command, not [agents] test-command (there is
+    // none, and no Cargo.toml). It fails first: the flag is missing.
+    verify(&mut ed, 0);
+    let t = agent(&ed, 0).latest_test().unwrap();
+    assert!(t.command.contains("test -f"), "{}", t.command);
+    assert_eq!(t.passed(), Some(false));
+    assert!(
+        agent(&ed, 0)
+            .history
+            .iter()
+            .any(|h| h.text.contains("tests started (from the task contract)")),
+        "{:?}",
+        agent(&ed, 0).history
+    );
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains("Warning: The last verification `sh -c test -f"),
+        "{text}"
+    );
+    assert!(text.contains("did not pass: failed (exit 1)"), "{text}");
+    run(&mut ed, "n");
+
+    std::fs::write(&flag, "").unwrap();
+    verify(&mut ed, 0);
+    assert_eq!(agent(&ed, 0).latest_test().unwrap().passed(), Some(true));
+    assert!(
+        agent(&ed, 0)
+            .latest_test()
+            .unwrap()
+            .output
+            .iter()
+            .any(|l| l == "verified")
+    );
+
+    // The dialog lists the file outside the contract, and y is refused.
+    open_integrate(&mut ed);
+    let (text, keys2) = dialog(&ed);
+    let _ = keys;
+    assert!(
+        text.contains("OUTSIDE THE TASK CONTRACT: 1 changed file(s) would be integrated: stray.txt matches no allowed pattern"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Warning:"),
+        "verified on these files: {text}"
+    );
+    assert_eq!(keys2[0].0, "O", "{keys2:?}");
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    run(&mut ed, "y");
+    assert!(
+        status_text(&ed).contains("outside the task contract: O integrates them anyway"),
+        "{:?}",
+        ed.status
+    );
+    assert!(ed.agents.panel.overlay.is_some(), "the dialog stays");
+    run(&mut ed, "n");
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+
+    // A change after the verification makes it stale.
+    std::fs::write(worktree(&ed, 0).join("notes.txt"), "notes, edited\n").unwrap();
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains("Warning: The files changed after the last verification")
+            && text.contains("ran: notes.txt."),
+        "{text}"
+    );
+
+    // O integrates anyway, and the commit says what was let in.
+    run(&mut ed, "O");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("stray.txt")).unwrap(),
+        "stray\n"
+    );
+    let log = f.git(&f.repo, &["log", "--format=%B", "-n", "2", "main^2"]);
+    assert!(
+        log.contains(
+            "Outside the task contract, integrated after a separate confirmation (O): stray.txt"
+        ),
+        "{log}"
+    );
+}
+
+fn files_outside_the_contract_written_after_the_dialog_stop_the_integration() {
+    let f = Fixture::new();
+    let mut ed = f.editor(config(&[(
+        "writer",
+        sh_provider("printf 'notes\\n' > notes.txt"),
+    )]));
+    run(&mut ed, " a");
+    start_contract_task(&mut ed, "write the notes\n@allow notes.txt", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    open_integrate(&mut ed);
+    let (text, keys) = dialog(&ed);
+    assert!(!text.contains("OUTSIDE"), "{text}");
+    assert_eq!(keys[0].0, "y");
+    // Something writes outside the contract while the dialog is up.
+    std::fs::write(worktree(&ed, 0).join("late.txt"), "late\n").unwrap();
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the refusal", |ed| {
+        status_text(ed).contains("not integrated")
+    });
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains(
+            "files outside the task contract appeared after the dialog was checked: late.txt"
+        ),
+        "{msg}"
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    assert!(!f.repo.join("late.txt").exists());
+    assert_ne!(status(&ed, 0), Status::Integrated);
+}
+
+fn overlapping_agents_show_conflicts_only_where_they_conflict() {
+    use maestro_editor::agents::conflicts::{self, Merge};
+    let f = Fixture::new();
+    let lines = |first: &str, last: &str| {
+        format!("printf '{first}\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n{last}\\n' > shared.txt")
+    };
+    std::fs::write(f.repo.join("shared.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "shared"]);
+    let mut ed = f.editor(config(&[
+        // alpha and gamma both change line 1; beta changes line 10; zeta
+        // touches another file.
+        ("alpha", sh_provider(&lines("A", "10"))),
+        ("beta", sh_provider(&lines("1", "B"))),
+        ("gamma", sh_provider(&lines("G", "10"))),
+        ("zeta", sh_provider("printf 'z\\n' > other.txt")),
+    ]));
+    run(&mut ed, " a");
+    for i in 0..4 {
+        start_task(&mut ed, "edit the shared file", i);
+        wait_files(
+            &mut ed,
+            i,
+            &[if i == 3 { "other.txt" } else { "shared.txt" }],
+        );
+    }
+    poll_until(&mut ed, "the dry runs", |ed| {
+        ed.agents.conflicts.pairs.len() == 3
+            && ed
+                .agents
+                .conflicts
+                .pairs
+                .iter()
+                .all(|p| p.merge != Merge::Checking)
+    });
+    let name = |ed: &Editor, id: AgentId| ed.agents.get(id).unwrap().name.clone();
+    let mut seen: Vec<(String, String, Merge)> = ed
+        .agents
+        .conflicts
+        .pairs
+        .iter()
+        .map(|p| {
+            assert_eq!(p.files, [PathBuf::from("shared.txt")]);
+            (name(&ed, p.a), name(&ed, p.b), p.merge.clone())
+        })
+        .collect();
+    seen.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+    assert_eq!(
+        seen,
+        [
+            ("alpha-1".into(), "beta-2".into(), Merge::Clean),
+            (
+                "alpha-1".into(),
+                "gamma-3".into(),
+                Merge::Conflicts(vec!["shared.txt".into()])
+            ),
+            ("beta-2".into(), "gamma-3".into(), Merge::Clean),
+        ]
+    );
+    let alpha = id(&ed, 0);
+    let words = conflicts::describe(&ed, alpha).join("\n");
+    assert!(
+        words.contains("overlaps beta-2 in shared.txt: would merge cleanly"),
+        "{words}"
+    );
+    assert!(
+        words.contains("overlaps gamma-3 in shared.txt: CONFLICT in shared.txt"),
+        "{words}"
+    );
+    assert_eq!(
+        conflicts::brief(&ed, id(&ed, 1)).as_deref(),
+        Some("overlaps alpha-1 gamma-3")
+    );
+    assert!(
+        conflicts::describe(&ed, id(&ed, 3)).is_empty(),
+        "zeta overlaps nothing"
+    );
+
+    // The cost bound: recomputing with nothing changed takes one snapshot
+    // per overlapping agent (zeta, which overlaps nobody, gets none) and
+    // reuses the dry runs cached by snapshot commit ids.
+    let state = &ed.agents.conflicts;
+    let (runs, snaps) = (state.dry_runs, state.snapshots);
+    conflicts::refresh(&mut ed);
+    poll_until(&mut ed, "the second pass", |ed| {
+        ed.agents
+            .conflicts
+            .pairs
+            .iter()
+            .all(|p| p.merge != Merge::Checking)
+            && ed.agents.conflicts.snapshots > snaps
+    });
+    assert_eq!(ed.agents.conflicts.dry_runs, runs, "cached by commit ids");
+    assert_eq!(
+        ed.agents.conflicts.snapshots,
+        snaps + 3,
+        "zeta is not snapshotted"
+    );
+
+    // The integrate dialog for alpha names gamma, and beta as clean.
+    select(&mut ed, 0);
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains("After this, the work of gamma-3 in shared.txt would conflict with main."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Overlapping agents whose work would still merge cleanly afterward: beta-2."),
+        "{text}"
+    );
+    // Integrating alpha drops it from the pairs.
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration and the new pairs", |ed| {
+        status(ed, 0) == Status::Integrated
+            && ed.agents.conflicts.pairs.len() == 1
+            && ed.agents.conflicts.pairs[0].merge != Merge::Checking
+    });
+    assert_eq!(ed.agents.conflicts.pairs[0].merge, Merge::Clean);
+    // gamma now conflicts with main itself: the dialog says so first, and
+    // integrating is refused.
+    select(&mut ed, 2);
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.starts_with("CONFLICT: this work conflicts with main in shared.txt"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Could not check for conflicts afterward with: beta-2: not checked, this work itself conflicts with main."),
+        "{text}"
+    );
+    // No verification command anywhere: nothing to warn about.
+    assert!(!text.contains("Warning:"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the refusal", |ed| {
+        status_text(ed).contains("not integrated")
+    });
+    assert!(
+        status_text(&ed).contains("conflict in shared.txt"),
+        "{:?}",
+        ed.status
+    );
+}
+
+fn contracts_and_verification_survive_a_restart() {
+    let f = Fixture::new();
+    let c = config(&[("writer", sh_provider("printf 'notes\\n' > notes.txt"))]);
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_contract_task(
+        &mut ed,
+        "write the notes\n@allow notes.txt\n@forbid secret\n@verify sh -c 'echo checked'\n@accept it is there",
+        0,
+    );
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    verify(&mut ed, 0);
+    let contract = agent(&ed, 0).contract.clone().unwrap();
+    let tree = agent(&ed, 0).latest_test().unwrap().tree.clone();
+    quit(&mut ed);
+    drop(ed);
+    let saved = std::fs::read_to_string(f.records()).unwrap();
+    assert!(saved.contains("\"contract\""), "{saved}");
+
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    let a = agent(&ed, 0);
+    assert_eq!(a.contract.as_ref(), Some(&contract));
+    assert_eq!(a.latest_test().unwrap().tree, tree);
+    // The loaded agent's `t` runs the contract's command, and integrate
+    // still knows the verification ran on these files.
+    verify(&mut ed, 0);
+    let t = agent(&ed, 0).latest_test().unwrap();
+    assert_eq!(t.command, "sh -c echo checked");
+    assert!(t.output.iter().any(|l| l == "checked"));
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("Warning:"), "{text}");
+    assert!(!text.contains("OUTSIDE"), "{text}");
 }

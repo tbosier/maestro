@@ -102,7 +102,15 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
         ed.error("tests are already running for this agent");
         return;
     }
-    let Some(cmd) = test_command(ed, &root) else {
+    // The task contract's command comes first, for this task only.
+    let from_contract = a.contract.as_ref().and_then(|c| c.verify.clone());
+    let source = if from_contract.is_some() {
+        " (from the task contract)"
+    } else {
+        ""
+    };
+    let agent_running = a.is_running();
+    let Some(cmd) = from_contract.or_else(|| test_command(ed, &root)) else {
         ed.error("no test command: the worktree has no Cargo.toml; set [agents] test-command");
         return;
     };
@@ -149,12 +157,14 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
                 output: VecDeque::new(),
                 dropped: 0,
                 finished: None,
+                tree: None,
+                agent_was_running: agent_running,
             });
             a.test_handle = Some(handle);
-            a.log(format!("tests started: {shown}"));
+            a.log(format!("tests started{source}: {shown}"));
             ed.agents.panel.view = DetailView::Tests;
             ed.agents.panel.scroll = 0;
-            ed.info(format!("running {shown}"));
+            ed.info(format!("running {shown}{source}"));
         }
         Err(e) => {
             let msg = format!("could not run {shown}: {e}");
@@ -214,9 +224,55 @@ fn on_test_event(ed: &mut Editor, id: AgentId, event: TaskEvent) {
                 summary,
             });
             let desc = run.describe();
+            let running = a.is_running();
+            if let Some(run) = a.tests.last_mut() {
+                run.agent_was_running |= running;
+            }
             a.test_handle = None;
             a.log(format!("tests {desc}"));
+            record_tested_tree(ed, id);
         }
+    }
+}
+
+/// Records which files the run that just finished was judged on: a
+/// snapshot of the worktree, taken on a background thread. Integrate
+/// compares it with the files at that time.
+fn record_tested_tree(ed: &mut Editor, id: AgentId) {
+    let git = ed.git.git().clone();
+    let Some(a) = ed.agents.get(id) else {
+        return;
+    };
+    let Some(w) = a.worktree.clone() else {
+        return;
+    };
+    let index = a.tests.len() - 1;
+    let started = a.tests[index].started;
+    let spawned = ed.spawn_background("agent-test-tree", move |tx| {
+        let tree = open_agent_worktree(&git, &w)
+            .and_then(|repo| repo.work_snapshot().map_err(|e| e.to_string()));
+        tx.send(move |ed| {
+            let Some(a) = ed.agents.get_mut(id) else {
+                return;
+            };
+            match tree {
+                Ok(s) => {
+                    if let Some(run) = a.tests.get_mut(index).filter(|r| r.started == started) {
+                        run.tree = Some(s.tree);
+                    }
+                }
+                Err(e) => a.log(format!(
+                    "could not record which files the tests ran on: {e}"
+                )),
+            }
+        });
+    });
+    if let Err(e) = spawned
+        && let Some(a) = ed.agents.get_mut(id)
+    {
+        a.log(format!(
+            "could not record which files the tests ran on: {e}"
+        ));
     }
 }
 
@@ -677,6 +733,7 @@ pub fn reject(ed: &mut Editor, id: AgentId, then_archive: bool) {
         ed.agents.panel.terminal_focus = None;
     }
     ed.info(format!("rejected {name}"));
+    super::conflicts::refresh(ed);
     if then_archive {
         if has_worktree {
             archive(ed, id, false);
@@ -886,6 +943,11 @@ pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
 }
 
 fn archived(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) {
+    archived_inner(ed, id, forced, removal);
+    super::conflicts::refresh(ed);
+}
+
+fn archived_inner(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
@@ -1013,6 +1075,97 @@ pub struct IntegrateFacts {
     pub uncommitted: Vec<PathBuf>,
     pub message: String,
     pub agent_running: bool,
+    /// The agent's task contract.
+    pub contract: Option<super::contract::Contract>,
+    /// Changed files the contract does not allow, with the reason, from a
+    /// review diff taken for the dialog. Integrating them needs `O`; after
+    /// the commit, any other file outside the contract stops the
+    /// integration.
+    pub out_of_scope: Vec<(PathBuf, String)>,
+    /// Why the last verification does not vouch for these files, if it
+    /// does not (failed, still running, none, or run on other files).
+    pub verification: Vec<String>,
+    /// Other agents whose work, merged after this one, would conflict with
+    /// the target branch: `name: files`.
+    pub conflicts_after: Vec<String>,
+    /// Other agents with overlapping files whose work would still merge.
+    pub clean_after: Vec<String>,
+    /// Dry runs that could not run, `name: why`.
+    pub unchecked: Vec<String>,
+    /// Files in which this agent's own work conflicts with the target
+    /// branch now, from a dry run; `maestro-git` refuses such a merge.
+    pub own_conflicts: Vec<PathBuf>,
+}
+
+/// What the integrate check needs to know about another agent.
+#[derive(Debug, Clone)]
+struct Other {
+    name: String,
+    worktree: super::WorktreeInfo,
+    paths: std::collections::BTreeSet<PathBuf>,
+}
+
+/// What the integrate check needs to know about the last verification.
+#[derive(Debug, Clone)]
+struct LastTest {
+    command: String,
+    /// `None` while running.
+    passed: Option<bool>,
+    describe: String,
+    tree: Option<String>,
+    agent_was_running: bool,
+}
+
+/// Plain sentences for the dialog about the last verification run, judged
+/// against the files now (`tree`).
+fn verification_warnings(
+    last: Option<&LastTest>,
+    has_command: bool,
+    tree: Option<&str>,
+    changed: &[PathBuf],
+) -> Vec<String> {
+    let Some(t) = last else {
+        // Without any verification command there is nothing to warn about
+        // that `t` could fix.
+        return if has_command {
+            vec!["No verification has run on this work (t runs it).".into()]
+        } else {
+            Vec::new()
+        };
+    };
+    let mut out = Vec::new();
+    match t.passed {
+        None => out.push(format!(
+            "The verification `{}` is still running; its result is not known.",
+            t.command
+        )),
+        Some(false) => out.push(format!(
+            "The last verification `{}` did not pass: {}.",
+            t.command, t.describe
+        )),
+        Some(true) => {}
+    }
+    if t.passed.is_some() {
+        match (&t.tree, tree) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some(_), Some(_)) => out.push(format!(
+                "The files changed after the last verification `{}` ran: {}.",
+                t.command,
+                list_paths(changed)
+            )),
+            _ => out.push(format!(
+                "Maestro cannot tell whether the files changed after the last verification `{}` ran.",
+                t.command
+            )),
+        }
+    }
+    if t.agent_was_running {
+        out.push(
+            "The agent was running during the last verification and may have changed files it did not see."
+                .into(),
+        );
+    }
+    out
 }
 
 /// The repository whose root is exactly `path`. Discovery alone would
@@ -1051,7 +1204,7 @@ fn same_repository(
 
 /// The agent's worktree, checked before changing anything in it: the root
 /// of a worktree of the main repository, on the branch the record names.
-fn open_agent_worktree(
+pub(crate) fn open_agent_worktree(
     git: &maestro_git::Git,
     w: &super::WorktreeInfo,
 ) -> Result<maestro_git::Repository, String> {
@@ -1173,6 +1326,32 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
     );
     let name = a.name.clone();
     let agent_running = a.is_running();
+    let contract = a.contract.clone();
+    let has_command = a.contract.as_ref().is_some_and(|c| c.verify.is_some())
+        || test_command(ed, &w.path).is_some();
+    let last_test = a.latest_test().map(|t| LastTest {
+        command: t.command.clone(),
+        passed: t.passed(),
+        describe: t.describe(),
+        tree: t.tree.clone(),
+        agent_was_running: t.agent_was_running,
+    });
+    // Other agents of this repository that could conflict afterward; only
+    // those whose changed files overlap this one's get a dry run.
+    let others: Vec<Other> = ed
+        .agents
+        .agents
+        .iter()
+        .filter(|o| o.id != id && super::conflicts::eligible(o))
+        .filter_map(|o| {
+            let ow = o.worktree.clone()?;
+            (ow.main_root == w.main_root).then(|| Other {
+                name: o.name.clone(),
+                worktree: ow,
+                paths: super::conflicts::changed_paths(o),
+            })
+        })
+        .collect();
     let spawned = ed.spawn_background("agent-integrate-check", move |tx| {
         let facts = (|| -> Result<IntegrateFacts, String> {
             let main = open_exact(&git, &w.main_root)?;
@@ -1189,14 +1368,52 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 uncommitted: Vec::new(),
                 message,
                 agent_running,
+                contract,
+                out_of_scope: Vec::new(),
+                verification: Vec::new(),
+                conflicts_after: Vec::new(),
+                clean_after: Vec::new(),
+                unchecked: Vec::new(),
+                own_conflicts: Vec::new(),
             };
-            let (wt, _) = check_before_commit(&git, &facts)?;
+            let (wt, main) = check_before_commit(&git, &facts)?;
             let st = wt.status().map_err(|e| e.to_string())?;
             facts.uncommitted = st
                 .uncommitted()
                 .chain(st.untracked())
                 .map(|e| e.path.clone())
                 .collect();
+            // What would be integrated, from Git now rather than the
+            // review's last refresh.
+            let files = wt.review_diff(&w.base).map_err(|e| e.to_string())?;
+            if let Some(c) = &facts.contract {
+                facts.out_of_scope = super::out_of_scope(c, &files);
+            }
+            let mine: std::collections::BTreeSet<PathBuf> =
+                files.iter().flat_map(super::file_paths).cloned().collect();
+            let snap = wt.work_snapshot().map_err(|e| e.to_string());
+            // The files now against the files the last verification ran on.
+            let tree = snap.as_ref().ok().map(|s| s.tree.clone());
+            let changed = match (last_test.as_ref().and_then(|t| t.tree.clone()), &tree) {
+                (Some(from), Some(to)) if from != *to => main
+                    .diff(
+                        &maestro_git::DiffSpec::Revisions {
+                            from,
+                            to: to.clone(),
+                        },
+                        &[],
+                    )
+                    .map(|d| d.iter().flat_map(super::file_paths).cloned().collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            facts.verification =
+                verification_warnings(last_test.as_ref(), has_command, tree.as_deref(), &changed);
+            let overlapping: Vec<&Other> = others
+                .iter()
+                .filter(|o| !o.paths.is_disjoint(&mine))
+                .collect();
+            conflicts_after(&git, &main, snap, &overlapping, &mut facts);
             Ok(facts)
         })();
         tx.send(move |ed| match facts {
@@ -1217,6 +1434,62 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
     });
     if let Err(e) = spawned {
         ed.error(format!("could not start the integration check: {e}"));
+    }
+}
+
+/// Whether this agent's work conflicts with the target branch now, and
+/// which overlapping agents would conflict with it once this work is
+/// merged. The merge is made in memory: a dry run of the target's `HEAD`
+/// with this worktree's files, written as an unreferenced commit, then a
+/// dry run of that commit with each other agent's files.
+fn conflicts_after(
+    git: &maestro_git::Git,
+    main: &maestro_git::Repository,
+    snap: Result<maestro_git::WorkSnapshot, String>,
+    others: &[&Other],
+    facts: &mut IntegrateFacts,
+) {
+    let mut unchecked = |why: String| {
+        for o in others {
+            facts.unchecked.push(format!("{}: {why}", o.name));
+        }
+    };
+    let snap = match snap {
+        Ok(s) => s,
+        Err(e) => return unchecked(e),
+    };
+    let head = match main.resolve("HEAD") {
+        Ok(h) => h,
+        Err(e) => return unchecked(e.to_string()),
+    };
+    let merged = match main.merge_check(&head, &snap.commit) {
+        Ok(maestro_git::MergeCheck::Clean { .. }) if others.is_empty() => return,
+        Ok(maestro_git::MergeCheck::Clean { tree }) => {
+            match main.commit_tree(&tree, &[&head, &snap.commit], "maestro integrate dry run") {
+                Ok(c) => c,
+                Err(e) => return unchecked(e.to_string()),
+            }
+        }
+        Ok(maestro_git::MergeCheck::Conflicts { files, .. }) => {
+            facts.own_conflicts = files;
+            return unchecked(format!(
+                "not checked, this work itself conflicts with {}",
+                facts.target
+            ));
+        }
+        Err(e) => return unchecked(e.to_string()),
+    };
+    for o in others {
+        let theirs = open_agent_worktree(git, &o.worktree)
+            .and_then(|r| r.work_snapshot().map_err(|e| e.to_string()));
+        match theirs.map(|t| main.merge_check(&merged, &t.commit)) {
+            Ok(Ok(maestro_git::MergeCheck::Clean { .. })) => facts.clean_after.push(o.name.clone()),
+            Ok(Ok(maestro_git::MergeCheck::Conflicts { files, .. })) => facts
+                .conflicts_after
+                .push(format!("{} in {}", o.name, list_paths(&files))),
+            Ok(Err(e)) => facts.unchecked.push(format!("{}: {e}", o.name)),
+            Err(e) => facts.unchecked.push(format!("{}: {e}", o.name)),
+        }
     }
 }
 
@@ -1241,8 +1514,58 @@ fn how_label(how: Integration) -> &'static str {
     }
 }
 
+/// At most `n` items, then how many more.
+fn first_of(items: &[String], n: usize) -> String {
+    let mut v: Vec<String> = items.iter().take(n).cloned().collect();
+    if items.len() > n {
+        v.push(format!("and {} more", items.len() - n));
+    }
+    v.join("; ")
+}
+
 pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts) -> Confirm {
     let mut lines = vec![];
+    if !facts.out_of_scope.is_empty() {
+        let names: Vec<String> = facts
+            .out_of_scope
+            .iter()
+            .map(|(_, why)| why.clone())
+            .collect();
+        lines.push(format!(
+            "OUTSIDE THE TASK CONTRACT: {} changed file(s) would be integrated: {}. y is refused; O integrates them anyway, D in the review drops one.",
+            facts.out_of_scope.len(),
+            first_of(&names, 8)
+        ));
+    }
+    if !facts.own_conflicts.is_empty() {
+        lines.push(format!(
+            "CONFLICT: this work conflicts with {} in {}; Git will refuse to merge it (after step 1 commits it on its branch).",
+            facts.target,
+            list_paths(&facts.own_conflicts)
+        ));
+    }
+    if !facts.conflicts_after.is_empty() {
+        lines.push(format!(
+            "After this, the work of {} would conflict with {}.",
+            first_of(&facts.conflicts_after, 5),
+            facts.target
+        ));
+    }
+    if !facts.clean_after.is_empty() {
+        lines.push(format!(
+            "Overlapping agents whose work would still merge cleanly afterward: {}.",
+            first_of(&facts.clean_after, 5)
+        ));
+    }
+    if !facts.unchecked.is_empty() {
+        lines.push(format!(
+            "Could not check for conflicts afterward with: {}.",
+            first_of(&facts.unchecked, 3)
+        ));
+    }
+    for v in &facts.verification {
+        lines.push(format!("Warning: {v}"));
+    }
     let subject = facts.message.lines().next().unwrap_or_default();
     if facts.uncommitted.is_empty() {
         lines.push(format!(
@@ -1300,15 +1623,30 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
             "The agent is still running: what it changes after the commit is left out.".into(),
         );
     }
+    let go = if facts.out_of_scope.is_empty() {
+        ("y".into(), format!("integrate by {}", how_label(how)))
+    } else {
+        (
+            "O".into(),
+            format!(
+                "integrate with files outside the contract by {}",
+                how_label(how)
+            ),
+        )
+    };
     Confirm {
         title: format!("integrate {} ({})", facts.name, how_label(how)),
         lines,
         keys: vec![
-            ("y".into(), format!("integrate by {}", how_label(how))),
+            go,
             ("tab".into(), "change method".into()),
             ("n".into(), "cancel".into()),
         ],
-        action: ConfirmAction::Integrate { agent, how, facts },
+        action: ConfirmAction::Integrate {
+            agent,
+            how,
+            facts: Box::new(facts),
+        },
     }
 }
 
@@ -1352,6 +1690,9 @@ struct Integrated {
     committed: Option<String>,
     target: String,
     outcome: Result<maestro_git::IntegrateOutcome, String>,
+    /// Files outside the task contract found on the branch after a
+    /// successful integration that the dialog did not list.
+    late_out_of_scope: Vec<PathBuf>,
 }
 
 fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration) -> Integrated {
@@ -1359,6 +1700,7 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
         committed: None,
         target: f.target.clone(),
         outcome: Err(String::new()),
+        late_out_of_scope: Vec::new(),
     };
     let (wt, main) = match check_before_commit(git, f) {
         Ok(r) => r,
@@ -1367,7 +1709,19 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             return out;
         }
     };
-    match wt.commit_all(&f.message) {
+    let mut message = f.message.clone();
+    if !f.out_of_scope.is_empty() {
+        let names: Vec<String> = f
+            .out_of_scope
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+        message.push_str(&format!(
+            "\nOutside the task contract, integrated after a separate confirmation (O): {}",
+            names.join(", ")
+        ));
+    }
+    match wt.commit_all(&message) {
         Ok(c) => out.committed = c,
         Err(maestro_git::GitError::Unmerged(p)) => {
             out.outcome = Err(format!(
@@ -1381,9 +1735,48 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             return out;
         }
     }
+    // What the branch brings now, after the commit, judged against the
+    // contract again: a file outside it that the dialog did not list
+    // (written after the dialog was checked) stops the integration.
+    let unseen = |wt: &maestro_git::Repository| -> Result<Vec<PathBuf>, String> {
+        let Some(c) = &f.contract else {
+            return Ok(Vec::new());
+        };
+        let files = wt.review_diff(&f.base).map_err(|e| e.to_string())?;
+        Ok(super::out_of_scope(c, &files)
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| !f.out_of_scope.iter().any(|(q, _)| q == p))
+            .collect())
+    };
+    match unseen(&wt) {
+        Ok(new) if new.is_empty() => {}
+        Ok(new) => {
+            out.outcome = Err(format!(
+                "files outside the task contract appeared after the dialog was checked: {}; \
+                 nothing was integrated. Press I again to see them",
+                list_paths(&new)
+            ));
+            return out;
+        }
+        Err(e) => {
+            out.outcome = Err(format!(
+                "could not check the work against the task contract ({e}); nothing was integrated"
+            ));
+            return out;
+        }
+    }
     out.outcome = main
         .integrate(&f.branch, how)
         .map_err(|e| integrate_words(&e, &f.target));
+    // The branch could still move in the moment between that check and
+    // the merge; say so loudly if it did.
+    if out.outcome.is_ok()
+        && let Ok(new) = unseen(&wt)
+        && !new.is_empty()
+    {
+        out.late_out_of_scope = new;
+    }
     out
 }
 
@@ -1452,8 +1845,20 @@ fn integrated(ed: &mut Editor, id: AgentId, how: Integration, r: Integrated) {
                 o.commits.len(),
                 super::create::short(&o.new_head)
             );
-            a.log(msg.clone());
-            ed.info(msg);
+            if !o.commits.is_empty() && !r.late_out_of_scope.is_empty() {
+                let warn = format!(
+                    "{msg}. WARNING: the agent's branch now also has files outside the task \
+                     contract that the dialog did not list: {}. They changed in the moment \
+                     before the merge and may have been integrated; check {} with git log",
+                    list_paths(&r.late_out_of_scope),
+                    r.target
+                );
+                a.log(warn.clone());
+                ed.error(warn);
+            } else {
+                a.log(msg.clone());
+                ed.info(msg);
+            }
         }
         Err(e) => {
             let mut msg = format!("not integrated: {e}");
@@ -1468,6 +1873,8 @@ fn integrated(ed: &mut Editor, id: AgentId, how: Integration, r: Integrated) {
         }
     }
     super::review::request(ed, id);
+    // An integrated agent no longer counts for overlaps.
+    super::conflicts::refresh(ed);
 }
 
 // ----- found worktrees ---------------------------------------------------------
