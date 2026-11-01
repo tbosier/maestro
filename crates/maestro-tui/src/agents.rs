@@ -793,7 +793,7 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
     }
 }
 
-fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
+pub(crate) fn draw_row(ed: &Editor, s: &mut Surface, area: Rect, row: &Row) {
     let ui = &ed.theme.ui;
     let d = &ed.theme.diff;
     match row {
@@ -973,46 +973,90 @@ fn draw_overlay(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
             None
         }
         Overlay::Confirm(c) => {
-            // The editor wraps the text, so it knows whether the dialog fits
-            // and refuses to accept one that does not.
-            let mut lines: Vec<(String, Style)> = panel::confirm_lines(area, c)
-                .into_iter()
-                .map(|l| (l, ui.popup))
-                .collect();
-            if !panel::confirm_fits(area, c) {
-                let room = (area.height as usize).saturating_sub(6);
-                lines.truncate(room);
-                lines.push((
-                    "the window is too small to show all of this; enlarge it to confirm".into(),
-                    ui.popup_title,
-                ));
-            }
             let forced = matches!(c.action, ConfirmAction::ForceArchive(_));
-            let h = (lines.len() as u16 + 4)
-                .min(area.height.saturating_sub(1))
-                .max(4);
-            let y = area.y + (area.height.saturating_sub(h)) / 3;
-            let b = Rect::new(x, y, w, h);
             let title = if forced {
                 format!("{}: this deletes files", c.title)
             } else {
                 c.title.clone()
             };
-            draw_box(s, b, &title, ui.popup, ui.popup_border, ui.popup_title);
-            let rows = (h - 4) as usize;
-            for (i, (text, style)) in lines.iter().take(rows).enumerate() {
-                s.print(x + 2, y + 1 + i as u16, text, *style, b.right() - 1);
-            }
-            let ky = b.bottom() - 2;
-            let mut kx = x + 2;
-            for (k, d) in &c.keys {
-                kx = s.print(kx, ky, k, ui.popup_title, b.right() - 1);
-                kx = s.print(kx + 1, ky, d, ui.popup, b.right() - 1);
-                kx += 3;
-            }
+            draw_dialog(ed, s, area, &title, &c.lines, &c.keys);
             None
         }
     }
+}
+
+/// A confirmation dialog: wrapped text and the keys that answer it. The
+/// editor wraps the text the same way, so it knows whether the dialog fits
+/// and refuses to accept one that does not.
+pub(crate) fn draw_dialog(
+    ed: &Editor,
+    s: &mut Surface,
+    area: Rect,
+    title: &str,
+    text: &[String],
+    keys: &[(String, String)],
+) {
+    let ui = &ed.theme.ui;
+    let (w, _) = panel::dialog_width(area);
+    let x = area.x + (area.width - w) / 2;
+    let mut lines: Vec<(String, Style)> = panel::dialog_lines(area, text)
+        .into_iter()
+        .map(|l| (l, ui.popup))
+        .collect();
+    if !panel::dialog_fits(area, text, keys) {
+        let room = (area.height as usize).saturating_sub(6);
+        lines.truncate(room);
+        lines.push((
+            "the window is too small to show all of this; enlarge it to confirm".into(),
+            ui.popup_title,
+        ));
+    }
+    let h = (lines.len() as u16 + 4)
+        .min(area.height.saturating_sub(1))
+        .max(4);
+    let y = area.y + (area.height.saturating_sub(h)) / 3;
+    let b = Rect::new(x, y, w, h);
+    draw_box(s, b, title, ui.popup, ui.popup_border, ui.popup_title);
+    let rows = (h - 4) as usize;
+    for (i, (text, style)) in lines.iter().take(rows).enumerate() {
+        s.print(x + 2, y + 1 + i as u16, text, *style, b.right() - 1);
+    }
+    let ky = b.bottom() - 2;
+    let mut kx = x + 2;
+    for (k, d) in keys {
+        kx = s.print(kx, ky, k, ui.popup_title, b.right() - 1);
+        kx = s.print(kx + 1, ky, d, ui.popup, b.right() - 1);
+        kx += 3;
+    }
+}
+
+/// An input box with a label, drawn like the panel's.
+pub(crate) fn draw_input(
+    ed: &Editor,
+    s: &mut Surface,
+    area: Rect,
+    label: &str,
+    text: &str,
+) -> CursorShape {
+    let ui = &ed.theme.ui;
+    let w = area.width.saturating_sub(4).min(90);
+    let inner = w.saturating_sub(4) as usize;
+    let x = area.x + (area.width - w) / 2;
+    let lines = wrap(text, inner.max(1));
+    let h = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let y = area.y + (area.height.saturating_sub(h)) / 3;
+    let b = Rect::new(x, y, w, h);
+    draw_box(s, b, label, ui.popup, ui.popup_border, ui.popup_title);
+    let rows = (h - 2) as usize;
+    let skip = lines.len().saturating_sub(rows);
+    let mut end = (x + 2, y + 1);
+    for (i, line) in lines.iter().skip(skip).enumerate() {
+        let ex = s.print(x + 2, y + 1 + i as u16, line, ui.popup, b.right() - 1);
+        end = (ex, y + 1 + i as u16);
+    }
+    CursorShape::Bar(end.0.min(b.right() - 2), end.1)
 }
 
 #[cfg(test)]

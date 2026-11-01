@@ -711,23 +711,32 @@ pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
 
 /// A confirmation dialog's text as drawn in `area`.
 pub fn confirm_lines(area: Rect, c: &Confirm) -> Vec<String> {
-    let (_, inner) = dialog_width(area);
-    c.lines.iter().flat_map(|l| wrap_words(l, inner)).collect()
+    dialog_lines(area, &c.lines)
 }
 
 /// True when the whole dialog, keys included, fits on screen. A dialog
 /// that does not fit cannot be accepted, so nothing it would hide can be
 /// agreed to unseen.
 pub fn confirm_fits(area: Rect, c: &Confirm) -> bool {
+    dialog_fits(area, &c.lines, &c.keys)
+}
+
+/// Any dialog's text lines, wrapped as drawn in `area`.
+pub fn dialog_lines(area: Rect, lines: &[String]) -> Vec<String> {
     let (_, inner) = dialog_width(area);
-    let keys: usize = c
-        .keys
+    lines.iter().flat_map(|l| wrap_words(l, inner)).collect()
+}
+
+/// [`confirm_fits`] for any dialog's lines and keys.
+pub fn dialog_fits(area: Rect, lines: &[String], keys: &[(String, String)]) -> bool {
+    let (_, inner) = dialog_width(area);
+    let keys: usize = keys
         .iter()
         .map(|(k, d)| k.chars().count() + d.chars().count() + 4)
         .sum();
     area.width >= 20
         && area.height >= 6
-        && confirm_lines(area, c).len() + 4 < area.height as usize
+        && dialog_lines(area, lines).len() + 4 < area.height as usize
         && keys <= inner + 3
 }
 

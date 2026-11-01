@@ -22,6 +22,7 @@ pub mod motion;
 pub mod navigation;
 pub mod picker;
 pub mod prompt;
+pub mod proposals;
 pub mod recovery;
 pub mod registers;
 pub mod search;

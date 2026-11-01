@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The protocol version this crate describes, as `MAJOR.MINOR`.
-pub const PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "1.1";
 pub const PROTOCOL_MAJOR: u64 = 1;
-pub const PROTOCOL_MINOR: u64 = 0;
+pub const PROTOCOL_MINOR: u64 = 1;
 /// The `jsonrpc` member of every message.
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -45,6 +45,11 @@ pub mod methods {
     pub const COMMAND_RUN: &str = "command.run";
     pub const COMMAND_LIST: &str = "command.list";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    /// Since 1.1.
+    pub const PROPOSAL_CREATE: &str = "proposal.create";
+    pub const PROPOSAL_STATUS: &str = "proposal.status";
+    pub const PROPOSAL_LIST: &str = "proposal.list";
+    pub const PROPOSAL_WITHDRAW: &str = "proposal.withdraw";
 
     /// Every request method, in the order `initialize` reports them.
     pub const ALL: &[&str] = &[
@@ -62,6 +67,10 @@ pub mod methods {
         COMMAND_RUN,
         COMMAND_LIST,
         EVENTS_SUBSCRIBE,
+        PROPOSAL_CREATE,
+        PROPOSAL_STATUS,
+        PROPOSAL_LIST,
+        PROPOSAL_WITHDRAW,
     ];
 }
 
@@ -69,8 +78,10 @@ pub mod methods {
 pub mod notifications {
     pub const DOCUMENT_CHANGED: &str = "document.changed";
     pub const EDITOR_STATUS: &str = "editor.status";
+    /// Since 1.1: a proposal reached its final state.
+    pub const PROPOSAL_RESOLVED: &str = "proposal.resolved";
 
-    pub const ALL: &[&str] = &[DOCUMENT_CHANGED, EDITOR_STATUS];
+    pub const ALL: &[&str] = &[DOCUMENT_CHANGED, EDITOR_STATUS, PROPOSAL_RESOLVED];
 }
 
 // ----- envelopes -------------------------------------------------------------
@@ -249,6 +260,12 @@ pub enum ErrorCode {
     CommandFailed,
     /// Another I/O failure.
     Io,
+    /// Nobody can review a proposal here: the editor runs headless, or too
+    /// many proposals already wait for review. Nothing was queued.
+    ReviewUnavailable,
+    /// The proposal is no longer pending (it was approved, rejected,
+    /// withdrawn or found stale), so it cannot be withdrawn.
+    NotPending,
 }
 
 impl ErrorCode {
@@ -269,6 +286,8 @@ impl ErrorCode {
             ErrorCode::UnsavedChanges => -32015,
             ErrorCode::CommandFailed => -32016,
             ErrorCode::Io => -32017,
+            ErrorCode::ReviewUnavailable => -32018,
+            ErrorCode::NotPending => -32019,
         }
     }
 
@@ -288,6 +307,8 @@ impl ErrorCode {
         ErrorCode::UnsavedChanges,
         ErrorCode::CommandFailed,
         ErrorCode::Io,
+        ErrorCode::ReviewUnavailable,
+        ErrorCode::NotPending,
     ];
 
     pub fn from_code(code: i64) -> Option<Self> {
@@ -603,13 +624,22 @@ pub struct EditRecord {
     pub new_version: u64,
     /// Milliseconds since the Unix epoch, from the editor's clock.
     pub timestamp_ms: u64,
+    /// The proposal this edit applied, when it came from an approved
+    /// `proposal.create` rather than `document.apply_edit`. Since 1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ProposalId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryResult {
     pub doc: DocId,
-    /// Oldest first. Only edits made through the API are listed.
+    /// Oldest first. Edits made through `document.apply_edit` and approved
+    /// proposals; typing, commands, undo and reloads are not listed.
     pub edits: Vec<EditRecord>,
+    /// Proposals for this document that were decided (approved, rejected,
+    /// withdrawn, stale or failed), oldest first. Since 1.1.
+    #[serde(default)]
+    pub proposals: Vec<ProposalInfo>,
 }
 
 // ----- selections ------------------------------------------------------------
@@ -709,6 +739,187 @@ pub struct DocumentChanged {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusChanged {
     pub status: Option<Status>,
+}
+
+// ----- proposals (since 1.1) ------------------------------------------------
+
+pub type ProposalId = u64;
+
+/// Who proposes a change. Recorded as given; the server does not verify it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Actor {
+    /// For example `"agent:refactor-bot"`. Must not be empty.
+    pub name: String,
+    /// An identifier the client uses for the agent, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+/// A command to run after an approved proposal is applied and saved. No
+/// shell is involved: `program` is looked up on `PATH` and gets `args` as
+/// given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationCommand {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalCreateParams {
+    /// The document, or `path` (exactly one of the two). A path that is
+    /// not open is opened without moving the user's view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<DocId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The document version the edits were computed against.
+    pub base_version: u64,
+    pub encoding: Encoding,
+    /// The same shapes `document.apply_edit` takes.
+    pub edits: Vec<TextEdit>,
+    pub actor: Actor,
+    /// What the change does, shown to the person reviewing it. Must not be
+    /// empty.
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalParams {
+    pub proposal: ProposalId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalWithdrawParams {
+    pub proposal: ProposalId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalListParams {
+    /// Only proposals for this document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<DocId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalListResult {
+    /// Oldest first.
+    pub proposals: Vec<ProposalInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProposalState {
+    /// Waiting for the person at the editor.
+    Pending,
+    /// Approved and applied; the verification command is running.
+    Verifying,
+    /// Final. `proposal.resolved` was sent to subscribers.
+    Resolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Decision {
+    /// The person approved it and it was applied.
+    Approved,
+    /// The person rejected it; nothing changed.
+    Rejected,
+    /// The client withdrew it; nothing changed.
+    Withdrawn,
+    /// The document moved on from `base_version` (or was closed) before it
+    /// could be applied; nothing changed.
+    Stale,
+    /// Approved, but applying it failed for another reason; nothing changed.
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeciderKind {
+    /// The person using the editor: an approval (including one refused as
+    /// stale) or a rejection.
+    User,
+    /// The client: a withdrawal.
+    Client,
+    /// The editor itself: the document was closed.
+    Editor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecidedBy {
+    pub kind: DeciderKind,
+    /// For `user`, the login name from `$USER` (or `$LOGNAME`), if set.
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationInfo {
+    pub program: String,
+    pub args: Vec<String>,
+    /// The directory it runs in: the editor's working directory.
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    /// The proposal was not applied, so nothing ran.
+    NotRun,
+    Running,
+    /// Exited with status 0.
+    Passed,
+    /// Exited with another status, or was killed (`exit_code` is `null`).
+    Failed,
+    /// Could not run: saving the file failed or the program did not start.
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationResult {
+    pub status: VerificationStatus,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    /// The last lines of stdout and stderr, interleaved as read, each cut to
+    /// at most 1,000 chars.
+    pub output_tail: Vec<String>,
+    /// Lines before `output_tail` that were not kept.
+    pub output_lines_dropped: u64,
+    pub error: Option<String>,
+}
+
+/// A proposal and, once decided, what happened to it. Also the params of
+/// `proposal.resolved`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalInfo {
+    pub id: ProposalId,
+    pub doc: DocId,
+    pub path: Option<String>,
+    pub actor: Actor,
+    pub description: String,
+    pub base_version: u64,
+    pub edit_count: u64,
+    pub verification: Option<VerificationInfo>,
+    pub state: ProposalState,
+    pub decision: Option<Decision>,
+    pub decided_by: Option<DecidedBy>,
+    /// The reviewer's reason for rejecting, the client's for withdrawing,
+    /// or why it was stale or failed.
+    pub reason: Option<String>,
+    /// The document version after the proposal was applied.
+    pub applied_version: Option<u64>,
+    /// True when the document was saved to disk after applying, before the
+    /// verification command ran.
+    pub saved: bool,
+    pub verification_result: Option<VerificationResult>,
+    /// Milliseconds since the Unix epoch, from the editor's clock.
+    pub created_ms: u64,
+    pub decided_ms: Option<u64>,
+    pub resolved_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -884,9 +1095,76 @@ mod tests {
                 base_version: 0,
                 new_version: 1,
                 timestamp_ms: 5,
+                proposal: None,
             }],
+            proposals: Vec::new(),
         };
         assert_eq!(round_trip(&hist), hist);
+        // Older replies (1.0) have neither field.
+        let old: HistoryResult = serde_json::from_value(json!({"doc": 1, "edits": [
+            {"actor": "a", "description": null, "base_version": 0, "new_version": 1, "timestamp_ms": 5}
+        ]}))
+        .unwrap();
+        assert_eq!(old, hist);
+        let v = serde_json::to_value(&hist).unwrap();
+        assert!(v["edits"][0].get("proposal").is_none(), "{v}");
+
+        let info = ProposalInfo {
+            id: 3,
+            doc: 1,
+            path: Some("/tmp/a".into()),
+            actor: Actor {
+                name: "agent:x".into(),
+                agent_id: Some("x-1".into()),
+            },
+            description: "d".into(),
+            base_version: 2,
+            edit_count: 1,
+            verification: Some(VerificationInfo {
+                program: "sh".into(),
+                args: vec!["-c".into(), "true".into()],
+                cwd: "/tmp".into(),
+            }),
+            state: ProposalState::Resolved,
+            decision: Some(Decision::Approved),
+            decided_by: Some(DecidedBy {
+                kind: DeciderKind::User,
+                name: Some("me".into()),
+            }),
+            reason: None,
+            applied_version: Some(3),
+            saved: true,
+            verification_result: Some(VerificationResult {
+                status: VerificationStatus::NotRun,
+                exit_code: None,
+                duration_ms: None,
+                output_tail: vec![],
+                output_lines_dropped: 0,
+                error: None,
+            }),
+            created_ms: 1,
+            decided_ms: Some(2),
+            resolved_ms: Some(3),
+        };
+        assert_eq!(round_trip(&info), info);
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["state"], "resolved");
+        assert_eq!(v["decided_by"]["kind"], "user");
+        assert_eq!(v["verification_result"]["status"], "not_run");
+
+        let create: ProposalCreateParams = serde_json::from_value(json!({
+            "doc": 1, "base_version": 0, "encoding": "char",
+            "edits": [{"range": {"start": 0, "end": 1}, "text": "x"}],
+            "actor": {"name": "a"}, "description": "d",
+            "verification": {"program": "true"}
+        }))
+        .unwrap();
+        assert_eq!(create.actor.agent_id, None);
+        assert_eq!(
+            create.verification.as_ref().unwrap().args,
+            Vec::<String>::new()
+        );
+        assert_eq!(round_trip(&create), create);
 
         let list = CommandListResult {
             commands: vec![CommandInfo {

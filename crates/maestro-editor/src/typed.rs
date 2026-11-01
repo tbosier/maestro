@@ -61,6 +61,12 @@ static TYPED: &[TypedCommand] = &[
         fun: agents,
     },
     TypedCommand {
+        name: "proposals",
+        aliases: &[],
+        doc: "Show or hide the review of edit proposals from automation clients",
+        fun: proposals,
+    },
+    TypedCommand {
         name: "open",
         aliases: &["e", "edit"],
         doc: "Open a file (e! reloads the current one)",
@@ -452,6 +458,7 @@ fn quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
 }
 
 fn finish_quit(ed: &mut Editor) {
+    crate::proposals::stop_all(ed);
     // Best effort: a session that cannot be written must not block quitting.
     let _ = crate::navigation::session::save(ed);
     crate::agents::persist::save(ed, true);
@@ -460,6 +467,11 @@ fn finish_quit(ed: &mut Editor) {
 
 fn agents(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     ed.run_command("agent_panel");
+    Ok(())
+}
+
+fn proposals(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    ed.run_command("proposal_review");
     Ok(())
 }
 
