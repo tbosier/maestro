@@ -66,7 +66,8 @@ pub fn location(action: &PickerAction) -> Option<(&Path, Option<usize>)> {
         PickerAction::Buffer(_)
         | PickerAction::Command(_)
         | PickerAction::ChangeDir(_)
-        | PickerAction::CodeAction(_) => None,
+        | PickerAction::CodeAction(_)
+        | PickerAction::Jump(_) => None,
     }
 }
 

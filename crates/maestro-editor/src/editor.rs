@@ -223,6 +223,9 @@ pub struct Editor {
     /// Edit proposals from automation clients and their review overlay
     /// (see [`crate::proposals`]).
     pub proposals: crate::proposals::Proposals,
+    /// Projects, worktrees, the sidebar, agent attention and switching
+    /// between worktrees (see [`crate::workspaces`]).
+    pub workspaces: crate::workspaces::Workspaces,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -275,6 +278,7 @@ impl Editor {
             navigation: Default::default(),
             agents: Default::default(),
             proposals: Default::default(),
+            workspaces: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -1088,15 +1092,21 @@ impl Editor {
             self.selected_register = None;
             return;
         }
-        if self.proposals.review_open() {
+        // The focused sidebar takes its own keys; anything else (a `space`
+        // sequence) goes to the normal keymap, never to what is behind it.
+        let sidebar = self.workspaces.sidebar.has_focus();
+        if sidebar && self.pending.is_empty() && crate::workspaces::sidebar::handle_key(self, key) {
+            return;
+        }
+        if !sidebar && self.proposals.review_open() {
             crate::proposals::review::handle_key(self, key);
             return;
         }
-        if self.agents.panel_open() {
+        if !sidebar && self.agents.panel_open() {
             crate::agents::panel::handle_key(self, key);
             return;
         }
-        if self.mode == Mode::Insert {
+        if !sidebar && self.mode == Mode::Insert {
             // An open completion popup takes its keys first.
             if self.pending.is_empty() && crate::lsp::completion::handle_key(self, key) {
                 return;
@@ -1128,6 +1138,10 @@ impl Editor {
         match self.keymaps.lookup(self.mode, &self.pending) {
             Lookup::Command(name) => {
                 self.pending.clear();
+                if sidebar && name != "toggle_sidebar" {
+                    // A command typed from the sidebar acts on the editor.
+                    self.workspaces.sidebar.focused = false;
+                }
                 self.run_command(&name);
                 if self.pending_char.is_none() {
                     self.count = None;
@@ -1228,6 +1242,7 @@ impl Editor {
             MouseKind::Down | MouseKind::Drag => {
                 if kind == MouseKind::Down {
                     self.focus = view_id;
+                    self.workspaces.sidebar.focused = false;
                 } else if self.focus != view_id {
                     return;
                 }
@@ -1399,7 +1414,8 @@ impl Editor {
             self.ensure_cursor_visible();
         }
         // Terminal output only wakes the loop; this notices it.
-        crate::agents::poll(self) || ran
+        let changed = crate::agents::poll(self) || ran;
+        crate::workspaces::check_attention(self) || changed
     }
 
     /// Bookkeeping every text change needs, whatever caused it: the buffer's
@@ -1465,7 +1481,9 @@ impl Editor {
         self.check_disk_changes();
         crate::git::tick(self);
         crate::lsp::reconcile(self);
+        crate::lsp::stop_unused(self, now);
         crate::agents::tick(self, now);
+        crate::workspaces::tick(self, now);
     }
 
     fn check_disk_changes(&mut self) {

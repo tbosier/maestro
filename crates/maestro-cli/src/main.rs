@@ -149,6 +149,9 @@ fn main() -> ExitCode {
     // only: not when measuring startup, and not headless, where unattended
     // runs must not start programs that can execute repository code.
     editor.lsp.enabled = !args.first_frame_only && !args.headless;
+    // The background scan of projects and worktrees that names them in
+    // the status line; interactive use only, like language servers.
+    editor.workspaces.enabled = !args.first_frame_only && !args.headless;
     // Sessions and recent files belong to interactive use. Headless runs
     // neither read nor write them, so a scripted quit cannot replace the
     // directory's saved session. --clean keeps nothing on disk either.

@@ -136,11 +136,17 @@ pub fn write_private(path: &Path, bytes: &[u8], durable: bool) -> std::io::Resul
 
 /// The session the editor would save now.
 pub fn capture(ed: &Editor, cwd: &Path) -> SessionFile {
+    capture_where(ed, cwd, &|_| true)
+}
+
+/// [`capture`], keeping only the files `keep` accepts. Views of other
+/// files stay in the layout and are dropped when it is restored.
+pub fn capture_where(ed: &Editor, cwd: &Path, keep: &dyn Fn(&Path) -> bool) -> SessionFile {
     let focused_doc = ed.view().doc;
     let mut focused = None;
     let mut buffers = Vec::new();
     for b in ed.buffers.values() {
-        let Some(path) = b.doc.path().and_then(Path::to_str) else {
+        let Some(path) = b.doc.path().filter(|p| keep(p)).and_then(Path::to_str) else {
             continue;
         };
         // A view showing the buffer has the live selection; prefer the
@@ -322,13 +328,28 @@ fn restore_layout(
 /// Saves the session if sessions are enabled. With no named buffers open
 /// the session file is removed, so closing everything and quitting starts
 /// fresh next time.
+///
+/// After a switch between worktrees (`crate::workspaces`), the session
+/// holds only the files of the current worktree; files of other worktrees
+/// kept open for their unsaved changes belong to theirs.
 pub fn save(ed: &Editor) -> Result<(), String> {
     let nav = &ed.navigation;
     let (Some(dir), Some(cwd), true) = (&nav.state_dir, &nav.session_cwd, nav.save_session) else {
         return Ok(());
     };
-    let path = session_path(dir, cwd);
-    let session = capture(ed, cwd);
+    let session = if nav.scoped {
+        let root = cwd.clone();
+        capture_where(ed, cwd, &|p| crate::workspaces::owned_by(ed, p, &root))
+    } else {
+        capture(ed, cwd)
+    };
+    write(dir, cwd, &session)
+}
+
+/// Writes `session` as the saved session of `cwd`, or removes the file
+/// when it names no files.
+pub fn write(state_dir: &Path, cwd: &Path, session: &SessionFile) -> Result<(), String> {
+    let path = session_path(state_dir, cwd);
     if session.buffers.is_empty() {
         return match fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -337,7 +358,7 @@ pub fn save(ed: &Editor) -> Result<(), String> {
             _ => Ok(()),
         };
     }
-    let text = toml::to_string(&session).map_err(|e| e.to_string())?;
+    let text = toml::to_string(session).map_err(|e| e.to_string())?;
     write_private(&path, text.as_bytes(), true)
         .map_err(|e| format!("could not save the session to {}: {e}", path.display()))
 }
@@ -376,6 +397,14 @@ pub fn restore(ed: &mut Editor) {
             return;
         }
     };
+    let (severity, msg) = apply(ed, &session, &cwd);
+    ed.add_status(severity, msg);
+}
+
+/// Opens a session's files and restores its layout and cursors. Returns
+/// what to tell the user: how many files were restored and which were
+/// missing or could not be opened.
+pub fn apply(ed: &mut Editor, session: &SessionFile, cwd: &Path) -> (Severity, String) {
     let mut opened: Vec<(DocumentId, &SessionBuffer)> = Vec::new();
     let mut missing = Vec::new();
     let mut failed = Vec::new();
@@ -383,7 +412,7 @@ pub fn restore(ed: &mut Editor) {
     for entry in &session.buffers {
         let path = Path::new(&entry.path);
         if !path.is_file() {
-            missing.push(super::display_path(path, &cwd));
+            missing.push(super::display_path(path, cwd));
             continue;
         }
         match ed.open(path) {
@@ -443,7 +472,7 @@ pub fn restore(ed: &mut Editor) {
         severity = Severity::Warning;
         msg.push_str(&format!("; could not open: {}", failed.join(", ")));
     }
-    ed.add_status(severity, msg);
+    (severity, msg)
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ pub mod clipboard;
 mod preview;
 mod proposals;
 pub mod render;
+mod sidebar;
 pub mod surface;
 pub mod terminal;
 
@@ -201,6 +202,12 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
         if editor.area != views {
             editor.resize(views);
             dirty = true;
+        }
+        // An agent that started needing you: the bell or an OSC 9
+        // notification (crate::terminal::notify), once per change.
+        let notes = editor.workspaces.take_notifications();
+        if !notes.is_empty() {
+            terminal::notify(&mut out, &notes)?;
         }
         if dirty {
             let t0 = Instant::now();

@@ -220,6 +220,32 @@ pub fn flush(
     Ok(written)
 }
 
+/// Delivers notifications: a BEL for `bell`, an OSC 9 desktop
+/// notification (`ESC ] 9 ; text BEL`) for `osc`. Control characters in
+/// the text are replaced, so it cannot end the sequence early or reach the
+/// terminal as commands.
+pub fn notify(
+    out: &mut impl Write,
+    notes: &[maestro_editor::workspaces::Notification],
+) -> io::Result<()> {
+    use maestro_config::NotifyMethod;
+    for n in notes {
+        match n.method {
+            NotifyMethod::Bell => out.write_all(b"\x07")?,
+            NotifyMethod::Osc => {
+                let text: String = n
+                    .text
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                write!(out, "\x1b]9;{text}\x07")?;
+            }
+            NotifyMethod::Off => {}
+        }
+    }
+    out.flush()
+}
+
 fn apply_style(
     out: &mut impl Write,
     prev: Option<Style>,
@@ -262,6 +288,27 @@ mod tests {
         assert_eq!(rgb_to_256(Rgb(255, 255, 255)), 231);
         assert_eq!(rgb_to_256(Rgb(128, 128, 128)), 244);
         assert_eq!(rgb_to_256(Rgb(255, 0, 0)), 196);
+    }
+
+    #[test]
+    fn notifications_ring_or_send_osc_9_with_clean_text() {
+        use maestro_config::NotifyMethod;
+        use maestro_editor::workspaces::Notification;
+        let note = |method, text: &str| Notification {
+            method,
+            text: text.into(),
+        };
+        let mut out = Vec::new();
+        notify(
+            &mut out,
+            &[
+                note(NotifyMethod::Bell, "a"),
+                note(NotifyMethod::Osc, "sh-1 needs you\x07\x1b]0;x"),
+                note(NotifyMethod::Off, "b"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out, b"\x07\x1b]9;sh-1 needs you  ]0;x\x07");
     }
 
     #[test]
