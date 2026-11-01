@@ -199,21 +199,110 @@ fn kill_stops_the_child_and_what_it_started() {
     h.kill();
 }
 
+/// Waits up to `limit` for `pid` to be gone; whether it is.
+#[cfg(unix)]
+fn gone_within(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !alive(pid)
+}
+
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+}
+
+/// The pid a script printed as its first line.
+#[cfg(unix)]
+fn first_pid(lines: &[String]) -> u32 {
+    lines
+        .first()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or_else(|| panic!("expected a pid first: {lines:?}"))
+}
+
 #[cfg(unix)]
 #[test]
-fn a_background_process_holding_the_pipe_does_not_hold_back_finished() {
-    // The shell exits at once; its background child keeps stdout open.
-    let (h, rx) = run(&sh("echo before; sleep 5 & exit 0"));
+fn a_background_process_left_behind_ends_when_the_command_finishes() {
+    // The shell exits at once; its background child would run for 1000
+    // seconds and keeps stdout open.
     let t = Instant::now();
-    let (lines, code, _) = collect(&rx, Duration::from_secs(4));
-    assert_eq!(lines, vec!["before"]);
+    let (_h, rx) = run(&sh("sleep 1000 & echo $!; echo done"));
+    let (lines, code, _) = collect(&rx, Duration::from_secs(5));
+    let elapsed = t.elapsed();
+    let leftover = first_pid(&lines);
+    let gone = gone_within(leftover, Duration::from_secs(1));
+    if !gone {
+        kill_pid(leftover);
+    }
+    assert_eq!(lines[1..], ["done"]);
+    assert_eq!(code, Some(0), "the command's own status, not the cleanup's");
+    assert!(gone, "the background sleep {leftover} outlived the task");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_leftover_that_ignores_sighup_is_killed_after_the_grace_period() {
+    let t = Instant::now();
+    let (_h, rx) = run(&sh(
+        "(trap '' HUP; exec sleep 1000) & echo $!; sleep 0.1; exit 4",
+    ));
+    let (lines, code, _) = collect(&rx, Duration::from_secs(5));
+    let elapsed = t.elapsed();
+    let leftover = first_pid(&lines);
+    let gone = gone_within(leftover, Duration::from_secs(1));
+    if !gone {
+        kill_pid(leftover);
+    }
+    assert_eq!(code, Some(4));
+    assert!(
+        gone,
+        "the sleep that ignores SIGHUP ({leftover}) outlived the task"
+    );
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_that_left_the_group_is_not_signaled_and_does_not_hold_back_finished() {
+    if std::process::Command::new("setsid")
+        .arg("true")
+        .status()
+        .is_err()
+    {
+        eprintln!("no setsid program; skipped");
+        return;
+    }
+    // `setsid` makes the sleep a session (and group) of its own. It keeps
+    // stdout open, so Finished waits for the pipe no longer than its
+    // bounds. The shell exits only once the sleep has left the group.
+    let ready = std::env::temp_dir().join(format!("maestro-setsid-{}", std::process::id()));
+    let _ = std::fs::remove_file(&ready);
+    let t = Instant::now();
+    let (_h, rx) = run(&spec(
+        "sh",
+        &[
+            "-c",
+            "setsid sh -c ': > \"$1\"; exec sleep 1000' sh \"$1\" & \
+             while [ ! -e \"$1\" ]; do sleep 0.01; done; echo $!; echo done",
+            "sh",
+            &ready.display().to_string(),
+        ],
+    ));
+    let (lines, code, _) = collect(&rx, Duration::from_secs(8));
+    let elapsed = t.elapsed();
+    let outside = first_pid(&lines);
+    let _ = std::fs::remove_file(&ready);
+    let survived = alive(outside);
+    kill_pid(outside);
     assert_eq!(code, Some(0));
-    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
-    // The leftover sleep is not ours to stop once the task finished, but
-    // tidy up the test's own process group.
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{}", h.id())])
-        .status();
+    assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+    assert!(survived, "a process outside the task's group was signaled");
 }
 
 fn expected_summary() -> TestSummary {

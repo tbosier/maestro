@@ -4,7 +4,7 @@ Scripts and agents drive Maestro through a JSON-RPC 2.0 protocol instead of simu
 
 - Wire types: `crates/maestro-protocol` (serde only, no editor dependency, so clients can depend on it).
 - Server and transports: `crates/maestro-automation`.
-- Protocol version: `1.1`. Version 1.1 added the `proposal.*` methods, the `proposal.resolved` notification, error codes -32018 and -32019, and two fields in `document.history` (`proposal` on an edit, and `proposals`). A 1.0 client keeps working: nothing it used changed shape.
+- Protocol version: `1.2`. Version 1.1 added the `proposal.*` methods, the `proposal.resolved` notification, error codes -32018 and -32019, and two fields in `document.history` (`proposal` on an edit, and `proposals`). Version 1.2 limits `proposal.withdraw` to the connection that created the proposal and added error code -32020. A 1.0 or 1.1 client keeps working unless it withdrew proposals another connection created.
 
 ## Transports
 
@@ -92,6 +92,7 @@ Selections use the editor's model: a range covers every grapheme from `min(ancho
 | -32017 | I/O | any other file error |
 | -32018 | review unavailable | `proposal.create` where nobody can review it (headless), or with 100 proposals already pending; nothing was queued |
 | -32019 | not pending | `proposal.withdraw` on a proposal that was already decided |
+| -32020 | not owner | `proposal.withdraw` from a connection other than the one that created the proposal; nothing changed |
 
 ## Methods
 
@@ -108,7 +109,7 @@ Params: `protocol_version` (string), `client_name` (optional). Result: `protocol
 <-- {"jsonrpc":"2.0","id":2,"result":{"capabilities":["apply_edit.char_positions","apply_edit.lsp_positions","apply_edit.version_check","document.history","events.document_changed","events.editor_status"],"methods":["initialize","editor.snapshot","editor.execute","editor.quit","document.open","document.text","document.save","document.apply_edit","document.history","selections.get","selections.set","command.run","command.list","events.subscribe"],"notifications":["document.changed","editor.status"],"protocol_version":"1.0","server_name":"maestro","server_version":"0.1.0"}}
 ```
 
-That exchange is from protocol 1.0. A 1.1 server, headless, answered a 1.0 client on October 31, 2026 with:
+That exchange is from protocol 1.0. A 1.1 server, headless, answered a 1.0 client on October 31, 2026 with the block below; on November 1, 2026 a 1.2 server answered a 1.1 client with the same result except `"protocol_version":"1.2"`:
 
 ```
 <-- {"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.1","server_name":"maestro","server_version":"0.1.0","methods":["initialize","editor.snapshot","editor.execute","editor.quit","document.open","document.text","document.save","document.apply_edit","document.history","selections.get","selections.set","command.run","command.list","events.subscribe","proposal.create","proposal.status","proposal.list","proposal.withdraw"],"notifications":["document.changed","editor.status","proposal.resolved"],"capabilities":["apply_edit.char_positions","apply_edit.lsp_positions","apply_edit.version_check","document.history","events.document_changed","events.editor_status"]}}
@@ -275,7 +276,16 @@ The base version and the edits are checked at once, with the same rules and erro
 
 - `proposal.status` params: `proposal` (the id). Result: the proposal. -32011 if there is no such proposal.
 - `proposal.list` params: `doc` (optional). Result: `proposals`, oldest first, pending and decided, for that document or for all.
-- `proposal.withdraw` params: `proposal`, `reason` (optional). The client takes back a pending proposal; it resolves as `withdrawn` with `decided_by` `client`. -32019 if it was already decided. A confirmation dialog the reviewer had open for it is closed.
+- `proposal.withdraw` params: `proposal`, `reason` (optional). The client takes back a pending proposal; it resolves as `withdrawn` with `decided_by` `client`. Only the connection that created the proposal can withdraw it: any other connection gets -32020, whatever actor name it sends, since actor names are whatever a client says and cannot tell clients apart. The check comes before the state check, so -32019 (already decided) goes only to the creator. A proposal whose connection closed can no longer be withdrawn; a new connection is a different connection. The person at the editor can still reject it. A confirmation dialog the reviewer had open for it is closed.
+
+Two Python clients on the socket of `maestro --clean --listen <path> greet.txt` (release build, November 1, 2026). Client A created proposal 1 with actor `agent:shared-name`; client B, on its own connection, tried to withdraw it:
+
+```
+B --> {"jsonrpc": "2.0", "id": 2, "method": "proposal.withdraw", "params": {"proposal": 1, "reason": "B tries"}}
+B <-- {"jsonrpc": "2.0", "id": 2, "error": {"code": -32020, "message": "proposal 1 was created by another connection; only that connection can withdraw it (the person at the editor can reject it). Nothing changed"}}
+```
+
+`proposal.status` from B still said `"state": "pending"`, and A's own `proposal.withdraw` then returned it with `"decision": "withdrawn"`.
 
 A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edit_count`, `verification` (`{program, args, cwd}` or `null`), `state` (`pending`, `verifying` while its command runs, `resolved`), `decision` (`approved`, `rejected`, `withdrawn`, `stale`, `failed`, or `null` while pending), `decided_by` (`{"kind": "user", "name": $USER}`, `{"kind": "client"}` or `{"kind": "editor"}`), `reason`, `applied_version`, `saved`, `verification_result`, and `created_ms`, `decided_ms`, `resolved_ms`.
 
@@ -301,7 +311,7 @@ On `y` the editor checks the proposal again. If the document is no longer at `ba
 
 A proposal with a verification command is then saved to disk, because the command reads the file. If the buffer already had unsaved edits of the user's (the client computed its change against them), saving writes those too, and the dialog says so before `y`. If the file's metadata (size, modification time, identity) shows it changed on disk since it was read, approval is refused before anything is applied, and the proposal stays pending. A rewrite that keeps the size and time is only found by the content check when saving, after the proposal was applied. Then, as for any failed save, the proposal stays applied (one `u` reverts it), the file is not written, the command does not run, and the proposal resolves with `verification_result.status` `error`. The command runs through `maestro-tasks` in its own process group; the editor does not wait for it. A proposal without a command is applied and not saved, like `document.apply_edit`.
 
-Closing a document resolves its pending proposals as `stale` with `decided_by` `editor`. Quitting the editor, or `c` in the review, kills a running verification command's process group. Background processes the command started and left behind after it exited are not killed: once the command itself has exited, Maestro cannot safely signal its process group.
+Closing a document resolves its pending proposals as `stale` with `decided_by` `editor`. Quitting the editor, or `c` in the review, kills a running verification command's process group. When the command exits, background processes it left in its process group get SIGHUP, then SIGKILL once nothing else is left in the group or after 200 ms, and only then does the proposal resolve. `verification_result.exit_code` is the command's own exit code. A process that moved to another process group or session (`setsid`, a daemon) is not reached. This goes through the `kill` program (each call waits for it at most a second); if `kill` is missing or fails, the leftovers keep running. On Linux, when Maestro was started with SIGCHLD ignored (the kernel then reaps children by itself, so no child's pid is safe to signal), no process group is signaled at all and leftovers keep running; elsewhere that case cannot be detected.
 
 ### Example
 

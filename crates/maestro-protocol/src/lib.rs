@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The protocol version this crate describes, as `MAJOR.MINOR`.
-pub const PROTOCOL_VERSION: &str = "1.1";
+pub const PROTOCOL_VERSION: &str = "1.2";
 pub const PROTOCOL_MAJOR: u64 = 1;
-pub const PROTOCOL_MINOR: u64 = 1;
+pub const PROTOCOL_MINOR: u64 = 2;
 /// The `jsonrpc` member of every message.
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -266,6 +266,9 @@ pub enum ErrorCode {
     /// The proposal is no longer pending (it was approved, rejected,
     /// withdrawn or found stale), so it cannot be withdrawn.
     NotPending,
+    /// `proposal.withdraw` from a connection other than the one that
+    /// created the proposal. Nothing changed.
+    NotOwner,
 }
 
 impl ErrorCode {
@@ -288,6 +291,7 @@ impl ErrorCode {
             ErrorCode::Io => -32017,
             ErrorCode::ReviewUnavailable => -32018,
             ErrorCode::NotPending => -32019,
+            ErrorCode::NotOwner => -32020,
         }
     }
 
@@ -309,6 +313,7 @@ impl ErrorCode {
         ErrorCode::Io,
         ErrorCode::ReviewUnavailable,
         ErrorCode::NotPending,
+        ErrorCode::NotOwner,
     ];
 
     pub fn from_code(code: i64) -> Option<Self> {

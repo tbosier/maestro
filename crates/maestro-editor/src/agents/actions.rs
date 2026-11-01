@@ -1104,9 +1104,9 @@ pub struct IntegrateFacts {
     pub agent_running: bool,
     /// The agent's task contract.
     pub contract: Option<super::contract::Contract>,
-    /// Changed files the contract does not allow, with the reason, from a
-    /// review diff taken for the dialog. Integrating them needs `O`; after
-    /// the commit, any other file outside the contract stops the
+    /// Changed files the contract does not allow, with the reason, from
+    /// the snapshot the dialog was checked on. Integrating them needs `O`;
+    /// after the commit, any other file outside the contract stops the
     /// integration.
     pub out_of_scope: Vec<(PathBuf, String)>,
     /// Why the last verification does not vouch for these files, if it
@@ -1122,25 +1122,49 @@ pub struct IntegrateFacts {
     /// Files in which this agent's own work conflicts with the target
     /// branch now, from a dry run; `maestro-git` refuses such a merge.
     pub own_conflicts: Vec<PathBuf>,
-    /// The tree of the agent's files when the dialog was checked. After
-    /// the commit, the branch must hold exactly this, or nothing is
-    /// integrated: the dialog's lists and warnings were about these files.
-    pub checked_tree: Option<String>,
+    /// The tree of the agent's files (committed, uncommitted and
+    /// untracked) when the dialog was checked; every list and warning in
+    /// the dialog comes from this one snapshot.
+    pub checked_tree: String,
+    /// The commit the agent's branch pointed at then. What is integrated
+    /// is this commit, or the commit Maestro makes on top of it, and only
+    /// when that holds exactly `checked_tree` and the branch still points
+    /// at it right before the merge. Anything else (the agent committed,
+    /// reset or rebased after the dialog was checked) integrates nothing.
+    pub checked_head: String,
 }
 
-/// Paths outside the contract that integrating the agent's branch could
-/// bring: those of the net diff from its fork point (committed and
-/// uncommitted work) and those any commit on the branch touches, since a
-/// file changed and changed back is invisible in the net diff but a
-/// cherry-pick applies each commit.
+/// The net change of `commit` since its fork point from `base`, as the
+/// review shows it.
+fn diff_since_fork(
+    repo: &maestro_git::Repository,
+    base: &str,
+    commit: &str,
+) -> Result<Vec<maestro_git::DiffFile>, String> {
+    repo.diff(
+        &maestro_git::DiffSpec::SinceForkPoint {
+            base: base.to_string(),
+            head: commit.to_string(),
+        },
+        &[],
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Paths outside the contract that integrating `commit` could bring:
+/// those of its net diff from the fork point and those any commit up to
+/// it touches, since a file changed and changed back is invisible in the
+/// net diff but a cherry-pick applies each commit. `commit` is a snapshot
+/// of the worktree for the dialog and the branch's commit afterward.
 fn contract_violations(
     c: &super::contract::Contract,
     wt: &maestro_git::Repository,
     base: &str,
+    commit: &str,
 ) -> Result<Vec<(PathBuf, String)>, String> {
-    let files = wt.review_diff(base).map_err(|e| e.to_string())?;
+    let files = diff_since_fork(wt, base, commit)?;
     let mut out = super::out_of_scope(c, &files);
-    for p in wt.paths_touched(base, "HEAD").map_err(|e| e.to_string())? {
+    for p in wt.paths_touched(base, commit).map_err(|e| e.to_string())? {
         if !out.iter().any(|(q, _)| *q == p)
             && let Some(why) = c.violation(&p)
         {
@@ -1428,27 +1452,31 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 clean_after: Vec::new(),
                 unchecked: Vec::new(),
                 own_conflicts: Vec::new(),
-                checked_tree: None,
+                checked_tree: String::new(),
+                checked_head: String::new(),
             };
             let (wt, main) = check_before_commit(&git, &facts)?;
+            // One snapshot of the agent's files, from Git now rather than
+            // the review's last refresh; everything below is about it.
+            let snap = wt
+                .work_snapshot()
+                .map_err(|e| format!("could not read the agent's files: {e}"))?;
+            facts.checked_tree = snap.tree.clone();
+            facts.checked_head = snap.head.clone();
             let st = wt.status().map_err(|e| e.to_string())?;
             facts.uncommitted = st
                 .uncommitted()
                 .chain(st.untracked())
                 .map(|e| e.path.clone())
                 .collect();
-            // What would be integrated, from Git now rather than the
-            // review's last refresh.
-            let files = wt.review_diff(&w.base).map_err(|e| e.to_string())?;
+            let files = diff_since_fork(&wt, &w.base, &snap.commit)?;
             if let Some(c) = &facts.contract {
-                facts.out_of_scope = contract_violations(c, &wt, &w.base)?;
+                facts.out_of_scope = contract_violations(c, &wt, &w.base, &snap.commit)?;
             }
             let mine: std::collections::BTreeSet<PathBuf> =
                 files.iter().flat_map(super::file_paths).cloned().collect();
-            let snap = wt.work_snapshot().map_err(|e| e.to_string());
             // The files now against the files the last verification ran on.
-            let tree = snap.as_ref().ok().map(|s| s.tree.clone());
-            facts.checked_tree = tree.clone();
+            let tree = Some(snap.tree.clone());
             let changed = match (last_test.as_ref().and_then(|t| t.tree.clone()), &tree) {
                 (Some(from), Some(to)) if from != *to => main
                     .diff(
@@ -1468,7 +1496,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 .iter()
                 .filter(|o| super::conflicts::paths_overlap(&o.paths, &mine))
                 .collect();
-            conflicts_after(&git, &main, snap, &overlapping, &mut facts);
+            conflicts_after(&git, &main, Ok(snap), &overlapping, &mut facts);
             Ok(facts)
         })();
         tx.send(move |ed| match facts {
@@ -1677,7 +1705,8 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
     );
     if facts.agent_running {
         lines.push(
-            "The agent is still running: what it changes after the commit is left out.".into(),
+            "The agent is still running: only what this check saw can be integrated. A commit or file change Maestro sees before the merge stops the integration; a later one is left out."
+                .into(),
         );
     }
     let go = if facts.out_of_scope.is_empty() {
@@ -1798,31 +1827,22 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             return out;
         }
     }
-    // The dialog's lists and warnings were about the files as they were
-    // then. If the committed branch holds anything else (the agent wrote
-    // while the dialog was up), nothing is integrated.
-    if let Some(checked) = &f.checked_tree {
-        match wt.work_snapshot().map(|s| s.tree) {
-            Ok(now) if now == *checked => {}
-            Ok(_) => {
-                out.outcome = Err(
-                    "the agent's files changed after the dialog was checked; nothing was \
-                     integrated. Press I again to see what it would bring now"
-                        .into(),
-                );
-                return out;
-            }
-            Err(e) => {
-                out.outcome = Err(format!("could not read the committed work ({e})"));
-                return out;
-            }
+    // The dialog's lists and warnings were about one snapshot: the
+    // branch at `checked_head` plus the files on disk. What may be
+    // integrated is that commit, or Maestro's commit of those files on top
+    // of it, and nothing else.
+    let reviewed = match reviewed_commit(&wt, f, out.committed.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            out.outcome = Err(e);
+            return out;
         }
-    }
+    };
     // Judged against the contract again, history included: a file outside
     // it that the dialog did not list stops the integration.
     let accepted = |p: &PathBuf| f.out_of_scope.iter().any(|(q, _)| q == p);
     if let Some(c) = &f.contract {
-        match contract_violations(c, &wt, &f.base) {
+        match contract_violations(c, &wt, &f.base, &reviewed) {
             Ok(v) => {
                 let new: Vec<PathBuf> = v
                     .into_iter()
@@ -1854,12 +1874,22 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             return out;
         }
     };
+    // Only that commit: `maestro-git` refuses if the branch no longer
+    // points at it, and gives git the commit id, not the branch name.
     out.outcome = main
-        .integrate(&f.branch, how)
+        .integrate_reviewed(
+            &f.branch,
+            maestro_git::Reviewed {
+                commit: &reviewed,
+                target: &f.target,
+                base: &f.base,
+            },
+            how,
+        )
         .map_err(|e| integrate_words(&e, &f.target));
-    // The branch could still move in the moment between those checks and
-    // the merge. What reached the target is checked against the contract,
-    // and anything outside it the dialog did not list is reported.
+    // What reached the target is checked against the contract once more,
+    // and anything outside it the dialog did not list is reported. It
+    // should never find anything; it is a check on the checks above.
     if let (Some(c), Ok(o)) = (&f.contract, &out.outcome) {
         let landed = main.diff(
             &maestro_git::DiffSpec::Revisions {
@@ -1880,6 +1910,50 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
         }
     }
     out
+}
+
+/// The commit to integrate, after Maestro's commit of the agent's work
+/// (`committed`, if it made one): it must be exactly what the dialog was
+/// checked on. Without a commit of Maestro's, that is the branch's commit
+/// then; with one, a commit whose only parent is that commit. Its files
+/// must be the dialog's snapshot either way.
+fn reviewed_commit(
+    wt: &maestro_git::Repository,
+    f: &IntegrateFacts,
+    committed: Option<&str>,
+) -> Result<String, String> {
+    let shape = wt
+        .commit_shape(committed.unwrap_or("HEAD"))
+        .map_err(|e| format!("could not read the agent's branch ({e}); nothing was integrated"))?;
+    let on_checked_head = match committed {
+        Some(_) => shape.parents == [f.checked_head.as_str()],
+        None => shape.commit == f.checked_head,
+    };
+    if !on_checked_head {
+        // Someone else committed (or reset) in the agent's worktree, before
+        // or while Maestro committed.
+        let now = match committed {
+            Some(_) => shape.parents.first().cloned().unwrap_or_default(),
+            None => shape.commit.clone(),
+        };
+        return Err(branch_moved(&now));
+    }
+    if shape.tree != f.checked_tree {
+        return Err(
+            "the agent's files changed after the dialog was checked; nothing was \
+             integrated. Press I again to see what it would bring now"
+                .into(),
+        );
+    }
+    Ok(shape.commit)
+}
+
+fn branch_moved(now: &str) -> String {
+    format!(
+        "the agent's branch moved after the dialog was checked (it is now at {}); nothing was \
+         integrated. Press I again to see what it would bring now",
+        super::create::short(now)
+    )
 }
 
 /// Plain words for a refusal or failure.
@@ -1922,6 +1996,15 @@ pub fn integrate_words(e: &IntegrateError, target: &str) -> String {
             "the main worktree changed during the checks; nothing was integrated".into()
         }
         IntegrateError::Unexpected(s) => format!("git reported success, but {s}"),
+        IntegrateError::SourceMoved { found, .. } => branch_moved(found),
+        IntegrateError::WrongTarget { expected, found } => {
+            format!("the main worktree is now on {found}, not {expected}; nothing was integrated")
+        }
+        IntegrateError::BaseNotOnTarget { base } => format!(
+            "the agent started from {}, which is no longer on {target}; integrating would also \
+             bring in commits the review does not show. Nothing was integrated",
+            super::create::short(base)
+        ),
     }
 }
 
@@ -1965,7 +2048,7 @@ fn integrated(ed: &mut Editor, id: AgentId, how: Integration, r: Integrated) {
                     ),
                     None => format!(
                         "{} now has changes outside the task contract that the dialog did not \
-                         list: {}. The agent's branch moved in the moment before the merge",
+                         list: {}",
                         r.target,
                         list_paths(&r.late_out_of_scope)
                     ),
