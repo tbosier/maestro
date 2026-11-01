@@ -1347,7 +1347,8 @@ fn a_change_while_the_dialog_is_open_needs_a_second_look() {
         json!({"doc": doc, "base_version": 0, "encoding": "char",
                "edits": [{"range": {"start": 0, "end": 0}, "text": "// c\n"}], "actor": "other"}),
     );
-    // `y` does not apply a change the dialog did not show.
+    // `y` does not apply a change the dialog did not show, and `a y` typed
+    // ahead in the same burst cannot approve it either.
     h.keys("y");
     assert!(
         h.status()
@@ -1355,10 +1356,26 @@ fn a_change_while_the_dialog_is_open_needs_a_second_look() {
         "{}",
         h.status()
     );
+    h.keys("a");
+    assert!(h.ed.proposals.review.as_ref().unwrap().dialog.is_none());
+    assert!(
+        h.status().contains("the diff just changed"),
+        "{}",
+        h.status()
+    );
+    h.keys("y");
     let st = h.ok("proposal.status", json!({"proposal": id}));
     assert_eq!(st["state"], "pending", "{st}");
     assert_eq!(h.text(doc), (format!("// c\n{LIB}"), 1));
-    // A second look shows the rebase, and `y` applies it.
+    // Half a second later (simulated), a second look shows the rebase, and
+    // `y` applies it.
+    h.ed.proposals
+        .get_mut(maestro_editor::proposals::ProposalId(id))
+        .unwrap()
+        .intent
+        .as_mut()
+        .unwrap()
+        .refused_ms = Some(0);
     h.keys("a");
     assert!(h.dialog_text().contains("Rebased"), "{}", h.dialog_text());
     h.keys("y");

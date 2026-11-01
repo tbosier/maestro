@@ -330,7 +330,17 @@ pub struct Intent {
     /// The preview version the approval dialog described when it was
     /// opened. Approval applies only that.
     pub shown: Option<DocumentVersion>,
+    /// When approval was last refused because the change differed from
+    /// the dialog's (milliseconds since the Unix epoch). An `a` right after
+    /// that was typed ahead, before the new diff could be drawn, so it is
+    /// ignored for [`RESHOW_MS`].
+    pub refused_ms: Option<u64>,
 }
+
+/// After approval was refused because the change was recomputed, `a` on
+/// that proposal is ignored for this long, so keys typed ahead in one
+/// burst (`y a y`) cannot approve a diff that was never on screen.
+pub const RESHOW_MS: u64 = 500;
 
 /// A rerun of an intent's pipeline that failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +360,7 @@ impl Intent {
             preview_version: run.version,
             failed: None,
             shown: None,
+            refused_ms: None,
         }
     }
 }
@@ -934,6 +945,9 @@ pub fn approve(ed: &mut Editor, id: ProposalId) {
              press a again",
             id.0, i.preview_version.0
         );
+        if let Some(i) = ed.proposals.get_mut(id).and_then(|p| p.intent.as_mut()) {
+            i.refused_ms = Some(now_ms());
+        }
         ed.error(msg);
         review::after_change(ed);
         return;

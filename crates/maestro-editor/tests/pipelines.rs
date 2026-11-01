@@ -865,6 +865,24 @@ fn replace_text_uses_capture_groups_inside_the_selections_only() {
 }
 
 #[test]
+fn a_selection_replaced_whole_still_covers_the_new_text() {
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 0, 80, 24));
+    run(&mut ed, "ifoo tail<esc>");
+    ed.set_selection(maestro_core::Selection::single(0, 2));
+    assert_eq!(selections(&ed), ["foo"]);
+    command(&mut ed, "replace-text foo longer");
+    assert_eq!(text(&ed), "longer tail");
+    assert_eq!(selections(&ed), ["longer"]);
+    // So the next step acts on all of it.
+    command(&mut ed, "append _suffix");
+    assert_eq!(text(&ed), "longer_suffix tail");
+    // A replacement inside the selection keeps both ends where they were.
+    ed.set_selection(maestro_core::Selection::single(0, 12));
+    command(&mut ed, "replace-text suf SUF");
+    assert_eq!(selections(&ed), ["longer_SUFfix"]);
+}
+
+#[test]
 fn delete_wrap_prepend_and_append_change_each_selection_as_one_undo_step() {
     let dir = temp_dir("edits");
     let src = "fn a() {\n    let s = \"x\";\n    let t = \"y\";\n}\nfn b() {}\n";
@@ -973,6 +991,7 @@ fn insert_below_follows_the_last_line_with_the_first_lines_indentation() {
 
 #[test]
 fn text_step_arguments_quote_and_escape_simply() {
+    const UNCLOSED: &str = "this quote is never closed, so the rest of the line would be text; close it, or write a quote character inside a quoted text as \\\"";
     let dir = temp_dir("quoting");
     let src = "fn a() {}\n";
     let mut ed = open(&dir.join("x.rs"), src);
@@ -988,11 +1007,25 @@ fn text_step_arguments_quote_and_escape_simply() {
     assert_eq!(text(&ed), "fn a() {}\\t\n");
     run(&mut ed, "u");
     assert_eq!(text(&ed), src);
+    // Paired quotes inside a bare text keep a bar from splitting and stay
+    // as written; a lone quote character is written quoted.
+    command(&mut ed, r#"select-nodes fn | insert-above #[doc = "a|b"]"#);
+    assert_eq!(text(&ed), "#[doc = \"a|b\"]\nfn a() {}\n");
+    run(&mut ed, "u");
+    command(&mut ed, r#"select-nodes fn | append "\"""#);
+    assert_eq!(text(&ed), "fn a() {}\"\n");
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
 
     let refused = [
         (
             r#"select-nodes fn | append "open"#,
-            r#"step 2 (append), column 26: this quoted text has no closing ""#.to_string(),
+            format!("step 2 (append), column 26: {UNCLOSED}"),
+        ),
+        (
+            // A quote inside a bare text must not swallow the next step.
+            r#"select-nodes fn | append foo" | delete"#,
+            format!("step 2 (append), column 29: {UNCLOSED}"),
         ),
         (
             "select-nodes fn | prepend x | append y",
