@@ -91,6 +91,14 @@ fn main() {
             "a_loaded_record_whose_worktree_changed_is_not_archived",
             a_loaded_record_whose_worktree_changed_is_not_archived,
         ),
+        (
+            "a_worktree_switched_after_loading_is_not_touched",
+            a_worktree_switched_after_loading_is_not_touched,
+        ),
+        (
+            "records_written_by_another_maestro_are_kept",
+            records_written_by_another_maestro_are_kept,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -1213,10 +1221,7 @@ fn records_survive_a_restart_and_loaded_agents_can_be_finished() {
     }
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("keep this") && saved.contains("3 passed"));
-    assert!(
-        !saved.contains("printf"),
-        "no provider command line is saved"
-    );
+    assert!(!saved.contains("printf"), "no provider arguments are saved");
 
     // A new editor in the same directory: nothing is read until the
     // panel opens.
@@ -1686,6 +1691,15 @@ fn a_loaded_acp_agent_relaunches_into_its_saved_session() {
             .iter()
             .any(|h| h.text.contains("loaded the saved session fake-session"))
     );
+    // A replayed tool call keeps its later update in the transcript, and
+    // neither goes into the history or the status.
+    assert!(
+        a.transcript.iter().any(|e| matches!(e,
+            TranscriptEntry::Tool { id, status, .. } if id == "old-tool" && status == "completed")),
+        "{:?}",
+        a.transcript
+    );
+    assert!(!a.history.iter().any(|h| h.text.contains("old-tool")));
     run(&mut ed, "f");
     ed.paste_text("say after the relaunch");
     run(&mut ed, "\n");
@@ -1761,4 +1775,128 @@ fn a_loaded_record_whose_worktree_changed_is_not_archived() {
         assert!(msg.contains("now on branch other"), "{key}: {msg}");
     }
     assert!(wt.join("x.txt").exists(), "nothing was removed");
+}
+
+fn x_writer() -> Config {
+    config(&[(
+        "sh",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "printf x > x.txt", "sh", "{task}"],
+        ),
+    )])
+}
+
+/// The worktree is checked again when it is used, not only at load: a
+/// switch to other work after loading stops tests, relaunch and drop file.
+fn a_worktree_switched_after_loading_is_not_touched() {
+    let f = Fixture::new();
+    let mut ed = f.session_editor(x_writer());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write x", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    let wt = worktree(&ed, 0);
+    quit(&mut ed);
+    drop(ed);
+
+    let mut ed = f.session_editor(x_writer());
+    open_and_load(&mut ed, 1);
+    assert!(agent(&ed, 0).worktree_note.is_none());
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "the review", |ed| review_paths(ed, 0) == ["x.txt"]);
+    run(&mut ed, "<esc>");
+    // Now someone puts other work in that directory, with an x.txt of its
+    // own that the old review still lists.
+    f.git(&wt, &["checkout", "-q", "-b", "other"]);
+    f.git(&wt, &["add", "-A"]);
+    f.git(&wt, &["commit", "-q", "-m", "not the agent's"]);
+    for key in ["t", "R"] {
+        run(&mut ed, key);
+        let msg = status_text(&ed);
+        assert!(msg.contains("on branch other now"), "{key}: {msg}");
+        assert!(!agent(&ed, 0).is_running() && agent(&ed, 0).tests.is_empty());
+    }
+    // The review still lists the file; dropping it is refused by the
+    // check on the background thread.
+    run(&mut ed, "\nDy");
+    poll_until(&mut ed, "the refused drop", |ed| {
+        status_text(ed).contains("could not drop the change")
+    });
+    let msg = status_text(&ed);
+    assert!(msg.contains("is on other, not maestro/write-x-1"), "{msg}");
+    assert_eq!(std::fs::read_to_string(wt.join("x.txt")).unwrap(), "x");
+}
+
+/// Another Maestro saving in between: its new records are kept, and a
+/// file it left unusable is not overwritten.
+fn records_written_by_another_maestro_are_kept() {
+    let f = Fixture::new();
+    let mut ed = f.session_editor(x_writer());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write x", 0);
+    poll_until(&mut ed, "the program", |ed| {
+        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+    });
+    quit(&mut ed);
+    drop(ed);
+
+    let mut ed = f.session_editor(x_writer());
+    open_and_load(&mut ed, 1);
+    start_task(&mut ed, "write y", 0);
+    poll_until(&mut ed, "the second agent", |ed| {
+        ed.agents.agents.len() == 2 && agent(ed, 1).exited.is_some()
+    });
+    assert_eq!(id(&ed, 1), AgentId(2));
+    // Meanwhile another Maestro saved an agent 2 of its own.
+    let path = f.records();
+    let mut file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut other = file["agents"][0].clone();
+    other["id"] = 2.into();
+    other["name"] = "sh-2".into();
+    other["task"] = "the other editor's task".into();
+    let elsewhere = f.tmp.join("repo-worktrees/elsewhere-2");
+    other["worktree"]["path"] = elsewhere.to_str().unwrap().into();
+    other["worktree"]["branch"] = "maestro/elsewhere-2".into();
+    file["agents"].as_array_mut().unwrap().push(other);
+    std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+    ed.tick(Instant::now());
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("1 agent record(s) saved by another Maestro"),
+        "{msg}"
+    );
+    let theirs = ed
+        .agents
+        .agents
+        .iter()
+        .find(|a| a.task == "the other editor's task")
+        .unwrap();
+    assert_eq!(theirs.id, AgentId(3), "renumbered: 2 was taken here");
+    assert_eq!(theirs.name, "sh-3");
+    assert!(theirs.from_earlier_session());
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let tasks: Vec<&str> = saved["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["task"].as_str().unwrap())
+        .collect();
+    assert_eq!(tasks, ["write x", "write y", "the other editor's task"]);
+
+    // Then it leaves the file unusable: this editor stops saving and does
+    // not replace it.
+    std::fs::write(&path, "{\"version\": 9}").unwrap();
+    run(&mut ed, "\nc");
+    ed.paste_text("a new comment");
+    run(&mut ed, "\n<esc>");
+    ed.tick(Instant::now());
+    let msg = status_text(&ed);
+    assert!(msg.contains("can no longer be used"), "{msg}");
+    quit(&mut ed);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\": 9}");
 }

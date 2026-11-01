@@ -803,18 +803,37 @@ fn loading(name: &str, extra: &[&str], session: &str) -> Harness {
 
 #[test]
 fn a_saved_session_is_loaded_when_the_agent_supports_it() {
-    let h = loading("load", &[LOAD_SESSION_ARG], SESSION_ID);
-    // Sent before the load is answered: it waits for the session.
+    // The fake answers session/load 300 ms after replaying, so the prompt
+    // below is issued while the load is still open (the session id is not
+    // set yet), and its turn runs once the load is answered.
+    let h = loading("load", &[LOAD_SESSION_ARG, SLOW_SESSION_ARG], SESSION_ID);
     h.client.prompt("say after the load").unwrap();
+    assert_eq!(h.client.session_id(), None, "the load is not answered yet");
     let events = h.wait_for(|e| matches!(e, AcpEvent::SessionLoaded { .. }));
     assert_eq!(
-        events,
+        events[0],
+        AcpEvent::Initialized {
+            agent_name: Some("fake-acp-agent".to_string()),
+            load_session: true,
+        }
+    );
+    assert_eq!(
+        events[1],
+        AcpEvent::Update(TranscriptEntry::User("earlier prompt".to_string()))
+    );
+    assert!(
+        matches!(&events[2], AcpEvent::Update(TranscriptEntry::Tool { id, status, .. })
+            if id == "old-tool" && status == "pending"),
+        "{events:?}"
+    );
+    assert!(
+        matches!(&events[3], AcpEvent::ToolUpdate { id, status: Some(s), .. }
+            if id == "old-tool" && s == "completed"),
+        "{events:?}"
+    );
+    assert_eq!(
+        events[4..],
         [
-            AcpEvent::Initialized {
-                agent_name: Some("fake-acp-agent".to_string()),
-                load_session: true,
-            },
-            AcpEvent::Update(TranscriptEntry::User("earlier prompt".to_string())),
             AcpEvent::Update(TranscriptEntry::Agent(format!("replayed {SESSION_ID}"))),
             AcpEvent::SessionLoaded {
                 session_id: SESSION_ID.to_string()

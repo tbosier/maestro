@@ -239,7 +239,9 @@ pub fn relaunch(ed: &mut Editor, id: AgentId) {
                 "not relaunched: the worktree {} is gone",
                 w.path.display()
             )),
-            Some(_) => None,
+            // Checked again now: the worktree may have changed since the
+            // records were loaded.
+            Some(w) => super::worktree_mismatch(w).map(|why| format!("not relaunched: {why}")),
         }
     };
     if let Some(why) = refusal {

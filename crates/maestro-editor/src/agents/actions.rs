@@ -92,6 +92,12 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
         ed.error(format!("tests not run: {note}"));
         return;
     }
+    // Checked again now: the worktree may have changed since it was made
+    // or loaded, and the tests run code from it.
+    if let Some(why) = a.worktree.as_ref().and_then(super::worktree_mismatch) {
+        ed.error(format!("tests not run: {why}"));
+        return;
+    }
     if a.tests_running() {
         ed.error("tests are already running for this agent");
         return;
@@ -592,7 +598,7 @@ pub fn drop_file(ed: &mut Editor, id: AgentId, old: Option<PathBuf>, new: Option
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let spawned = ed.spawn_background("agent-drop", move |tx| {
-        let result = open_exact(&git, &w.path).and_then(|repo| {
+        let result = open_agent_worktree(&git, &w).and_then(|repo| {
             repo.drop_change(&w.base, old.as_deref(), new.as_deref())
                 .map_err(|e| e.to_string())
         });
@@ -981,6 +987,47 @@ fn open_exact(git: &maestro_git::Git, path: &Path) -> Result<maestro_git::Reposi
     Ok(repo)
 }
 
+/// Both are worktrees of one repository (they share a Git directory). A
+/// recorded path now holding another clone with a branch of the same name
+/// fails this.
+fn same_repository(
+    wt: &maestro_git::Repository,
+    main: &maestro_git::Repository,
+) -> Result<(), String> {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(wt.common_dir()) == canon(main.common_dir()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is not a worktree of the repository at {}",
+            wt.root().display(),
+            main.root().display()
+        ))
+    }
+}
+
+/// The agent's worktree, checked before changing anything in it: the root
+/// of a worktree of the main repository, on the branch the record names.
+fn open_agent_worktree(
+    git: &maestro_git::Git,
+    w: &super::WorktreeInfo,
+) -> Result<maestro_git::Repository, String> {
+    let wt = open_exact(git, &w.path)?;
+    match wt.head().map_err(|e| e.to_string())? {
+        Head::Branch(b) if b == w.branch => {}
+        other => {
+            return Err(format!(
+                "the agent's worktree is on {}, not {}",
+                other.label(),
+                w.branch
+            ));
+        }
+    }
+    let main = open_exact(git, &w.main_root)?;
+    same_repository(&wt, &main)?;
+    Ok(wt)
+}
+
 /// Everything integration needs to hold before anything is committed:
 /// both worktrees exist and are on the expected branches, the main
 /// worktree is clean, and the agent's base commit is on the target branch
@@ -1002,6 +1049,7 @@ fn check_before_commit(
         }
     }
     let main = open_exact(git, &f.main_root)?;
+    same_repository(&wt, &main)?;
     match main.head().map_err(|e| e.to_string())? {
         Head::Branch(b) if b == f.target => {}
         Head::Detached(_) => {
@@ -1440,7 +1488,18 @@ pub fn adopt(ed: &mut Editor, id: AgentId, provider: ProviderSpec) {
     a.provider = provider;
     a.decide(Status::Stopped);
     let name = a.name.clone();
+    let main_root = a.worktree.as_ref().map(|w| w.main_root.clone());
+    let saved = match main_root
+        .as_deref()
+        .and_then(|r| ed.agents.persist.blocked(r))
+    {
+        Some(why) => format!("it is not saved in this session ({why})"),
+        None if super::persist::enabled(ed).is_none() => {
+            "it is not saved: sessions are off".to_string()
+        }
+        None => "it is saved from now on".to_string(),
+    };
     ed.info(format!(
-        "adopted {branch} as {name}: it is saved from now on; R relaunches it"
+        "adopted {branch} as {name}: {saved}; R relaunches it"
     ));
 }

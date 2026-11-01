@@ -19,8 +19,8 @@
 //! name, group, task, provider name and kind, worktree, status, archived
 //! flag, how the process ended, errors, history, comments, test run
 //! summaries with the end of their output, and the ACP session id. Never the
-//! provider's command line or environment, the ACP transcript, or the
-//! terminal screen.
+//! provider's arguments or environment (the history names the program
+//! started), the ACP transcript, or the terminal screen.
 //!
 //! The same scan lists the repository's worktrees. Worktrees on `maestro/`
 //! branches under the agents' worktree directory that no record names are
@@ -28,7 +28,8 @@
 //!
 //! Saving is coalesced: [`save`] serializes the records and writes only
 //! when the text changed. It runs from [`super::tick`] (about once a
-//! second) and when the editor quits.
+//! second) and when the editor quits. Before writing, it compares the file
+//! with what this session last read or wrote ([`take_outside_changes`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -52,6 +53,8 @@ pub const MAX_TEST_RUNS: usize = 10;
 pub const MAX_TEST_TAIL: usize = 100;
 /// Errors kept per agent (the latest).
 pub const MAX_ERRORS: usize = 100;
+/// Ids and groups above this are refused.
+const MAX_ID: u64 = 1 << 40;
 /// A records file larger than this is refused rather than read.
 const MAX_FILE_BYTES: u64 = 64 << 20;
 
@@ -165,27 +168,54 @@ pub enum ReadOutcome {
 
 /// Reads and checks the records file at `path` for `main_root`.
 pub fn read(path: &Path, main_root: &Path) -> ReadOutcome {
+    read_seen(path, main_root).0
+}
+
+/// A hash of the file's bytes as this session last read or wrote them;
+/// `None` when there was no file.
+type Seen = Option<u64>;
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// [`read`], with a hash of exactly the bytes that were parsed, so a later
+/// save can tell whether someone else wrote the file since.
+fn read_seen(path: &Path, main_root: &Path) -> (ReadOutcome, Seen) {
     let shown = path.display();
+    let unusable = |m: String| (ReadOutcome::Unusable(m), Some(0));
     match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
-        Err(e) => return ReadOutcome::Unusable(format!("could not read {shown}: {e}")),
-        // A FIFO here could block the reader forever.
-        Ok(m) if !m.is_file() => {
-            return ReadOutcome::Unusable(format!("{shown} is not a regular file"));
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (ReadOutcome::Missing, None);
         }
+        Err(e) => return unusable(format!("could not read {shown}: {e}")),
+        // A FIFO here could block the reader forever.
+        Ok(m) if !m.is_file() => return unusable(format!("{shown} is not a regular file")),
         Ok(m) if m.len() > MAX_FILE_BYTES => {
-            return ReadOutcome::Unusable(format!(
+            return unusable(format!(
                 "{shown} is larger than {} MiB",
                 MAX_FILE_BYTES >> 20
             ));
         }
         Ok(_) => {}
     }
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => return ReadOutcome::Unusable(format!("could not read {shown}: {e}")),
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (ReadOutcome::Missing, None);
+        }
+        Err(e) => return unusable(format!("could not read {shown}: {e}")),
     };
-    let value: serde_json::Value = match serde_json::from_str(&text) {
+    let seen = Some(hash_bytes(&bytes));
+    (parse(&bytes, path, main_root), seen)
+}
+
+fn parse(bytes: &[u8], path: &Path, main_root: &Path) -> ReadOutcome {
+    let shown = path.display();
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => return ReadOutcome::Unusable(format!("{shown} is not valid JSON: {e}")),
     };
@@ -223,8 +253,10 @@ pub fn read(path: &Path, main_root: &Path) -> ReadOutcome {
 /// file unusable, so a save never drops a record it could not represent.
 fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
     kind_from(&r.kind).ok_or_else(|| format!("unknown provider kind {:?}", r.kind))?;
-    if r.id == 0 {
-        return Err("id 0".into());
+    // Ids and groups count up from 1; a huge one would overflow the
+    // counters new agents take theirs from.
+    if r.id == 0 || r.id > MAX_ID || r.group > MAX_ID {
+        return Err(format!("id {} or group {} is out of range", r.id, r.group));
     }
     let w = &r.worktree;
     if !Path::new(&w.path).is_absolute() {
@@ -239,8 +271,10 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
     if !w.branch.starts_with("maestro/") || w.branch.len() <= "maestro/".len() {
         return Err(format!("branch {:?} is not a maestro/ branch", w.branch));
     }
-    if w.base.is_empty() || w.base.starts_with('-') {
-        return Err(format!("base {:?} is not a commit", w.base));
+    // A full commit id: hexadecimal, so it is never taken for an option
+    // and can be cut anywhere for display.
+    if !(4..=64).contains(&w.base.len()) || !w.base.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("base {:?} is not a commit id", w.base));
     }
     Ok(())
 }
@@ -434,7 +468,7 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
         Some(_) => None,
         None => Some(format!("its saved status {:?} is unknown", r.status)),
     };
-    let mut note = "loaded from an earlier session; no process runs for it".to_string();
+    let mut note = "loaded from an earlier session; this Maestro has no process for it".to_string();
     if let Some(w) = was {
         note.push_str(&format!("; {w}"));
     }
@@ -449,8 +483,12 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
 #[derive(Debug)]
 enum RepoState {
     /// Read (or found missing); saves go to this repository's file.
-    /// `written` is the last text written and whether it was synced.
-    Ready { written: Option<(String, bool)> },
+    /// `written` is the last text written and whether it was synced;
+    /// `seen` the file as this session last read or wrote it.
+    Ready {
+        written: Option<(String, bool)>,
+        seen: Seen,
+    },
     /// The file could not be used; it is left alone and never written.
     Blocked(String),
 }
@@ -533,6 +571,7 @@ pub fn enabled(ed: &Editor) -> Option<PathBuf> {
 struct Scan {
     main_root: PathBuf,
     file: ReadOutcome,
+    seen: Seen,
     worktrees: Vec<maestro_git::Worktree>,
     /// The main worktree's `HEAD` commit and branch, the base found
     /// worktrees are compared against.
@@ -600,11 +639,12 @@ fn scan(
         let commit = main.resolve("HEAD").ok()?;
         Some((commit, main.head().ok()?.label()))
     });
-    let file = read(&records_path(state, &main_root), &main_root);
+    let (file, seen) = read_seen(&records_path(state, &main_root), &main_root);
     let agents_dir = normalize_path(&super::create::worktree_root(&main_root, setting));
     Ok(Some(Scan {
         main_root,
         file,
+        seen,
         worktrees,
         main_head,
         agents_dir,
@@ -621,6 +661,7 @@ fn apply(ed: &mut Editor, mut scan: Scan) {
         ed,
         &root,
         std::mem::replace(&mut scan.file, ReadOutcome::Missing),
+        scan.seen,
     );
     let checked = verify(ed, &root, &scan.worktrees);
     let found = add_found(ed, &scan);
@@ -657,7 +698,7 @@ fn apply(ed: &mut Editor, mut scan: Scan) {
 
 /// Records the file's outcome for `root` and merges its records. Returns
 /// how many were added.
-fn take_file(ed: &mut Editor, root: &Path, file: ReadOutcome) -> usize {
+fn take_file(ed: &mut Editor, root: &Path, file: ReadOutcome, seen: Seen) -> usize {
     match file {
         ReadOutcome::Unusable(why) => {
             ed.add_status(
@@ -674,18 +715,24 @@ fn take_file(ed: &mut Editor, root: &Path, file: ReadOutcome) -> usize {
             0
         }
         ReadOutcome::Missing => {
-            ed.agents
-                .persist
-                .repos
-                .insert(root.to_path_buf(), RepoState::Ready { written: None });
+            ed.agents.persist.repos.insert(
+                root.to_path_buf(),
+                RepoState::Ready {
+                    written: None,
+                    seen,
+                },
+            );
             0
         }
         ReadOutcome::Records(f) => {
             let n = merge(ed, &f.agents);
-            ed.agents
-                .persist
-                .repos
-                .insert(root.to_path_buf(), RepoState::Ready { written: None });
+            ed.agents.persist.repos.insert(
+                root.to_path_buf(),
+                RepoState::Ready {
+                    written: None,
+                    seen,
+                },
+            );
             n
         }
     }
@@ -706,16 +753,25 @@ fn merge(ed: &mut Editor, records: &[AgentRecord]) -> usize {
     state.next_group = state
         .next_group
         .max(records.iter().map(|r| r.group).max().unwrap_or(0));
+    let taken_groups: HashSet<u64> = state.agents.iter().map(|a| a.group).collect();
+    let mut groups: HashMap<u64, u64> = HashMap::new();
     let mut seen = HashSet::new();
     for r in &records {
         let mut a = from_record(r, &providers);
         if taken.contains(&r.id) || !seen.insert(r.id) {
             let new = state.fresh_id();
+            let name = format!("{}-{}", r.provider, new.0);
             a.log(format!(
-                "renumbered from {} to {}: another agent already had its id",
-                r.id, new.0
+                "renumbered from {} ({}) to {} ({name}): another agent already had its id",
+                r.id, r.name, new.0
             ));
             a.id = new;
+            a.name = name;
+        }
+        // A group already used by agents of this session belongs to
+        // another task; these get a group of their own.
+        if taken_groups.contains(&r.group) {
+            a.group = *groups.entry(r.group).or_insert_with(|| state.fresh_group());
         }
         state.agents.push(a);
     }
@@ -842,13 +898,83 @@ pub fn ensure_loaded(ed: &mut Editor, main_root: &Path) {
     if ed.agents.persist.repos.contains_key(&root) {
         return;
     }
-    let file = read(&records_path(&state, &root), &root);
-    let n = take_file(ed, &root, file);
+    let (file, seen) = read_seen(&records_path(&state, &root), &root);
+    let n = take_file(ed, &root, file, seen);
     if n > 0 {
         ed.add_status(
             Severity::Info,
             format!("loaded {n} agent record(s) from an earlier session, not running"),
         );
+    }
+}
+
+/// Before a save: for each repository saved to, looks at its file. If it
+/// is not what this session last read or wrote (another Maestro saved, or
+/// someone edited it), its records for worktrees this session does not
+/// know are added as loaded agents, so the save keeps them; a file that can
+/// no longer be used blocks saving instead of being replaced. Records both
+/// sessions have are saved as this session has them.
+///
+/// Another program can still write between this check and the rename.
+fn take_outside_changes(ed: &mut Editor, state: &Path, errors: &mut Vec<String>) {
+    let roots: Vec<(PathBuf, Seen)> = ed
+        .agents
+        .persist
+        .repos
+        .iter()
+        .filter_map(|(root, r)| match r {
+            RepoState::Ready { seen, .. } => Some((root.clone(), *seen)),
+            RepoState::Blocked(_) => None,
+        })
+        .collect();
+    for (root, seen) in roots {
+        let path = records_path(state, &root);
+        let (now, now_seen) = read_seen(&path, &root);
+        if now_seen == seen {
+            continue;
+        }
+        match now {
+            // Removed by someone: this session's records are written anew.
+            ReadOutcome::Missing => {}
+            ReadOutcome::Unusable(why) => {
+                errors.push(format!(
+                    "the agent records file changed and can no longer be used ({why}); it is \
+                     left as it is, and agents in this repository are no longer saved in this \
+                     session"
+                ));
+                ed.agents
+                    .persist
+                    .repos
+                    .insert(root.clone(), RepoState::Blocked(why));
+                continue;
+            }
+            ReadOutcome::Records(f) => {
+                let known: HashSet<PathBuf> = ed
+                    .agents
+                    .agents
+                    .iter()
+                    .filter(|a| a.origin != Origin::Found)
+                    .filter_map(|a| a.worktree.as_ref().map(|w| normalize_path(&w.path)))
+                    .collect();
+                let new: Vec<AgentRecord> = f
+                    .agents
+                    .into_iter()
+                    .filter(|r| !known.contains(&normalize_path(Path::new(&r.worktree.path))))
+                    .collect();
+                if !new.is_empty() {
+                    let n = merge(ed, &new);
+                    ed.add_status(
+                        Severity::Info,
+                        format!(
+                            "{n} agent record(s) saved by another Maestro were added, not running"
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(RepoState::Ready { seen, .. }) = ed.agents.persist.repos.get_mut(&root) {
+            *seen = now_seen;
+        }
     }
 }
 
@@ -865,18 +991,37 @@ pub fn save(ed: &mut Editor, durable: bool) {
     if !durable && ed.agents.persist.last_fingerprint == Some(print) {
         return;
     }
+    let mut errors = Vec::new();
+    take_outside_changes(ed, &state, &mut errors);
     let mut groups: BTreeMap<PathBuf, Vec<AgentRecord>> = BTreeMap::new();
+    let mut unsaved = Vec::new();
     for a in &ed.agents.agents {
-        if let (Some(r), Some(w)) = (to_record(a), &a.worktree) {
-            groups
-                .entry(normalize_path(&w.main_root))
-                .or_default()
-                .push(r);
+        let Some(w) = &a.worktree else {
+            continue;
+        };
+        match to_record(a) {
+            Some(r) => {
+                if r.comments.len() < a.comments.len() {
+                    unsaved.push(format!("comments of {} on files", a.name));
+                }
+                groups
+                    .entry(normalize_path(&w.main_root))
+                    .or_default()
+                    .push(r);
+            }
+            None if a.origin != Origin::Found => unsaved.push(a.name.clone()),
+            None => {}
         }
     }
-    let mut errors = Vec::new();
+    if !unsaved.is_empty() {
+        errors.push(format!(
+            "not saved, because a path is not valid UTF-8: {}",
+            unsaved.join(", ")
+        ));
+    }
     for (root, mut records) in groups {
-        let Some(RepoState::Ready { written }) = ed.agents.persist.repos.get_mut(&root) else {
+        let Some(RepoState::Ready { written, seen }) = ed.agents.persist.repos.get_mut(&root)
+        else {
             // Blocked, or never read: never written.
             continue;
         };
@@ -904,7 +1049,10 @@ pub fn save(ed: &mut Editor, durable: bool) {
         }
         let path = records_path(&state, &root);
         match crate::navigation::session::write_private(&path, text.as_bytes(), durable) {
-            Ok(()) => *written = Some((text, durable)),
+            Ok(()) => {
+                *seen = Some(hash_bytes(text.as_bytes()));
+                *written = Some((text, durable));
+            }
             Err(e) => errors.push(format!(
                 "could not save agent records to {}: {e}",
                 path.display()
@@ -1015,6 +1163,20 @@ mod tests {
         let main = write(&dir, "main.json", &serde_json::to_string(&f).unwrap());
         assert!(
             matches!(read(&main, Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("not a maestro/ branch"))
+        );
+        // A base that is not a commit id (it would be cut mid-character
+        // for display), and an id that would overflow the counters.
+        let mut f = file.clone();
+        f.agents[0].worktree.base = "1234567é".into();
+        let base = write(&dir, "base.json", &serde_json::to_string(&f).unwrap());
+        assert!(
+            matches!(read(&base, Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("not a commit id"))
+        );
+        let mut f = file.clone();
+        f.agents[0].id = u64::MAX;
+        let id = write(&dir, "id.json", &serde_json::to_string(&f).unwrap());
+        assert!(
+            matches!(read(&id, Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("out of range"))
         );
         let mut f = file;
         f.agents[0].kind = "robot".into();

@@ -56,9 +56,11 @@
 //!
 //! With [`LOAD_SESSION_ARG`] the agent advertises `loadSession` and answers
 //! `session/load`. Only [`SESSION_ID`] can be loaded: the agent first
-//! replays a `user_message_chunk` saying `earlier prompt` and an
-//! `agent_message_chunk` saying `replayed <session id>`, then answers with
-//! an empty result. Any other session id gets a `-32002` "session not
+//! replays a `user_message_chunk` saying `earlier prompt`, a `tool_call`
+//! `old-tool` (kind `edit`, status `pending`) and its `tool_call_update` to
+//! `completed`, and an `agent_message_chunk` saying `replayed <session
+//! id>`, then answers with an empty result ([`SLOW_SESSION_ARG`] delays the
+//! answer by 300 ms). Any other session id gets a `-32002` "session not
 //! found" error. Without the argument, `session/load` is method not found.
 
 use std::io::{BufRead, BufReader, Write};
@@ -278,7 +280,23 @@ impl Agent {
                     "sessionUpdate": "user_message_chunk",
                     "content": {"type": "text", "text": "earlier prompt"},
                 }));
+                self.update(json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "old-tool",
+                    "title": "Edit an old file",
+                    "kind": "edit",
+                    "status": "pending",
+                    "locations": [],
+                }));
+                self.update(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "old-tool",
+                    "status": "completed",
+                }));
                 self.say(&format!("replayed {SESSION_ID}"));
+                if self.slow_session {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
                 reply(id, json!({}));
             }
             "session/prompt" => {

@@ -752,7 +752,6 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
         // The saved conversation coming back: transcript only, so the
         // history and status are not rewritten by old events.
         E::Update(entry) if a.replaying => a.push_transcript(entry),
-        E::ToolUpdate { .. } if a.replaying => {}
         E::Update(entry) => {
             match &entry {
                 TranscriptEntry::Plan(_) if a.turn_running && a.permissions.is_empty() => {
@@ -802,7 +801,7 @@ pub(crate) fn on_acp_event(ed: &mut Editor, id: AgentId, event: maestro_agent::A
                     break;
                 }
             }
-            if let Some(s) = status {
+            if let Some(s) = status.filter(|_| !a.replaying) {
                 a.log(format!("tool {tool}: {s}"));
             }
         }
@@ -988,6 +987,60 @@ pub fn stop_all(ed: &mut Editor) {
         std::thread::sleep(Duration::from_millis(10));
     }
     persist::save(ed, true);
+}
+
+/// Why the worktree on disk is not the one the record names, if it is not:
+/// checked from the worktree's `.git` file and `HEAD` without running Git,
+/// so it can run on the editor thread before tests or a relaunch. The
+/// worktree must be a linked worktree of `main_root`'s repository with the
+/// recorded branch checked out. Only regular files are read: the agent
+/// controls its worktree, and a FIFO there must not block the editor.
+pub(crate) fn worktree_mismatch(w: &WorktreeInfo) -> Option<String> {
+    fn read_small(p: &Path) -> Result<String, String> {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_file() && m.len() < 64 * 1024 => {
+                std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))
+            }
+            Ok(_) => Err(format!("{} is not a small regular file", p.display())),
+            Err(e) => Err(format!("{}: {e}", p.display())),
+        }
+    }
+    let check = || -> Result<(), String> {
+        let dot_git = read_small(&w.path.join(".git"))
+            .map_err(|e| format!("{} is not a linked worktree ({e})", w.path.display()))?;
+        let gitdir = dot_git
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .ok_or_else(|| format!("{} has an unexpected .git file", w.path.display()))?;
+        let gitdir = w.path.join(gitdir);
+        let head = read_small(&gitdir.join("HEAD"))?;
+        let branch = head.trim().strip_prefix("ref: refs/heads/");
+        if branch != Some(w.branch.as_str()) {
+            return Err(format!(
+                "the worktree {} is on {} now, not {}",
+                w.path.display(),
+                branch.map_or("a detached HEAD".to_string(), |b| format!("branch {b}")),
+                w.branch
+            ));
+        }
+        // The worktree's Git directory belongs to the main worktree's
+        // repository (when that keeps its Git directory in `.git`).
+        let main_git = w.main_root.join(".git");
+        if main_git.is_dir() {
+            let common = read_small(&gitdir.join("commondir"))?;
+            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canon(&gitdir.join(common.trim())) != canon(&main_git) {
+                return Err(format!(
+                    "{} is not a worktree of the repository at {}",
+                    w.path.display(),
+                    w.main_root.display()
+                ));
+            }
+        }
+        Ok(())
+    };
+    check().err()
 }
 
 /// The Git work for this agent that runs in the background while its
