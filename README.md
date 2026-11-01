@@ -34,6 +34,11 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 
 - Overlaps between agents: when two agents change the same file, the panel says so and runs a merge dry run of their work (uncommitted files included) to show whether they would conflict. The integrate dialog says when this agent's own work conflicts with your branch, and names the overlapping agents whose work would conflict with it after this one is merged.
 - Agent records survive a restart: they are saved per repository with the editor sessions and come back when the panel opens, marked "not running (from an earlier session)". Review, tests, integrate and archive work on them; `R` starts one again in its worktree (an ACP agent gets its saved session back when it supports `session/load`; a terminal agent starts without its task). Worktrees on `maestro/` branches that no record names are listed as found worktrees to review, archive or adopt (`a`).
 
+- Projects and worktrees in a sidebar (`space s`). The top lists every agent grouped by what it needs from you: needs you (a permission request, work ready for review, failed tests, a failure, a blocked turn), then working, idle and done. Each row has a mark and a word, never color alone. Below that are the projects: the Git repositories in `[projects] paths`, the directories of earlier sessions and the one you are in. Each unfolds to its worktrees with the branch, the number of changed files, ahead and behind of the upstream when there is one, and the agent working there. `ret` on a worktree or an agent switches the editor to it: the working directory moves (the file finder, workspace search, the agent panel and new language servers follow), your files and splits are saved as that worktree's session, and the target's session comes back. Buffers with unsaved changes are never closed: they stay open, the status line names them, and the sidebar counts them on their worktree's row. The status line names the project and worktree (`alpha:main`). Git runs on a background thread and the sidebar rescans every five seconds while it is open.
+- A jump palette (`space j`): one fuzzy list of projects, worktrees, agents (by name and task) and open buffers. Choosing one goes there, switching worktree when needed.
+- When an agent starts needing you, the status line says so once, and the terminal gets a bell or an OSC 9 desktop notification (`[notify] method`).
+- Language servers start for the worktree you switch into when its files open. Servers of roots you left stop after five unused minutes, or when more than three roots have servers; a server with an open buffer is never stopped.
+
 Not built yet: an OS sandbox for agents (a worktree keeps their files apart, not their permissions; see [docs/security.md](docs/security.md)). That is tracked in the roadmap.
 
 ## Build and run
@@ -76,6 +81,8 @@ cargo build --release
 | `space c` / `:code-action` | pick a code action for the cursor or selection |
 | `space =` / `:format`, `:format-selection` | format the buffer, or the primary selection, with the language server |
 | `space a` | the agent panel: `n` new task (with `@allow`, `@forbid`, `@verify`, `@accept` or `@contract` lines for a task contract), `N` same task with another provider, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate (`O` instead of `y` when files are outside the contract), `X` reject, `A` archive, `R` relaunch, `a` adopt a found worktree, `v` history or test output, `C-\` keys to the agent's terminal and back |
+| `space s` | the sidebar: opens and focuses it, focuses it, or hides it. In it: `j`/`k` move, `ret` switch to a worktree or agent (on a project: fold or unfold), `l`/`h` unfold or fold, `r` rescan, `q` hide, `esc` back to the editor with the sidebar still shown, `space ...` the usual space keys |
+| `space j` | jump to a project, worktree, agent or open buffer |
 | in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `D` drop the file's change, `ret` open the file there |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
@@ -112,6 +119,19 @@ args = ["--prompt", "{task}"]         # without {task}, the task is typed in aft
 kind = "terminal"
 command = "codex"
 enabled = false                       # hides a built-in provider
+
+[projects]
+paths = ["~/src/maestro", "~/src/site"]   # listed in the sidebar and the jump palette
+
+[sidebar]
+width = 36
+
+[notify]
+method = "bell"                       # "osc" for an OSC 9 desktop notification, "off"
+
+[lsp]
+stop-unused-after-secs = 300          # stop servers of worktrees you left; 0 never does
+max-live-roots = 3                    # 0 means no limit
 ```
 
 Unknown keys in the file are errors, so a typo does not silently do nothing. `--clean` starts without the config, and reads and writes neither the session, the recent-files list nor the agent records.

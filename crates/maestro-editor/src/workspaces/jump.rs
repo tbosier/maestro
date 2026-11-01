@@ -72,7 +72,12 @@ pub fn items(ed: &Editor) -> Vec<PickerItem> {
         };
         out.push(PickerItem {
             label: format!("project {}", p.name),
-            detail: crate::navigation::display_path(&p.root, &ed.cwd),
+            // A short detail: a long path would cover the label.
+            detail: format!(
+                "{} worktree{}",
+                p.worktrees.len(),
+                if p.worktrees.len() == 1 { "" } else { "s" }
+            ),
             action: PickerAction::Jump(Jump::Worktree(main.path.clone())),
         });
         for w in p.worktrees.iter().filter(|w| !w.missing) {
