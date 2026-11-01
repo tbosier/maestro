@@ -26,6 +26,7 @@ pub mod proposals;
 pub mod recovery;
 pub mod registers;
 pub mod search;
+pub mod structural;
 pub mod syntax;
 pub mod syntax_commands;
 pub mod typed;
