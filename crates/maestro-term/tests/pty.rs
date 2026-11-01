@@ -245,6 +245,36 @@ fn drop_returns_at_once_and_kills_the_program() {
     }
 }
 
+/// A background child that ignores SIGHUP used to outlive the program and
+/// keep the PTY open. Kill signals the whole process group.
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_ends_descendants_that_ignore_hangup() {
+    let h = sh(
+        "sh -c 'trap \"\" HUP; echo child=$$; while :; do sleep 1; done' & wait",
+        SIZE,
+    );
+    h.wait_for("the child's pid", |t| {
+        t.snapshot().row_text(0).starts_with("child=")
+    });
+    let pid: u32 = h.term.snapshot().row_text(0)["child=".len()..]
+        .trim()
+        .parse()
+        .unwrap();
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    assert!(proc_dir.exists());
+    h.term.kill().unwrap();
+    h.wait_for_exit();
+    let deadline = Instant::now() + TIMEOUT;
+    while proc_dir.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} survived the kill"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn input_echoes_through_cat() {
     let h = start_spec(&spec("cat", &[]), SIZE);

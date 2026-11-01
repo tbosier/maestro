@@ -17,10 +17,10 @@
 //! `CSI 65535 b` (repeat) asks the parser for about four million characters.
 //!
 //! Known gaps, all on Unix:
-//! - Kill and drop signal only the child. A descendant that ignores SIGHUP
-//!   and keeps the PTY open keeps the reader thread and the PTY alive until it
-//!   exits. Killing the whole process group needs `killpg`, which std does not
-//!   offer and `unsafe` is forbidden here.
+//! - Kill and drop signal the program's process group (SIGHUP, 200 ms, then
+//!   SIGKILL) through kill(1). A descendant that moved itself to another
+//!   process group or session (a daemon, `setsid`) is not reached, and keeps
+//!   the PTY and the reader thread alive if it holds the terminal open.
 //! - portable-pty starts the program in `$HOME` when the working directory is
 //!   missing. `spawn` checks the directory just before spawning, which narrows
 //!   but does not close that window.
@@ -546,8 +546,19 @@ fn wait_for_child(
         if control.kill && !kill_sent {
             drop(control);
             kill_sent = true;
-            // portable-pty sends SIGHUP, gives the child up to 200 ms, then
-            // sends SIGKILL. This blocks only this thread.
+            // The child leads its own session (portable-pty calls setsid),
+            // so its process group id is its pid. Signal the whole group:
+            // SIGHUP, a grace period, then SIGKILL, so descendants that
+            // ignore SIGHUP end too. The child has not been reaped yet (no
+            // try_wait since the check above), so its pid, and with it the
+            // group id, cannot have been reused. This blocks only this
+            // thread.
+            if let Some(pid) = child.process_id() {
+                signal_group("HUP", pid);
+                thread::sleep(KILL_GRACE);
+                signal_group("KILL", pid);
+            }
+            // Then portable-pty's own kill for the child, which also reaps.
             let _ = child.kill();
             delay = MIN_POLL;
             continue;
@@ -563,6 +574,26 @@ fn wait_for_child(
         drop(control);
         delay = (delay * 2).min(MAX_POLL);
     }
+}
+
+/// How long the program's process group gets between SIGHUP and SIGKILL.
+const KILL_GRACE: Duration = Duration::from_millis(200);
+
+/// Sends `signal` to process group `pgid`. std has no `killpg` and the
+/// workspace forbids `unsafe`, so this runs kill(1), as maestro-tasks and
+/// maestro-agent do.
+fn signal_group(signal: &str, pgid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args([format!("-{signal}"), "--".into(), format!("-{pgid}")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    let _ = (signal, pgid);
 }
 
 fn exit_info(status: &portable_pty::ExitStatus) -> ExitInfo {
