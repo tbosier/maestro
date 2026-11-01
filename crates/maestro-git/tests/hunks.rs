@@ -422,7 +422,10 @@ fn a_file_turned_into_a_symlink_needs_both_its_hunks() {
     let new = files.iter().position(|d| d.old_path.is_none()).unwrap();
     let main = f.open(&f.repo);
     let add = whole(&files[new], 0);
-    let r = refusals(main.tree_from_hunks(&base, &[add.clone()]).unwrap_err());
+    let r = refusals(
+        main.tree_from_hunks(&base, std::slice::from_ref(&add))
+            .unwrap_err(),
+    );
     assert!(
         r[0].1.contains("it adds link, which the base already has"),
         "{r:?}"
