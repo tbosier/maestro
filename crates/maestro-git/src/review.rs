@@ -259,6 +259,43 @@ impl Repository {
         shadow.parse_diff(&args)
     }
 
+    /// Every path that any commit in `from..to` changes, each once, with
+    /// renames as their two paths and merge commits compared with each of
+    /// their parents. A net diff can hide a file changed and changed back;
+    /// integrating by cherry-pick applies such commits one by one, so this
+    /// is what a check of everything a branch could bring needs.
+    pub fn paths_touched(&self, from: &str, to: &str) -> Result<Vec<PathBuf>> {
+        check_rev(from)?;
+        check_rev(to)?;
+        let range = format!("{from}..{to}");
+        let out = self.run(
+            &[
+                "log",
+                "--no-renames",
+                "-m",
+                "--name-only",
+                "-z",
+                "--format=",
+                "--end-of-options",
+                &range,
+            ],
+            Access::ReadOnly,
+        )?;
+        let mut paths: Vec<PathBuf> = split_nul(&out)
+            .into_iter()
+            .map(|p| {
+                // `--format=` leaves the newline that ends each commit's
+                // (empty) header in front of its first path.
+                let p = p.strip_prefix(b"\n").unwrap_or(p);
+                bytes_to_path(p)
+            })
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     /// A commit holding everything in this worktree as it is on disk:
     /// `HEAD` plus staged, unstaged and untracked files (ignored files left
     /// out), with `HEAD` as its parent. Nothing the user sees changes: it
@@ -285,6 +322,13 @@ impl Repository {
         let out = shadow.run(&["write-tree"], Access::Write)?;
         let tree = String::from_utf8_lossy(&out).trim().to_string();
         check_rev(&tree)?;
+        // The parent must be the HEAD the files were taken on; a commit made
+        // in between would give the new files an old ancestry.
+        if self.resolve("HEAD")? != head {
+            return Err(GitError::InvalidArgument(
+                "HEAD moved while the worktree was being read; try again".into(),
+            ));
+        }
         let commit = self.commit_tree(&tree, &[&head], "maestro work snapshot")?;
         Ok(WorkSnapshot { commit, tree })
     }

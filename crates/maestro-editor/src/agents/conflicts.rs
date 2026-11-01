@@ -41,6 +41,16 @@ pub enum Merge {
     Failed(String),
 }
 
+/// What a cached dry run is valid for: the repository it ran in (its
+/// merge configuration counts, not only the commits) and the two snapshot
+/// commits, ordered.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    repo: PathBuf,
+    ours: String,
+    theirs: String,
+}
+
 /// Two agents whose changes name the same files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pair {
@@ -68,8 +78,8 @@ impl Pair {
 pub struct ConflictState {
     /// Overlapping pairs from the last recomputation.
     pub pairs: Vec<Pair>,
-    /// Dry-run results by (snapshot commit, snapshot commit), ordered.
-    cache: HashMap<(String, String), Merge>,
+    /// Dry-run results by repository and ordered pair of snapshot commits.
+    cache: HashMap<CacheKey, Merge>,
     running: bool,
     again: bool,
     /// `merge-tree` dry runs and worktree snapshots taken so far, for the
@@ -119,13 +129,33 @@ pub fn overlaps(agents: &[Agent]) -> Vec<(AgentId, AgentId, Vec<PathBuf>)> {
             if !same_repo {
                 continue;
             }
-            let shared: Vec<PathBuf> = pa.intersection(pb).cloned().collect();
+            let shared = shared_paths(pa, pb);
             if !shared.is_empty() {
                 out.push((a.id, b.id, shared));
             }
         }
     }
     out
+}
+
+/// The paths two change sets share: the same path, or a path of one that
+/// is a directory holding a path of the other (one agent adds the file
+/// `assets`, the other `assets/icon.png`, which Git cannot merge).
+pub fn shared_paths(a: &BTreeSet<PathBuf>, b: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    let mut out: BTreeSet<PathBuf> = a.intersection(b).cloned().collect();
+    for (x, y) in [(a, b), (b, a)] {
+        for p in x {
+            if y.iter().any(|q| q != p && q.starts_with(p)) {
+                out.insert(p.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// [`shared_paths`] is not empty.
+pub fn paths_overlap(a: &BTreeSet<PathBuf>, b: &BTreeSet<PathBuf>) -> bool {
+    !shared_paths(a, b).is_empty()
 }
 
 /// Recomputes the overlapping pairs now, and their dry runs on a
@@ -186,7 +216,7 @@ pub fn refresh(ed: &mut Editor) {
 
 struct DryRuns {
     results: Vec<((AgentId, AgentId), Merge)>,
-    new_cache: Vec<((String, String), Merge)>,
+    new_cache: Vec<(CacheKey, Merge)>,
     dry_runs: u64,
     snapshots: u64,
 }
@@ -197,7 +227,7 @@ fn dry_runs(
     git: &maestro_git::Git,
     involved: &[(AgentId, WorktreeInfo)],
     pairs: &[(AgentId, AgentId)],
-    cache: &HashMap<(String, String), Merge>,
+    cache: &HashMap<CacheKey, Merge>,
 ) -> DryRuns {
     let mut out = DryRuns {
         results: Vec::new(),
@@ -218,16 +248,23 @@ fn dry_runs(
     for &(a, b) in pairs {
         let merge = match (snaps.get(&a), snaps.get(&b)) {
             (Some(Ok((ca, root))), Some(Ok((cb, _)))) => {
-                let key = if ca <= cb {
-                    (ca.clone(), cb.clone())
-                } else {
-                    (cb.clone(), ca.clone())
+                let (x, y) = if ca <= cb { (ca, cb) } else { (cb, ca) };
+                let key = CacheKey {
+                    repo: root.clone(),
+                    ours: x.clone(),
+                    theirs: y.clone(),
                 };
-                match cache.get(&key) {
+                let known = cache.get(&key).or_else(|| {
+                    out.new_cache
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, m)| m)
+                });
+                match known {
                     Some(m) => m.clone(),
                     None => {
                         out.dry_runs += 1;
-                        let m = check(git, root, &key.0, &key.1);
+                        let m = check(git, root, &key.ours, &key.theirs);
                         if !matches!(m, Merge::Failed(_)) {
                             out.new_cache.push((key, m.clone()));
                         }
@@ -267,10 +304,12 @@ fn applied(ed: &mut Editor, r: DryRuns) {
     state.running = false;
     state.dry_runs += r.dry_runs;
     state.snapshots += r.snapshots;
+    // At most MAX_CACHE entries: when the new ones would not fit, the old
+    // ones go, and of a batch larger than the cache only the first are kept.
     if state.cache.len() + r.new_cache.len() > MAX_CACHE {
         state.cache.clear();
     }
-    state.cache.extend(r.new_cache);
+    state.cache.extend(r.new_cache.into_iter().take(MAX_CACHE));
     for ((a, b), merge) in r.results {
         if let Some(p) = state.pairs.iter_mut().find(|p| p.a == a && p.b == b) {
             p.merge = merge;
@@ -340,4 +379,31 @@ pub fn brief(ed: &Editor, id: AgentId) -> Option<String> {
     }
     let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
     Some(format!("overlaps {}", names.join(" ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_file_and_a_directory_of_the_same_name_overlap() {
+        assert_eq!(
+            shared_paths(&set(&["assets", "x"]), &set(&["assets/icon.png"])),
+            [PathBuf::from("assets")]
+        );
+        assert_eq!(
+            shared_paths(&set(&["a/b.txt"]), &set(&["a"])),
+            [PathBuf::from("a")]
+        );
+        assert_eq!(
+            shared_paths(&set(&["same.txt"]), &set(&["same.txt", "other"])),
+            [PathBuf::from("same.txt")]
+        );
+        // A shared prefix of names is not a directory.
+        assert!(!paths_overlap(&set(&["asset"]), &set(&["assets/icon.png"])));
+    }
 }

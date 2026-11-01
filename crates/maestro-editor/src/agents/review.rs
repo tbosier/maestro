@@ -291,7 +291,13 @@ pub fn request(ed: &mut Editor, id: AgentId) {
             // was switched to other work shows that instead of its diff.
             Ok(Some(repo)) if canon(repo.root()) == canon(&w.path) => match repo.head() {
                 Ok(maestro_git::Head::Branch(b)) if b == w.branch => {
-                    repo.review_diff(&w.base).map_err(|e| e.to_string())
+                    // The commit too: the same diff on another history
+                    // (a merge resolved back to the same text) can merge
+                    // differently with other agents' work.
+                    let head = repo.resolve("HEAD").ok();
+                    repo.review_diff(&w.base)
+                        .map(|files| (files, head))
+                        .map_err(|e| e.to_string())
                 }
                 Ok(other) => Err(format!(
                     "the worktree is on {} now, not {}; no diff shown",
@@ -312,22 +318,29 @@ pub fn request(ed: &mut Editor, id: AgentId) {
     }
 }
 
-fn applied(ed: &mut Editor, id: AgentId, result: Result<Vec<DiffFile>, String>) {
+fn applied(ed: &mut Editor, id: AgentId, result: Result<(Vec<DiffFile>, Option<String>), String>) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
     a.review.running = false;
     // Overlaps and conflicts with other agents follow every change to
-    // what the diff says (files, an error, the first result).
+    // what the diff says (files, an error, the first result) and to the
+    // commit it is on. A binary file's diff does not show its contents,
+    // so a diff with one always counts as changed.
     let changed = match &result {
-        Ok(files) => {
-            a.review.computed.is_none() || a.review.error.is_some() || *files != a.review.files
+        Ok((files, head)) => {
+            a.review.computed.is_none()
+                || a.review.error.is_some()
+                || *files != a.review.files
+                || *head != a.review.head
+                || files.iter().any(|f| f.binary)
         }
         Err(e) => a.review.error.as_ref() != Some(e),
     };
     match result {
-        Ok(files) => {
+        Ok((files, head)) => {
             a.review.files = files;
+            a.review.head = head;
             a.review.error = None;
             a.review.computed = Some(Instant::now());
             // A finished agent with nothing to review says so, judged

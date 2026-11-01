@@ -1494,6 +1494,35 @@ fn index_copies_keep_racy_git_protection() {
 }
 
 #[test]
+fn paths_touched_sees_changes_a_net_diff_hides() {
+    let f = Fixture::new();
+    let wt = agent_branch(&f, "maestro/t", "keep.txt", "k\n");
+    // Changed and changed back: the net diff does not name a.txt.
+    commit_in(&f, &wt, "a.txt", "changed\n", "change a");
+    commit_in(&f, &wt, "a.txt", "one\ntwo\nthree\n", "restore a");
+    f.git_ok(&wt, &["mv", "keep.txt", "moved name.txt"]);
+    f.git_ok(&wt, &["commit", "-q", "-m", "move"]);
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let net: Vec<_> = repo
+        .review_diff("main")
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.path().cloned())
+        .collect();
+    assert_eq!(net, [PathBuf::from("moved name.txt")]);
+    assert_eq!(
+        repo.paths_touched("main", "HEAD").unwrap(),
+        [
+            PathBuf::from("a.txt"),
+            PathBuf::from("keep.txt"),
+            PathBuf::from("moved name.txt")
+        ]
+    );
+    assert!(repo.paths_touched("HEAD", "HEAD").unwrap().is_empty());
+    assert!(repo.paths_touched("-x", "HEAD").is_err());
+}
+
+#[test]
 fn work_snapshots_hold_uncommitted_work_and_change_nothing() {
     let f = Fixture::new();
     f.write(".gitignore", "build/\n");

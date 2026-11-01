@@ -27,7 +27,7 @@ pub mod review;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 pub use maestro_agent::{
@@ -339,6 +339,8 @@ const MAX_TRANSCRIPT: usize = 5_000;
 #[derive(Debug, Default)]
 pub struct ReviewData {
     pub files: Vec<DiffFile>,
+    /// The worktree's `HEAD` commit when `files` was computed.
+    pub head: Option<String>,
     /// When `files` was computed. `None` before the first diff.
     pub computed: Option<Instant>,
     pub error: Option<String>,
@@ -409,6 +411,9 @@ pub struct Agent {
     pub created: SystemTime,
     pub tests: Vec<TestRun>,
     test_handle: Option<maestro_tasks::TaskHandle>,
+    /// Set by [`Agent::stop`]: a run whose process is still being started
+    /// on a background thread is not started, or is killed on arrival.
+    test_cancel: Arc<AtomicBool>,
     pub errors: Vec<String>,
     pub stderr: VecDeque<String>,
     pub review: ReviewData,
@@ -462,6 +467,7 @@ impl Agent {
             created: SystemTime::now(),
             tests: Vec::new(),
             test_handle: None,
+            test_cancel: Arc::default(),
             errors: Vec::new(),
             stderr: VecDeque::new(),
             review: ReviewData::default(),
@@ -604,6 +610,7 @@ impl Agent {
         if let Some(h) = &self.test_handle {
             h.kill();
         }
+        self.test_cancel.store(true, Ordering::SeqCst);
         self.pending_input = None;
     }
 
