@@ -57,7 +57,7 @@ cargo build --release
 | `x` | select the line (again to extend) |
 | `%` | select the whole file |
 | `s` | select regex matches inside the selections |
-| `C` | add a cursor on the next line |
+| `C` | copy the selection to the next line it fits on (a cursor below, for a plain cursor) |
 | `,` / `;` | keep only the primary selection / collapse selections |
 | `d c y p` | delete, change, yank, paste |
 | `i a o O I A` | insert modes |
