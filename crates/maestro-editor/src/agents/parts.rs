@@ -234,7 +234,7 @@ pub fn steps(f: &IntegrateFacts, p: &PartPlan, how: Integration) -> Vec<String> 
         lines.push(format!("  {}", pick.label()));
     }
     lines.push(format!(
-        "The rest of the work stays on {} and in its worktree, which Maestro does not touch; it can be integrated or rejected later.",
+        "The rest of the work stays on {} and in its worktree, which Maestro does not touch; it can be integrated or rejected later. Without marks, I integrates all of the work.",
         p.agent_branch
     ));
     let subject = f.message.lines().next().unwrap_or_default();

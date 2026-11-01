@@ -316,9 +316,46 @@ impl Repository {
                 }
                 None => Vec::new(),
             };
-            let base_lines = split_lines(&base_bytes);
+            let mut base_lines = split_lines(&base_bytes);
+            let mut entry = entry;
+            let mut ids: Vec<usize> = ids.clone();
+            // Git shows a file whose type changed (a file turned into a
+            // symlink, say) as a deletion and an addition of one path.
+            // Taken together, the deletion empties it and the addition
+            // fills it; the addition alone is refused below.
+            let is_added =
+                |i: usize| picks[i].change == FileChange::Added || picks[i].old_path.is_none();
+            let deleting: Vec<usize> = ids
+                .iter()
+                .copied()
+                .filter(|&i| whole_deletion(&picks[i]))
+                .collect();
+            if entry.is_some() && !deleting.is_empty() && ids.iter().any(|&i| is_added(i)) {
+                let mut ok = true;
+                for &i in &ids {
+                    if deleting.contains(&i) {
+                        if let Err(why) = resolve(i, &picks[i], &base_lines, &shown) {
+                            fail(&mut failures, i, why);
+                            ok = false;
+                        }
+                    } else if !is_added(i) {
+                        fail(
+                            &mut failures,
+                            i,
+                            format!("it changes {shown}, which another taken hunk deletes"),
+                        );
+                        ok = false;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                ids.retain(|&i| is_added(i));
+                base_lines = Vec::new();
+                entry = None;
+            }
             let mut cores: Vec<Core> = Vec::new();
-            for &i in ids {
+            for &i in &ids {
                 let p = &picks[i];
                 let added = p.change == FileChange::Added || p.old_path.is_none();
                 if added && entry.is_some() {
@@ -446,14 +483,7 @@ impl Repository {
             }
             // A deleted file whose every line is taken is removed; otherwise
             // the file stays with what is left.
-            let deletes = ids.iter().any(|&i| {
-                let p = &picks[i];
-                p.new_path.is_none()
-                    && p.change == FileChange::Deleted
-                    && p.lines
-                        .as_ref()
-                        .is_none_or(|s| changed_lines(&p.hunk).iter().all(|l| s.contains(l)))
-            });
+            let deletes = ids.iter().any(|&i| whole_deletion(&picks[i]));
             let new = if deletes && out.is_empty() {
                 None
             } else {
@@ -462,7 +492,7 @@ impl Repository {
                     None => {
                         let m = picks[ids[0]].new_mode.clone().unwrap_or("100644".into());
                         if !["100644", "100755", "120000"].contains(&m.as_str()) {
-                            for &i in ids {
+                            for &i in &ids {
                                 fail(&mut failures, i, format!("{shown} has mode {m}"));
                             }
                             continue;
@@ -622,6 +652,15 @@ impl Repository {
         }
         Ok(())
     }
+}
+
+/// The pick deletes its file and takes every line of the deletion.
+fn whole_deletion(p: &HunkPick) -> bool {
+    p.new_path.is_none()
+        && p.change == FileChange::Deleted
+        && p.lines
+            .as_ref()
+            .is_none_or(|s| changed_lines(&p.hunk).iter().all(|l| s.contains(l)))
 }
 
 /// Reduces pick `i` to the operations it takes, checks them against the
