@@ -441,12 +441,20 @@ fn check_replacement(re: &Regex, with: &str) -> Result<(), String> {
             continue;
         }
         let (name, next) = if chars.get(i + 1) == Some(&'{') {
+            // Stricter than the regex crate, which reads an unclosed `${`
+            // as text and goes on expanding what follows it.
             match chars[i + 2..].iter().position(|c| *c == '}') {
+                Some(0) => return Err("the replacement has an empty ${}".into()),
                 Some(len) => (
                     chars[i + 2..i + 2 + len].iter().collect::<String>(),
                     i + 3 + len,
                 ),
-                None => (String::new(), chars.len()),
+                None => {
+                    return Err(
+                        "the replacement has a ${ with no closing } (write $$ for a literal $)"
+                            .into(),
+                    );
+                }
             }
         } else {
             let len = chars[i + 1..]
@@ -476,7 +484,36 @@ fn check_replacement(re: &Regex, with: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The char offset of a `"` in a text step's argument that is never
+/// closed. The splitter ([`split_parts`]) reads every unescaped quote in a
+/// text step as opening or closing a string, so an unclosed one has
+/// swallowed the rest of the line, `|` steps included.
+fn unclosed_quote(arg: &str) -> Option<usize> {
+    let mut open: Option<usize> = None;
+    let mut escaped = false;
+    for (i, c) in arg.chars().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            open = if open.is_some() { None } else { Some(i) };
+        }
+    }
+    open
+}
+
 fn parse_step(name: &str, arg: &str, lang: Option<Language>) -> Result<Step, ArgError> {
+    if TEXT_STEPS.contains(&name)
+        && let Some(at) = unclosed_quote(arg)
+    {
+        return Err((
+            Some(at),
+            "this quote is never closed, so the rest of the line would be text; close it, or \
+             write a quote character inside a quoted text as \\\""
+                .into(),
+        ));
+    }
     let line_free = |t: &str| -> Result<(), ArgError> {
         if t.chars().any(maestro_core::text::is_line_ending_char) {
             Err((
@@ -901,7 +938,13 @@ fn run_command_line(ed: &mut Editor, line: &str) -> Result<(), String> {
             // The new selections ride on the transaction, so a refused edit
             // (a read-only buffer) leaves the old ones too. Text inserted
             // at a selection's start lands outside it (`Range::map`).
-            let after = out.selection.map(&edit.changes);
+            let after = if edit.name == "replace-text" {
+                // A match can cover a whole selection; plain mapping would
+                // collapse it into the replaced text's first character.
+                cover_replaced(&text, &out.selection, &edit.changes, &edit.new_text)
+            } else {
+                out.selection.map(&edit.changes)
+            };
             // Close any undo group the user has open (insert mode, through
             // the automation API), so one undo reverts exactly this edit.
             ed.commit();
@@ -916,6 +959,27 @@ fn run_command_line(ed: &mut Editor, line: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Each selection after `replace-text`: from the start of its first
+/// replacement to the end of its last, so a selection whose text was
+/// replaced whole still covers the new text.
+fn cover_replaced(old: &Rope, sel: &Selection, cs: &ChangeSet, new: &Rope) -> Selection {
+    let (s_old, s_new) = (old.slice(..), new.slice(..));
+    let ranges = sel
+        .iter()
+        .map(|r| {
+            let (a, b) = span(s_old, r);
+            let na = cs.map_pos(a, maestro_core::change::Assoc::Before);
+            let nb = cs.map_pos(b, maestro_core::change::Assoc::After);
+            if nb > na {
+                Range::new(na, prev_grapheme_boundary(s_new, nb))
+            } else {
+                Range::point(na)
+            }
+        })
+        .collect();
+    Selection::new(ranges, sel.primary_index()).normalize(s_new)
 }
 
 /// The covered char span `from..to` of an inclusive range.
@@ -1523,5 +1587,9 @@ mod tests {
         assert!(check_replacement(&re, "$3").is_err());
         assert!(check_replacement(&re, "$1x").is_err());
         assert!(check_replacement(&re, "${name}").is_err());
+        // An empty or unclosed brace would hide a bad group after it.
+        assert!(check_replacement(&re, "${}").is_err());
+        assert!(check_replacement(&re, "${broken$99").is_err());
+        assert!(check_replacement(&re, "$ and $").is_ok());
     }
 }

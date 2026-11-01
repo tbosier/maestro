@@ -641,6 +641,16 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
                 ed.proposals.review = Some(v);
                 super::approve(ed, id);
                 return;
+            } else if ed
+                .proposals
+                .get(id)
+                .and_then(|p| p.intent.as_ref()?.refused_ms)
+                .is_some_and(|t| super::now_ms().saturating_sub(t) < super::RESHOW_MS)
+            {
+                ed.error(
+                    "the diff just changed; look at it before approving (a is ignored for half \
+                     a second)",
+                );
             } else {
                 v.dialog = approve_dialog(ed, id);
                 super::mark_shown(ed, id);
