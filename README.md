@@ -20,7 +20,7 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 
 - UTF-8, UTF-8 with BOM, and UTF-16 files with a BOM. LF and CRLF are preserved. Binary files and invalid UTF-8 open read-only.
 - The Duskfox theme from nightfox.nvim, with every interface text pair checked for WCAG AA contrast by a test.
 
-- Language servers (rust-analyzer, pyright or pylsp, typescript-language-server, clangd when installed): diagnostics in the gutter and status line, `]d`/`[d`, `gd`, `gr`, hover on `space k`, and completion in insert mode: a popup opens after a trigger character, after a short pause in typing an identifier, or on `C-x`, and narrows as you type. Snippets go in as plain text. No signature help, code actions, rename or formatting yet.
+- Language servers (rust-analyzer, pyright or pylsp, typescript-language-server, clangd when installed): diagnostics in the gutter and status line, `]d`/`[d`, `gd`, `gr`, hover on `space k`, and completion in insert mode: a popup opens after a trigger character, after a short pause in typing an identifier, or on `C-x`, and narrows as you type. Snippets go in as plain text. Rename (`space n`) asks for the new name and changes every file the server names; files that were not open come up as unsaved buffers, so nothing is written until you save (`:wa`). `space =` or `:format` formats the buffer as one undo step. `space c` lists code actions (quick fixes, refactors) for the cursor or selection. In insert mode, typing `(` or `,` in a call, or `C-k`, shows the signature with the current parameter marked. An edit from the server is applied whole or not at all: if the server says which version of a buffer it edited and the buffer has changed since, or the edits overlap or point past the end, nothing changes and the status line says why.
 - Git: `+`, `~` and `-` signs in the gutter, the branch in the status line, and `:git-status` and `:worktrees` pickers.
 - An automation API for agents and scripts: `maestro --headless` (JSON-RPC on stdio) or `--listen <socket>` alongside the interactive editor, with version-checked edits. See [docs/automation.md](docs/automation.md).
 - Edit proposals from those clients: a change to an open file that waits for you. The status line says one is waiting; `space e` or `:proposals` shows who sent it, why, and the diff with changed words marked. `a` approves after a dialog that names the exact verification command the client asked for, `x` rejects with an optional reason. An approved proposal is one undo step; if the file changed since the client looked, it is refused as stale. With a verification command the file is saved and the command runs in the background, and its exit code and output go back to the client and into the file's history. Headless runs refuse proposals.
@@ -70,6 +70,11 @@ cargo build --release
 | `space f` / `space /` / `space r` | find a file / search the workspace / recent files |
 | `C-x` (insert mode) | ask the language server for completions |
 | `C-n` `C-p`, Tab or Enter, Escape | in the completion popup: move, accept, close |
+| `C-k` (insert mode) | show the signature of the call around the cursor |
+| `gd` / `gr` / `space k` | go to the definition / list references / hover |
+| `space n` / `:rename [name]` | rename the symbol under the cursor across files (unsaved until `:wa`) |
+| `space c` / `:code-action` | pick a code action for the cursor or selection |
+| `space =` / `:format`, `:format-selection` | format the buffer, or the primary selection, with the language server |
 | `space a` | the agent panel: `n` new task (with `@allow`, `@forbid`, `@verify`, `@accept` or `@contract` lines for a task contract), `N` same task with another provider, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate (`O` instead of `y` when files are outside the contract), `X` reject, `A` archive, `R` relaunch, `a` adopt a found worktree, `v` history or test output, `C-\` keys to the agent's terminal and back |
 | in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `D` drop the file's change, `ret` open the file there |
 
