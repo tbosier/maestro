@@ -27,7 +27,7 @@ CI (`.github/workflows/ci.yml`) runs the same commands on Linux, checks that the
 
 ## Pull requests and releases
 
-Every change reaches `main` through a pull request that fills in the template and passes CI. After a pull request merges, `main` is tagged: a new minor version (`v0.2.0`) for a pull request that adds a feature, a new patch version (`v0.1.1`) for fixes and documentation.
+Every change reaches `main` through a pull request that fills in the template and passes CI. After a pull request merges, `main` is tagged with the version that pull request set in `Cargo.toml`: a new minor version (`v0.2.0`) for a pull request that adds a feature, a new patch version (`v0.1.1`) for fixes and documentation.
 
 Changes that affect what you see or how input behaves also need an interactive check in a real terminal. The pattern used so far:
 
