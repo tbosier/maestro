@@ -100,7 +100,10 @@ fn repository_list_has_status_inline() {
     assert_eq!(items[0].author, "tidy-dev");
     let draft = &items[2];
     assert!(draft.draft);
-    assert_eq!(draft.pr_status().unwrap().summary().label(), "passed 1, 20 skipped");
+    assert_eq!(
+        draft.pr_status().unwrap().summary().label(),
+        "passed 1, 20 skipped"
+    );
 }
 
 #[test]
@@ -118,18 +121,30 @@ fn detail() {
     assert_eq!(d.reviews[0].author, "babakks");
     assert_eq!(d.reviews[0].state, "APPROVED");
     assert_eq!(d.status.review_decision, ReviewDecision::Approved);
-    assert_eq!(d.status.head_oid, "936921fa9e67cdbf78fb25abc6252afabafef056");
+    assert_eq!(
+        d.status.head_oid,
+        "936921fa9e67cdbf78fb25abc6252afabafef056"
+    );
     assert_eq!(d.merge_state, "CLEAN");
     assert_eq!(d.base_ref, "trunk");
     assert!(!d.cross_repo);
     assert_eq!(d.files.len(), 2);
-    assert_eq!(d.files[0].path, ".github/workflows/dependabot-triage.lock.yml");
+    assert_eq!(
+        d.files[0].path,
+        ".github/workflows/dependabot-triage.lock.yml"
+    );
     assert_eq!((d.files[0].additions, d.files[0].deletions), (2, 2));
     let sum = d.status.summary();
     assert_eq!((sum.passed, sum.skipped), (9, 7));
     let text = plain_text(&d.body);
-    assert!(text.starts_with("Bumps [actions/create-github-app-token]"), "{text}");
-    assert!(!text.contains("<details>") && !text.contains("<p>"), "{text}");
+    assert!(
+        text.starts_with("Bumps [actions/create-github-app-token]"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("<details>") && !text.contains("<p>"),
+        "{text}"
+    );
 }
 
 #[test]

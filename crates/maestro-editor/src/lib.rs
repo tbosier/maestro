@@ -7,11 +7,13 @@
 //! on their own threads (see [`lsp`]); large parses run in the background
 //! (see [`syntax`]). Coding agents, their terminals, tests and review run
 //! through `maestro-agent`, `maestro-term`, `maestro-tasks` and
-//! `maestro-git` (see [`agents`]).
+//! `maestro-git` (see [`agents`]). The GitHub inbox runs the GitHub CLI
+//! through `maestro-forge` on background threads (see [`forge`]).
 
 pub mod agents;
 pub mod commands;
 pub mod editor;
+pub mod forge;
 pub mod git;
 pub mod key;
 pub mod keymap;

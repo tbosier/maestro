@@ -67,7 +67,10 @@ pwd > "$d/calls/$i.cwd"
                 let read = |ext: &str| {
                     std::fs::read_to_string(self.dir.join(format!("calls/{stem}.{ext}"))).unwrap()
                 };
-                (read("args").lines().map(String::from).collect(), read("stdin"))
+                (
+                    read("args").lines().map(String::from).collect(),
+                    read("stdin"),
+                )
             })
             .collect()
     }
@@ -90,7 +93,10 @@ pwd > "$d/calls/$i.cwd"
         // `<nanoseconds>.<pid>`: numeric order is start order.
         stems.sort_by_key(|s| {
             let (t, p) = s.split_once('.').unwrap_or((s, "0"));
-            (t.parse::<u128>().unwrap_or(0), p.parse::<u64>().unwrap_or(0))
+            (
+                t.parse::<u128>().unwrap_or(0),
+                p.parse::<u64>().unwrap_or(0),
+            )
         });
         stems
     }
@@ -131,7 +137,15 @@ fn comment_and_request_changes_send_the_body_on_stdin() {
     let calls = f.calls();
     assert_eq!(
         calls[0].0,
-        args(&["pr", "comment", "41", "--repo", "octo/demo", "--body-file", "-"])
+        args(&[
+            "pr",
+            "comment",
+            "41",
+            "--repo",
+            "octo/demo",
+            "--body-file",
+            "-"
+        ])
     );
     assert_eq!(calls[0].1, body);
     assert_eq!(
@@ -199,12 +213,7 @@ fn browse_and_checkout_commands_run_where_asked() {
     let repo = f.dir.clone();
     f.gh().run(&browse_command(&PR(), true)).unwrap();
     f.gh()
-        .run(&checkout_command(
-            &PR(),
-            "pr-41",
-            &repo.join("wt"),
-            &repo,
-        ))
+        .run(&checkout_command(&PR(), "pr-41", &repo.join("wt"), &repo))
         .unwrap();
     let calls = f.calls();
     assert_eq!(
@@ -242,7 +251,11 @@ fn a_slow_gh_is_stopped_at_the_timeout() {
         .run(&GhCommand::new(["search", "prs"]))
         .unwrap_err();
     assert_eq!(e, ForgeError::Timeout { secs: 1 });
-    assert!(start.elapsed() < Duration::from_secs(4), "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 /// Answers every read-only query the inbox makes from the fixtures.
@@ -270,12 +283,12 @@ fn inbox_loads_every_section_and_each_status_once() {
     assert_eq!(inbox.current_repo(), Some("cli/cli"));
     let rr = inbox.section(SectionKind::ReviewRequested).unwrap();
     let items = rr.items.as_ref().unwrap();
-    assert_eq!(
-        items[0].pr_status().unwrap().summary().label(),
-        "passed 6"
-    );
+    assert_eq!(items[0].pr_status().unwrap().summary().label(), "passed 6");
     // One status lookup failed: that row says so, the rest still load.
-    assert!(matches!(&items[2].status, Some(Err(ForgeError::Command { .. }))));
+    assert!(matches!(
+        &items[2].status,
+        Some(Err(ForgeError::Command { .. }))
+    ));
     assert!(!rr.limited);
     assert_eq!(
         inbox
@@ -341,7 +354,10 @@ esac"#,
     let this = inbox.section(SectionKind::ThisRepository).unwrap();
     assert_eq!(
         this.repo,
-        Err("failed to run git: fatal: not a git repository (or any parent up to mount point /)".into())
+        Err(
+            "failed to run git: fatal: not a git repository (or any parent up to mount point /)"
+                .into()
+        )
     );
     assert_eq!(this.items, Ok(Vec::new()));
     assert_eq!(inbox.review_requests(), Some(0));
@@ -350,9 +366,8 @@ esac"#,
 #[test]
 fn logged_out_missing_and_offline_are_whole_inbox_problems() {
     // gh's real message and exit code when no account is logged in.
-    let f = Fake::new(
-        "echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4",
-    );
+    let f =
+        Fake::new("echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4");
     let inbox = load_inbox(&f.gh(), &f.dir, 30);
     assert_eq!(inbox.fatal, Some(ForgeError::NotLoggedIn));
     assert_eq!(inbox.review_requests(), None);
@@ -371,7 +386,10 @@ fn logged_out_missing_and_offline_are_whole_inbox_problems() {
          echo 'check your internet connection or https://githubstatus.com' >&2; exit 1",
     );
     let inbox = load_inbox(&f.gh(), &f.dir, 30);
-    assert!(matches!(inbox.fatal, Some(ForgeError::Network(_))), "{inbox:?}");
+    assert!(
+        matches!(inbox.fatal, Some(ForgeError::Network(_))),
+        "{inbox:?}"
+    );
 }
 
 #[test]
@@ -414,7 +432,9 @@ esac"#,
     let calls = f.calls();
     assert_eq!(
         calls[1].0,
-        args(&["pr", "diff", "14716", "--repo", "cli/cli", "--color", "never"])
+        args(&[
+            "pr", "diff", "14716", "--repo", "cli/cli", "--color", "never"
+        ])
     );
 }
 
@@ -422,5 +442,8 @@ esac"#,
 fn unparsable_output_is_a_parse_error() {
     let f = Fake::new("echo '<html>'");
     let e = search_prs(&f.gh(), "--author=@me", 5).unwrap_err();
-    assert!(matches!(e, ForgeError::Parse { ref command, .. } if command == "gh search prs"), "{e}");
+    assert!(
+        matches!(e, ForgeError::Parse { ref command, .. } if command == "gh search prs"),
+        "{e}"
+    );
 }

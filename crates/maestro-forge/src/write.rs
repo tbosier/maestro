@@ -16,7 +16,8 @@ pub enum MergeMethod {
 }
 
 impl MergeMethod {
-    pub const ALL: [MergeMethod; 3] = [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase];
+    pub const ALL: [MergeMethod; 3] =
+        [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase];
 
     pub fn flag(self) -> &'static str {
         match self {
