@@ -293,17 +293,40 @@ fn spec_example_selects_exactly_the_right_functions_and_adds_the_attribute_as_on
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The raw-query pipeline as docs/editor-model.md prints it.
+fn documented_raw_pipeline() -> String {
+    let doc = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/editor-model.md"),
+    )
+    .unwrap();
+    doc.lines()
+        .find_map(|l| l.strip_prefix(":select-nodes (function_item"))
+        .map(|rest| format!("select-nodes (function_item{rest}"))
+        .expect("the raw pipeline is in the docs")
+}
+
 #[test]
-fn raw_queries_give_the_same_result_as_the_shortcuts() {
+fn the_documented_raw_queries_give_the_same_result_as_the_shortcuts() {
+    let raw = documented_raw_pipeline();
     let dir = temp_dir("raw");
     let mut ed = open(&dir.join("service.rs"), FIXTURE);
-    command(
-        &mut ed,
-        r#"select-nodes (function_item (visibility_modifier) @v (#eq? @v "pub") (function_modifiers "async")) @select | keep-nodes (function_item return_type: [(generic_type type: (type_identifier) @t) (generic_type type: (scoped_type_identifier name: (type_identifier) @t))] (#eq? @t "Result")) @select | remove-nodes ((attribute_item (attribute [(identifier) (scoped_identifier)] @a (#match? @a "^(tracing::)?instrument$"))) . [(attribute_item) (line_comment) (block_comment)]* . (function_item) @select) | insert-above #[tracing::instrument]"#,
-    );
+    command(&mut ed, &raw);
     let (sev, msg) = status(&ed);
     assert_eq!(sev, Severity::Info, "{msg}");
     assert_eq!(text(&ed), expected_after_spec_pipeline());
+
+    // Return types the fixture lacks: a plain `Result` alias and paths.
+    let src = "type Result = std::result::Result<(), ()>;\npub async fn a() -> Result {\n    Ok(())\n}\npub async fn b() -> io::Result<()> {\n    Ok(())\n}\npub async fn c() -> std::io::Result<()> {\n    Ok(())\n}\npub async fn d() -> Option<Result> {\n    None\n}\n";
+    let mut results = Vec::new();
+    for line in [raw.as_str(), SPEC_PIPELINE] {
+        let mut ed = open(&dir.join("alias.rs"), src);
+        command(&mut ed, line);
+        assert_eq!(status(&ed).0, Severity::Info, "{:?}", status(&ed));
+        results.push(text(&ed));
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0].matches("#[tracing::instrument]").count(), 3);
+    assert!(!results[0].contains("#[tracing::instrument]\npub async fn d"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -363,6 +386,22 @@ fn invalid_queries_report_the_position_and_change_nothing() {
     assert_eq!(
         status(&ed).1,
         "step 2 (insert-above): insert-above changes the text, so it must be the last step"
+    );
+    command(
+        &mut ed,
+        r#"select-nodes (function_item name: (identifier) @n (#equal? @n "fetch")) @select | insert-above #[inline]"#,
+    );
+    assert!(
+        status(&ed).1.starts_with(
+            "step 1 (select-nodes): invalid query at column 39: unsupported predicate #equal?"
+        ),
+        "{:?}",
+        status(&ed)
+    );
+    ed.execute_line("select-nodes fn | insert-above // one\n// two");
+    assert_eq!(
+        status(&ed).1,
+        "step 2 (insert-above): takes one line of text, without line breaks"
     );
     command(&mut ed, "select-nodes fn | | keep-matching y");
     assert_eq!(status(&ed).1, "step 2 is empty");
@@ -445,7 +484,7 @@ fn filters_by_text_and_by_contained_nodes() {
     assert_eq!(fn_names(&ed), ["traced_private"]);
     assert_eq!(
         status(&ed).1,
-        "select-nodes 14 (1 nested or overlapping merged) | remove-containing 2 | keep-matching 1"
+        "select-nodes 15 | remove-containing 2 | keep-matching 1"
     );
     // A Rust function's node does not include the attributes above it, so
     // its text does not either.
@@ -455,7 +494,7 @@ fn filters_by_text_and_by_contained_nodes() {
     );
     assert_eq!(
         status(&ed).1,
-        "step 3 (keep-matching) left no selections (after select-nodes 14 (1 nested or overlapping merged) | remove-containing 2); nothing changed"
+        "step 3 (keep-matching) left no selections (after select-nodes 15 | remove-containing 2); nothing changed"
     );
     assert_eq!(fn_names(&ed), ["traced_private"]);
     // keep-nodes tests the selection's own node; keep-containing any node
@@ -527,11 +566,11 @@ fn nested_matches_merge_and_the_status_says_so() {
     let dir = temp_dir("nested");
     let mut ed = open(&dir.join("service.rs"), FIXTURE);
     command(&mut ed, "select-nodes fn");
-    // 15 function items (a trait's signature and a macro body are not),
-    // helper merged into no_result.
+    // 15 function items (a trait's signature and a macro body are not);
+    // helper merges into no_result only when the selection is made.
     assert_eq!(
         status(&ed).1,
-        "select-nodes 14 (1 nested or overlapping merged)"
+        "select-nodes 15; 14 selections after merging 1 nested in others"
     );
     assert!(!fn_names(&ed).contains(&"helper".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -670,6 +709,97 @@ fn buffers_without_a_tree_say_why() {
     );
     ed.run_command("insert-above");
     assert_eq!(status(&ed).1, "insert-above: needs the text to insert");
+}
+
+#[test]
+fn a_function_nested_in_one_the_filters_drop_still_gets_the_attribute() {
+    let dir = temp_dir("nested-kept");
+    let src = "pub async fn outer() -> u32 {\n    pub async fn inner() -> Result<(), ()> {\n        Ok(())\n    }\n    1\n}\n\npub async fn sibling() -> Result<(), ()> {\n    Ok(())\n}\n";
+    let mut ed = open(&dir.join("x.rs"), src);
+    command(&mut ed, SPEC_PIPELINE);
+    assert_eq!(
+        status(&ed).1,
+        "select-nodes 3 | keep-nodes 2 | remove-nodes 2 | insert-above 2: inserted 2 lines (u undoes)"
+    );
+    assert_eq!(
+        text(&ed),
+        "pub async fn outer() -> u32 {\n    #[tracing::instrument]\n    pub async fn inner() -> Result<(), ()> {\n        Ok(())\n    }\n    1\n}\n\n#[tracing::instrument]\npub async fn sibling() -> Result<(), ()> {\n    Ok(())\n}\n"
+    );
+    assert_eq!(fn_names(&ed), ["inner", "sibling"]);
+    // When both the outer and the inner function survive, both get the
+    // line, and the selection merges them.
+    run(&mut ed, "u");
+    command(&mut ed, "select-nodes pub-async-fn | insert-above // async");
+    assert_eq!(
+        status(&ed).1,
+        "select-nodes 3 | insert-above 3: inserted 3 lines (u undoes); 2 selections after merging 1 nested in others"
+    );
+    assert_eq!(text(&ed).matches("// async\n").count(), 3);
+    assert_eq!(fn_names(&ed), ["outer", "sibling"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_above_treats_only_newline_as_a_line_break() {
+    let dir = temp_dir("separators");
+    for sep in ['\u{2028}', '\u{2029}', '\r', '\u{0b}', '\u{0c}', '\u{85}'] {
+        let src = format!("// disabled{sep}fn disabled() {{}}\nfn real() {{}}\n");
+        let mut ed = open(&dir.join("x.rs"), &src);
+        // The commented-out function is not a node.
+        command(&mut ed, "select-nodes fn");
+        assert_eq!(selections(&ed), ["fn real() {}"], "{sep:?}");
+        // A cursor on it, after the separator, is mid-line for a compiler.
+        let at = src.chars().position(|c| c == sep).unwrap() + 1;
+        ed.set_selection(maestro_core::Selection::point(at));
+        command(&mut ed, "insert-above // note");
+        assert_eq!(status(&ed).0, Severity::Error, "{sep:?}");
+        assert!(status(&ed).1.contains("starts after other text"), "{sep:?}");
+        assert_eq!(text(&ed), src, "{sep:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pipeline_run_during_an_insert_session_is_its_own_undo_step() {
+    let dir = temp_dir("insert-undo");
+    let mut ed = open(&dir.join("x.rs"), "fn f() {}\n");
+    run(&mut ed, "i\n");
+    assert_eq!(text(&ed), "\nfn f() {}\n");
+    // As the automation API's editor.execute does, mid-insert.
+    ed.execute_line("select-nodes fn | insert-above // hi");
+    assert_eq!(text(&ed), "\n// hi\nfn f() {}\n");
+    run(&mut ed, "<esc>u");
+    assert_eq!(text(&ed), "\nfn f() {}\n", "the typed newline stays");
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), "fn f() {}\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn regex_filters_count_empty_matches() {
+    let dir = temp_dir("zero-width");
+    let mut ed = open(&dir.join("x.rs"), "fn f() {}\n");
+    command(&mut ed, "select-nodes fn | keep-matching ^");
+    assert_eq!(status(&ed).1, "select-nodes 1 | keep-matching 1");
+    command(
+        &mut ed,
+        "select-nodes fn | remove-matching ^ | insert-above #[inline]",
+    );
+    assert_eq!(
+        status(&ed).1,
+        "step 2 (remove-matching) left no selections (after select-nodes 1); nothing changed"
+    );
+    assert_eq!(text(&ed), "fn f() {}\n");
+    // A character class with a paren does not swallow the next step.
+    command(
+        &mut ed,
+        "select-nodes fn | remove-matching [(] | insert-above #[inline]",
+    );
+    assert_eq!(
+        status(&ed).1,
+        "step 2 (remove-matching) left no selections (after select-nodes 1); nothing changed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A generated Rust file of `lines` lines with the fixture's kinds of

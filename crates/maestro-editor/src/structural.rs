@@ -11,8 +11,8 @@
 //! changes nothing, and the edit is one transaction and one undo step.
 //! `docs/editor-model.md` describes the commands for users.
 
-use maestro_core::text::{line_indent, prev_grapheme_boundary};
-use maestro_core::{Change, ChangeSet, Range, Rope, Selection, Transaction};
+use maestro_core::text::prev_grapheme_boundary;
+use maestro_core::{Change, ChangeSet, Range, Rope, RopeSlice, Selection, Transaction};
 use maestro_syntax::{Language, NodeQuery, Syntax, shortcuts};
 use regex::Regex;
 
@@ -74,27 +74,59 @@ impl Step {
     }
 }
 
-/// Splits a command line into steps at each `|` that is outside double
-/// quotes and outside `()`, `[]` and `{}`. A backslash keeps the next
-/// character from counting, so `\|` and `\(` in a regex do not split or
-/// nest.
+/// Splits a command line into steps at each `|` that is outside
+/// parentheses, outside a `[...]` bracket (a regex character class or a
+/// query alternation), and outside a double-quoted string inside
+/// parentheses (a query predicate's argument). A backslash keeps the next
+/// character from counting, so `\|` and `\(` do not split or nest. Inside a
+/// bracket nothing counts until its closing `]`; a `]` right after `[` or
+/// `[^` belongs to the class, as in a regex.
 pub fn split_steps(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut quoted = false;
+    // Some(n): inside a bracket, with n chars of it seen so far.
+    let mut bracket: Option<usize> = None;
+    let mut caret = false;
     let mut escaped = false;
     let mut start = 0;
     for (i, c) in line.char_indices() {
         if escaped {
             escaped = false;
+            if let Some(n) = &mut bracket {
+                *n += 1;
+            }
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(n) = bracket {
+            let literal_close = n == 0 || (n == 1 && caret);
+            if c == ']' && !literal_close {
+                bracket = None;
+            } else {
+                caret = n == 0 && c == '^';
+                bracket = Some(n + 1);
+            }
+            continue;
+        }
+        if quoted {
+            if c == '"' {
+                quoted = false;
+            }
             continue;
         }
         match c {
-            '\\' => escaped = true,
-            '"' => quoted = !quoted,
-            '(' | '[' | '{' if !quoted => depth += 1,
-            ')' | ']' | '}' if !quoted => depth = depth.saturating_sub(1),
-            '|' if !quoted && depth == 0 => {
+            '"' if depth > 0 => quoted = true,
+            '[' => {
+                bracket = Some(0);
+                caret = false;
+            }
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
                 out.push(line[start..i].trim());
                 start = i + 1;
             }
@@ -174,6 +206,9 @@ fn parse_step(name: &str, arg: &str, lang: Option<Language>) -> Result<Step, Str
             if arg.is_empty() {
                 return Err("needs the text to insert".into());
             }
+            if arg.chars().any(maestro_core::text::is_line_ending_char) {
+                return Err("takes one line of text, without line breaks".into());
+            }
             Step::InsertAbove {
                 text: arg.to_string(),
             }
@@ -237,8 +272,13 @@ fn run(ed: &mut Editor, line: &str) -> Result<(), String> {
         None
     };
 
-    // Compute the selections step by step without touching the editor.
-    let mut sel = ed.view().selection.clone();
+    // Run the selection steps on a list of candidate ranges that may nest
+    // (a function inside a function), without touching the editor. Merging
+    // them into a selection waits until the end, so a filter that drops an
+    // outer function keeps a matching one inside it.
+    let s = text.slice(..);
+    let cursor = ed.view().selection.primary().cursor();
+    let mut cands: Vec<Range> = ed.view().selection.ranges().to_vec();
     let mut report: Vec<String> = Vec::new();
     let mut insert: Option<String> = None;
     for (i, (name, step)) in steps.into_iter().enumerate() {
@@ -246,107 +286,106 @@ fn run(ed: &mut Editor, line: &str) -> Result<(), String> {
             insert = Some(text);
             break;
         }
-        let (next, merged) = apply_step(&step, syntax, &text, &sel);
-        let Some(next) = next else {
+        cands = apply_step(&step, syntax, &text, cands);
+        if cands.is_empty() {
             let mut msg = format!("{} left no selections", label(i, name));
             if !report.is_empty() {
                 msg.push_str(&format!(" (after {})", report.join(" | ")));
             }
             msg.push_str("; nothing changed");
             return Err(msg);
-        };
-        let mut entry = format!("{name} {}", next.len());
-        if merged > 0 {
-            entry.push_str(&format!(" ({merged} nested or overlapping merged)"));
         }
-        report.push(entry);
-        sel = next;
+        report.push(format!("{name} {}", cands.len()));
     }
+
+    // The first candidate that ends past the old cursor becomes primary, so
+    // the view stays near where the user was (and a filter that keeps the
+    // old primary keeps it primary).
+    let primary = cands
+        .iter()
+        .position(|r| r.to(s) > cursor)
+        .unwrap_or(cands.len() - 1);
+    let sel = Selection::new(cands.clone(), primary).normalize(s);
+    let merged = cands.len() - sel.len();
+    let merge_note = if merged > 0 {
+        format!(
+            "; {} selections after merging {merged} nested in others",
+            sel.len()
+        )
+    } else {
+        String::new()
+    };
 
     match insert {
         None => {
             ed.set_selection(sel);
-            ed.info(report.join(" | "));
+            ed.info(format!("{}{merge_note}", report.join(" | ")));
         }
         Some(line_text) => {
-            let (cs, lines) = insert_above(ed, &text, &sel, &line_text)?;
+            let (cs, lines) = insert_above(ed, &text, &cands, &line_text)?;
             // The new selections ride on the transaction, so a refused edit
             // (a read-only buffer) leaves the old ones too. Text inserted
             // at a selection's start lands outside it (`Range::map`).
             let after = sel.map(&cs);
+            // Close any undo group the user has open (insert mode, through
+            // the automation API), so one undo reverts exactly this edit.
+            ed.commit();
             if !ed.apply_or_report(Transaction::new(cs).with_selection(after)) {
                 return Ok(());
             }
-            let n = ed.view().selection.len();
             report.push(format!(
-                "insert-above {n}: inserted {lines} line{} (u undoes)",
+                "insert-above {}: inserted {lines} line{} (u undoes)",
+                cands.len(),
                 if lines == 1 { "" } else { "s" }
             ));
-            ed.info(report.join(" | "));
+            ed.info(format!("{}{merge_note}", report.join(" | ")));
         }
     }
     Ok(())
 }
 
-/// Turns char ranges into inclusive selection ranges, sorted and merged.
-/// Returns the selection (or `None` if there are no ranges) and how many
-/// ranges merged into others.
-fn to_selection(
-    text: &Rope,
-    ranges: Vec<std::ops::Range<usize>>,
-    cursor: usize,
-) -> (Option<Selection>, usize) {
-    let s = text.slice(..);
-    let ranges: Vec<Range> = ranges
-        .into_iter()
-        .filter(|r| r.start < r.end)
-        .map(|r| Range::new(r.start, prev_grapheme_boundary(s, r.end)))
-        .collect();
-    if ranges.is_empty() {
-        return (None, 0);
-    }
-    let n = ranges.len();
-    // The first range that ends past the old cursor becomes primary, so the
-    // view stays near where the user was.
-    let primary = ranges
-        .iter()
-        .position(|r| r.to(s) > cursor)
-        .unwrap_or(n - 1);
-    let sel = Selection::new(ranges, primary).normalize(s);
-    let merged = n - sel.len();
-    (Some(sel), merged)
+/// The covered char span `from..to` of an inclusive range.
+fn span(s: RopeSlice, r: &Range) -> (usize, usize) {
+    (r.from(), r.to(s))
 }
 
-/// Runs one selection step. Returns the new selection (`None` when nothing
-/// is left) and how many ranges merged. `syntax` is present whenever a
-/// step needs it ([`Step::needs_tree`]).
-fn apply_step(
-    step: &Step,
-    syntax: Option<&Syntax>,
-    text: &Rope,
-    sel: &Selection,
-) -> (Option<Selection>, usize) {
+/// Inclusive ranges for char spans, sorted by start (longest first) with
+/// duplicates removed. Nested spans stay.
+fn candidates(s: RopeSlice, spans: impl IntoIterator<Item = std::ops::Range<usize>>) -> Vec<Range> {
+    let mut spans: Vec<(usize, usize)> = spans
+        .into_iter()
+        .filter(|r| r.start < r.end)
+        .map(|r| (r.start, r.end))
+        .collect();
+    spans.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    spans.dedup();
+    spans
+        .into_iter()
+        .map(|(a, b)| Range::new(a, prev_grapheme_boundary(s, b)))
+        .collect()
+}
+
+/// Runs one selection step on the candidates and returns the new ones
+/// (empty when nothing is left). `syntax` is present whenever a step needs
+/// it ([`Step::needs_tree`]).
+fn apply_step(step: &Step, syntax: Option<&Syntax>, text: &Rope, cands: Vec<Range>) -> Vec<Range> {
     let s = text.slice(..);
     let tree = || syntax.expect("the caller checked for a tree");
     match step {
         Step::Select {
             query,
             inside: false,
-        } => {
-            let found = tree().query_nodes(text, query);
-            to_selection(text, found, sel.primary().cursor())
-        }
+        } => candidates(s, tree().query_nodes(text, query)),
         Step::Select {
             query,
             inside: true,
         } => {
             let found = tree().query_nodes(text, query);
-            let mut out = Vec::new();
-            for r in sel.iter() {
-                let (from, to) = (r.from(), r.to(s));
-                out.extend(within(&found, from, to).cloned());
-            }
-            to_selection(text, out, sel.primary().cursor())
+            let inner = cands.iter().flat_map(|r| {
+                let (from, to) = span(s, r);
+                within(&found, from, to).cloned().collect::<Vec<_>>()
+            });
+            candidates(s, inner)
         }
         Step::FilterNodes {
             query,
@@ -355,7 +394,7 @@ fn apply_step(
         } => {
             let found = tree().query_nodes(text, query);
             let hit = |r: &Range| {
-                let (from, to) = (r.from(), r.to(s));
+                let (from, to) = span(s, r);
                 if *containing {
                     within(&found, from, to).next().is_some()
                 } else {
@@ -364,23 +403,22 @@ fn apply_step(
                         .is_ok()
                 }
             };
-            let next = sel.transform_many(s, |r| if hit(&r) == *keep { vec![r] } else { vec![] });
-            (next, 0)
+            cands.into_iter().filter(|r| hit(r) == *keep).collect()
         }
-        Step::FilterRegex { re, keep } => {
-            let next = sel.transform_many(s, |r| {
-                let hit = !crate::search::matches_in(text, re, r.from(), r.to(s)).is_empty();
-                if hit == *keep { vec![r] } else { vec![] }
-            });
-            (next, 0)
-        }
+        Step::FilterRegex { re, keep } => cands
+            .into_iter()
+            .filter(|r| {
+                let (from, to) = span(s, r);
+                re.is_match(&s.slice(from..to).to_string()) == *keep
+            })
+            .collect(),
         Step::ExpandTo { kinds } => {
             let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
-            let found: Vec<std::ops::Range<usize>> = sel
-                .iter()
-                .filter_map(|r| tree().enclosing_kind(text, r.from(), r.to(s), &kinds))
-                .collect();
-            to_selection(text, found, sel.primary().cursor())
+            let grown = cands.iter().filter_map(|r| {
+                let (from, to) = span(s, r);
+                tree().enclosing_kind(text, from, to, &kinds)
+            });
+            candidates(s, grown)
         }
         Step::InsertAbove { .. } => unreachable!("handled by the caller"),
     }
@@ -399,36 +437,50 @@ fn within(
         .filter(move |f| f.end <= to)
 }
 
-/// The change set that inserts `line_text` on a new line above the first
-/// line of each selection, indented like that line. Refuses (changing
-/// nothing) when a selection starts after the first non-blank character of
-/// its line, where the new line would land above other code.
+/// The change set that inserts `line_text` on a new line above the line of
+/// each candidate's start, indented like that line, and how many lines it
+/// inserts. Lines end at `\n` here, as they do for compilers: Ropey also
+/// breaks lines at a lone CR, form feed or U+2028, and inserting after one
+/// of those inside a `//` comment would end the comment early. Refuses
+/// (changing nothing) when a candidate starts after other text on its
+/// line, where the new line would sit above other code.
 fn insert_above(
     ed: &Editor,
     text: &Rope,
-    sel: &Selection,
+    cands: &[Range],
     line_text: &str,
 ) -> Result<(ChangeSet, usize), String> {
     let s = text.slice(..);
     let le = ed.doc().line_ending().as_str();
-    let mut changes = Vec::new();
-    let mut last_line = None;
-    for r in sel.iter() {
-        let line = s.char_to_line(r.from());
-        let start = s.line_to_char(line);
-        let indent = line_indent(s, line);
-        if r.from() > start + indent.chars().count() {
+    let mut starts: Vec<usize> = Vec::new();
+    for r in cands {
+        let from = r.from();
+        let mut start = from;
+        while start > 0 && s.char(start - 1) != '\n' {
+            start -= 1;
+        }
+        let blank = s.slice(start..from).chars().all(|c| c == ' ' || c == '\t');
+        if !blank {
             return Err(format!(
                 "insert-above: the selection on line {} starts after other text on that line, so a line above it would not belong to it; nothing changed",
-                line + 1
+                s.char_to_line(from) + 1
             ));
         }
-        if last_line == Some(line) {
-            continue;
-        }
-        last_line = Some(line);
-        changes.push(Change::insert(start, format!("{indent}{line_text}{le}")));
+        starts.push(start);
     }
+    starts.sort_unstable();
+    starts.dedup();
+    let changes: Vec<Change> = starts
+        .iter()
+        .map(|&start| {
+            let indent: String = s
+                .slice(start..)
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            Change::insert(start, format!("{indent}{line_text}{le}"))
+        })
+        .collect();
     let lines = changes.len();
     let cs = ChangeSet::from_changes(text.len_chars(), changes).map_err(|e| e.to_string())?;
     Ok((cs, lines))
@@ -471,17 +523,27 @@ mod tests {
         assert_eq!(split_steps("a | b|c"), ["a", "b", "c"]);
         assert_eq!(
             split_steps(
-                r#"keep-nodes ((x) @a (#match? @a "p|q")) | keep-matching (a|b) | k [|] {|}"#
+                r#"keep-nodes ((x) @a (#match? @a "p|q")) | keep-matching (a|b) | k [|] [)|] [^]|] []|]"#
             ),
             [
                 r#"keep-nodes ((x) @a (#match? @a "p|q"))"#,
                 "keep-matching (a|b)",
-                "k [|] {|}"
+                "k [|] [)|] [^]|] []|]"
             ]
+        );
+        // A regex class with a paren does not swallow the next step.
+        assert_eq!(
+            split_steps("remove-matching [(] | insert-above #[allow(dead_code)]"),
+            ["remove-matching [(]", "insert-above #[allow(dead_code)]"]
         );
         assert_eq!(
             split_steps(r"keep-matching a\|b | keep-matching \(x | y"),
             [r"keep-matching a\|b", r"keep-matching \(x", "y"]
+        );
+        // A quote outside parentheses is just a character.
+        assert_eq!(
+            split_steps(r#"keep-matching " | insert-above x"#),
+            [r#"keep-matching ""#, "insert-above x"]
         );
         assert_eq!(split_steps("a |"), ["a", ""]);
     }
