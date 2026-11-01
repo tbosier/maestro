@@ -6,8 +6,8 @@
 //! state reported to subscribers. Proposals themselves live in the editor
 //! ([`maestro_editor::proposals`]), where the review overlay decides them.
 //! A [`Session`]
-//! holds what belongs to one connection: whether it has initialized and
-//! whether it subscribed to events.
+//! holds what belongs to one connection: whether it has initialized, the
+//! number the server gave it then, and whether it subscribed to events.
 //!
 //! Every call runs on the thread that owns the editor. Transports
 //! ([`crate::headless`], [`crate::socket`]) only move lines in and out.
@@ -49,11 +49,14 @@ pub const VERIFY_CAPABILITY: &str = "proposal.verification";
 /// Most API edits remembered per buffer; older records are dropped first.
 pub const HISTORY_LIMIT: usize = 10_000;
 
-/// Per-connection state.
+/// Per-connection state. Each transport makes one per connection.
 #[derive(Debug, Default, Clone)]
 pub struct Session {
     initialized: bool,
     subscribed: bool,
+    /// Given by the server at `initialize`, unique for the server's
+    /// lifetime. Proposals remember the connection that created them.
+    connection: Option<u64>,
 }
 
 impl Session {
@@ -74,6 +77,12 @@ pub struct Server {
     seen_resolved: u64,
     /// A person can answer proposals (the interactive editor).
     reviewer: bool,
+    /// The last connection number handed out by `initialize`.
+    connections: u64,
+    /// Proposal id to the connection that created it. Only that connection
+    /// may withdraw it. Actor names are whatever the client sends, so they
+    /// cannot tell clients apart; connections can.
+    owners: HashMap<u64, u64>,
 }
 
 type Res<T> = Result<T, RpcError>;
@@ -340,6 +349,8 @@ impl Server {
             seen_status: None,
             seen_resolved: ed.proposals.last_seq(),
             reviewer: false,
+            connections: 0,
+            owners: HashMap::new(),
         };
         let _ = s.collect_events(ed);
         s
@@ -512,7 +523,9 @@ impl Server {
                         .collect(),
                 })
             }
-            methods::PROPOSAL_CREATE => to_value(self.proposal_create(ed, params(raw)?)?),
+            methods::PROPOSAL_CREATE => {
+                to_value(self.proposal_create(ed, session, params(raw)?)?)
+            }
             methods::PROPOSAL_STATUS => {
                 let p: p::ProposalParams = params(raw)?;
                 to_value(proposal_info(find_proposal(ed, p.proposal)?))
@@ -531,6 +544,12 @@ impl Server {
             }
             methods::PROPOSAL_WITHDRAW => {
                 let p: p::ProposalWithdrawParams = params(raw)?;
+                find_proposal(ed, p.proposal)?;
+                if session.connection.is_none()
+                    || self.owners.get(&p.proposal) != session.connection.as_ref()
+                {
+                    return Err(not_owner(p.proposal));
+                }
                 match props::withdraw(ed, ProposalId(p.proposal), p.reason) {
                     Ok(()) => to_value(proposal_info(find_proposal(ed, p.proposal)?)),
                     Err(props::WithdrawError::NotFound) => Err(no_proposal(p.proposal)),
@@ -599,6 +618,8 @@ impl Server {
             }));
         }
         session.initialized = true;
+        self.connections += 1;
+        session.connection = Some(self.connections);
         Ok(p::InitializeResult {
             protocol_version: p::PROTOCOL_VERSION.to_string(),
             server_name: "maestro".to_string(),
@@ -661,10 +682,12 @@ impl Server {
 
     /// Validates a proposal like `document.apply_edit` validates an edit and
     /// queues it for the person at the editor. Nothing changes until they
-    /// approve it.
+    /// approve it. The proposal belongs to `session`'s connection: only it
+    /// can withdraw the proposal.
     pub fn proposal_create(
         &mut self,
         ed: &mut Editor,
+        session: &Session,
         p: p::ProposalCreateParams,
     ) -> Res<p::ProposalInfo> {
         if !self.reviewer {
@@ -732,6 +755,12 @@ impl Server {
                 verify: p.verification.map(|v| (v.program, v.args)),
             },
         );
+        // Forget the owners of proposals the editor no longer keeps.
+        self.owners
+            .retain(|id, _| ed.proposals.get(ProposalId(*id)).is_some());
+        if let Some(c) = session.connection {
+            self.owners.insert(pid.0, c);
+        }
         find_proposal(ed, pid.0).map(proposal_info)
     }
 
@@ -794,6 +823,16 @@ impl Server {
 }
 
 // ----- proposals ---------------------------------------------------------------
+
+fn not_owner(id: u64) -> RpcError {
+    err(
+        ErrorCode::NotOwner,
+        format!(
+            "proposal {id} was created by another connection; only that connection can \
+             withdraw it (the person at the editor can reject it). Nothing changed"
+        ),
+    )
+}
 
 fn no_proposal(id: u64) -> RpcError {
     err(ErrorCode::NotFound, format!("no proposal with id {id}"))

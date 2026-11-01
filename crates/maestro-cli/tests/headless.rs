@@ -78,7 +78,7 @@ fn headless_acceptance_open_edit_stale_save_history() {
         json!({"protocol_version": "1.0", "client_name": "test"}),
     );
     // A 1.0 client is accepted; the server says which minor it speaks.
-    assert_eq!(init["protocol_version"], "1.1");
+    assert_eq!(init["protocol_version"], "1.2");
     // Nobody can review proposals headless, so it does not offer them.
     assert!(
         !init["capabilities"]

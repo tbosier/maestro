@@ -4,7 +4,7 @@ Scripts and agents drive Maestro through a JSON-RPC 2.0 protocol instead of simu
 
 - Wire types: `crates/maestro-protocol` (serde only, no editor dependency, so clients can depend on it).
 - Server and transports: `crates/maestro-automation`.
-- Protocol version: `1.1`. Version 1.1 added the `proposal.*` methods, the `proposal.resolved` notification, error codes -32018 and -32019, and two fields in `document.history` (`proposal` on an edit, and `proposals`). A 1.0 client keeps working: nothing it used changed shape.
+- Protocol version: `1.2`. Version 1.1 added the `proposal.*` methods, the `proposal.resolved` notification, error codes -32018 and -32019, and two fields in `document.history` (`proposal` on an edit, and `proposals`). Version 1.2 limits `proposal.withdraw` to the connection that created the proposal and added error code -32020. A 1.0 or 1.1 client keeps working unless it withdrew proposals another connection created.
 
 ## Transports
 
@@ -92,6 +92,7 @@ Selections use the editor's model: a range covers every grapheme from `min(ancho
 | -32017 | I/O | any other file error |
 | -32018 | review unavailable | `proposal.create` where nobody can review it (headless), or with 100 proposals already pending; nothing was queued |
 | -32019 | not pending | `proposal.withdraw` on a proposal that was already decided |
+| -32020 | not owner | `proposal.withdraw` from a connection other than the one that created the proposal; nothing changed |
 
 ## Methods
 
@@ -275,7 +276,7 @@ The base version and the edits are checked at once, with the same rules and erro
 
 - `proposal.status` params: `proposal` (the id). Result: the proposal. -32011 if there is no such proposal.
 - `proposal.list` params: `doc` (optional). Result: `proposals`, oldest first, pending and decided, for that document or for all.
-- `proposal.withdraw` params: `proposal`, `reason` (optional). The client takes back a pending proposal; it resolves as `withdrawn` with `decided_by` `client`. -32019 if it was already decided. A confirmation dialog the reviewer had open for it is closed.
+- `proposal.withdraw` params: `proposal`, `reason` (optional). The client takes back a pending proposal; it resolves as `withdrawn` with `decided_by` `client`. Only the connection that created the proposal can withdraw it: any other connection gets -32020, whatever actor name it sends, since actor names are whatever a client says and cannot tell clients apart. The check comes before the state check, so -32019 (already decided) goes only to the creator. A proposal whose connection closed can no longer be withdrawn; a new connection is a different connection. The person at the editor can still reject it. A confirmation dialog the reviewer had open for it is closed.
 
 A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edit_count`, `verification` (`{program, args, cwd}` or `null`), `state` (`pending`, `verifying` while its command runs, `resolved`), `decision` (`approved`, `rejected`, `withdrawn`, `stale`, `failed`, or `null` while pending), `decided_by` (`{"kind": "user", "name": $USER}`, `{"kind": "client"}` or `{"kind": "editor"}`), `reason`, `applied_version`, `saved`, `verification_result`, and `created_ms`, `decided_ms`, `resolved_ms`.
 
