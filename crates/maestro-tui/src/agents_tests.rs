@@ -250,3 +250,70 @@ fn contracts_and_conflicts_are_shown_in_words() {
         "{text}"
     );
 }
+
+#[test]
+fn side_by_side_numbers_each_side_from_its_own_file() {
+    use maestro_editor::agents::persist::from_record;
+    use maestro_editor::agents::review::ReviewView;
+    use maestro_editor::agents::{DiffLine, Hunk};
+    let line = |kind, old, new, text: &str| DiffLine {
+        kind,
+        old_line: old,
+        new_line: new,
+        text: text.into(),
+        no_newline: false,
+    };
+    // Three lines inserted after old line 21: old 22 is new 25 below them.
+    let mut file = added("report.rs");
+    file.old_path = Some("report.rs".into());
+    file.change = FileChange::Modified;
+    file.hunks = vec![Hunk {
+        old_start: 21,
+        old_len: 2,
+        new_start: 21,
+        new_len: 5,
+        section: String::new(),
+        lines: vec![
+            line(DiffLineKind::Context, Some(21), Some(21), "context above"),
+            line(DiffLineKind::Added, None, Some(22), "one"),
+            line(DiffLineKind::Added, None, Some(23), "two"),
+            line(DiffLineKind::Added, None, Some(24), "three"),
+            line(DiffLineKind::Context, Some(22), Some(25), "context below"),
+        ],
+    }];
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 120, 28));
+    let mut a = from_record(&record(1, "ready-for-review"), &[]);
+    a.review.files = vec![file];
+    a.review.computed = Some(std::time::Instant::now());
+    let id = a.id;
+    ed.agents.agents.push(a);
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    ed.agents.panel.review = Some(ReviewView {
+        agent: id,
+        file: 0,
+        cursor: 0,
+        top: 0,
+        side_by_side: true,
+    });
+    let rows = screen(&ed);
+    let text = rows.join("\n");
+    let below = rows
+        .iter()
+        .find(|r| r.contains("context below"))
+        .expect(&text);
+    let (left, right) = below.rsplit_once('│').unwrap();
+    assert!(
+        left.contains("  22 ") && left.contains("context below"),
+        "{below}"
+    );
+    assert!(
+        right.contains("  25 ") && right.contains("context below"),
+        "{below}"
+    );
+    let added_row = rows.iter().find(|r| r.contains("two")).expect(&text);
+    assert!(
+        added_row.rsplit_once('│').unwrap().1.contains("  23 "),
+        "{added_row}"
+    );
+}
