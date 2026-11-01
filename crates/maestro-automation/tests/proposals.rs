@@ -43,7 +43,7 @@ impl Harness {
             events: Vec::new(),
         };
         let init = h.ok("initialize", json!({"protocol_version": "1.1"}));
-        assert_eq!(init["protocol_version"], "1.1");
+        assert_eq!(init["protocol_version"], "1.2");
         let caps = init["capabilities"].as_array().unwrap();
         assert!(caps.contains(&json!("proposal.review")), "{init}");
         assert!(
@@ -610,6 +610,83 @@ fn withdrawing_resolves_a_pending_proposal_only() {
     h.keys("a");
     assert!(h.ed.proposals.review.as_ref().unwrap().dialog.is_none());
     assert_eq!(h.text(doc), ("abc\n".into(), 0));
+}
+
+/// Sends one request on `session`, a connection other than the harness's
+/// own, and returns the response as JSON.
+fn call_on(h: &mut Harness, session: &mut Session, id: i64, method: &str, params: Value) -> Value {
+    let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+    let out = h
+        .server
+        .handle_line(&mut h.ed, session, &line)
+        .expect("requests with an id get a response");
+    serde_json::from_str(&out).unwrap()
+}
+
+#[test]
+fn only_the_connection_that_created_a_proposal_can_withdraw_it() {
+    let mut h = Harness::new("withdraw-owner");
+    let doc = h.file("w.txt", "abc\n");
+    let id = create(&mut h, edit(doc, 0, 0, 1, "A"))["id"]
+        .as_u64()
+        .unwrap();
+
+    // A second connection, even one claiming the same actor name, cannot
+    // withdraw it.
+    let mut other = Session::default();
+    let init = call_on(
+        &mut h,
+        &mut other,
+        1,
+        "initialize",
+        json!({"protocol_version": "1.2"}),
+    );
+    assert!(init.get("result").is_some(), "{init}");
+    let r = call_on(
+        &mut h,
+        &mut other,
+        2,
+        "proposal.withdraw",
+        json!({"proposal": id, "reason": "not mine"}),
+    );
+    assert_eq!(r["error"]["code"], -32020, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another connection"),
+        "{r}"
+    );
+    let st = h.ok("proposal.status", json!({"proposal": id}));
+    assert_eq!(st["state"], "pending", "{st}");
+    assert_eq!(st["decision"], Value::Null);
+    assert!(h.resolved().is_empty());
+
+    // The second connection's own proposal is its own to withdraw.
+    let mut mine = edit(doc, 0, 1, 2, "B");
+    mine["actor"]["name"] = json!("agent:other");
+    let r = call_on(&mut h, &mut other, 3, "proposal.create", mine);
+    let other_id = r["result"]["id"].as_u64().unwrap();
+    let r = call_on(
+        &mut h,
+        &mut other,
+        4,
+        "proposal.withdraw",
+        json!({"proposal": other_id}),
+    );
+    assert_eq!(r["result"]["decision"], "withdrawn", "{r}");
+    // Ownership is checked before the state: the first connection gets
+    // the same refusal for the other's proposal, decided or not.
+    let r = h.call("proposal.withdraw", json!({"proposal": other_id}));
+    assert_eq!(
+        r.error().and_then(|e| e.kind()),
+        Some(ErrorCode::NotOwner),
+        "{r:?}"
+    );
+
+    // The creator still can.
+    let st = h.ok("proposal.withdraw", json!({"proposal": id}));
+    assert_eq!(st["decision"], "withdrawn");
 }
 
 #[test]

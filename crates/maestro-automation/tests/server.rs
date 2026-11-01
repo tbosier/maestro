@@ -99,12 +99,12 @@ fn methods_before_initialize_are_refused_and_major_versions_checked() {
     );
     let e = r.error().unwrap();
     assert_eq!(e.kind(), Some(ErrorCode::UnsupportedProtocolVersion));
-    assert_eq!(e.data.as_ref().unwrap()["supported"], "1.1");
+    assert_eq!(e.data.as_ref().unwrap()["supported"], "1.2");
     let r = call(
         r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocol_version":"1.7"}}"#,
     );
     let v = r.result().unwrap();
-    assert_eq!(v["protocol_version"], "1.1");
+    assert_eq!(v["protocol_version"], "1.2");
     assert!(
         v["methods"]
             .as_array()

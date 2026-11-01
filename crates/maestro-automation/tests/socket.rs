@@ -356,3 +356,98 @@ fn proposal_over_the_socket_is_reviewed_applied_verified_and_recorded() {
     drop(listener);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Connects and returns the writer and reader.
+fn client(path: &std::path::Path) -> (UnixStream, BufReader<UnixStream>) {
+    let stream = UnixStream::connect(path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    (stream.try_clone().unwrap(), BufReader::new(stream))
+}
+
+/// Sends a request and reads until its response (notifications skipped).
+fn request(
+    w: &mut UnixStream,
+    r: &mut BufReader<UnixStream>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> maestro_protocol::Response {
+    send(
+        w,
+        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+    );
+    loop {
+        if let ServerMessage::Response(resp) = read_msg(r) {
+            return resp;
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs AF_UNIX sockets; run with --ignored outside sandboxes that block them"]
+fn a_second_connection_cannot_withdraw_a_proposal_it_did_not_create() {
+    let dir = std::env::temp_dir().join(format!("maestro-sock4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ed.sock");
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 100, 30));
+    let doc = ed.add_document(Document::from_text("abc\n"));
+    ed.switch_to(doc);
+    let d = doc.0;
+    let listener = socket::listen(&ed, &path).unwrap();
+
+    let p = path.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let init = json!({"protocol_version": "1.2"});
+        let (mut wa, mut ra) = client(&p);
+        let (mut wb, mut rb) = client(&p);
+        request(&mut wa, &mut ra, 1, "initialize", init.clone());
+        request(&mut wb, &mut rb, 1, "initialize", init);
+        // Both claim the same actor; only the connection tells them apart.
+        let proposal = |text: &str| {
+            json!({
+                "doc": d, "base_version": 0, "encoding": "char",
+                "edits": [{"range": {"start": 0, "end": 1}, "text": text}],
+                "actor": {"name": "agent:same", "agent_id": "x"},
+                "description": "capitalize",
+            })
+        };
+        let created = request(&mut wa, &mut ra, 2, "proposal.create", proposal("A"));
+        let id = created.result().unwrap()["id"].as_u64().unwrap();
+        let by_b = request(
+            &mut wb,
+            &mut rb,
+            2,
+            "proposal.withdraw",
+            json!({"proposal": id}),
+        );
+        let status_b = request(
+            &mut wb,
+            &mut rb,
+            3,
+            "proposal.status",
+            json!({"proposal": id}),
+        );
+        let by_a = request(
+            &mut wa,
+            &mut ra,
+            3,
+            "proposal.withdraw",
+            json!({"proposal": id}),
+        );
+        tx.send((by_b, status_b, by_a)).unwrap();
+    });
+    let (by_b, status_b, by_a) = drive(&mut ed, &rx);
+    let e = by_b.error().expect("the second connection is refused");
+    assert_eq!(e.code, -32020, "{e:?}");
+    assert!(e.message.contains("another connection"), "{}", e.message);
+    assert_eq!(status_b.result().unwrap()["state"], "pending");
+    assert_eq!(by_a.result().unwrap()["decision"], "withdrawn");
+    assert_eq!(ed.doc().text().to_string(), "abc\n");
+
+    drop(listener);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
