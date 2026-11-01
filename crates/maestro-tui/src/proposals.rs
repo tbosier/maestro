@@ -222,13 +222,12 @@ fn draw_summary(ed: &Editor, s: &mut Surface, sm: Rect, p: &Proposal) {
         let y = sm.y + 3;
         match (&p.verify, &p.result) {
             (None, _) => {
-                s.print(
-                    sm.x + 1,
-                    y,
-                    "no verification command; approving does not save the file",
-                    ui.text_muted,
-                    r,
-                );
+                let text = if p.state == State::Pending {
+                    "no verification command; approving does not save the file"
+                } else {
+                    "no verification command"
+                };
+                s.print(sm.x + 1, y, text, ui.text_muted, r);
             }
             (Some(v), None) => {
                 s.print(
