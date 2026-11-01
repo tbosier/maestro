@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use maestro_git::{DiffFile, DiffLine, DiffLineKind, FileChange, Hunk, LineHunk, diff_lines};
+use maestro_git::{
+    DiffFile, DiffLine, DiffLineKind, FileChange, Hunk, LineHunk, LineHunkKind, diff_lines,
+};
 
 use super::{Decision, ProposalId, State};
 use crate::agents::review::Row;
@@ -24,6 +26,9 @@ pub struct ReviewView {
     pub cursor: usize,
     /// First row shown.
     pub top: usize,
+    /// Columns of each line scrolled off to the left (`h`, `l`), so a long
+    /// line can be read to its end.
+    pub left: usize,
     pub side_by_side: bool,
     /// Show the verification output instead of the diff.
     pub output: bool,
@@ -59,6 +64,7 @@ pub fn open(ed: &mut Editor) {
         selected: default_selection(ed),
         cursor: 0,
         top: 0,
+        left: 0,
         side_by_side: false,
         output: false,
         dialog: None,
@@ -142,27 +148,102 @@ pub fn current_rows(ed: &Editor) -> Vec<Row> {
         }
         return out;
     }
-    crate::agents::review::rows(&p.diff, v.side_by_side, &[])
+    let mut rows = Vec::new();
+    // A change to the final newline shows as two lines with the same text;
+    // say what differs.
+    let ends = |t: &maestro_core::Rope| t.len_chars() == 0 || t.char(t.len_chars() - 1) == '\n';
+    match (ends(&p.old_text), ends(&p.new_text)) {
+        (true, false) => rows.push(Row::Note(
+            "this change removes the newline at the end of the file".into(),
+        )),
+        (false, true) => rows.push(Row::Note(
+            "this change adds a newline at the end of the file".into(),
+        )),
+        _ => {}
+    }
+    rows.extend(crate::agents::review::rows(&p.diff, v.side_by_side, &[]));
+    rows
 }
 
-/// Splits text into lines as `maestro_git::diff_lines` does: without their
-/// terminator, `\r\n` counted as `\n`.
-fn split_lines(text: &str) -> Vec<&str> {
+/// Columns the unified diff has for a line's text in `area` (the line
+/// numbers, sign and cursor column take the rest), as the front end draws
+/// it.
+pub fn text_columns(area: crate::layout::Rect) -> usize {
+    (crate::agents::panel::layout(area).content.width as usize).saturating_sub(12)
+}
+
+/// Changed lines of proposal `p` wider than `cols` columns, with tabs
+/// counted at their widest.
+pub fn wide_changed_lines(p: &super::Proposal, cols: usize) -> usize {
+    p.diff
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind != DiffLineKind::Context)
+        .filter(|l| crate::agents::panel::text_width(&l.text.replace('\t', "    ")) > cols)
+        .count()
+}
+
+/// Splits text into lines as `maestro_git::diff_lines` numbers them, but
+/// keeps each line's bytes: the line without its `\n`, a `\r` before it
+/// kept, and whether a `\n` ended it.
+fn split_lines(text: &str) -> Vec<(&str, bool)> {
     let mut out = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
         match rest.find('\n') {
             Some(i) => {
-                let line = &rest[..i];
-                out.push(line.strip_suffix('\r').unwrap_or(line));
+                out.push((&rest[..i], true));
                 rest = &rest[i + 1..];
             }
             None => {
-                out.push(rest);
+                out.push((rest, false));
                 rest = "";
             }
         }
     }
+    out
+}
+
+/// `diff_lines` treats `\r\n` and `\n` as the same line ending, which is
+/// right for gutter signs and wrong for a review: a `\r` can change what a
+/// script does. Lines it calls equal whose bytes differ (in a `\r`, or a
+/// final newline) become changes of their own, merged with their
+/// neighbors.
+fn exact_changes(ol: &[(&str, bool)], nl: &[(&str, bool)], loose: Vec<LineHunk>) -> Vec<LineHunk> {
+    let mut out: Vec<LineHunk> = Vec::new();
+    let mut push = |h: LineHunk| match out.last_mut() {
+        Some(last) if last.old.end == h.old.start && last.new.end == h.new.start => {
+            last.old.end = h.old.end;
+            last.new.end = h.new.end;
+            last.kind = LineHunkKind::Modified;
+        }
+        _ => out.push(h),
+    };
+    let (mut o, mut n) = (0, 0);
+    let equal_run = |o: usize, n: usize, len: usize, push: &mut dyn FnMut(LineHunk)| {
+        for k in 0..len {
+            if ol[o + k] != nl[n + k] {
+                push(LineHunk {
+                    kind: LineHunkKind::Modified,
+                    old: o + k..o + k + 1,
+                    new: n + k..n + k + 1,
+                });
+            }
+        }
+    };
+    for h in loose {
+        equal_run(o, n, h.old.start - o, &mut push);
+        o = h.old.end;
+        n = h.new.end;
+        push(h);
+    }
+    equal_run(
+        o,
+        n,
+        ol.len().saturating_sub(o).min(nl.len().saturating_sub(n)),
+        &mut push,
+    );
     out
 }
 
@@ -171,7 +252,7 @@ fn split_lines(text: &str) -> Vec<&str> {
 pub fn text_diff(old: &str, new: &str, path: &Path) -> DiffFile {
     let ol = split_lines(old);
     let nl = split_lines(new);
-    let changes = diff_lines(old, new);
+    let changes = exact_changes(&ol, &nl, diff_lines(old, new));
     // Changes closer than twice the context share a hunk.
     let mut groups: Vec<Vec<LineHunk>> = Vec::new();
     for h in changes {
@@ -182,12 +263,23 @@ pub fn text_diff(old: &str, new: &str, path: &Path) -> DiffFile {
             _ => groups.push(vec![h]),
         }
     }
-    let line = |kind, old: Option<usize>, new: Option<usize>, text: &str| DiffLine {
-        kind,
-        old_line: old.map(|i| i + 1),
-        new_line: new.map(|i| i + 1),
-        text: text.to_string(),
-        no_newline: false,
+    // A `\r` before the newline is dropped from what is shown, unless the
+    // hunk's changed lines disagree about it: then every changed line in the
+    // hunk keeps it, and the screen shows it as `?`.
+    let line = |kind, old: Option<usize>, new: Option<usize>, l: (&str, bool), keep_cr: bool| {
+        let (text, newline) = l;
+        let shown = if keep_cr || !newline {
+            text
+        } else {
+            text.strip_suffix('\r').unwrap_or(text)
+        };
+        DiffLine {
+            kind,
+            old_line: old.map(|i| i + 1),
+            new_line: new.map(|i| i + 1),
+            text: shown.to_string(),
+            no_newline: !newline,
+        }
     };
     let mut hunks = Vec::new();
     for g in groups {
@@ -196,24 +288,35 @@ pub fn text_diff(old: &str, new: &str, path: &Path) -> DiffFile {
         let (old0, new0) = (first.old.start - before, first.new.start - before);
         let (mut o, mut n) = (old0, new0);
         let mut lines = Vec::new();
+        let ends_cr = |l: &(&str, bool)| l.1 && l.0.ends_with('\r');
+        let changed: Vec<bool> = g
+            .iter()
+            .flat_map(|h| {
+                h.old
+                    .clone()
+                    .map(|i| ends_cr(&ol[i]))
+                    .chain(h.new.clone().map(|j| ends_cr(&nl[j])))
+            })
+            .collect();
+        let keep_cr = changed.iter().any(|c| *c) && !changed.iter().all(|c| *c);
         for h in &g {
             while o < h.old.start && n < nl.len() {
-                lines.push(line(DiffLineKind::Context, Some(o), Some(n), ol[o]));
+                lines.push(line(DiffLineKind::Context, Some(o), Some(n), ol[o], false));
                 o += 1;
                 n += 1;
             }
             for i in h.old.clone() {
-                lines.push(line(DiffLineKind::Removed, Some(i), None, ol[i]));
+                lines.push(line(DiffLineKind::Removed, Some(i), None, ol[i], keep_cr));
             }
             for j in h.new.clone() {
-                lines.push(line(DiffLineKind::Added, None, Some(j), nl[j]));
+                lines.push(line(DiffLineKind::Added, None, Some(j), nl[j], keep_cr));
             }
             o = h.old.end;
             n = h.new.end;
         }
         let after = (ol.len() - o).min(nl.len().saturating_sub(n)).min(CONTEXT);
         for _ in 0..after {
-            lines.push(line(DiffLineKind::Context, Some(o), Some(n), ol[o]));
+            lines.push(line(DiffLineKind::Context, Some(o), Some(n), ol[o], false));
             o += 1;
             n += 1;
         }
@@ -280,6 +383,13 @@ pub fn approve_dialog(ed: &Editor, id: ProposalId) -> Option<Dialog> {
             "It has no verification command: nothing runs, and the buffer is not saved.".into(),
         ),
     }
+    let wide = wide_changed_lines(p, text_columns(ed.area));
+    if wide > 0 {
+        lines.push(format!(
+            "{wide} changed line(s) are wider than the review shows: a > at the right \
+             edge marks them. l and h scroll sideways; read them before approving."
+        ));
+    }
     Some(Dialog::Approve {
         id,
         title: format!("approve proposal {}", id.0),
@@ -307,6 +417,7 @@ fn move_selection(ed: &mut Editor, delta: isize) {
     v.selected = Some(ids[(at + delta).rem_euclid(n) as usize]);
     v.cursor = 0;
     v.top = 0;
+    v.left = 0;
 }
 
 /// Handles a key while the overlay is open.
@@ -452,6 +563,12 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             v.cursor = 0;
             v.top = 0;
         }
+        KeyCode::Char('l') | KeyCode::Right if !ctrl => {
+            v.left += (text_columns(ed.area) / 2).max(1);
+        }
+        KeyCode::Char('h') | KeyCode::Left if !ctrl => {
+            v.left = v.left.saturating_sub((text_columns(ed.area) / 2).max(1));
+        }
         KeyCode::Char('o') if !ctrl => {
             v.output = !v.output;
             v.cursor = 0;
@@ -550,6 +667,7 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         ("n/p", "next/previous"),
         ("j/k", "line"),
         ("]/[", "hunk"),
+        ("h/l", "scroll sideways"),
         ("s", "side by side"),
         ("o", if v.output { "diff" } else { "output" }),
         ("esc", "close"),
@@ -608,6 +726,33 @@ mod tests {
                 assert_eq!(o[l.old_line.unwrap() - 1], n[l.new_line.unwrap() - 1]);
             }
         }
+    }
+
+    #[test]
+    fn a_carriage_return_change_is_shown() {
+        // `\r` before the newline breaks a shell line continuation; the
+        // gutter diff ignores it, the review must not.
+        let old = "echo safe \\\nprintf HIDDEN\n";
+        let new = "echo safe \\\r\nprintf HIDDEN\n";
+        let f = text_diff(old, new, Path::new("x"));
+        let k = kinds(&f);
+        assert!(
+            k.contains(&(DiffLineKind::Removed, Some(1), None, "echo safe \\".into())),
+            "{k:?}"
+        );
+        assert!(
+            k.contains(&(DiffLineKind::Added, None, Some(1), "echo safe \\\r".into())),
+            "{k:?}"
+        );
+        // A whole CRLF document with an ordinary change shows no `\r`.
+        let f = text_diff("a\r\nb\r\n", "a\r\nB\r\n", Path::new("x"));
+        let k = kinds(&f);
+        assert!(k.iter().all(|l| !l.3.contains('\r')), "{k:?}");
+        assert_eq!(f.counts(), (1, 1));
+        // A missing final newline is a change too.
+        let f = text_diff("a\nb\n", "a\nb", Path::new("x"));
+        assert_eq!(f.counts(), (1, 1));
+        assert!(f.hunks[0].lines.iter().any(|l| l.no_newline));
     }
 
     #[test]

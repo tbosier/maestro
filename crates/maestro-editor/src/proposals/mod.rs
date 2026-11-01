@@ -81,11 +81,13 @@ pub struct VerifySpec {
 
 impl VerifySpec {
     /// The command as a shell would need it typed, every word quoted where
-    /// it has to be, so the dialog shows exactly what runs.
+    /// it has to be, so the dialog shows exactly what runs. The program is
+    /// quoted more strictly than the arguments (see [`quote_program`]).
+    /// Builtins are the one gap: Maestro runs `program` from `PATH`, while a
+    /// shell given `exec` or `cd` would run its builtin.
     pub fn display(&self) -> String {
-        std::iter::once(&self.program)
-            .chain(&self.args)
-            .map(|w| shell_quote(w))
+        std::iter::once(quote_program(&self.program))
+            .chain(self.args.iter().map(|w| shell_quote(w)))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -115,15 +117,45 @@ fn hides_text(c: char) -> bool {
 /// override) is shown in Bash's `$'...'` form with those characters
 /// escaped, so every character of the command is visible.
 pub fn shell_quote(w: &str) -> String {
+    quote_word(w, hides_text)
+}
+
+/// Shell words that a shell reads as syntax, not as a program to run.
+const RESERVED: &[&str] = &[
+    "!", "{", "}", "[[", "]]", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for",
+    "function", "if", "in", "select", "then", "time", "until", "while",
+];
+
+/// Quotes the program for display. Beyond [`shell_quote`]: a word with `=`
+/// is quoted (unquoted, a shell reads `A=b c` as an assignment and runs
+/// `c`), so is a reserved word, and every non-ASCII character is escaped,
+/// so a program name cannot pass for a different one that looks the same.
+pub fn quote_program(w: &str) -> String {
+    if w.contains('=') || RESERVED.contains(&w) {
+        if w.is_ascii() && !w.chars().any(hides_text) {
+            return format!("'{}'", w.replace('\'', r"'\''"));
+        }
+        return ansi_c(w, |c| hides_text(c) || !c.is_ascii());
+    }
+    quote_word(w, |c| hides_text(c) || !c.is_ascii())
+}
+
+fn quote_word(w: &str, escape: impl Fn(char) -> bool) -> String {
     let plain = !w.is_empty()
         && w.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
     if plain {
         return w.to_string();
     }
-    if !w.chars().any(hides_text) {
+    if !w.chars().any(&escape) {
         return format!("'{}'", w.replace('\'', r"'\''"));
     }
+    ansi_c(w, escape)
+}
+
+/// Bash's `$'...'` form, with every character `escape` picks written as a
+/// `\u` (or `\U`) escape.
+fn ansi_c(w: &str, escape: impl Fn(char) -> bool) -> String {
     let mut out = String::from("$'");
     for c in w.chars() {
         match c {
@@ -132,7 +164,8 @@ pub fn shell_quote(w: &str) -> String {
             '\n' => out.push_str(r"\n"),
             '\t' => out.push_str(r"\t"),
             '\r' => out.push_str(r"\r"),
-            c if hides_text(c) => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if escape(c) && (c as u32) > 0xFFFF => out.push_str(&format!("\\U{:08X}", c as u32)),
+            c if escape(c) => out.push_str(&format!("\\u{:04X}", c as u32)),
             c => out.push(c),
         }
     }
@@ -383,21 +416,17 @@ impl Proposals {
         self.prune();
     }
 
+    /// Drops the proposals resolved longest ago, by resolution order (not
+    /// creation order), so the one just resolved is never the one dropped.
     fn prune(&mut self) {
-        let resolved = self
-            .items
-            .iter()
-            .filter(|p| p.state == State::Resolved)
-            .count();
-        let mut excess = resolved.saturating_sub(MAX_RESOLVED);
-        self.items.retain(|p| {
-            if excess > 0 && p.state == State::Resolved {
-                excess -= 1;
-                false
-            } else {
-                true
-            }
-        });
+        let mut seqs: Vec<u64> = self.items.iter().filter_map(|p| p.resolved_seq).collect();
+        if seqs.len() <= MAX_RESOLVED {
+            return;
+        }
+        seqs.sort_unstable();
+        let cutoff = seqs[seqs.len() - MAX_RESOLVED];
+        self.items
+            .retain(|p| p.resolved_seq.is_none_or(|s| s >= cutoff));
     }
 }
 
@@ -821,7 +850,9 @@ fn finished(ed: &mut Editor, id: ProposalId, code: Option<i32>, duration: Durati
         duration: Some(duration),
         output_tail: tail.lines.into_iter().collect(),
         dropped: tail.dropped,
-        error: p.canceled.then(|| "canceled by the user".to_string()),
+        // A cancel that came after the command exited 0 changed nothing.
+        error: (p.canceled && status != VerifyStatus::Passed)
+            .then(|| "canceled by the user".to_string()),
     };
     let msg = format!("proposal {} verification {}", id.0, result.summary());
     p.result = Some(result);
@@ -913,5 +944,18 @@ mod tests {
         assert_eq!(shell_quote("cargo"), "cargo");
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("back\\slash\t"), r"$'back\\slash\t'");
+        // A program with `=` would read as an assignment; reserved words
+        // as syntax; non-ASCII letters as other letters.
+        assert_eq!(quote_program("CHECK=./runner"), "'CHECK=./runner'");
+        assert_eq!(quote_program("time"), "'time'");
+        assert_eq!(quote_program("sh"), "sh");
+        assert_eq!(quote_program("\u{0455}h"), r"$'\u0455h'");
+        assert_eq!(shell_quote("\u{0455}h"), "'\u{0455}h'");
+        let v = VerifySpec {
+            program: "CHECK=./runner".into(),
+            args: vec!["true".into()],
+            cwd: PathBuf::from("/"),
+        };
+        assert_eq!(v.display(), "'CHECK=./runner' true");
     }
 }

@@ -249,7 +249,7 @@ Params: `force` (default false). Refused with `-32015` while buffers have unsave
 
 No params. Result: `notifications`, the names this connection will receive from now on.
 
-- `document.changed` `{doc, version, actor}`: a buffer's version changed. `actor` is the actor of the `document.apply_edit` that produced exactly this version, or `null` for any other change (typing, commands, undo, reload). Changes are coalesced: on the socket transport, changes made outside the API are checked every 100 ms, so several keystrokes can arrive as one notification with the latest version. Treat it as a cue to re-read.
+- `document.changed` `{doc, version, actor}`: a buffer's version changed. `actor` is the actor of the `document.apply_edit` or approved proposal that produced exactly this version, or `null` for any other change (typing, commands, undo, reload). Changes are coalesced: on the socket transport, changes made outside the API are checked every 100 ms, so several keystrokes can arrive as one notification with the latest version. Treat it as a cue to re-read.
 - `editor.status` `{status}`: the status line changed; `status` is `null` when it was cleared.
 - `proposal.resolved`: a proposal reached its final state. The params are the proposal, in the shape `proposal.status` returns. A rejected, withdrawn, stale or failed proposal resolves at once. An approved one with a verification command resolves when the command has exited (or could not run), so the notification always carries the result.
 
@@ -283,7 +283,7 @@ A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edi
 
 ### Review in the editor
 
-`space e` or `:proposals` opens the review over the editor area: the queue on the left, and for the selected proposal the actor, its base version next to the document's current version (with a warning when they differ), the description, the verification command, and a unified diff of the document text before and after, with intraline marks, in the agent review screen's colors. The diff is computed from the document text, not from Git.
+`space e` or `:proposals` opens the review over the editor area: the queue on the left, and for the selected proposal the actor, its base version next to the document's current version (with a warning when they differ), the description, the verification command, and a unified diff of the document text before and after, with intraline marks, in the agent review screen's colors. The diff is computed from the document text, not from Git. It compares exact bytes: a line whose only change is a `\r` before its newline is shown as changed, with the `\r` drawn as `?`, and a change to the newline at the end of the file gets a note above the diff. A line wider than the review is cut at the right edge with a `>` in the last column; `h` and `l` scroll sideways (a `<` marks text scrolled off to the left), and the approval dialog says how many changed lines are that wide.
 
 | Key | Does |
 |---|---|
@@ -291,6 +291,7 @@ A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edi
 | `x` | Reject: asks for an optional reason, which goes back to the client. `enter` rejects, `esc` cancels. |
 | `n`, `p` (`tab`, `S-tab`) | Next and previous proposal |
 | `j`, `k`, `]`, `[`, `g`, `G` | Move in the diff, by line or hunk |
+| `h`, `l` | Scroll the diff sideways, half a screen at a time |
 | `s` | Unified or side-by-side diff |
 | `o` | The verification output instead of the diff |
 | `c` | Stop a running verification command; its result says it was canceled |
@@ -298,9 +299,9 @@ A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edi
 
 On `y` the editor checks the proposal again. If the document is no longer at `base_version` (the user typed, another client edited it, another proposal was approved first), it is refused and resolved as `stale` with the reason, and nothing changes; there is no rebase. The same happens when the buffer was saved under another name (`:w other`) since the proposal was made. Keys replayed by a macro or `.` are ignored in the review. Pressing `a` on a proposal that is already stale resolves it that way without a dialog. Otherwise the change is applied with `Document::apply_at_version` against the base version as one undo step: any undo group the user had open is closed first, so one `u` reverts exactly the proposal.
 
-A proposal with a verification command is then saved to disk, because the command reads the file. If the buffer already had unsaved edits of the user's (the client computed its change against them), saving writes those too, and the dialog says so before `y`. If the file changed on disk since it was read, approval is refused before anything is applied, and the proposal stays pending. If saving still fails, the proposal stays applied and resolves with `verification_result.status` `error` and the command does not run. The command runs through `maestro-tasks` in its own process group; the editor does not wait for it. A proposal without a command is applied and not saved, like `document.apply_edit`.
+A proposal with a verification command is then saved to disk, because the command reads the file. If the buffer already had unsaved edits of the user's (the client computed its change against them), saving writes those too, and the dialog says so before `y`. If the file's metadata (size, modification time, identity) shows it changed on disk since it was read, approval is refused before anything is applied, and the proposal stays pending. A rewrite that keeps the size and time is only found by the content check when saving, after the proposal was applied. Then, as for any failed save, the proposal stays applied (one `u` reverts it), the file is not written, the command does not run, and the proposal resolves with `verification_result.status` `error`. The command runs through `maestro-tasks` in its own process group; the editor does not wait for it. A proposal without a command is applied and not saved, like `document.apply_edit`.
 
-Closing a document resolves its pending proposals as `stale` with `decided_by` `editor`. Quitting the editor stops running verification commands.
+Closing a document resolves its pending proposals as `stale` with `decided_by` `editor`. Quitting the editor, or `c` in the review, kills a running verification command's process group. Background processes the command started and left behind after it exited are not killed: once the command itself has exited, Maestro cannot safely signal its process group.
 
 ### Example
 
@@ -327,7 +328,7 @@ In the same session a proposal against version 0, sent after the first was appli
 ## Not built yet
 
 - Rebasing a stale proposal. A proposal whose document moved on is refused; the client must compute a new one against the current version.
-- Proposals that span several files, and proposals that create or delete files.
+- Proposals that span several files, and proposals that delete or rename files. (A `path` that does not exist opens as an empty document, so a proposal that inserts text there creates the file when it is saved: on approval with a verification command, or when the user saves.)
 - Approving proposals without a person (headless, or a flag). By design for now.
 - Persistent provenance. The edit log and the proposal records are in memory.
 - Opening or closing buffers and views, splits, and typing into prompts through the API.

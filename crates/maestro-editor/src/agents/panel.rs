@@ -673,34 +673,67 @@ pub fn dialog_width(area: Rect) -> (u16, usize) {
     (w, w.saturating_sub(4) as usize)
 }
 
-/// Splits `text` into lines of at most `width` chars, at spaces where it
-/// can.
+/// The terminal cells a grapheme takes when the front end draws it: control
+/// characters are drawn as one `?`, everything else at its display width
+/// and at least one cell (as `maestro-tui`'s surface does).
+pub fn cell_width(g: &str) -> usize {
+    if g.chars().any(char::is_control) {
+        1
+    } else {
+        maestro_core::text::grapheme_width(g, 0, 1).max(1)
+    }
+}
+
+fn graphemes(s: &str) -> Vec<String> {
+    let rope = maestro_core::Rope::from_str(s);
+    maestro_core::text::graphemes(rope.slice(..))
+        .map(|g| g.into_owned())
+        .collect()
+}
+
+/// Cells `s` takes on screen.
+pub fn text_width(s: &str) -> usize {
+    graphemes(s).iter().map(|g| cell_width(g)).sum()
+}
+
+/// Splits `text` into lines of at most `width` terminal cells, at spaces
+/// where it can. Widths are counted as the screen draws them, so a line
+/// of wide characters is never cut off at the dialog's edge.
 pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut cur_w = 0;
     for word in text.split(' ') {
-        let mut word = word.to_string();
+        let mut gs = graphemes(word);
         loop {
-            let cur_len = cur.chars().count();
-            let word_len = word.chars().count();
-            let sep = usize::from(cur_len > 0);
-            if cur_len + sep + word_len <= width {
+            let word_w: usize = gs.iter().map(|g| cell_width(g)).sum();
+            let sep = usize::from(!cur.is_empty());
+            if cur_w + sep + word_w <= width {
                 if sep == 1 {
                     cur.push(' ');
                 }
-                cur.push_str(&word);
+                cur.push_str(&gs.concat());
+                cur_w += sep + word_w;
                 break;
             }
-            if cur_len > 0 {
+            if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
+                cur_w = 0;
                 continue;
             }
-            // A word longer than a line is cut.
-            let head: String = word.chars().take(width).collect();
-            word = word.chars().skip(width).collect();
-            out.push(head);
-            if word.is_empty() {
+            // A word wider than a line is cut, by whole graphemes.
+            let mut head_w = 0;
+            let mut n = 0;
+            while n < gs.len() && head_w + cell_width(&gs[n]) <= width {
+                head_w += cell_width(&gs[n]);
+                n += 1;
+            }
+            // A single grapheme wider than the line still goes somewhere.
+            let n = n.max(1);
+            out.push(gs[..n].concat());
+            gs.drain(..n);
+            if gs.is_empty() {
                 break;
             }
         }
@@ -869,6 +902,18 @@ mod tests {
         assert_eq!(wrap_words("aa bb cc", 5), ["aa bb", "cc"]);
         assert_eq!(wrap_words("abcdefgh", 3), ["abc", "def", "gh"]);
         assert_eq!(wrap_words("", 3), [""]);
+    }
+
+    #[test]
+    fn wrapping_counts_screen_cells_not_chars() {
+        // 44 wide characters take 88 cells: a line of 80 cells cannot hold
+        // them, so the command after them must land on a line of its own.
+        let cmd = format!("echo {};touch${{IFS}}marker", "界".repeat(44));
+        let lines = wrap_words(&cmd, 80);
+        assert!(lines.iter().all(|l| text_width(l) <= 80), "{lines:?}");
+        assert_eq!(lines.concat().replace(' ', ""), cmd.replace(' ', ""));
+        assert!(lines.len() >= 2, "{lines:?}");
+        assert_eq!(wrap_words("ab 界界", 4), ["ab", "界界"]);
     }
 
     #[test]
