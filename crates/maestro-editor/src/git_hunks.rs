@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maestro_core::io::Encoding;
-use maestro_core::{Change, ChangeSet, DocumentVersion, LineEnding, Selection, Transaction};
+use maestro_core::{Change, ChangeSet, DocumentVersion, LineEnding, Rope, Selection, Transaction};
 use maestro_git::{ApplyTo, DiffLineKind, LineHunk, LineHunkKind, Side, TextPatch, intraline};
 
 use crate::editor::{DocumentId, Editor, Severity};
@@ -95,6 +95,9 @@ impl BlameCell {
 pub struct BlameColumn {
     /// The buffer version `lines` was computed for.
     pub version: Option<DocumentVersion>,
+    /// The repository's change count then: a commit, a checkout or a
+    /// change to the index blames again.
+    epoch: u64,
     /// One entry per buffer line.
     pub lines: Vec<Option<BlameCell>>,
     pub error: Option<String>,
@@ -143,8 +146,35 @@ fn hunk_at(hunks: &[LineHunk], line: usize) -> Option<usize> {
 }
 
 fn cursor_line(ed: &Editor) -> usize {
-    let text = ed.doc().text().slice(..);
-    text.char_to_line(ed.primary().head.min(text.len_chars()))
+    nl_line_of(ed.doc().text(), ed.primary().head)
+}
+
+// Git and the gutter signs count lines by `\n` alone; the rope also breaks
+// lines at a lone CR and at Unicode line separators. Hunk positions are
+// mapped to the buffer with these, never with the rope's line functions.
+
+/// The zero-based `\n`-counted line holding char `pos`.
+pub fn nl_line_of(text: &Rope, pos: usize) -> usize {
+    let pos = pos.min(text.len_chars());
+    text.slice(..pos).chars().filter(|c| *c == '\n').count()
+}
+
+/// The char index where `\n`-counted line `line` starts, or the end of
+/// the text past the last line.
+pub fn nl_line_start(text: &Rope, line: usize) -> usize {
+    if line == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (i, c) in text.chars().enumerate() {
+        if c == '\n' {
+            seen += 1;
+            if seen == line {
+                return i + 1;
+            }
+        }
+    }
+    text.len_chars()
 }
 
 /// The buffer's changes, when they are current for its text. Says why
@@ -198,7 +228,7 @@ fn goto_hunk(ed: &mut Editor, forward: bool) {
         return;
     };
     ed.push_jump();
-    let pos = ed.doc().text().line_to_char(target);
+    let pos = nl_line_start(ed.doc().text(), target);
     ed.set_selection(Selection::point(pos));
     ed.info(format!(
         "change {} of {}",
@@ -364,8 +394,8 @@ fn apply_reset(
     }
     let crlf = ed.doc().line_ending() == LineEnding::Crlf;
     let text = ed.doc().text().clone();
-    let from = text.line_to_char(h.new.start.min(text.len_lines()));
-    let to = text.line_to_char(h.new.end.min(text.len_lines()));
+    let from = nl_line_start(&text, h.new.start);
+    let to = nl_line_start(&text, h.new.end);
     let replacement = reset_text(base, h, crlf);
     let cs =
         match ChangeSet::from_changes(text.len_chars(), [Change::replace(from, to, replacement)]) {
@@ -419,8 +449,8 @@ fn stage_hunk(ed: &mut Editor) {
         None
     } else {
         let len = text.len_chars();
-        let first = text.char_to_line(r.from().min(len));
-        let last = text.char_to_line(r.last().min(len));
+        let first = nl_line_of(&text, r.from().min(len));
+        let last = nl_line_of(&text, r.last().min(len));
         Some((first, last))
     };
     let line = cursor_line(ed);
@@ -480,6 +510,28 @@ fn stage_in_background(
         ));
     };
     let new = repo.staged_form(path).map_err(|e| e.to_string())?;
+    // Buffer line numbers only mean the same lines in what git stages when
+    // the two differ at most in CRLF versus LF. A clean filter or an
+    // encoding conversion can move lines; refuse rather than guess.
+    let lf = |b: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') {
+                i += 1;
+                continue;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
+    };
+    if lf(&new) != lf(buffer) {
+        return Err(format!(
+            "git changes {} when staging it (a clean filter or an encoding setting), so buffer lines do not map to staged lines; stage it from the status screen (space g)",
+            rel.display()
+        ));
+    }
     let tp = TextPatch::new(&rel, &base, &new)?;
     let (picks, what) = match lines {
         Some((a, b)) => (
@@ -590,7 +642,8 @@ pub fn refresh_blame(ed: &mut Editor) {
             continue;
         };
         let col = &ed.git.blame[&doc];
-        if col.running || col.version == Some(buf.doc.version()) {
+        let epoch = ed.git.epoch_of(doc);
+        if col.running || (col.version == Some(buf.doc.version()) && col.epoch == epoch) {
             continue;
         }
         if buf.last_edit.is_some_and(|t| t.elapsed() < BLAME_DEBOUNCE) && col.version.is_some() {
@@ -625,16 +678,18 @@ pub fn refresh_blame(ed: &mut Editor) {
             });
             tx.send(move |ed| {
                 let current = ed.buffers.get(&doc).map(|b| b.doc.version());
+                let now = ed.git.epoch_of(doc);
                 let Some(col) = ed.git.blame.get_mut(&doc) else {
                     return;
                 };
                 col.running = false;
-                if current != Some(version) {
+                if current != Some(version) || now != epoch {
                     // The buffer changed meanwhile; the next refresh blames
                     // the new text.
                     return;
                 }
                 col.version = Some(version);
+                col.epoch = epoch;
                 match result {
                     Ok(lines) => {
                         let n = lines.iter().map(|l| l.final_line).max().unwrap_or(0);

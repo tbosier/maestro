@@ -562,6 +562,17 @@ fn destructive_keys_are_refused_during_a_merge() {
         "{:?}",
         ed.status
     );
+    goto(&mut ed, "Unstaged (1)");
+    press(&mut ed, "s");
+    assert!(
+        status_is(&ed, Severity::Error, "a.txt still has conflict markers"),
+        "{:?}",
+        ed.status
+    );
+    assert!(
+        f.git(&["diff", "--name-only", "--diff-filter=U"])
+            .contains("a.txt")
+    );
     assert!(
         f.raw(&f.repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])
             .status
@@ -1123,6 +1134,164 @@ fn space_h_b_blames_the_line_and_space_h_capital_b_shows_a_column() {
     });
     ed.feed_keys(&keys(" hB"));
     assert_eq!(ed.gutter_width(ed.view()), width);
+}
+
+// ----- regressions from the independent review ------------------------------
+
+#[test]
+fn closing_a_message_without_saving_aborts_even_a_prefilled_amend() {
+    let f = Fixture::new();
+    f.write("a.txt", "a\n");
+    f.commit_all("init");
+    f.write("a.txt", "b\n");
+    f.commit_all("Keep this subject");
+    f.write("a.txt", "c\n");
+    f.git(&["add", "a.txt"]);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let mut ed = open(&f);
+    ed.feed_keys(&keys("ca"));
+    poll_until(&mut ed, "the message buffer", |ed| {
+        ed.git.commit_message.is_some()
+    });
+    let path = ed.doc().path().unwrap().to_path_buf();
+    assert!(
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("MAESTRO_EDITMSG-")
+    );
+    // The prefilled message is on disk, but it was never saved from the
+    // buffer: :q aborts.
+    ed.feed_keys(&keys(":q\n"));
+    poll_until(&mut ed, "the abort", |ed| {
+        status_is(
+            ed,
+            Severity::Warning,
+            "amend aborted: the message buffer was closed without saving",
+        )
+    });
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+    assert!(!path.exists(), "the message file is removed");
+
+    // Unsaved edits, then the buffer closed by force: aborted too.
+    press(&mut ed, " g");
+    ed.feed_keys(&keys("ca"));
+    poll_until(&mut ed, "the message buffer", |ed| {
+        ed.git.commit_message.is_some()
+    });
+    ed.feed_keys(&keys("ggiNew <esc>"));
+    ed.poll_background();
+    ed.feed_keys(&keys(":bc!\n"));
+    poll_until(&mut ed, "the abort", |ed| {
+        status_is(ed, Severity::Warning, "amend aborted")
+    });
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn a_commit_is_refused_when_head_moved_while_the_message_was_open() {
+    let f = Fixture::new();
+    f.write("a.txt", "a\n");
+    f.commit_all("init");
+    f.write("a.txt", "b\n");
+    f.git(&["add", "a.txt"]);
+    let mut ed = open(&f);
+    ed.feed_keys(&keys("cc"));
+    poll_until(&mut ed, "the message buffer", |ed| {
+        ed.git.commit_message.is_some()
+    });
+    let path = ed.doc().path().unwrap().to_path_buf();
+    // Someone commits meanwhile.
+    f.git(&["commit", "-q", "--allow-empty", "-m", "from elsewhere"]);
+    ed.feed_keys(&keys("iMine<esc>:wq\n"));
+    poll_until(&mut ed, "the refusal", |ed| {
+        status_is(ed, Severity::Error, "not committed: HEAD moved")
+    });
+    assert_eq!(f.git(&["log", "--format=%s"]), "from elsewhere\ninit\n");
+    assert!(path.exists(), "the message is kept");
+    assert!(std::fs::read_to_string(&path).unwrap().starts_with("Mine"));
+}
+
+#[test]
+fn discarding_a_staged_deletion_never_overwrites_a_recreated_file() {
+    let f = Fixture::new();
+    f.write("a.txt", "committed\n");
+    f.commit_all("init");
+    f.git(&["rm", "-q", "a.txt"]);
+    let mut ed = open(&f);
+    goto(&mut ed, "deleted    a.txt");
+    ed.feed_keys(&keys("x"));
+    assert!(screen(&ed).dialog.is_some());
+    // The file is made again while the dialog is up.
+    f.write("a.txt", "new work\n");
+    press(&mut ed, "y");
+    assert!(
+        status_is(&ed, Severity::Error, "a.txt is an untracked file now"),
+        "{:?}",
+        ed.status
+    );
+    assert_eq!(f.read("a.txt"), "new work\n");
+}
+
+#[test]
+fn unstaging_the_hunk_of_a_renamed_file_keeps_the_rename() {
+    let f = Fixture::new();
+    f.write("old.txt", twenty());
+    f.commit_all("init");
+    f.git(&["mv", "old.txt", "new.txt"]);
+    f.write("new.txt", twenty().replace("line 2\n", "line two\n"));
+    f.git(&["add", "new.txt"]);
+    let mut ed = open(&f);
+    goto(&mut ed, "renamed    old.txt -> new.txt");
+    ed.feed_keys(&keys("<tab>"));
+    goto(&mut ed, "@@ -1,5 +1,5 @@");
+    press(&mut ed, "u");
+    assert_eq!(
+        f.git(&["diff", "--cached", "-M", "--name-status"]),
+        "R100\told.txt\tnew.txt\n"
+    );
+    assert_eq!(f.git(&["show", ":new.txt"]), twenty());
+}
+
+#[test]
+fn reset_counts_lines_the_way_git_does() {
+    let f = Fixture::new();
+    // A lone CR is not a line break for git; the rope would count it.
+    f.write("cr.txt", "a\rb\nc\n");
+    f.commit_all("init");
+    let path = f.write("cr.txt", "A\rb\nc\n");
+    let mut ed = f.editor();
+    ed.open(&path).unwrap();
+    poll_until(&mut ed, "signs", |ed| signs(ed) == vec![(0, Sign::Changed)]);
+    ed.feed_keys(&keys(" hr"));
+    ed.feed_keys(&keys("y"));
+    assert_eq!(ed.doc().text().to_string(), "a\rb\nc\n");
+}
+
+#[test]
+fn the_blame_column_follows_a_commit() {
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.commit_all("first");
+    let path = f.write("a.txt", "one\ntwo\n");
+    let mut ed = f.editor();
+    ed.open(&path).unwrap();
+    let doc = ed.view().doc;
+    ed.feed_keys(&keys(" hB"));
+    poll_until(&mut ed, "blame", |ed| {
+        maestro_editor::git_hunks::blame_cell(ed, doc, 1).is_some_and(|c| c.uncommitted)
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    f.commit_all("second");
+    // The editor notices the commit on its tick, as the terminal loop
+    // calls it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !maestro_editor::git_hunks::blame_cell(&ed, doc, 1).is_some_and(|c| !c.uncommitted) {
+        ed.tick(Instant::now());
+        ed.poll_background();
+        assert!(Instant::now() < deadline, "blame did not follow the commit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

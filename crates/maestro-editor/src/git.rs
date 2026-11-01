@@ -198,6 +198,14 @@ impl GitState {
         self.repos.get(root)?.head.as_ref().map(Head::label)
     }
 
+    /// How many times the repository holding a buffer has changed (index,
+    /// `HEAD`), as far as the editor has noticed; 0 when unknown.
+    pub(crate) fn epoch_of(&self, doc: DocumentId) -> u64 {
+        self.root_of(doc)
+            .and_then(|r| self.repos.get(r))
+            .map_or(0, |i| i.epoch)
+    }
+
     /// The repository root holding a buffer, once known.
     pub fn root_of(&self, doc: DocumentId) -> Option<&Path> {
         self.docs.get(&doc)?.root.as_deref()
