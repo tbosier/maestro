@@ -189,3 +189,14 @@ crates = ["maestro-git", "maestro-editor", "maestro-tasks", "maestro-automation"
 branch = "feat/hardening"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "intent-edits"
+title = "Intent edits: proposals and headless edits as structural pipelines, rebased by running them again"
+crates = ["maestro-protocol", "maestro-automation", "maestro-editor", "maestro-tui"]
+branch = "feat/intent-edits"
+owner = "agent"
+status = "done"
+# Protocol 1.3: pipeline and expect in proposal.create, document.apply_pipeline
+# (rebase only with allow_rebase), -32021. New text steps: insert-below,
+# replace-text, delete, wrap, prepend, append. Errors name step and column.

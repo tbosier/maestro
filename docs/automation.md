@@ -1,10 +1,10 @@
 # Automation API
 
-Scripts and agents drive Maestro through a JSON-RPC 2.0 protocol instead of simulated keystrokes. This is the M3 slice: version-checked edits, edit proposals that wait for the person at the editor to approve them and can run a verification command, an edit log per buffer, named commands and change events.
+Scripts and agents drive Maestro through a JSON-RPC 2.0 protocol instead of simulated keystrokes. This is the M3 slice: version-checked edits, edit proposals that wait for the person at the editor to approve them and can run a verification command, intent edits (a structural pipeline instead of a text diff, run again when the document moved on), an edit log per buffer, named commands and change events.
 
 - Wire types: `crates/maestro-protocol` (serde only, no editor dependency, so clients can depend on it).
 - Server and transports: `crates/maestro-automation`.
-- Protocol version: `1.2`. Version 1.1 added the `proposal.*` methods, the `proposal.resolved` notification, error codes -32018 and -32019, and two fields in `document.history` (`proposal` on an edit, and `proposals`). Version 1.2 limits `proposal.withdraw` to the connection that created the proposal and added error code -32020. A 1.0 or 1.1 client keeps working unless it withdrew proposals another connection created.
+- Protocol version: `1.3`. Version 1.3 added intent edits: `pipeline` and `expect` in `proposal.create` (with `encoding` optional when there are no `edits`), the method `document.apply_pipeline`, error code -32021, the capability `intent_edits`, and the fields `pipeline`, `expect`, `rebased`, `ran_on_version` and `step_counts` on proposals and `pipeline`, `rebased` and `step_counts` on edit records, all left out for text-diff proposals and plain edits. Version 1.1 added the `proposal.*` methods, the `proposal.resolved` notification, error codes -32018 and -32019, and two fields in `document.history` (`proposal` on an edit, and `proposals`). Version 1.2 limits `proposal.withdraw` to the connection that created the proposal and added error code -32020. A 1.0 or 1.1 client keeps working unless it withdrew proposals another connection created.
 
 ## Transports
 
@@ -22,7 +22,7 @@ maestro: headless automation server, protocol 1.0; send newline-delimited JSON-R
 
 The headless editor has an 80 by 24 screen for scrolling purposes, does not write recovery files, and uses an in-memory clipboard.
 
-Nobody can approve a proposal in a headless run, so `proposal.create` is refused there with -32018 and nothing is queued or run. There is no flag to approve proposals automatically. A script that wants to change text headless uses `document.apply_edit`, which applies at once.
+Nobody can approve a proposal in a headless run, so `proposal.create` is refused there with -32018 and nothing is queued or run. There is no flag to approve proposals automatically. A script that wants to change text headless uses `document.apply_edit` or `document.apply_pipeline`, which apply at once.
 
 ### Live: `maestro --listen <path|auto>`
 
@@ -78,11 +78,11 @@ Selections use the editor's model: a range covers every grapheme from `min(ancho
 | -32700 | parse error | the line is not JSON or not UTF-8 |
 | -32600 | invalid request | not a request object, `jsonrpc` is not `"2.0"`, or a second `initialize` |
 | -32601 | method not found | unknown method |
-| -32602 | invalid params | missing or malformed params, positions out of bounds or in the wrong encoding, overlapping or reversed edits, empty edits or actor, edits that change nothing, a path that is not a regular file |
+| -32602 | invalid params | missing or malformed params, positions out of bounds or in the wrong encoding, overlapping or reversed edits, empty edits or actor, edits that change nothing, a path that is not a regular file, an invalid pipeline (`data` is `{"step", "name", "column"}`), a `base_version` newer than the document |
 | -32603 | internal | a bug in the server |
 | -32002 | not initialized | a method before `initialize` |
 | -32003 | unsupported protocol version | `initialize` with another major version; `data` is `{"requested", "supported"}` |
-| -32010 | stale version | `base_version` is not the current version (`document.apply_edit`, `proposal.create`); `data` is `{"expected", "current"}`; nothing changed |
+| -32010 | stale version | `base_version` is not the current version (`document.apply_edit`, `proposal.create` with `edits`, `document.apply_pipeline` without `allow_rebase`); `data` is `{"expected", "current"}`; nothing changed |
 | -32011 | not found | no such document, view, command, file or proposal |
 | -32012 | read-only | the document opened read-only (binary, undecodable or unwritable) |
 | -32013 | permission denied | the operating system refused a file operation |
@@ -93,6 +93,7 @@ Selections use the editor's model: a range covers every grapheme from `min(ancho
 | -32018 | review unavailable | `proposal.create` where nobody can review it (headless), or with 100 proposals already pending; nothing was queued |
 | -32019 | not pending | `proposal.withdraw` on a proposal that was already decided |
 | -32020 | not owner | `proposal.withdraw` from a connection other than the one that created the proposal; nothing changed |
+| -32021 | pipeline failed | a pipeline (`proposal.create`, `document.apply_pipeline`) ran but selected nothing, changed nothing, had its text step refuse, had no syntax tree, or left another selection count than `expect`; `data` is `{"reason", "step", "expected", "actual", "version", "step_counts"}` with `reason` one of `no_selections`, `no_change`, `refused`, `no_tree`, `expect_mismatch`; nothing changed or was queued |
 
 ## Methods
 
@@ -115,7 +116,7 @@ That exchange is from protocol 1.0. A 1.1 server, headless, answered a 1.0 clien
 <-- {"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.1","server_name":"maestro","server_version":"0.1.0","methods":["initialize","editor.snapshot","editor.execute","editor.quit","document.open","document.text","document.save","document.apply_edit","document.history","selections.get","selections.set","command.run","command.list","events.subscribe","proposal.create","proposal.status","proposal.list","proposal.withdraw"],"notifications":["document.changed","editor.status","proposal.resolved"],"capabilities":["apply_edit.char_positions","apply_edit.lsp_positions","apply_edit.version_check","document.history","events.document_changed","events.editor_status"]}}
 ```
 
-The interactive editor behind `--listen` adds two capabilities, `proposal.review` and `proposal.verification`. Check for `proposal.review` before creating proposals: without it, `proposal.create` is refused.
+The interactive editor behind `--listen` adds two capabilities, `proposal.review` and `proposal.verification`. Check for `proposal.review` before creating proposals: without it, `proposal.create` is refused. A 1.3 server also lists `intent_edits` (both transports) and the method `document.apply_pipeline`.
 
 ### document.open
 
@@ -158,11 +159,46 @@ The edits apply as one transaction through `Document::apply_at_version`, so a st
 
 (The `document.changed` lines appear because the session called `events.subscribe` as request 5.)
 
+### document.apply_pipeline
+
+Since 1.3. Params: `doc`, `base_version` (the version the client looked at), `pipeline` (a structural pipeline in the `:` line syntax of [docs/editor-model.md](editor-model.md#structural-pipelines), one line, ending in a step that changes text), `expect` (optional, at least 1), `allow_rebase` (default false), `actor` (non-empty string), `description` (optional). Result: `doc`, `base_version`, `ran_on_version`, `version`, `rebased`, `step_counts`, `edit_count`.
+
+The pipeline runs on the whole document (its first step starts from one selection covering all of it, whatever the user has selected), and its change is applied at once as one undo step, like `document.apply_edit`. The rules are those of [intent edits](#intent-edits): it must select something and change something, and with `expect` the selection count after the selection steps must equal it. Nobody reviews this change, so a document that moved on from `base_version` is refused with -32010 unless `allow_rebase` is true; then the pipeline runs on the current text and the result says `"rebased": true`. A `base_version` newer than the document is -32602.
+
+This session ran `maestro --headless --clean` on November 1, 2026 in a directory holding `lib.rs` with a private `read`, `pub fn helper() -> u32` and `pub fn load(path: &str) -> Result<String, Error>` (paths shortened to `<dir>`):
+
+```
+--> {"jsonrpc":"2.0","id":2,"method":"document.open","params":{"path":"lib.rs","focus":true}}
+<-- {"jsonrpc":"2.0","id":2,"result":{"doc":3,"path":"<dir>/lib.rs","version":0,"read_only":null,"already_open":false}}
+--> {"jsonrpc":"2.0","id":3,"method":"document.apply_pipeline","params":{"doc":3,"base_version":0,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","expect":1,"actor":"script:must-use","description":"mark load #[must_use]"}}
+<-- {"jsonrpc":"2.0","id":3,"result":{"doc":3,"base_version":0,"ran_on_version":0,"version":1,"rebased":false,"step_counts":[{"step":"select-nodes","count":2},{"step":"keep-nodes","count":1},{"step":"insert-above","count":1}],"edit_count":1}}
+--> {"jsonrpc":"2.0","id":4,"method":"command.run","params":{"name":"undo"}}
+<-- {"jsonrpc":"2.0","id":4,"result":{"mode":"normal","status":null}}
+--> {"jsonrpc":"2.0","id":5,"method":"document.apply_edit","params":{"doc":3,"base_version":2,"encoding":"char","edits":[{"range":{"start":0,"end":0},"text":"fn typed() {}\n"}],"actor":"other"}}
+<-- {"jsonrpc":"2.0","id":5,"result":{"doc":3,"base_version":2,"version":3}}
+--> {"jsonrpc":"2.0","id":6,"method":"document.apply_pipeline","params":{"doc":3,"base_version":2,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","expect":1,"actor":"script:must-use"}}
+<-- {"jsonrpc":"2.0","id":6,"error":{"code":-32010,"message":"the pipeline was written against version 2 but the document is at 3; nothing was changed. Pass allow_rebase to run it on the current text","data":{"expected":2,"current":3}}}
+--> {"jsonrpc":"2.0","id":7,"method":"document.apply_pipeline","params":{"doc":3,"base_version":2,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","expect":1,"allow_rebase":true,"actor":"script:must-use"}}
+<-- {"jsonrpc":"2.0","id":7,"result":{"doc":3,"base_version":2,"ran_on_version":3,"version":4,"rebased":true,"step_counts":[{"step":"select-nodes","count":2},{"step":"keep-nodes","count":1},{"step":"insert-above","count":1}],"edit_count":1}}
+--> {"jsonrpc":"2.0","id":8,"method":"document.apply_pipeline","params":{"doc":3,"base_version":4,"pipeline":"select-nodes (function_item (nope)) | insert-above x","actor":"script:must-use"}}
+<-- {"jsonrpc":"2.0","id":8,"error":{"code":-32602,"message":"invalid pipeline: step 1 (select-nodes), column 30: invalid query: unknown node kind \"nope\"","data":{"step":1,"name":"select-nodes","column":30}}}
+--> {"jsonrpc":"2.0","id":9,"method":"document.apply_pipeline","params":{"doc":3,"base_version":4,"pipeline":"select-nodes enum | delete","actor":"script:must-use"}}
+<-- {"jsonrpc":"2.0","id":9,"error":{"code":-32021,"message":"step 1 (select-nodes) left no selections; nothing changed","data":{"reason":"no_selections","step":1,"expected":null,"actual":null,"version":4,"step_counts":[]}}}
+--> {"jsonrpc":"2.0","id":10,"method":"document.apply_pipeline","params":{"doc":3,"base_version":4,"pipeline":"select-nodes pub-fn | replace-text \"(\\w+)_v1\" \"${1}_v2\"","actor":"script:must-use"}}
+<-- {"jsonrpc":"2.0","id":10,"error":{"code":-32021,"message":"the pipeline changed nothing: replace-text 2 (replaced 0 matches in 0 selections); nothing changed","data":{"reason":"no_change","step":null,"expected":null,"actual":null,"version":4,"step_counts":[{"step":"select-nodes","count":2},{"step":"replace-text","count":2}]}}}
+--> {"jsonrpc":"2.0","id":11,"method":"document.apply_pipeline","params":{"doc":3,"base_version":4,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","expect":2,"actor":"script:must-use"}}
+<-- {"jsonrpc":"2.0","id":11,"error":{"code":-32021,"message":"the pipeline selected 1 where 2 were expected (select-nodes 2 | keep-nodes 1); nothing changed","data":{"reason":"expect_mismatch","step":null,"expected":2,"actual":1,"version":4,"step_counts":[{"step":"select-nodes","count":2},{"step":"keep-nodes","count":1},{"step":"insert-above","count":1}]}}}
+--> {"jsonrpc":"2.0","id":12,"method":"document.apply_pipeline","params":{"doc":3,"base_version":4,"pipeline":"select-nodes fn | keep-matching ^fn typed | replace-text typed \"typed_v2\"","expect":1,"actor":"script:rename"}}
+<-- {"jsonrpc":"2.0","id":12,"result":{"doc":3,"base_version":4,"ran_on_version":4,"version":5,"rebased":false,"step_counts":[{"step":"select-nodes","count":4},{"step":"keep-matching","count":1},{"step":"replace-text","count":1}],"edit_count":1}}
+```
+
+Request 4 undid the first pipeline (one undo step, version 2), request 5 stood in for another client typing a line at the top, and request 7 ran the pipeline again on version 3 because it allowed a rebase. `#[must_use]` went above `pub fn load` both times, and request 12 renamed `typed` to `typed_v2` inside that one function. `document.history` then listed the three pipeline edits with `pipeline`, `rebased` and `step_counts`, and the plain edit without them.
+
 ### document.history
 
 Params: `doc`. Result: `doc`, `edits` and `proposals`.
 
-`edits` lists, oldest first (by `new_version`), the edits made through `document.apply_edit` and approved proposals: `actor`, `description`, `base_version`, `new_version`, `timestamp_ms` (milliseconds since the Unix epoch, from the editor's clock), and `proposal` (the proposal's id) on an edit that came from one. Typing, commands, undo and reloads are not listed. For `document.apply_edit` the log stores what the request gave and nothing else; it lives in memory, is dropped when the buffer closes, and keeps the most recent 10,000 records per buffer.
+`edits` lists, oldest first (by `new_version`), the edits made through `document.apply_edit`, `document.apply_pipeline` and approved proposals: `actor`, `description`, `base_version`, `new_version`, `timestamp_ms` (milliseconds since the Unix epoch, from the editor's clock), and `proposal` (the proposal's id) on an edit that came from one. An edit made by a pipeline also has `pipeline` (the text sent), `rebased` (true when it ran on a newer version than `base_version`) and `step_counts` (`[{"step", "count"}]`, the selections each step left). Typing, commands, undo and reloads are not listed. For `document.apply_edit` the log stores what the request gave and nothing else; it lives in memory, is dropped when the buffer closes, and keeps the most recent 10,000 records per buffer.
 
 `proposals` lists, oldest first, every proposal for the document that was decided (approved, rejected, withdrawn, stale or failed), in the shape `proposal.status` returns: who proposed it, the decision and who made it, the versions, the verification command and its exit code, duration and output tail. The editor keeps the last 500 decided proposals in memory; none of this is written to disk.
 
@@ -265,12 +301,12 @@ A proposal is a change a client asks to make to an open document. The editor che
 Params:
 
 - `doc`, or `path` (exactly one). A path that is not open is opened as `document.open` does, without moving the user's view.
-- `base_version`, `encoding`, `edits`: as for `document.apply_edit`.
+- `base_version`, `encoding`, `edits`: as for `document.apply_edit`. Or, since 1.3, `pipeline` and optionally `expect` instead of `edits` (and `encoding`): an intent edit, below. Give exactly one of `edits` and `pipeline`.
 - `actor`: `{"name": "...", "agent_id": "..."}`. `name` must not be empty; `agent_id` is optional. Both are recorded as given.
 - `description`: what the change does, shown to the reviewer. Must not be empty.
 - `verification` (optional): `{"program": "...", "args": [...]}`. No shell is involved; `program` is looked up on `PATH` and gets `args` as given. Write `{"program": "sh", "args": ["-c", "..."]}` for a shell command. It runs in the editor's working directory (where `maestro` was started), which the result reports as `verification.cwd`. A document with no path (a scratch buffer) cannot have one.
 
-The base version and the edits are checked at once, with the same rules and error codes as `document.apply_edit`: a stale `base_version` is -32010, invalid edits are -32602, a read-only document is -32012. On any error nothing is queued. On success the result is the proposal (below) with `state` `pending`, and the status line says that a proposal waits and how to open the review. While any are pending, the focused status line says how many.
+For a text-diff proposal, the base version and the edits are checked at once, with the same rules and error codes as `document.apply_edit`: a stale `base_version` is -32010, invalid edits are -32602, a read-only document is -32012. On any error nothing is queued. On success the result is the proposal (below) with `state` `pending`, and the status line says that a proposal waits and how to open the review. While any are pending, the focused status line says how many.
 
 ### proposal.status, proposal.list, proposal.withdraw
 
@@ -287,7 +323,7 @@ B <-- {"jsonrpc": "2.0", "id": 2, "error": {"code": -32020, "message": "proposal
 
 `proposal.status` from B still said `"state": "pending"`, and A's own `proposal.withdraw` then returned it with `"decision": "withdrawn"`.
 
-A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edit_count`, `verification` (`{program, args, cwd}` or `null`), `state` (`pending`, `verifying` while its command runs, `resolved`), `decision` (`approved`, `rejected`, `withdrawn`, `stale`, `failed`, or `null` while pending), `decided_by` (`{"kind": "user", "name": $USER}`, `{"kind": "client"}` or `{"kind": "editor"}`), `reason`, `applied_version`, `saved`, `verification_result`, and `created_ms`, `decided_ms`, `resolved_ms`.
+A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edit_count`, `verification` (`{program, args, cwd}` or `null`), `state` (`pending`, `verifying` while its command runs, `resolved`), `decision` (`approved`, `rejected`, `withdrawn`, `stale`, `failed`, or `null` while pending), `decided_by` (`{"kind": "user", "name": $USER}`, `{"kind": "client"}` or `{"kind": "editor"}`), `reason`, `applied_version`, `saved`, `verification_result`, and `created_ms`, `decided_ms`, `resolved_ms`. An intent edit also has `pipeline`, `expect` (or `null`), `rebased`, `ran_on_version` (the version its pipeline last ran on) and `step_counts` (of that run; for a rerun that failed, the steps that ran). For an intent edit `edit_count` is the number of separate changes the pipeline made.
 
 `verification_result` is `null` for a proposal without a command, and otherwise `{status, exit_code, duration_ms, output_tail, output_lines_dropped, error}`. `status` is `not_run` (the proposal was not applied), `running`, `passed` (exit 0), `failed` (another exit code, or killed: `exit_code` is then `null`), or `error` (saving failed or the program did not start; `error` says which). `output_tail` holds the last 40 lines of stdout and stderr, interleaved as read, each cut to 1,000 chars.
 
@@ -307,11 +343,51 @@ A proposal has `id`, `doc`, `path`, `actor`, `description`, `base_version`, `edi
 | `c` | Stop a running verification command; its result says it was canceled |
 | `esc`, `q` | Close the review |
 
-On `y` the editor checks the proposal again. If the document is no longer at `base_version` (the user typed, another client edited it, another proposal was approved first), it is refused and resolved as `stale` with the reason, and nothing changes; there is no rebase. The same happens when the buffer was saved under another name (`:w other`) since the proposal was made. Keys replayed by a macro or `.` are ignored in the review. Pressing `a` on a proposal that is already stale resolves it that way without a dialog. Otherwise the change is applied with `Document::apply_at_version` against the base version as one undo step: any undo group the user had open is closed first, so one `u` reverts exactly the proposal.
+On `y` the editor checks the proposal again. If the document is no longer at `base_version` (the user typed, another client edited it, another proposal was approved first), a text-diff proposal is refused and resolved as `stale` with the reason, and nothing changes; an intent edit is rebased instead (below). The same happens when the buffer was saved under another name (`:w other`) since the proposal was made. Keys replayed by a macro or `.` are ignored in the review. Pressing `a` on a proposal that is already stale resolves it that way without a dialog. Otherwise the change is applied with `Document::apply_at_version` against the base version as one undo step: any undo group the user had open is closed first, so one `u` reverts exactly the proposal.
 
 A proposal with a verification command is then saved to disk, because the command reads the file. If the buffer already had unsaved edits of the user's (the client computed its change against them), saving writes those too, and the dialog says so before `y`. If the file's metadata (size, modification time, identity) shows it changed on disk since it was read, approval is refused before anything is applied, and the proposal stays pending. A rewrite that keeps the size and time is only found by the content check when saving, after the proposal was applied. Then, as for any failed save, the proposal stays applied (one `u` reverts it), the file is not written, the command does not run, and the proposal resolves with `verification_result.status` `error`. The command runs through `maestro-tasks` in its own process group; the editor does not wait for it. A proposal without a command is applied and not saved, like `document.apply_edit`.
 
 Closing a document resolves its pending proposals as `stale` with `decided_by` `editor`. Quitting the editor, or `c` in the review, kills a running verification command's process group. When the command exits, background processes it left in its process group get SIGHUP, then SIGKILL once nothing else is left in the group or after 200 ms, and only then does the proposal resolve. `verification_result.exit_code` is the command's own exit code. A process that moved to another process group or session (`setsid`, a daemon) is not reached. This goes through the `kill` program (each call waits for it at most a second); if `kill` is missing or fails, the leftovers keep running. On Linux, when Maestro was started with SIGCHLD ignored (the kernel then reaps children by itself, so no child's pid is safe to signal), no process group is signaled at all and leftovers keep running; elsewhere that case cannot be detected.
+
+### Intent edits
+
+An intent edit sends what the agent means instead of the text it computed: a structural pipeline that selects the places and changes them. `proposal.create` takes it as `pipeline`, in the same line syntax as the `:` command line ([docs/editor-model.md](editor-model.md#structural-pipelines)), with `base_version` still required so the agent says what it looked at. The pipeline must be one line (a `\n` inside a quoted text is a line break) and end in a step that changes text. It runs on the whole document: the first step starts from one selection over all of it, whatever the user has selected.
+
+At creation the editor runs the pipeline on the current text to get the change the review shows. It refuses, and queues nothing, when the pipeline:
+
+- is invalid: -32602, with the step and the column (`invalid pipeline: step 1 (select-nodes), column 30: invalid query: unknown node kind "nope"`, `data` `{"step": 1, "name": "select-nodes", "column": 30}`);
+- selects nothing: -32021 with `reason` `no_selections` and the step;
+- changes nothing: -32021 with `reason` `no_change`;
+- leaves another selection count than `expect` after the selection steps (nested matches count separately, as in the status line): -32021 with `reason` `expect_mismatch`, `expected` and `actual`.
+
+A `base_version` older than the document is not refused: the preview is computed on the current text, and the proposal says `"rebased": true` from the start. A newer one is -32602.
+
+When the person approves:
+
+- If the document is at the version the preview was computed on, that change is applied exactly, as one undo step.
+- If it moved on, the pipeline runs again on the current text. The review (`space e`) shows the new diff, and above it the pipeline, the selection counts and two lines saying it was rebased, why and onto which version: `rebased onto version 29: changed since version 0, which agent:realcheck looked at` and `the pipeline ran again on version 29; this diff is from that run`. The summary line says `rebased onto version 29` where a text-diff proposal says `stale: approving will refuse it`. The approval dialog says the same: `Rebased: agent:realcheck looked at version 0, and the document is at version 29 now, so the pipeline ran again on version 29. The diff shown is from that run.`
+- If the rerun selects nothing, fails, changes nothing or misses `expect`, the review says so (`no longer applies: ...`, then the error), and `a` resolves the proposal as `stale` with that reason. Nothing changes.
+- The review reruns the pipeline when it opens, before each key, and before each frame while it is open, so the diff on screen is the one `y` would apply. If the document changes while the approval dialog is open, `y` applies nothing and says so ("the document changed while the approval dialog was open, so the pipeline ran again on version N; nothing was applied"); the proposal stays pending and `a` shows the new dialog.
+
+`proposal.resolved`, `proposal.status` and `document.history` record the pipeline, whether it was rebased, the version it ran on and the selection counts per step.
+
+On November 1, 2026 the release binary ran in tmux as `maestro --clean --listen <socket> src/lib.rs` in a scratch crate (`<dir>`) whose `src/lib.rs` held a private `read`, `pub fn helper() -> u32` and `pub fn load(path: &str) -> Result<String, Error>`. A Python client subscribed to events and sent:
+
+```
+--> {"jsonrpc": "2.0", "id": 4, "method": "proposal.create", "params": {"doc": 3, "base_version": 0, "pipeline": "select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]", "expect": 1, "actor": {"name": "agent:realcheck"}, "description": "mark load #[must_use]", "verification": {"program": "sh", "args": ["-c", "cargo check --quiet --offline && grep -B1 'pub fn load' src/lib.rs | head -n 1 | grep -qx '#\\[must_use\\]' && echo 'cargo check ok; #[must_use] is right above pub fn load'"]}}}
+<-- {"jsonrpc":"2.0","id":4,"result":{"id":1,"doc":3,"path":"<dir>/src/lib.rs","actor":{"name":"agent:realcheck"},"description":"mark load #[must_use]","base_version":0,"edit_count":1,"verification":{"program":"sh","args":["-c","cargo check --quiet --offline && grep -B1 'pub fn load' src/lib.rs | head -n 1 | grep -qx '#\\[must_use\\]' && echo 'cargo check ok; #[must_use] is right above pub fn load'"],"cwd":"<dir>"},"state":"pending","decision":null,"decided_by":null,"reason":null,"applied_version":null,"saved":false,"verification_result":null,"created_ms":1793558020742,"decided_ms":null,"resolved_ms":null,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","expect":1,"rebased":false,"ran_on_version":0,"step_counts":[{"step":"select-nodes","count":2},{"step":"keep-nodes","count":1},{"step":"insert-above","count":1}]}}
+```
+
+Before approving, the user went to line 15 and typed `pub fn extra() -> u32 { 2 }` and an empty line above `pub fn load`, which took the document to version 29. `space e` showed the rebase lines above a diff adding `+#[must_use]` as new line 17 (it would have been line 15 at version 0), with `selections: select-nodes 3 | keep-nodes 1 | insert-above 1 (expected 1)`. `a` showed the dialog with the `Rebased:` sentence, and `y` applied it, saved, and ran the command. The client, still waiting, received:
+
+```
+<-- {"jsonrpc":"2.0","method":"document.changed","params":{"doc":3,"version":30,"actor":"agent:realcheck"}}
+<-- {"jsonrpc":"2.0","method":"proposal.resolved","params":{"id":1,"doc":3,"path":"<dir>/src/lib.rs","actor":{"name":"agent:realcheck"},"description":"mark load #[must_use]","base_version":0,"edit_count":1,"verification":{"program":"sh","args":["-c","cargo check --quiet --offline && grep -B1 'pub fn load' src/lib.rs | head -n 1 | grep -qx '#\\[must_use\\]' && echo 'cargo check ok; #[must_use] is right above pub fn load'"],"cwd":"<dir>"},"state":"resolved","decision":"approved","decided_by":{"kind":"user","name":"user"},"reason":null,"applied_version":30,"saved":true,"verification_result":{"status":"passed","exit_code":0,"duration_ms":53,"output_tail":["cargo check ok; #[must_use] is right above pub fn load"],"output_lines_dropped":0,"error":null},"created_ms":1793558020742,"decided_ms":1793558037942,"resolved_ms":1793558038017,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","expect":1,"rebased":true,"ran_on_version":29,"step_counts":[{"step":"select-nodes","count":3},{"step":"keep-nodes","count":1},{"step":"insert-above","count":1}]}}
+--> {"jsonrpc": "2.0", "id": 5, "method": "document.history", "params": {"doc": 3}}
+<-- {"jsonrpc":"2.0","id":5,"result":{"doc":3,"edits":[{"actor":"agent:realcheck","description":"mark load #[must_use]","base_version":0,"new_version":30,"timestamp_ms":1793558037942,"proposal":1,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","rebased":true,"step_counts":[{"step":"select-nodes","count":3},{"step":"keep-nodes","count":1},{"step":"insert-above","count":1}]}],"proposals":[{"id":1,"doc":3,"path":"<dir>/src/lib.rs","actor":{"name":"agent:realcheck"},"description":"mark load #[must_use]","base_version":0,"edit_count":1,"verification":{"program":"sh","args":["-c","cargo check --quiet --offline && grep -B1 'pub fn load' src/lib.rs | head -n 1 | grep -qx '#\\[must_use\\]' && echo 'cargo check ok; #[must_use] is right above pub fn load'"],"cwd":"<dir>"},"state":"resolved","decision":"approved","decided_by":{"kind":"user","name":"user"},"reason":null,"applied_version":30,"saved":true,"verification_result":{"status":"passed","exit_code":0,"duration_ms":53,"output_tail":["cargo check ok; #[must_use] is right above pub fn load"],"output_lines_dropped":0,"error":null},"created_ms":1793558020742,"decided_ms":1793558037942,"resolved_ms":1793558038017,"pipeline":"select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]","expect":1,"rebased":true,"ran_on_version":29,"step_counts":[{"step":"select-nodes","count":3},{"step":"keep-nodes","count":1},{"step":"insert-above","count":1}]}]}}
+```
+
+The file on disk then had `#[must_use]` on line 17, right above `pub fn load` and below the typed function.
 
 ### Example
 
@@ -337,7 +413,8 @@ In the same session a proposal against version 0, sent after the first was appli
 
 ## Not built yet
 
-- Rebasing a stale proposal. A proposal whose document moved on is refused; the client must compute a new one against the current version.
+- Rebasing a stale text-diff proposal. A text-diff proposal whose document moved on is refused; the client must compute a new one, or send an intent edit, which is rebased by running its pipeline again.
+- More than one text-changing step in an intent edit, and intent edits across several files.
 - Proposals that span several files, and proposals that delete or rename files. (A `path` that does not exist opens as an empty document, so a proposal that inserts text there creates the file when it is saved: on approval with a verification command, or when the user saves.)
 - Approving proposals without a person (headless, or a flag). By design for now.
 - Persistent provenance. The edit log and the proposal records are in memory.
