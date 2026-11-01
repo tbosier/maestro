@@ -408,3 +408,27 @@ fn crlf_lines_keep_their_carriage_returns() {
     let c = commit(&main, &base, &[whole(file(&files, "w.txt"), 0)]);
     assert_eq!(f.show(&c, "w.txt").unwrap(), b"one\r\nTWO\r\nthree\r\n");
 }
+
+#[test]
+fn a_file_turned_into_a_symlink_needs_both_its_hunks() {
+    let f = Fixture::new(&[("link", "was a file\n"), ("target.txt", "t\n")]);
+    let base = f.head();
+    let wt = f.worktree("agent");
+    std::fs::remove_file(wt.join("link")).unwrap();
+    std::os::unix::fs::symlink("target.txt", wt.join("link")).unwrap();
+    let files = f.open(&wt).review_diff(&base).unwrap();
+    // Git shows the type change as a deletion and an addition of `link`.
+    let gone = files.iter().position(|d| d.new_path.is_none()).unwrap();
+    let new = files.iter().position(|d| d.old_path.is_none()).unwrap();
+    let main = f.open(&f.repo);
+    let add = whole(&files[new], 0);
+    let r = refusals(main.tree_from_hunks(&base, &[add.clone()]).unwrap_err());
+    assert!(
+        r[0].1.contains("it adds link, which the base already has"),
+        "{r:?}"
+    );
+    let c = commit(&main, &base, &[whole(&files[gone], 0), add]);
+    let ls = f.git(&f.repo, &["ls-tree", &c, "link"]);
+    assert!(ls.starts_with("120000 blob "), "{ls}");
+    assert_eq!(f.show(&c, "link").unwrap(), b"target.txt");
+}

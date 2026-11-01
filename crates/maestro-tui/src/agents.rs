@@ -871,17 +871,10 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
         s.print(sm.x + 1, sm.y + 1, &line, ui.text, r);
     }
     if sm.height > 2 {
-        let mut marked = match marks::describe(a) {
-            Some(m) => format!("{m} (* marked, = integrated)  "),
+        let marked = match marks::describe(a) {
+            Some(m) => format!("{m} (*)  "),
             None => String::new(),
         };
-        if let Some(p) = a.parts.last() {
-            marked.push_str(&format!(
-                "{} part(s) integrated, last on {}  ",
-                a.parts.len(),
-                p.branch
-            ));
-        }
         let x = s.print(sm.x + 1, sm.y + 2, &marked, ui.text.bold(), r);
         let unsent = a.comments.iter().filter(|c| !c.sent).count();
         let state = if a.review.running {
@@ -894,16 +887,23 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
         let text = format!("{unsent} unsent comment(s)  diff {state}");
         s.print(x, sm.y + 2, &text, ui.text_muted, r);
     }
-    if sm.height > 3
-        && let Some(e) = &a.review.error
-    {
-        s.print(
-            sm.x + 1,
-            sm.y + 3,
-            &format!("diff failed: {e}"),
-            ui.message_error,
-            r,
-        );
+    if sm.height > 3 {
+        if let Some(e) = &a.review.error {
+            s.print(
+                sm.x + 1,
+                sm.y + 3,
+                &format!("diff failed: {e}"),
+                ui.message_error,
+                r,
+            );
+        } else if let Some(p) = a.parts.last() {
+            let text = format!(
+                "{} part(s) integrated on their own (=), the last on {}; the rest stays here",
+                a.parts.len(),
+                p.branch
+            );
+            s.print(sm.x + 1, sm.y + 3, &text, ui.text_muted, r);
+        }
     }
     if sm.height > 4 {
         let outside = a.out_of_scope();
