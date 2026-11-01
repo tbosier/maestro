@@ -383,7 +383,23 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<(Vec<DiffFile>, Option<S
         Err(e) => a.review.error = Some(e),
     }
     // Marks follow the diff: a hunk the agent changed since is unmarked.
-    let dropped = super::marks::prune(a);
+    let mut dropped = super::marks::prune(a);
+    // The compose view's marks of this agent follow its diff the same way.
+    let keys: std::collections::BTreeSet<super::marks::HunkKey> = a
+        .review
+        .files
+        .iter()
+        .flat_map(|f| f.hunks.iter().map(move |h| super::marks::HunkKey::of(f, h)))
+        .collect();
+    if let Some(c) = &mut ed.agents.panel.compose {
+        let before = c.marks.len();
+        c.marks
+            .retain(|(agent, m)| *agent != id || keys.contains(&m.key));
+        dropped += before - c.marks.len();
+    }
+    let Some(a) = ed.agents.get_mut(id) else {
+        return;
+    };
     let again = a.review.again && !a.archived;
     if again {
         request(ed, id);

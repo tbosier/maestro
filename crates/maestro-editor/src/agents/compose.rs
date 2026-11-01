@@ -223,14 +223,15 @@ pub fn items(ed: &Editor, v: &ComposeView) -> Vec<Item> {
         let Some(a) = ed.agents.get(*id) else {
             continue;
         };
-        let Some((fi, f)) = file_of(a, &path) else {
-            continue;
-        };
-        if unmarkable(f).is_some() {
-            continue;
-        }
-        for (hi, h) in f.hunks.iter().enumerate() {
-            raw.push((h.old_start, h.old_start + h.old_len, col, *id, fi, hi));
+        // Every entry of the path: a file whose type changed is a deletion
+        // and an addition of one path.
+        for (fi, f) in a.review.files.iter().enumerate() {
+            if f.path() != Some(&path) || unmarkable(f).is_some() {
+                continue;
+            }
+            for (hi, h) in f.hunks.iter().enumerate() {
+                raw.push((h.old_start, h.old_start + h.old_len, col, *id, fi, hi));
+            }
         }
     }
     raw.sort_by_key(|r| (r.0, r.1, r.2));
@@ -521,12 +522,7 @@ fn check(ed: &mut Editor) {
         .collect();
     let owners: Vec<(AgentId, HunkKey)> = picks
         .iter()
-        .map(|(id, p, _)| {
-            (
-                *id,
-                HunkKey::from_parts(p.old_path.clone(), p.new_path.clone(), &p.hunk),
-            )
-        })
+        .map(|(id, p, _)| (*id, HunkKey::of_pick(p)))
         .collect();
     let picks: Vec<HunkPick> = picks.into_iter().map(|(_, p, _)| p).collect();
     if let Some(c) = &mut ed.agents.panel.compose {

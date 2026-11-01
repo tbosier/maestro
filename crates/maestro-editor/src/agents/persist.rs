@@ -150,6 +150,8 @@ pub struct SavedPart {
 pub struct SavedPartHunk {
     pub old_path: Option<String>,
     pub new_path: Option<String>,
+    #[serde(default)]
+    pub new_mode: Option<String>,
     pub old_start: usize,
     pub old_len: usize,
     pub body: String,
@@ -455,6 +457,7 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
                     Some(SavedPartHunk {
                         old_path: path(&k.old_path)?,
                         new_path: path(&k.new_path)?,
+                        new_mode: k.new_mode.clone(),
                         old_start: k.old_start,
                         old_len: k.old_len,
                         body: k.body.clone(),
@@ -569,6 +572,7 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
                         super::marks::HunkKey {
                             old_path: h.old_path.as_ref().map(PathBuf::from),
                             new_path: h.new_path.as_ref().map(PathBuf::from),
+                            new_mode: h.new_mode.clone(),
                             old_start: h.old_start,
                             old_len: h.old_len,
                             body: h.body.clone(),
@@ -1179,6 +1183,11 @@ pub fn save(ed: &mut Editor, durable: bool) {
             Some(r) => {
                 if r.comments.len() < a.comments.len() {
                     unsaved.push(format!("comments of {} on files", a.name));
+                }
+                let kept: usize = r.parts.iter().map(|p| p.hunks.len()).sum();
+                let all: usize = a.parts.iter().map(|p| p.hunks.len()).sum();
+                if kept < all {
+                    unsaved.push(format!("integrated hunks of {} in files", a.name));
                 }
                 groups
                     .entry(normalize_path(&w.main_root))

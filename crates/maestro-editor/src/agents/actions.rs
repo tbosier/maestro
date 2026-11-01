@@ -1787,6 +1787,15 @@ pub fn integrate(ed: &mut Editor, id: AgentId, how: Integration, facts: Integrat
         ed.error(msg);
         return;
     }
+    // A part integrates the hunks as marked when the dialog was checked;
+    // the marks must still be exactly those (a refresh drops the mark of a
+    // hunk the agent changed since).
+    if let Some(p) = &facts.part
+        && let Some(why) = super::parts::marks_changed(a, p)
+    {
+        ed.error(format!("not integrated, nothing changed: {why}"));
+        return;
+    }
     if let Some(a) = ed.agents.get_mut(id) {
         a.git_busy = Some("integrating");
     }

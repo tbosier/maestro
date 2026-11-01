@@ -147,6 +147,9 @@ struct Entry {
     oid: String,
 }
 
+/// A path's new mode and contents, or `None` to remove it.
+type NewFile = Option<(String, Vec<u8>)>;
+
 /// A line of a file: its bytes without the newline, and whether it had one.
 fn split_lines(bytes: &[u8]) -> Vec<(&[u8], bool)> {
     let mut out = Vec::new();
@@ -289,7 +292,7 @@ impl Repository {
         let entries = self.entries_at(&base, &wanted)?;
 
         // New contents per path: `Some((mode, bytes))`, or `None` to remove.
-        let mut results: BTreeMap<PathBuf, Option<(String, Vec<u8>)>> = BTreeMap::new();
+        let mut results: BTreeMap<PathBuf, NewFile> = BTreeMap::new();
         for (path, ids) in &by_path {
             let shown = path.display().to_string();
             let entry = entries.get(path);
@@ -539,12 +542,55 @@ impl Repository {
                 }
             }
         }
+        // A file added where the base has a directory: every file in it
+        // must be removed by a taken hunk. Each path is listed on its own,
+        // since ls-tree lists a directory's entry only when none of its
+        // files is asked for too.
+        for p in &created {
+            let listed = self.entries_at(&base, std::slice::from_ref(*p))?;
+            if !listed.get(*p).is_some_and(|e| e.kind == "tree") {
+                continue;
+            }
+            let args: Vec<OsString> = vec![
+                "ls-tree".into(),
+                "-r".into(),
+                "-z".into(),
+                "--name-only".into(),
+                "--full-tree".into(),
+                "--end-of-options".into(),
+                base.clone().into(),
+                "--".into(),
+                p.as_os_str().to_owned(),
+            ];
+            let out = self.run(&args, Access::ReadOnly)?;
+            let left: Vec<String> = split_nul(&out)
+                .into_iter()
+                .map(bytes_to_path)
+                .filter(|f| !matches!(results.get(f), Some(None)))
+                .map(|f| f.display().to_string())
+                .collect();
+            if !left.is_empty() {
+                for &i in &by_path[*p] {
+                    fail(
+                        &mut failures,
+                        i,
+                        format!(
+                            "it adds {}, but the base has a directory there with files no taken \
+                             hunk removes: {}",
+                            p.display(),
+                            left.join(", ")
+                        ),
+                    );
+                }
+            }
+        }
         if !failures.is_empty() {
             failures.sort_by_key(|f| f.pick);
             return Err(HunksError::DoNotApply(failures));
         }
 
-        // Write the tree through a temporary index.
+        // Write the tree through a temporary index: removals first, so a
+        // file can take the place of a directory whose files were removed.
         let index = TempFile::create("hunks-index", &[]).map_err(GitError::Io)?;
         std::fs::remove_file(&index.0).map_err(GitError::Io)?;
         let shadow = self.with_git(
@@ -554,7 +600,9 @@ impl Repository {
                 .config("core.splitIndex=false"),
         );
         shadow.run(&["read-tree", &base], Access::Write)?;
-        for (path, new) in &results {
+        let mut writes: Vec<(&PathBuf, &NewFile)> = results.iter().collect();
+        writes.sort_by_key(|(p, new)| (new.is_some(), *p));
+        for (path, new) in writes {
             match new {
                 Some((mode, bytes)) => {
                     let blob = TempFile::create("hunks-blob", bytes).map_err(GitError::Io)?;
@@ -696,9 +744,38 @@ fn resolve<'a>(
     } else {
         h.old_start - 1
     };
+    // Within a run of changes, the k-th removed line pairs with the k-th
+    // added one, as the side-by-side review shows them: a kept removed
+    // line stays where it is, before the additions paired with later
+    // lines. (Taken in unified order, keeping `b` of `-a -b +A +B` while
+    // taking `-a +A` would give `b A` instead of `A b`.)
+    let mut order: Vec<usize> = Vec::with_capacity(h.lines.len());
+    let mut at = 0;
+    while at < h.lines.len() {
+        if h.lines[at].kind == DiffLineKind::Context {
+            order.push(at);
+            at += 1;
+            continue;
+        }
+        let run_end = (at..h.lines.len())
+            .find(|&j| h.lines[j].kind == DiffLineKind::Context)
+            .unwrap_or(h.lines.len());
+        let removed: Vec<usize> = (at..run_end)
+            .filter(|&j| h.lines[j].kind == DiffLineKind::Removed)
+            .collect();
+        let added: Vec<usize> = (at..run_end)
+            .filter(|&j| h.lines[j].kind == DiffLineKind::Added)
+            .collect();
+        for k in 0..removed.len().max(added.len()) {
+            order.extend(removed.get(k));
+            order.extend(added.get(k));
+        }
+        at = run_end;
+    }
     let mut ops: Vec<(Op, &str, bool)> = Vec::new();
     let mut o = start;
-    for (idx, l) in h.lines.iter().enumerate() {
+    for idx in order {
+        let l = &h.lines[idx];
         let op = match l.kind {
             DiffLineKind::Context => Op::Keep,
             DiffLineKind::Removed if taken(idx) => Op::Remove,

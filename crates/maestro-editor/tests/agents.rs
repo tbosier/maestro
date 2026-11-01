@@ -3054,6 +3054,38 @@ fn marked_hunks_integrate_alone_and_the_rest_stays() {
             .contains("part-2")
     );
     f.git(&f.repo, &["checkout", "-q", "--", "README.md"]);
+    // The agent changes the marked hunk while the dialog is up: the refresh
+    // unmarks it, and y integrates nothing.
+    open_integrate(&mut ed);
+    let full = read(&wt.join("calc.txt"));
+    std::fs::write(
+        wt.join("calc.txt"),
+        full.replace("line twenty-eight", "line XXVIII"),
+    )
+    .unwrap();
+    let first = id(&ed, 0);
+    maestro_editor::agents::review::request(&mut ed, first);
+    poll_until(&mut ed, "the refresh that drops the mark", |ed| {
+        agent(ed, 0).marks.is_empty()
+    });
+    let msg = confirm_refused(&mut ed, "y");
+    assert!(
+        msg.contains("the marked hunks changed after the dialog was checked"),
+        "{msg}"
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    std::fs::write(wt.join("calc.txt"), &full).unwrap();
+    let first = id(&ed, 0);
+    maestro_editor::agents::review::request(&mut ed, first);
+    poll_until(&mut ed, "the refresh", |ed| {
+        !agent(ed, 0).review.running
+            && agent(ed, 0).review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "line twenty-eight"))
+    });
+    run(&mut ed, "g] ");
+    assert_eq!(marks::counts(agent(&ed, 0)), (1, 2));
     open_integrate(&mut ed);
     let (text, _) = dialog(&ed);
     assert!(text.contains("  calc.txt -25,6 +25,6\n"), "{text}");
@@ -3177,7 +3209,22 @@ fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
     assert_eq!(ed.agents.panel.compose.as_ref().unwrap().problems.len(), 2);
     assert!(ed.agents.panel.overlay.is_none());
     // Beta's line 15 instead of its line 3: they apply together.
-    run(&mut ed, " j \n");
+    // Beta changes its marked hunk: the refresh drops that mark from the
+    // compose view too, so it cannot block the next check.
+    let beta_wt = worktree(&ed, 1);
+    let beta_text = read(&beta_wt.join("calc.txt"));
+    std::fs::write(
+        beta_wt.join("calc.txt"),
+        beta_text.replace("beta 3", "beta three"),
+    )
+    .unwrap();
+    let beta = id(&ed, 1);
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "the refresh that drops beta's mark", |ed| {
+        ed.agents.panel.compose.as_ref().unwrap().marks.len() == 1
+    });
+    assert!(status_text(&ed).contains("unmarked"), "{:?}", ed.status);
+    run(&mut ed, "j \n");
     poll_until(&mut ed, "the compose dialog", |ed| {
         matches!(&ed.agents.panel.overlay,
             Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Compose(_)))
@@ -3211,7 +3258,7 @@ fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
     assert_eq!(read(&w.path.join("calc.txt")), want);
     // The agents' worktrees are untouched, and so is main.
     assert!(read(&worktree(&ed, 0).join("calc.txt")).contains("alpha 28"));
-    assert!(read(&worktree(&ed, 1).join("calc.txt")).contains("beta 3"));
+    assert!(read(&worktree(&ed, 1).join("calc.txt")).contains("beta three"));
     assert_eq!(read(&f.repo.join("calc.txt")), thirty());
     let message = f.git(&f.repo, &["log", "-1", "--format=%B", "maestro/compose-3"]);
     assert!(

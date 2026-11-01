@@ -444,7 +444,15 @@ fn the_compose_view_shows_each_agents_hunks_side_by_side() {
     one.review.computed = Some(std::time::Instant::now());
     let mut two = from_record(&record(2, "ready-for-review"), &[]);
     two.group = one.group;
-    two.review.files = vec![modified("calc.rs", &[2])];
+    // A file turned into a symlink: a deletion and an addition of `link`.
+    let mut gone = added("link");
+    gone.old_path = Some("link".into());
+    gone.new_path = None;
+    gone.change = FileChange::Deleted;
+    gone.hunks = modified("link", &[0]).hunks;
+    let mut link = added("link");
+    link.hunks = modified("link", &[0]).hunks;
+    two.review.files = vec![modified("calc.rs", &[2]), gone, link];
     two.review.computed = Some(std::time::Instant::now());
     two.tests.push(TestRun {
         command: "t".into(),
@@ -517,4 +525,14 @@ fn the_compose_view_shows_each_agents_hunks_side_by_side() {
         text.contains("! 1 marked hunk(s) do not apply together"),
         "{text}"
     );
+    // Both halves of the type change are hunks to mark.
+    ed.handle_key(KeyEvent::plain(KeyCode::Tab));
+    let v = ed.agents.panel.compose.clone().unwrap();
+    assert_eq!(
+        compose::files(&ed, &v)[v.file],
+        std::path::PathBuf::from("link")
+    );
+    let files: Vec<usize> = compose::items(&ed, &v).iter().map(|i| i.file).collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert_ne!(files[0], files[1]);
 }
