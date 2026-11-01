@@ -630,6 +630,18 @@ pub fn stale_reason(ed: &Editor, p: &Proposal) -> Option<String> {
             b.doc.version().0,
             p.base_version.0
         )),
+        // `:w other` renames a buffer without changing its version. The
+        // review showed the old path; saving would write the new one.
+        Some(b)
+            if b.doc.path().map(crate::editor::normalize_path)
+                != p.path.as_deref().map(crate::editor::normalize_path) =>
+        {
+            Some(format!(
+                "the document was saved as {} since the proposal was made for {}",
+                b.doc.display_name(),
+                p.file_label()
+            ))
+        }
         Some(_) => None,
     }
 }

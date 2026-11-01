@@ -832,6 +832,61 @@ fn a_dialog_that_does_not_fit_cannot_be_accepted() {
 }
 
 #[test]
+fn a_replayed_macro_cannot_approve_a_proposal() {
+    let mut h = Harness::new("macro");
+    let doc = h.file("m.txt", "abc\n");
+    let first = create(&mut h, edit(doc, 0, 0, 1, "A"))["id"]
+        .as_u64()
+        .unwrap();
+    // The user records a macro while approving the first one by hand.
+    h.keys("Q");
+    h.open_review();
+    h.keys("ay");
+    h.esc();
+    h.keys("Q");
+    assert_eq!(
+        h.ok("proposal.status", json!({"proposal": first}))["decision"],
+        "approved"
+    );
+    let (_, v) = h.text(doc);
+    let second = create(&mut h, edit(doc, v, 1, 2, "B"))["id"]
+        .as_u64()
+        .unwrap();
+    // Replaying it opens the review, but its `a` and `y` are ignored.
+    h.keys("q");
+    assert!(h.ed.proposals.review_open());
+    assert!(
+        h.status().contains("replayed keys are ignored"),
+        "{}",
+        h.status()
+    );
+    assert_eq!(
+        h.ok("proposal.status", json!({"proposal": second}))["state"],
+        "pending"
+    );
+    assert_eq!(h.text(doc).0, "Abc\n");
+}
+
+#[test]
+fn a_buffer_saved_under_another_name_makes_its_proposals_stale() {
+    let mut h = Harness::new("renamed");
+    let doc = h.file("old.txt", "abc\n");
+    let id = create(&mut h, with_verify(edit(doc, 0, 0, 1, "A"), "touch ran"))["id"]
+        .as_u64()
+        .unwrap();
+    // `:w new.txt` renames the buffer without changing its version.
+    h.ok("editor.execute", json!({"line": "w new.txt"}));
+    assert_eq!(h.text(doc).1, 0);
+    h.open_review();
+    h.keys("a");
+    let st = h.ok("proposal.status", json!({"proposal": id}));
+    assert_eq!(st["decision"], "stale", "{st}");
+    assert!(st["reason"].as_str().unwrap().contains("saved as"), "{st}");
+    assert_eq!(h.text(doc).0, "abc\n");
+    assert!(!exists(&h.dir, "ran"));
+}
+
+#[test]
 fn closing_the_document_resolves_its_pending_proposals() {
     let mut h = Harness::new("close");
     let doc = h.file("c.txt", "abc\n");

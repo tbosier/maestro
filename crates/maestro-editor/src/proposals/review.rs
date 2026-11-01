@@ -314,6 +314,12 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     let Some(mut v) = ed.proposals.review.clone() else {
         return;
     };
+    // A macro or `.` replays keys the user typed for something else; it
+    // must not approve or reject a proposal they have not seen.
+    if ed.is_replaying() {
+        ed.error("the proposal review takes keys typed by hand; replayed keys are ignored");
+        return;
+    }
     let ctrl = key.mods.ctrl;
     match v.dialog.take() {
         Some(Dialog::Approve {
