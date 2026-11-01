@@ -68,14 +68,23 @@ impl SignatureHelp {
     }
 }
 
-/// The popup, if it belongs to the focused view in insert mode.
+/// The popup, if it belongs to the focused view in insert mode and the
+/// text and cursors are what the last request was made for. A change
+/// without a key (a mouse click, a paste) hides it until the next key
+/// asks again.
 pub fn visible(ed: &Editor) -> Option<&Popup> {
-    let p = ed.lsp.signature.popup.as_ref()?;
+    let s = &ed.lsp.signature;
+    let p = s.popup.as_ref()?;
+    let in_step = s
+        .seen
+        .as_ref()
+        .is_some_and(|(v, sel)| *v == ed.doc().version() && *sel == ed.view().selection);
     let ok = ed.mode == Mode::Insert
         && ed.prompt.is_none()
         && ed.picker.is_none()
         && ed.focus == p.view
-        && ed.view().doc == p.doc;
+        && ed.view().doc == p.doc
+        && in_step;
     ok.then_some(p)
 }
 
@@ -91,6 +100,7 @@ pub fn show(ed: &mut Editor, result: &Value) -> bool {
         view: ed.focus,
         help,
     });
+    ed.lsp.signature.seen = Some((ed.doc().version(), ed.view().selection.clone()));
     true
 }
 

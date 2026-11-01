@@ -3,10 +3,11 @@
 //!
 //! One such request is out at a time; a new one cancels the old. Replies
 //! come back as jobs like every other request (see [`super`]) and pass a
-//! guard first: a reply that would edit text is dropped if any buffer's
-//! version moved since the request went out, and one that would open a
-//! prompt or a picker is also dropped if the user moved to another buffer,
-//! a prompt, a picker or insert mode meanwhile. Edits then go through
+//! guard first: a reply that would edit text is dropped if any buffer
+//! changed, opened or closed since the request went out, and one that
+//! would open a prompt or a picker is also dropped if the cursor moved or
+//! the user moved to another buffer, a prompt, a picker or insert mode
+//! meanwhile. Edits then go through
 //! [`super::edit`], which checks the whole edit before changing anything.
 //!
 //! * Rename asks `textDocument/prepareRename` first when the server offers
@@ -114,10 +115,16 @@ fn versions(ed: &Editor) -> HashMap<DocumentId, DocumentVersion> {
         .collect()
 }
 
+/// True if any buffer changed, opened or closed since `versions` was taken.
+/// An edit without versions for a file that was not open when the request
+/// went out is computed against the file on disk; if the file has since
+/// been opened (and maybe edited), that text may no longer match.
 fn changed_since(ed: &Editor, versions: &HashMap<DocumentId, DocumentVersion>) -> bool {
-    versions
-        .iter()
-        .any(|(id, v)| ed.buffers.get(id).is_some_and(|b| b.doc.version() != *v))
+    ed.buffers.len() != versions.len()
+        || ed
+            .buffers
+            .iter()
+            .any(|(id, b)| versions.get(id) != Some(&b.doc.version()))
 }
 
 /// Cancels the request that is out, if any.
@@ -228,6 +235,11 @@ fn stale_reason(ed: &Editor, p: &Pending) -> Option<&'static str> {
         if ed.focus != p.view || ed.view().doc != p.doc {
             return Some("another buffer is shown now");
         }
+        // The answer is about the symbol or range where the request was
+        // made; a rename prompt would otherwise point at another one.
+        if ed.view().selection.primary().head != p.head {
+            return Some("the cursor moved");
+        }
         if ed.prompt.is_some() || ed.picker.is_some() {
             return Some("a prompt or picker is open");
         }
@@ -316,6 +328,9 @@ pub fn rename(ed: &mut Editor, new_name: Option<&str>) {
         );
         return;
     }
+    // The prompt may open only after the server answers, so a macro could
+    // not replay the keys typed into it.
+    ed.not_repeatable("a rename prompt");
     let prepare = ed.lsp.servers[&server]
         .capabilities
         .as_ref()
@@ -338,7 +353,7 @@ pub fn rename(ed: &mut Editor, new_name: Option<&str>) {
             ed.error("rename: no name under the cursor");
             return;
         }
-        open_rename_prompt(ed, server, &word);
+        open_rename_prompt(ed, server, &word, head);
     }
 }
 
@@ -374,15 +389,15 @@ fn prepared(ed: &mut Editor, p: &Pending, result: &Value) {
             None => word_at(ed, p.head),
         },
     };
-    open_rename_prompt(ed, p.server, &name);
+    open_rename_prompt(ed, p.server, &name, p.head);
 }
 
-fn open_rename_prompt(ed: &mut Editor, server: ServerId, name: &str) {
+fn open_rename_prompt(ed: &mut Editor, server: ServerId, name: &str, head: usize) {
     ed.lsp.actions.rename = Some(RenameTarget {
         server,
         doc: ed.view().doc,
         version: ed.doc().version(),
-        head: ed.view().selection.primary().head,
+        head,
     });
     crate::prompt::open(ed, PromptKind::Rename);
     if let Some(p) = ed.prompt.as_mut() {
@@ -547,6 +562,8 @@ pub fn code_actions(ed: &mut Editor) {
     else {
         return;
     };
+    // The picker opens only after the server answers.
+    ed.not_repeatable("the code action picker");
     let doc = ed.view().doc;
     let text = ed.doc().text().clone();
     let r = ed.view().selection.primary();
@@ -636,6 +653,9 @@ fn listed(ed: &mut Editor, p: &Pending, result: Value) {
 
 /// Runs the code action at `index` of the last list (the picker's choice).
 pub(crate) fn run_code_action(ed: &mut Editor, index: usize) {
+    // An edit applied now, during the picker's Enter, must not make `.`
+    // replay the picker keys.
+    ed.not_repeatable("a code action");
     let Some(menu) = ed.lsp.actions.menu.take() else {
         ed.error("code action: the list is gone; ask again");
         return;
@@ -741,6 +761,12 @@ fn execute(ed: &mut Editor, server: ServerId, cmd: &Value, title: &str) {
 
 /// Answers `workspace/applyEdit`: applies the edit (all or nothing) and
 /// says whether it was applied.
+///
+/// While a command Maestro sent to this server is still running, the edit
+/// is most likely that command's, computed from the text when it was sent:
+/// it is refused if any buffer changed, opened or closed since. Edits a
+/// server sends on its own have no such reference point; only their
+/// document versions, when they give them, are checked.
 pub(super) fn apply_edit_request(ed: &mut Editor, server: ServerId, params: &Value) -> Value {
     let name = ed
         .lsp
@@ -748,7 +774,17 @@ pub(super) fn apply_edit_request(ed: &mut Editor, server: ServerId, params: &Val
         .get(&server)
         .map_or_else(String::new, |s| s.name.clone());
     let label = params["label"].as_str().unwrap_or("edit");
-    match apply_workspace_edit(ed, &params["edit"]) {
+    let stale = ed.lsp.actions.pending.as_ref().is_some_and(|p| {
+        p.server == server
+            && matches!(p.action, Action::Execute { .. })
+            && changed_since(ed, &p.versions)
+    });
+    let result = if stale {
+        Err("a buffer changed since the command was sent".to_string())
+    } else {
+        apply_workspace_edit(ed, &params["edit"])
+    };
+    match result {
         Ok(a) => {
             if !a.changed.is_empty() {
                 let sev = if a.warnings.is_empty() {

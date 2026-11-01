@@ -198,6 +198,24 @@ pub(crate) fn changes_for(
     edits: &[TextEdit],
     refine: bool,
 ) -> Result<(ChangeSet, usize), String> {
+    if edits.is_empty() {
+        return Ok((ChangeSet::identity(text.len_chars()), 0));
+    }
+    // The editor's line numbers come from Ropey, which also breaks lines at
+    // form feed, vertical tab, NEL and the Unicode line and paragraph
+    // separators; the protocol counts only LF, CRLF and CR. With any of
+    // those in the text, a server's line numbers would land on the wrong
+    // lines, so the edit is refused.
+    if let Some(c) = text
+        .chars()
+        .find(|c| matches!(c, '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'))
+    {
+        return Err(format!(
+            "the text contains U+{:04X}, a line break the editor and the protocol count \
+             differently",
+            c as u32
+        ));
+    }
     let mut list: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
     for e in edits {
         let (start, end) = match (
@@ -207,16 +225,18 @@ pub(crate) fn changes_for(
             (Some(s), Some(e)) => (s, e),
             _ => return Err("an edit has a malformed range".into()),
         };
+        // Line numbers in messages are one-based; u64 so the largest u32
+        // line cannot overflow.
         if (start.line, start.character) > (end.line, end.character) {
             return Err(format!(
                 "an edit's range ends before it starts (line {})",
-                start.line + 1
+                u64::from(start.line) + 1
             ));
         }
         let (Some(from), Some(to)) = (lsp_to_char(text, start), lsp_to_char(text, end)) else {
             return Err(format!(
                 "an edit reaches line {}, past the end of the text ({} lines)",
-                end.line + 1,
+                u64::from(end.line) + 1,
                 text.len_lines()
             ));
         };
@@ -389,6 +409,15 @@ mod tests {
         assert!(e.unwrap_err().contains("past the end"));
         let e = apply(text, &[edit(1, 2, 0, 0, "x")], false);
         assert!(e.unwrap_err().contains("ends before it starts"));
+        // The largest line numbers are refused, not overflowed.
+        let e = apply(text, &[edit(u32::MAX, 0, u32::MAX, 0, "x")], false);
+        assert!(e.unwrap_err().contains("line 4294967296"));
+        let e = apply(text, &[edit(u32::MAX, 0, 0, 0, "x")], false);
+        assert!(e.unwrap_err().contains("ends before it starts"));
+        // A form feed is a line break to the editor but not to the
+        // protocol: line 1 would be `foo` here instead of `bar();`.
+        let e = apply("//\u{0C}foo\nbar();\n", &[edit(1, 0, 1, 3, "baz")], false);
+        assert!(e.unwrap_err().contains("U+000C"));
         // Touching edits and an insert at a replacement's start are fine.
         assert_eq!(
             apply(
