@@ -99,10 +99,33 @@ struct State {
     permissions: Vec<(Value, Vec<String>)>,
 }
 
+/// A check on the files an agent asks the client to write, on top of the
+/// confinement to its root. It gets the resolved path relative to the root
+/// and refuses the write by returning a message.
+pub type WriteRule = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+
+/// Extra rules for the requests an agent sends the client.
+#[derive(Clone, Default)]
+pub struct ClientRules {
+    /// Applied to every `fs/write_text_file` after the root confinement.
+    /// A refusal is answered to the agent as an error and reported as
+    /// [`AcpEvent::Error`], like any refused write.
+    pub write: Option<WriteRule>,
+}
+
+impl std::fmt::Debug for ClientRules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientRules")
+            .field("write", &self.write.as_ref().map(|_| "rule"))
+            .finish()
+    }
+}
+
 struct Shared {
     /// To the dispatcher thread.
     events: Sender<AcpEvent>,
     files: FileAccess,
+    rules: ClientRules,
     state: Mutex<State>,
     child: Mutex<Child>,
     out: Sender<Outgoing>,
@@ -153,7 +176,18 @@ impl AcpClient {
         root: &Path,
         on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
     ) -> io::Result<AcpClient> {
-        Self::start_inner(spec, root, None, on_event)
+        Self::start_inner(spec, root, None, ClientRules::default(), on_event)
+    }
+
+    /// [`start`](AcpClient::start) with extra rules for the agent's
+    /// requests (see [`ClientRules`]).
+    pub fn start_with_rules(
+        spec: &ProviderSpec,
+        root: &Path,
+        rules: ClientRules,
+        on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
+    ) -> io::Result<AcpClient> {
+        Self::start_inner(spec, root, None, rules, on_event)
     }
 
     /// Like [`start`](AcpClient::start), but resumes the saved session
@@ -175,13 +209,32 @@ impl AcpClient {
         session_id: &str,
         on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
     ) -> io::Result<AcpClient> {
-        Self::start_inner(spec, root, Some(session_id.to_string()), on_event)
+        Self::start_inner(
+            spec,
+            root,
+            Some(session_id.to_string()),
+            ClientRules::default(),
+            on_event,
+        )
+    }
+
+    /// [`load_session`](AcpClient::load_session) with extra rules for the
+    /// agent's requests (see [`ClientRules`]).
+    pub fn load_session_with_rules(
+        spec: &ProviderSpec,
+        root: &Path,
+        session_id: &str,
+        rules: ClientRules,
+        on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
+    ) -> io::Result<AcpClient> {
+        Self::start_inner(spec, root, Some(session_id.to_string()), rules, on_event)
     }
 
     fn start_inner(
         spec: &ProviderSpec,
         root: &Path,
         resume: Option<String>,
+        rules: ClientRules,
         on_event: impl Fn(AcpEvent) + Send + Sync + 'static,
     ) -> io::Result<AcpClient> {
         let files = FileAccess::new(root)?;
@@ -226,6 +279,7 @@ impl AcpClient {
         let shared = Arc::new(Shared {
             events,
             files,
+            rules,
             state: Mutex::new(State {
                 alive: true,
                 pending: HashMap::new(),
@@ -748,7 +802,10 @@ impl Shared {
                 Ok(r) if !self.session_is(&r.session_id.0) => {
                     jsonrpc::error_response(id, jsonrpc::INVALID_PARAMS, "unknown session")
                 }
-                Ok(r) => match self.files.write(&r.path, &r.content) {
+                Ok(r) => match match &self.rules.write {
+                    Some(rule) => self.files.write_with(&r.path, &r.content, rule.as_ref()),
+                    None => self.files.write(&r.path, &r.content),
+                } {
                     Ok(path) => {
                         self.send(jsonrpc::response(
                             id,

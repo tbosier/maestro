@@ -169,7 +169,27 @@ impl FileAccess {
     /// symlink inside the root keeps pointing where it did and its target
     /// gets the contents.
     pub fn write(&self, path: &Path, content: &str) -> Result<PathBuf, AccessError> {
+        self.write_with(path, content, &|_| Ok(()))
+    }
+
+    /// [`write`](FileAccess::write) with one more check: once the path is
+    /// resolved and found inside the root, `allow` gets the resolved path
+    /// relative to the root (the file that would actually be written, after
+    /// symlinks) and refuses the write by returning an error message,
+    /// reported as [`AccessError::Refused`]. Nothing is created before it
+    /// agrees.
+    pub fn write_with(
+        &self,
+        path: &Path,
+        content: &str,
+        allow: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> Result<PathBuf, AccessError> {
         let target = self.resolve(path)?;
+        let relative = target
+            .path
+            .strip_prefix(&self.root)
+            .map_err(|_| AccessError::OutsideRoot(path.to_path_buf()))?;
+        allow(relative).map_err(AccessError::Refused)?;
         let dir = target
             .path
             .parent()
@@ -512,6 +532,36 @@ mod tests {
             .filter(|n| n.to_string_lossy().contains("maestro-agent"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_write_rule_sees_the_resolved_path_and_can_refuse() {
+        let f = fixture("rule");
+        let only_src = |p: &Path| -> Result<(), String> {
+            if p.starts_with("src") {
+                Ok(())
+            } else {
+                Err(format!("{} is not under src", p.display()))
+            }
+        };
+        let ok = f.root.join("src/new.rs");
+        assert_eq!(f.access.write_with(&ok, "x", &only_src).unwrap(), ok);
+        // Refused before anything is created, directories included.
+        let out = f.root.join("docs/notes.md");
+        match f.access.write_with(&out, "x", &only_src) {
+            Err(AccessError::Refused(m)) => assert_eq!(m, "docs/notes.md is not under src"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!f.root.join("docs").exists());
+        // A symlink in src pointing elsewhere in the root is judged by
+        // the file that would be written.
+        std::os::unix::fs::symlink(f.root.join("README"), f.root.join("src/link")).unwrap();
+        assert!(matches!(
+            f.access
+                .write_with(&f.root.join("src/link"), "x", &only_src),
+            Err(AccessError::Refused(_))
+        ));
+        assert!(!f.root.join("README").exists());
     }
 
     #[test]

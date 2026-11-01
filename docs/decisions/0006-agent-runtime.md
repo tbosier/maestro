@@ -120,6 +120,9 @@ impl AcpClient {
     /// (replayed updates arrive as `Update`, then `SessionLoaded`). Without the capability, or when the
     /// load fails (reported as `Error`), a new session starts and `SessionStarted` is reported.
     pub fn load_session(spec: &ProviderSpec, root: &Path, session_id: &str, on_event: impl Fn(AcpEvent) + Send + Sync + 'static) -> io::Result<AcpClient>;
+    /// `start` and `load_session` with extra rules for the agent's requests (added for task contracts).
+    pub fn start_with_rules(spec: &ProviderSpec, root: &Path, rules: ClientRules, on_event: impl Fn(AcpEvent) + Send + Sync + 'static) -> io::Result<AcpClient>;
+    pub fn load_session_with_rules(spec: &ProviderSpec, root: &Path, session_id: &str, rules: ClientRules, on_event: impl Fn(AcpEvent) + Send + Sync + 'static) -> io::Result<AcpClient>;
     /// Fails when a turn is already running or the agent is gone. Before `SessionStarted` it is queued.
     pub fn prompt(&self, text: &str) -> io::Result<()>;
     /// Sends `session/cancel` and answers pending permission requests as cancelled.
@@ -141,7 +144,12 @@ impl FileAccess {
     pub fn read(&self, path: &Path, line: Option<u32> /* 1-based */, limit: Option<u32>) -> Result<String, AccessError>;
     /// Temp file in the same directory, then rename. Creates missing parent directories inside the root.
     pub fn write(&self, path: &Path, content: &str) -> Result<PathBuf, AccessError>;
+    /// `write`, after `allow` agrees to the resolved path relative to the root (`Refused` otherwise).
+    pub fn write_with(&self, path: &Path, content: &str, allow: &dyn Fn(&Path) -> Result<(), String>) -> Result<PathBuf, AccessError>;
 }
+/// Extra rules for an agent's requests: `write` is applied to every `fs/write_text_file` after the confinement.
+pub type WriteRule = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+#[derive(Clone, Default)] pub struct ClientRules { pub write: Option<WriteRule> }
 pub enum AccessError { OutsideRoot(PathBuf), GitDir(PathBuf), NotRegularFile(PathBuf), NotFound(PathBuf), NotAbsolute(PathBuf), BadPath(PathBuf), Refused(String), Io(io::Error) }
 
 // Behind the `fake-agent` feature: `maestro_agent::fake` (a scriptable fake ACP agent,
@@ -207,7 +215,15 @@ impl Repository {
     /// then HEAD, open operations and changed files are checked. After a success, the result is
     /// checked too (nothing open, same branch, HEAD moved forward).
     pub fn integrate(&self, branch: &str, how: Integration) -> Result<IntegrateOutcome, IntegrateError>;
+    /// Added for conflict detection: the worktree's files (HEAD plus staged, unstaged and untracked,
+    /// not ignored) as an unreferenced commit with HEAD as parent, built in a temporary index copy
+    /// that keeps the real index's modification time (so Git's racy-file check still works).
+    /// Fixed author and dates: the same files on the same HEAD give the same commit id.
+    pub fn work_snapshot(&self) -> Result<WorkSnapshot>;
+    /// An unreferenced commit of `tree` with `parents`, fixed author and dates. For dry runs.
+    pub fn commit_tree(&self, tree: &str, parents: &[&str], message: &str) -> Result<String>;
 }
+pub struct WorkSnapshot { pub commit: String, pub tree: String }
 /// Merge always creates a merge commit (--no-ff). CherryPick copies the branch's commits not on
 /// the target, oldest first, skipping ones whose changes the target already has.
 pub enum Integration { FastForwardOnly, Merge, CherryPick }
@@ -249,3 +265,5 @@ The glue lives in `crates/maestro-editor/src/agents/` (state, creation, panel ke
 - Agent records are saved by `agents/persist.rs` per repository (keyed by the canonical main worktree path) to `<state>/agents/<hash>.json` with `navigation::session::write_private`, only when the navigation state has a state directory and sessions on. `agents::tick` saves when a cheap fingerprint of the records changed, and quitting (`finish_quit`, `stop_all`) saves with sync. The panel's first open starts a background scan (`git worktree list`, the main worktree's `HEAD`, the records file); its result adds loaded agents (`Origin::Loaded`, no runtime, active statuses mapped to the new `Status::Stopped`), notes worktrees that changed, and adds found worktrees (`Origin::Found`). Creating an agent waits for the scan. An unusable file blocks saving for that repository for the session.
 - `R` relaunches through `create::relaunch`: `AcpClient::load_session` when the record has a session id and the agent advertised `loadSession`, else `AcpClient::start`, with no prompt (status `Idle` once the session is up); a terminal agent's spec without the arguments that held `{task}`. The editor gained `Status::Idle` and `Status::Stopped`, `Origin`, and the agent fields `origin`, `session_id`, `load_session` and `worktree_note`. `maestro-agent` gained `AcpClient::load_session`, `AcpEvent::SessionLoaded` and the fake agent's `--fake-load-session`.
 - Archive checks, on its background thread, that Git lists the worktree on the recorded branch before removing it, and marks the record archived without removing anything when the directory is gone and Git no longer lists it. The review diff is computed only while the worktree is on the recorded branch.
+- Task contracts (`agents/contract.rs`, added November 1, 2026): `Agent::contract` holds a `Contract` (allowed and forbidden patterns, verification command, acceptance criteria, source file), set from `NewAgent::contract` and saved in the record. The contract check for ACP writes is a closure the editor passes to `maestro-agent` as `ClientRules::write` (`AcpClient::start_with_rules`, `load_session_with_rules`). The check has to run on the client's reader thread, which answers `fs/write_text_file` synchronously; routing every write through the editor thread and back would add a round trip and a new failure mode to the client. A rule closure keeps `maestro-agent` free of any notion of contracts or globs: it only learns "a caller-supplied predicate on the resolved relative path", applied through `FileAccess::write_with` after the existing confinement. The integrate check takes a fresh `review_diff` for the out-of-contract list and checks it again in `run_integration` after `commit_all`; `ConfirmAction::Integrate` accepts `O` instead of `y` when that list is not empty. `t` prefers `contract.verify`; each finished run records `TestRun::tree` from a `work_snapshot` on a background thread, compared with a fresh snapshot in the integrate check.
+- Conflicts between agents (`agents/conflicts.rs`): `AgentState::conflicts` holds the overlapping pairs. `review::applied` calls `conflicts::refresh` when an agent's diff changed, and reject, integrate and archive call it too. Overlap is computed in memory from the review diffs; one background job at a time snapshots the agents in overlapping pairs and runs `merge_check` per pair, cached by the ordered pair of snapshot commit ids (256 entries). The integrate check merges the target's `HEAD` with the agent's snapshot in memory (`merge_check`, then `commit_tree`) and dry-runs that against each overlapping agent's snapshot. The agent panel's summary grew from four rows to six (`panel::agent_layout`); `panel::layout` keeps four rows for the proposal review.

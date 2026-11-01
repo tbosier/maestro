@@ -108,6 +108,9 @@ pub struct AgentRecord {
     pub load_session: bool,
     /// Milliseconds since the Unix epoch.
     pub created: u64,
+    /// The task contract, checked like a typed one when loaded.
+    #[serde(default)]
+    pub contract: Option<super::contract::Contract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +149,12 @@ pub struct SavedTestRun {
     pub tail: Vec<String>,
     /// Output lines not kept.
     pub dropped: usize,
+    /// The tree of the worktree's files when the run finished.
+    #[serde(default)]
+    pub tree: Option<String>,
+    /// The agent's process ran during the run.
+    #[serde(default)]
+    pub agent_was_running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,10 +282,23 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
     }
     // A full commit id: hexadecimal, so it is never taken for an option
     // and can be cut anywhere for display.
-    if !(4..=64).contains(&w.base.len()) || !w.base.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_object_id(&w.base) {
         return Err(format!("base {:?} is not a commit id", w.base));
     }
+    if let Some(c) = &r.contract {
+        c.validate().map_err(|e| format!("task contract: {e}"))?;
+    }
+    for t in &r.tests {
+        if let Some(tree) = t.tree.as_deref().filter(|t| !is_object_id(t)) {
+            return Err(format!("test tree {tree:?} is not an object id"));
+        }
+    }
     Ok(())
+}
+
+/// Hexadecimal, 4 to 64 characters: never taken for an option.
+fn is_object_id(s: &str) -> bool {
+    (4..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn kind_from(s: &str) -> Option<ProviderKind> {
@@ -335,6 +357,8 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
                     .cloned()
                     .collect(),
                 dropped: t.dropped + (t.output.len() - keep),
+                tree: t.tree.clone(),
+                agent_was_running: t.agent_was_running,
             }
         })
         .collect();
@@ -375,6 +399,7 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
         session_id: a.session_id.clone(),
         load_session: a.load_session,
         created: millis(a.created),
+        contract: a.contract.clone(),
     })
 }
 
@@ -410,6 +435,7 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
     a.errors = r.errors.clone();
     a.session_id = r.session_id.clone();
     a.load_session = r.load_session;
+    a.contract = r.contract.clone();
     a.history = r
         .history
         .iter()
@@ -440,6 +466,9 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
                 started: Instant::now(),
                 output: t.tail.iter().cloned().collect(),
                 dropped: t.dropped,
+                // A run that had not finished has no files to vouch for.
+                tree: t.tree.clone().filter(|_| t.finished),
+                agent_was_running: t.agent_was_running,
                 // A run that was going when the record was saved did not
                 // finish as far as Maestro knows: it shows as killed.
                 finished: Some(TestFinish {
@@ -542,6 +571,8 @@ fn fingerprint(ed: &Editor) -> u64 {
         }
         a.tests.len().hash(&mut h);
         a.tests.last().map(|t| t.finished.is_some()).hash(&mut h);
+        a.tests.last().map(|t| &t.tree).hash(&mut h);
+        a.contract.as_ref().map(|c| c.brief()).hash(&mut h);
     }
     h.finish()
 }
@@ -1099,6 +1130,7 @@ mod tests {
             session_id: None,
             load_session: false,
             created: 1_000,
+            contract: None,
         }
     }
 
@@ -1178,6 +1210,16 @@ mod tests {
         assert!(
             matches!(read(&id, Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("out of range"))
         );
+        // A saved contract is checked like a typed one.
+        let mut f = file.clone();
+        f.agents[0].contract = Some(super::super::contract::Contract {
+            allowed: vec!["../outside".into()],
+            ..Default::default()
+        });
+        let bad = write(&dir, "contract.json", &serde_json::to_string(&f).unwrap());
+        assert!(
+            matches!(read(&bad, Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("task contract"))
+        );
         let mut f = file;
         f.agents[0].kind = "robot".into();
         let kind = write(&dir, "kind.json", &serde_json::to_string(&f).unwrap());
@@ -1204,6 +1246,8 @@ mod tests {
             summary: None,
             tail: vec!["compiling".into()],
             dropped: 0,
+            tree: Some("abcdef".into()),
+            agent_was_running: false,
         });
         let a = from_record(&r, &[]);
         assert_eq!(a.status(), Status::Stopped);
@@ -1242,6 +1286,8 @@ mod tests {
             output: (0..500).map(|i| format!("line {i}")).collect(),
             dropped: 7,
             finished: None,
+            tree: None,
+            agent_was_running: false,
         };
         run.finished = Some(TestFinish {
             code: Some(0),

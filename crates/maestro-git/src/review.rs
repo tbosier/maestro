@@ -88,6 +88,16 @@ pub enum IntegrateError {
     Unexpected(String),
 }
 
+/// A worktree's files as an unreferenced commit, from
+/// [`Repository::work_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkSnapshot {
+    /// The commit: the tree below with the worktree's `HEAD` as parent.
+    pub commit: String,
+    /// The tree of every tracked and untracked (not ignored) file.
+    pub tree: String,
+}
+
 /// `git merge-tree` accepts trees, not only commits, with `--merge-base`
 /// from 2.45. The cherry-pick dry run chains trees.
 pub const MERGE_TREE_TREES: GitVersion = GitVersion::new(2, 45, 0);
@@ -101,6 +111,17 @@ impl TempFile {
     /// planted at the name in a shared temp directory is never written
     /// through.
     fn create(tag: &str, contents: &[u8]) -> std::io::Result<Self> {
+        Self::create_at(tag, contents, None)
+    }
+
+    /// [`create`](TempFile::create), with the modification time set on the
+    /// same handle (never through the path, which a shared temp directory
+    /// lets others replace).
+    fn create_at(
+        tag: &str,
+        contents: &[u8],
+        modified: Option<std::time::SystemTime>,
+    ) -> std::io::Result<Self> {
         use std::io::Write;
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -115,7 +136,34 @@ impl TempFile {
             .open(&path)?;
         let made = Self(path);
         file.write_all(contents)?;
+        if let Some(t) = modified {
+            file.set_modified(t)?;
+        }
         Ok(made)
+    }
+
+    /// A copy of the index at `index` (or no file, when there is none)
+    /// with the original's modification time. Git trusts an entry's cached
+    /// file stats only when the file is older than the index (its "racy
+    /// git" check), so a copy with a new time would hide a file rewritten
+    /// with the same size in the same second as the checkout.
+    fn index_copy(tag: &str, index: &Path) -> Result<Self> {
+        // The time is read first: if git replaces the index in between,
+        // the copy gets an older time than its contents, which only makes
+        // git check more files.
+        let modified = std::fs::metadata(index).and_then(|m| m.modified());
+        match std::fs::read(index) {
+            Ok(bytes) => Ok(Self::create_at(tag, &bytes, Some(modified?))?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No index yet: git must find no file (an empty one is an
+                // error). It creates it through an exclusive lock file and
+                // a rename, which never write through a planted symlink.
+                let t = Self::create(tag, &[])?;
+                std::fs::remove_file(&t.0)?;
+                Ok(t)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -185,18 +233,7 @@ impl Repository {
         // A copy of the index keeps its cached file stats, so git does not
         // have to rehash every tracked file. Git replaces the index by
         // renaming, so this reads one whole version even if git is writing.
-        let index = match std::fs::read(self.git_dir().join("index")) {
-            Ok(bytes) => TempFile::create("review-index", &bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // No index yet: git must find no file (an empty one is an
-                // error). It creates it through an exclusive lock file and
-                // a rename, which never write through a planted symlink.
-                let t = TempFile::create("review-index", &[])?;
-                std::fs::remove_file(&t.0)?;
-                t
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let index = TempFile::index_copy("review-index", &self.git_dir().join("index"))?;
         let list = TempFile::create("review-paths", &untracked)?;
         // With a split index, the copy points at shared index files in the
         // real git directory, and writing it could make a new shared file
@@ -220,6 +257,68 @@ impl Repository {
             Access::Write,
         )?;
         shadow.parse_diff(&args)
+    }
+
+    /// A commit holding everything in this worktree as it is on disk:
+    /// `HEAD` plus staged, unstaged and untracked files (ignored files left
+    /// out), with `HEAD` as its parent. Nothing the user sees changes: it
+    /// is built in a temporary copy of the index, no ref or reflog points
+    /// at it, and `HEAD`, the real index and the working tree are not
+    /// touched. It does write the worktree's file contents and the commit
+    /// to the object store as unreferenced objects, which `git gc` drops.
+    ///
+    /// Author, committer, dates and message are fixed, so the same files on
+    /// the same `HEAD` always give the same commit id; callers can cache
+    /// on it. Used for merge dry runs between worktrees that hold
+    /// uncommitted work ([`Repository::merge_check`]).
+    pub fn work_snapshot(&self) -> Result<WorkSnapshot> {
+        let head = self.resolve("HEAD")?;
+        let index = TempFile::index_copy("snapshot-index", &self.git_dir().join("index"))?;
+        // As in `review_diff`: a whole index, never new shared index files.
+        let shadow = self.with_git(
+            self.git()
+                .clone()
+                .env("GIT_INDEX_FILE", &index.0)
+                .config("core.splitIndex=false"),
+        );
+        shadow.run(&["add", "--all", "--", "."], Access::Write)?;
+        let out = shadow.run(&["write-tree"], Access::Write)?;
+        let tree = String::from_utf8_lossy(&out).trim().to_string();
+        check_rev(&tree)?;
+        let commit = self.commit_tree(&tree, &[&head], "maestro work snapshot")?;
+        Ok(WorkSnapshot { commit, tree })
+    }
+
+    /// Writes a commit object for `tree` with `parents` and returns its id,
+    /// without moving any ref. Author and committer are fixed (`maestro`,
+    /// the Unix epoch), so the id depends only on the tree, the parents and
+    /// the message. For dry runs only: the commit is unreferenced.
+    pub fn commit_tree(&self, tree: &str, parents: &[&str], message: &str) -> Result<String> {
+        check_rev(tree)?;
+        let mut args: Vec<OsString> =
+            vec!["commit-tree".into(), "--no-gpg-sign".into(), tree.into()];
+        for p in parents {
+            check_rev(p)?;
+            args.push("-p".into());
+            args.push((*p).into());
+        }
+        args.push("-m".into());
+        args.push(message.into());
+        let fixed = self.with_git(
+            self.git()
+                .clone()
+                .env("GIT_AUTHOR_NAME", "maestro")
+                .env("GIT_AUTHOR_EMAIL", "maestro@localhost")
+                .env("GIT_AUTHOR_DATE", "@0 +0000")
+                .env("GIT_COMMITTER_NAME", "maestro")
+                .env("GIT_COMMITTER_EMAIL", "maestro@localhost")
+                .env("GIT_COMMITTER_DATE", "@0 +0000")
+                .config("commit.gpgSign=false"),
+        );
+        let out = fixed.run(&args, Access::Write)?;
+        let commit = String::from_utf8_lossy(&out).trim().to_string();
+        check_rev(&commit)?;
+        Ok(commit)
     }
 
     fn parse_diff(&self, args: &[OsString]) -> Result<Vec<DiffFile>> {

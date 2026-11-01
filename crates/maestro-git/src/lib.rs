@@ -27,7 +27,7 @@ pub use intraline::{INTRALINE_MAX_LINE, intraline};
 pub use linediff::{LineHunk, LineHunkKind, Sign, SignMap, diff_lines};
 pub use merge::MergeCheck;
 pub use repo::{Base, Head, Repository};
-pub use review::{IntegrateError, IntegrateOutcome, Integration, MERGE_TREE_TREES};
+pub use review::{IntegrateError, IntegrateOutcome, Integration, MERGE_TREE_TREES, WorkSnapshot};
 pub use status::{BranchInfo, ChangeKind, ConflictKind, EntryState, Status, StatusEntry};
 pub use worktree::{RemoveError, RemoveRefusal, Worktree};
 

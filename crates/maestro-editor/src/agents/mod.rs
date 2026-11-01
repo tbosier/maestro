@@ -17,6 +17,8 @@
 //! threads started with [`Editor::spawn_background`].
 
 pub mod actions;
+pub mod conflicts;
+pub mod contract;
 pub mod create;
 pub mod panel;
 pub mod persist;
@@ -266,6 +268,14 @@ pub struct TestRun {
     pub output: VecDeque<String>,
     pub dropped: usize,
     pub finished: Option<TestFinish>,
+    /// The tree of the worktree's files (tracked and untracked, not
+    /// ignored) as they were just after the run finished, from
+    /// `maestro_git::Repository::work_snapshot`. Integrate compares it
+    /// with the files then; `None` until computed, or when it could not be.
+    pub tree: Option<String>,
+    /// The agent's process was running when the run started or finished,
+    /// so it may have changed files the run did not see.
+    pub agent_was_running: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -350,11 +360,38 @@ impl ReviewData {
     }
 }
 
+/// The paths a diff file names (old and new, once each), relative to the
+/// worktree root.
+pub fn file_paths(f: &DiffFile) -> Vec<&PathBuf> {
+    let mut v: Vec<&PathBuf> = f.old_path.iter().chain(f.new_path.iter()).collect();
+    v.dedup();
+    v
+}
+
+/// Files of `files` that `contract` does not allow, with the reason, in
+/// diff order. A rename or deletion counts when either of its paths is
+/// outside the contract.
+pub fn out_of_scope(contract: &contract::Contract, files: &[DiffFile]) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for f in files {
+        for p in file_paths(f) {
+            if let Some(why) = contract.violation(p) {
+                out.push((p.clone(), why));
+            }
+        }
+    }
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
 /// Everything the editor knows about one agent.
 pub struct Agent {
     pub id: AgentId,
     pub name: String,
     pub task: String,
+    /// The task contract attached when the task was created: what it may
+    /// change, its verification command, its acceptance criteria.
+    pub contract: Option<contract::Contract>,
     /// Agents started on the same task (competing implementations) share
     /// a group.
     pub group: u64,
@@ -413,6 +450,7 @@ impl Agent {
             id,
             name: format!("{}-{}", provider.name, id.0),
             task,
+            contract: None,
             group,
             provider,
             worktree: None,
@@ -502,6 +540,38 @@ impl Agent {
         self.tests.last()
     }
 
+    /// Files in the last review diff that the contract does not allow.
+    pub fn out_of_scope(&self) -> Vec<(PathBuf, String)> {
+        match &self.contract {
+            Some(c) => out_of_scope(c, &self.review.files),
+            None => Vec::new(),
+        }
+    }
+
+    /// The task as sent to the agent: the task text, then the contract.
+    pub fn task_for_agent(&self) -> String {
+        contract::task_with_contract(&self.task, self.contract.as_ref())
+    }
+
+    /// The rule ACP file writes through Maestro must pass: inside the
+    /// contract's allowed paths and outside its forbidden ones. `None`
+    /// without a contract that limits paths.
+    pub fn client_rules(&self) -> maestro_agent::ClientRules {
+        let Some(c) = self
+            .contract
+            .clone()
+            .filter(|c| !c.allowed.is_empty() || !c.forbidden.is_empty())
+        else {
+            return maestro_agent::ClientRules::default();
+        };
+        maestro_agent::ClientRules {
+            write: Some(Arc::new(move |p: &Path| match c.violation(p) {
+                Some(why) => Err(format!("{why}: outside the task contract")),
+                None => Ok(()),
+            })),
+        }
+    }
+
     /// Records an event in the history.
     pub fn log(&mut self, text: impl Into<String>) {
         self.history.push(HistoryEntry {
@@ -562,6 +632,8 @@ pub struct AgentState {
     last_refresh: Option<Instant>,
     /// Saved records: which repositories were read, and what was written.
     pub persist: persist::PersistState,
+    /// Which agents' changes overlap, and whether they would conflict.
+    pub conflicts: conflicts::ConflictState,
 }
 
 impl AgentState {
