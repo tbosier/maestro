@@ -12,6 +12,10 @@ use maestro_forge::{
 use super::{DraftKind, MessageDraft};
 use crate::editor::{DocumentId, Editor, Mode};
 use crate::key::{KeyCode, KeyEvent};
+use maestro_core::DocumentVersion;
+
+/// A message buffer and the version its text was taken at.
+pub type Draft = (DocumentId, DocumentVersion);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
@@ -22,8 +26,9 @@ pub enum Dialog {
         keys: Vec<(String, String)>,
         pr: PrRef,
         action: WriteAction,
-        /// The message buffer the body came from, closed once sent.
-        draft: Option<DocumentId>,
+        /// The message buffer the body came from and its version then.
+        /// Closed once sent, unless it changed since.
+        draft: Option<Draft>,
     },
     /// Choosing how to merge `pr`.
     Merge {
@@ -76,7 +81,7 @@ fn command_lines(pr: &PrRef, action: &WriteAction) -> Vec<String> {
     lines
 }
 
-fn ask(ed: &mut Editor, pr: PrRef, title: &str, action: WriteAction, draft: Option<DocumentId>) {
+fn ask(ed: &mut Editor, pr: PrRef, title: &str, action: WriteAction, draft: Option<Draft>) {
     if let Some(w) = &ed.forge.writing {
         ed.error(format!("still sending: {w}; wait for it to finish"));
         return;
@@ -196,7 +201,8 @@ pub fn send_draft(ed: &mut Editor) -> Result<(), String> {
     if ed.mode == Mode::Insert {
         ed.run_command("normal_mode");
     }
-    ask(ed, draft.pr, &title, action, Some(draft.doc));
+    let version = ed.doc().version();
+    ask(ed, draft.pr, &title, action, Some((draft.doc, version)));
     Ok(())
 }
 
@@ -482,7 +488,7 @@ pub fn dialog_key(ed: &mut Editor, key: KeyEvent) {
 }
 
 /// Runs a confirmed write action in the background.
-fn send(ed: &mut Editor, pr: PrRef, action: WriteAction, draft: Option<DocumentId>) {
+fn send(ed: &mut Editor, pr: PrRef, action: WriteAction, draft: Option<Draft>) {
     let gh = super::gh(ed);
     let what = format!("{} {pr}", action.verb());
     ed.forge.writing = Some(what.clone());
@@ -501,20 +507,27 @@ fn sent(
     ed: &mut Editor,
     pr: PrRef,
     action: WriteAction,
-    draft: Option<DocumentId>,
+    draft: Option<Draft>,
     result: maestro_forge::Result<String>,
 ) {
     ed.forge.writing = None;
     match result {
         Ok(_) => {
-            if let Some(doc) = draft
-                && ed.buffers.contains_key(&doc)
+            let mut note = "";
+            if let Some((doc, version)) = draft
+                && let Some(b) = ed.buffers.get(&doc)
             {
-                // The text is on GitHub now; the buffer was only a draft.
-                let _ = ed.close_buffer(doc, true);
+                if b.doc.version() == version {
+                    // The text is on GitHub now; the buffer was only a draft.
+                    let _ = ed.close_buffer(doc, true);
+                } else {
+                    // Typed into while it was being sent: that text was not
+                    // sent, so the buffer stays (no longer a draft).
+                    note = "; the message buffer changed after it was sent, so it is kept";
+                }
                 ed.forge.drafts.retain(|d| d.doc != doc);
             }
-            ed.info(format!("{} {pr}", action.done()));
+            ed.info(format!("{} {pr}{note}", action.done()));
             if ed.forge.screen.detail.as_ref().is_some_and(|d| d.pr == pr) {
                 super::detail::load(ed, pr);
             }
