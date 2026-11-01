@@ -43,14 +43,26 @@ impl PartPlan {
     fn keys(&self) -> Vec<(HunkKey, Option<BTreeSet<usize>>)> {
         self.picks
             .iter()
-            .map(|p| {
-                (
-                    HunkKey::from_parts(p.old_path.clone(), p.new_path.clone(), &p.hunk),
-                    p.lines.clone(),
-                )
-            })
+            .map(|p| (HunkKey::of_pick(p), p.lines.clone()))
             .collect()
     }
+}
+
+/// Why the agent's marks are no longer the ones `p` was checked on, if
+/// they are not.
+pub(crate) fn marks_changed(a: &super::Agent, p: &PartPlan) -> Option<String> {
+    let now: BTreeSet<HunkKey> = a.marks.iter().map(|m| m.key.clone()).collect();
+    let then: BTreeSet<HunkKey> = p.picks.iter().map(HunkKey::of_pick).collect();
+    let same_lines = p.picks.iter().all(|pick| {
+        a.marks
+            .iter()
+            .any(|m| m.key == HunkKey::of_pick(pick) && m.pick.lines == pick.lines)
+    });
+    (now != then || !same_lines).then(|| {
+        "the marked hunks changed after the dialog was checked (the agent changed a marked \
+         hunk, or marks were added or removed); press I again"
+            .to_string()
+    })
 }
 
 /// Plain words for hunks that do not apply.
@@ -262,7 +274,7 @@ pub fn steps(f: &IntegrateFacts, p: &PartPlan, how: Integration) -> Vec<String> 
         f.main_root.display()
     ));
     lines.push(
-        "Before step 1 Maestro checks both worktrees and the main worktree again, and stops on a change. Git then refuses on conflicts."
+        "On y Maestro refuses if the marks changed meanwhile (a refresh unmarks a hunk the agent changed), checks the agent's worktree and the main worktree again, and stops on a change there; the hunks are taken as marked. Git then refuses on conflicts."
             .into(),
     );
     lines

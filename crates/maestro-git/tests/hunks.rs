@@ -435,3 +435,50 @@ fn a_file_turned_into_a_symlink_needs_both_its_hunks() {
     assert!(ls.starts_with("120000 blob "), "{ls}");
     assert_eq!(f.show(&c, "link").unwrap(), b"target.txt");
 }
+
+#[test]
+fn a_replaced_line_taken_alone_stays_in_its_place() {
+    // `-a -b +A +B`: taking `-a +A` (the first pair the side-by-side
+    // review shows) gives `A b`, not `b A`.
+    let f = Fixture::new(&[("p.txt", "a\nb\n")]);
+    let base = f.head();
+    let wt = f.worktree("agent");
+    write(&wt, "p.txt", "A\nB\n");
+    let files = f.open(&wt).review_diff(&base).unwrap();
+    let main = f.open(&f.repo);
+    let p = file(&files, "p.txt");
+    let c = commit(&main, &base, &[lines_of(p, 0, &["a", "A"])]);
+    assert_eq!(f.show(&c, "p.txt").unwrap(), b"A\nb\n");
+    let c = commit(&main, &base, &[lines_of(p, 0, &["b", "B"])]);
+    assert_eq!(f.show(&c, "p.txt").unwrap(), b"a\nB\n");
+    let c = commit(&main, &base, &[lines_of(p, 0, &["B"])]);
+    assert_eq!(f.show(&c, "p.txt").unwrap(), b"a\nb\nB\n");
+}
+
+#[test]
+fn a_directory_turned_into_a_file_needs_every_removal() {
+    let f = Fixture::new(&[("dir/one.txt", "1\n"), ("dir/two.txt", "2\n")]);
+    let base = f.head();
+    let wt = f.worktree("agent");
+    std::fs::remove_dir_all(wt.join("dir")).unwrap();
+    write(&wt, "dir", "now a file\n");
+    let files = f.open(&wt).review_diff(&base).unwrap();
+    let main = f.open(&f.repo);
+    let add = whole(file(&files, "dir"), 0);
+    let one = whole(file(&files, "dir/one.txt"), 0);
+    let two = whole(file(&files, "dir/two.txt"), 0);
+    // One of the two removals left out: refused, naming the file left.
+    let r = refusals(
+        main.tree_from_hunks(&base, &[add.clone(), one.clone()])
+            .unwrap_err(),
+    );
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(
+        r[0].1.contains("files no taken hunk removes: dir/two.txt"),
+        "{r:?}"
+    );
+    // All of it: the file takes the directory's place.
+    let c = commit(&main, &base, &[add, one, two]);
+    assert_eq!(f.show(&c, "dir").unwrap(), b"now a file\n");
+    assert_eq!(f.show(&c, "dir/one.txt"), None);
+}

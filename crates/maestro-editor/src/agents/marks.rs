@@ -15,26 +15,51 @@ use super::review::{Row, RowLine};
 use super::{Agent, AgentId};
 use crate::editor::Editor;
 
-/// What identifies a hunk across review refreshes: the file's paths, where
-/// it starts in the base file and its lines. Where it lands in the new
-/// file is left out, so a change elsewhere in the file does not drop it.
+/// What identifies a hunk across review refreshes: the file's paths and
+/// new mode, where it starts in the base file, and its lines. Where it
+/// lands in the new file is left out, so a change elsewhere in the file
+/// does not drop it. Two keys are equal only when everything a commit of
+/// the hunk is built from is equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HunkKey {
     pub old_path: Option<PathBuf>,
     pub new_path: Option<PathBuf>,
+    /// The added file's mode.
+    pub new_mode: Option<String>,
     pub old_start: usize,
     pub old_len: usize,
-    /// The lines, one per line: a sign, the text, and `\` when the line
-    /// has no newline.
+    /// One line per diff line: its sign, `1` when it has no newline (else
+    /// `0`), then its text. Diff lines hold no newline, so this cannot be
+    /// read two ways.
     pub body: String,
 }
 
 impl HunkKey {
     pub fn of(f: &DiffFile, h: &Hunk) -> Self {
-        Self::from_parts(f.old_path.clone(), f.new_path.clone(), h)
+        Self::build(
+            f.old_path.clone(),
+            f.new_path.clone(),
+            f.new_mode.clone(),
+            h,
+        )
     }
 
-    pub fn from_parts(old_path: Option<PathBuf>, new_path: Option<PathBuf>, h: &Hunk) -> Self {
+    /// The key of the hunk a pick takes.
+    pub fn of_pick(p: &HunkPick) -> Self {
+        Self::build(
+            p.old_path.clone(),
+            p.new_path.clone(),
+            p.new_mode.clone(),
+            &p.hunk,
+        )
+    }
+
+    fn build(
+        old_path: Option<PathBuf>,
+        new_path: Option<PathBuf>,
+        new_mode: Option<String>,
+        h: &Hunk,
+    ) -> Self {
         let mut body = String::new();
         for l in &h.lines {
             body.push(match l.kind {
@@ -42,15 +67,14 @@ impl HunkKey {
                 DiffLineKind::Added => '+',
                 DiffLineKind::Removed => '-',
             });
+            body.push(if l.no_newline { '1' } else { '0' });
             body.push_str(&l.text);
-            if l.no_newline {
-                body.push('\\');
-            }
             body.push('\n');
         }
         Self {
             old_path,
             new_path,
+            new_mode,
             old_start: h.old_start,
             old_len: h.old_len,
             body,
@@ -240,12 +264,19 @@ fn refusal(a: &Agent, f: &DiffFile, index: usize) -> Option<String> {
     if let Some(why) = unmarkable(f) {
         return Some(why.to_string());
     }
-    if let HunkState::Integrated { part, .. } = hunk_state(a, f, index) {
-        return Some(format!(
+    match hunk_state(a, f, index) {
+        HunkState::Integrated { part, whole: true } => Some(format!(
             "this hunk was integrated in part {part}; it is already on the target branch"
-        ));
+        )),
+        // Each part is built on the agent's starting commit, so the lines
+        // left would change the same lines as the part already there.
+        HunkState::Integrated { part, whole: false } => Some(format!(
+            "some lines of this hunk were integrated in part {part}; the lines left cannot be \
+             integrated on their own, only with the whole work (I with no marks), where Git \
+             reports a conflict if they clash with the part"
+        )),
+        _ => None,
     }
-    None
 }
 
 /// `space` in the review: marks the hunk under the cursor, or unmarks it.
@@ -380,4 +411,56 @@ pub fn picks(a: &Agent) -> Vec<HunkPick> {
         .collect();
     out.sort_by_key(|(f, h, _)| (*f, *h));
     out.into_iter().map(|(_, _, p)| p).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maestro_git::DiffLine;
+
+    fn hunk(text: &str, no_newline: bool) -> Hunk {
+        Hunk {
+            old_start: 0,
+            old_len: 0,
+            new_start: 1,
+            new_len: 1,
+            section: String::new(),
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Added,
+                old_line: None,
+                new_line: Some(1),
+                text: text.into(),
+                no_newline,
+            }],
+        }
+    }
+
+    #[test]
+    fn keys_tell_apart_what_builds_different_files() {
+        let file = |mode: &str| DiffFile {
+            old_path: None,
+            new_path: Some("a".into()),
+            change: FileChange::Added,
+            old_mode: None,
+            new_mode: Some(mode.into()),
+            binary: false,
+            unmerged: false,
+            hunks: vec![],
+        };
+        let f = file("100644");
+        // `new` without a newline and `new\` with one.
+        assert_ne!(
+            HunkKey::of(&f, &hunk("new", true)),
+            HunkKey::of(&f, &hunk("new\\", false))
+        );
+        // The same text as a file and as a symlink.
+        assert_ne!(
+            HunkKey::of(&f, &hunk("t", true)),
+            HunkKey::of(&file("120000"), &hunk("t", true))
+        );
+        assert_eq!(
+            HunkKey::of(&f, &hunk("t", true)),
+            HunkKey::of(&f, &hunk("t", true))
+        );
+    }
 }
