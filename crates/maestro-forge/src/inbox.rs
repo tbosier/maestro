@@ -71,12 +71,13 @@ pub fn pr_status(gh: &Gh, pr: &PrRef) -> Result<PrStatus> {
     gh.json(&cmd, parse::parse_status)
 }
 
-/// The `owner/name` of the GitHub repository `dir` is in. `Ok(None)` with
+/// The `owner/name` (`host/owner/name` off github.com) of the GitHub
+/// repository `dir` is in. `Ok(None)` with
 /// gh's reason when it is not in one (no Git repository, or no remote on
 /// a GitHub host); errors that are not about the directory (gh missing,
 /// logged out, network) stay errors.
 pub fn current_repo(gh: &Gh, dir: &Path) -> Result<std::result::Result<String, String>> {
-    let cmd = GhCommand::new(["repo", "view", "--json", "nameWithOwner"]).cwd(dir);
+    let cmd = GhCommand::new(["repo", "view", "--json", "nameWithOwner,url"]).cwd(dir);
     match gh.json(&cmd, parse::parse_repo_view) {
         Ok(name) => Ok(Ok(name)),
         Err(ForgeError::Command { message, .. }) => Ok(Err(message)),
@@ -99,6 +100,61 @@ pub fn repo_prs(gh: &Gh, repo: &str, limit: usize) -> Result<Vec<Item>> {
         LIST_FIELDS.into(),
     ]);
     gh.json(&cmd, |out| parse::parse_pr_list(out, repo))
+}
+
+fn pr_view_one(pr: &PrRef, field: &str) -> GhCommand {
+    GhCommand::new([
+        "pr".to_string(),
+        "view".into(),
+        pr.number.to_string(),
+        "--repo".into(),
+        pr.repo.clone(),
+        "--json".into(),
+        field.into(),
+    ])
+}
+
+/// The pull request's head commit now.
+pub fn pr_head(gh: &Gh, pr: &PrRef) -> Result<String> {
+    gh.json(&pr_view_one(pr, "headRefOid"), parse::parse_head)
+}
+
+/// The pull request's state now: `OPEN`, `CLOSED` or `MERGED`.
+pub fn pr_state(gh: &Gh, pr: &PrRef) -> Result<String> {
+    gh.json(&pr_view_one(pr, "state"), parse::parse_state)
+}
+
+/// The detail and the diff, checked to describe the same commit: the head
+/// is read before and after both, and must be the commit the detail
+/// names. If the pull request moved while they loaded, the detail is a
+/// [`ForgeError::HeadMoved`] (the diff may be of either commit).
+pub fn pr_detail_and_diff(gh: &Gh, pr: &PrRef) -> (Result<PrDetail>, Result<Vec<DiffFile>>) {
+    let before = match pr_head(gh, pr) {
+        Ok(h) => h,
+        Err(e) => return (Err(e.clone()), Err(e)),
+    };
+    let (detail, diff) = std::thread::scope(|s| {
+        let d = s.spawn(|| pr_detail(gh, pr));
+        let f = pr_diff(gh, pr);
+        let d = d
+            .join()
+            .unwrap_or_else(|_| Err(ForgeError::Io("the detail thread panicked".into())));
+        (d, f)
+    });
+    let after = pr_head(gh, pr);
+    let detail = match (detail, after) {
+        (Ok(d), Ok(after)) if d.status.head_oid == before && after == before => Ok(d),
+        (Ok(d), Ok(after)) => Err(ForgeError::HeadMoved {
+            shown: if d.status.head_oid != before {
+                d.status.head_oid
+            } else {
+                before
+            },
+            now: after,
+        }),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
+    (detail, diff)
 }
 
 /// Everything the detail view shows except the diff.

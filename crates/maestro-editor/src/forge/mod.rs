@@ -39,6 +39,9 @@ pub struct MessageDraft {
     pub doc: DocumentId,
     pub pr: maestro_forge::PrRef,
     pub kind: DraftKind,
+    /// For a change request: the head commit shown when it was started,
+    /// which the review is submitted on.
+    pub head: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,9 @@ pub struct Forge {
     pub drafts: Vec<MessageDraft>,
     /// A write action being sent: what it is, for the screen.
     pub writing: Option<String>,
+    /// Numbers detail loads across detail views, so a slow answer for an
+    /// earlier one is dropped even after the view was closed and reopened.
+    pub(crate) detail_seq: u64,
 }
 
 impl Forge {

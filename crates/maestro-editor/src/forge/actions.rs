@@ -61,24 +61,50 @@ fn confirm_keys() -> Vec<(String, String)> {
     ]
 }
 
-/// The lines every write dialog ends with: the command and the body.
+/// The lines every write dialog ends with: the text as it will read, the
+/// command, and exactly what goes to its standard input.
 fn command_lines(pr: &PrRef, action: &WriteAction) -> Vec<String> {
     let cmd = action.command(pr);
-    let mut lines = vec![
-        "This runs:".to_string(),
-        format!("  {}", visible(&cmd.display())),
-    ];
-    if let Some(body) = action.body() {
-        let n = body.lines().count().max(1);
+    let mut lines = Vec::new();
+    let body = action.body();
+    let stdin = cmd.stdin.as_deref();
+    let n_lines = |s: &str| {
+        let n = s.lines().count().max(1);
+        format!("{n} line{}", if n == 1 { "" } else { "s" })
+    };
+    // A review's text is inside JSON; show it as it will read first.
+    if let Some(b) = body
+        && stdin != Some(b)
+    {
+        lines.push(format!("The text ({}):", n_lines(b)));
+        lines.extend(b.lines().map(|l| format!("  │ {}", visible(l))));
+    }
+    lines.push("This runs:".into());
+    lines.push(format!("  {}", visible(&cmd.display())));
+    if let Some(input) = stdin {
         lines.push(format!(
-            "with this text on its standard input ({n} line{}):",
-            if n == 1 { "" } else { "s" }
+            "with this on its standard input ({}):",
+            n_lines(input)
         ));
-        for l in body.lines() {
-            lines.push(format!("  │ {}", visible(l)));
-        }
+        lines.extend(input.lines().map(|l| format!("  │ {}", visible(l))));
     }
     lines
+}
+
+/// `abc123456789 (the head shown here)` for a review or merge dialog.
+fn pinned_line(action: &WriteAction) -> Option<String> {
+    let head = action.head()?;
+    let short = maestro_forge::short(head);
+    Some(match action {
+        WriteAction::Merge { .. } => format!(
+            "Only head commit {short} is merged: if commits were pushed since this screen \
+             loaded, GitHub refuses."
+        ),
+        _ => format!(
+            "The review is on commit {short}, the head shown here. If newer commits were \
+             pushed since, nothing is sent."
+        ),
+    })
 }
 
 fn ask(ed: &mut Editor, pr: PrRef, title: &str, action: WriteAction, draft: Option<Draft>) {
@@ -99,9 +125,10 @@ fn ask(ed: &mut Editor, pr: PrRef, title: &str, action: WriteAction, draft: Opti
              participants."
                 .into(),
         ),
-        WriteAction::Approve => lines.push("The review is submitted with no text.".into()),
+        WriteAction::Approve { .. } => lines.push("The review is submitted with no text.".into()),
         WriteAction::Merge { .. } => {}
     }
+    lines.extend(pinned_line(&action));
     lines.extend(command_lines(&pr, &action));
     ed.forge.screen.dialog = Some(Dialog::Confirm {
         title: format!("{} {pr}", action.verb()),
@@ -122,10 +149,30 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// `a`: asks to approve the pull request.
+/// The head commit of `pr` as shown on screen, or why there is none.
+fn shown_head(ed: &Editor, pr: &PrRef) -> Result<String, String> {
+    match known_status(ed, pr) {
+        Some((s, _)) if !s.head_oid.is_empty() => Ok(s.head_oid),
+        Some(_) => Err(format!(
+            "GitHub did not give the head commit of {pr}; r reloads it"
+        )),
+        None => Err(format!(
+            "the state of {pr} is not loaded, so the commit to review is not known; r reloads it"
+        )),
+    }
+}
+
+/// `a`: asks to approve the pull request, on the head commit shown.
 pub fn ask_approve(ed: &mut Editor) {
-    match super::screen::target_pr(ed) {
-        Ok((pr, title)) => ask(ed, pr, &title, WriteAction::Approve, None),
+    let (pr, title) = match super::screen::target_pr(ed) {
+        Ok(t) => t,
+        Err(e) => {
+            ed.error(e);
+            return;
+        }
+    };
+    match shown_head(ed, &pr) {
+        Ok(head) => ask(ed, pr, &title, WriteAction::Approve { head }, None),
         Err(e) => ed.error(e),
     }
 }
@@ -140,12 +187,23 @@ pub fn start_message(ed: &mut Editor, kind: DraftKind) {
             return;
         }
     };
+    // A change request is a review of the commit on screen now.
+    let head = match kind {
+        DraftKind::Comment => None,
+        DraftKind::RequestChanges => match shown_head(ed, &pr) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                ed.error(e);
+                return;
+            }
+        },
+    };
     ed.forge.drafts.retain(|d| ed.buffers.contains_key(&d.doc));
     let existing = ed
         .forge
         .drafts
         .iter()
-        .find(|d| d.pr == pr && d.kind == kind)
+        .find(|d| d.pr == pr && d.kind == kind && d.head == head)
         .map(|d| d.doc);
     let doc = match existing {
         Some(doc) => doc,
@@ -155,6 +213,7 @@ pub fn start_message(ed: &mut Editor, kind: DraftKind) {
                 doc,
                 pr: pr.clone(),
                 kind,
+                head,
             });
             doc
         }
@@ -193,9 +252,14 @@ pub fn send_draft(ed: &mut Editor) -> Result<(), String> {
             draft.kind.label()
         ));
     }
-    let action = match draft.kind {
-        DraftKind::Comment => WriteAction::Comment { body },
-        DraftKind::RequestChanges => WriteAction::RequestChanges { body },
+    let action = match (draft.kind, draft.head.clone()) {
+        (DraftKind::Comment, _) => WriteAction::Comment { body },
+        (DraftKind::RequestChanges, Some(head)) => WriteAction::RequestChanges { body, head },
+        (DraftKind::RequestChanges, None) => {
+            return Err(
+                "this change request has no commit to review; start it again with R".into(),
+            );
+        }
     };
     let title = known_title(ed, &draft.pr);
     if ed.mode == Mode::Insert {
@@ -360,10 +424,9 @@ fn ask_merge_method(
     base: Option<String>,
     method: MergeMethod,
 ) {
-    let short: String = status.head_oid.chars().take(12).collect();
     let action = WriteAction::Merge {
         method,
-        head: Some(status.head_oid.clone()),
+        head: status.head_oid.clone(),
     };
     let into = base.map(|b| format!(" into {b}")).unwrap_or_default();
     let mut lines = vec![format!(
@@ -375,13 +438,16 @@ fn ask_merge_method(
         lines.push(format!("\"{}\"", visible(title)));
     }
     lines.extend(merge_warnings(status));
-    lines.push(format!(
-        "Only head commit {short} is merged: if commits were pushed since this screen \
-         loaded, GitHub refuses. The branch is not deleted."
-    ));
+    lines.extend(pinned_line(&action));
     lines.push(
-        "If the base branch uses a merge queue, GitHub queues it (or turns on auto-merge) \
-         instead of merging now."
+        "Maestro does not ask GitHub to delete the branch; the repository's own setting \
+         may delete it after the merge."
+            .into(),
+    );
+    lines.push(
+        "If the base branch uses a merge queue, GitHub queues it instead of merging now \
+         (the queue decides how it is merged), or turns on auto-merge until checks pass. \
+         The status line says which happened."
             .into(),
     );
     lines.extend(command_lines(&pr, &action));
@@ -508,11 +574,11 @@ fn sent(
     pr: PrRef,
     action: WriteAction,
     draft: Option<Draft>,
-    result: maestro_forge::Result<String>,
+    result: maestro_forge::Result<maestro_forge::Outcome>,
 ) {
     ed.forge.writing = None;
     match result {
-        Ok(_) => {
+        Ok(outcome) => {
             let mut note = "";
             if let Some((doc, version)) = draft
                 && let Some(b) = ed.buffers.get(&doc)
@@ -527,7 +593,18 @@ fn sent(
                 }
                 ed.forge.drafts.retain(|d| d.doc != doc);
             }
-            ed.info(format!("{} {pr}{note}", action.done()));
+            match outcome {
+                maestro_forge::Outcome::MergeState(Ok(s)) if s != "MERGED" => ed.info(format!(
+                    "gh accepted the merge of {pr}, and GitHub reports it {}: a merge queue \
+                     or auto-merge has it, not merged yet",
+                    s.to_lowercase()
+                )),
+                maestro_forge::Outcome::MergeState(Err(e)) => ed.error(format!(
+                    "gh accepted the merge of {pr}, but its state could not be read \
+                     afterward: {e}"
+                )),
+                _ => ed.info(format!("{} {pr}{note}", action.done())),
+            }
             if ed.forge.screen.detail.as_ref().is_some_and(|d| d.pr == pr) {
                 super::detail::load(ed, pr);
             }
@@ -667,6 +744,24 @@ fn worktree_job(
         .first()
         .map(|w| w.path.clone())
         .unwrap_or_else(|| repo.root().to_path_buf());
+    // The repository on disk must be the pull request's: the working
+    // directory may have changed since the inbox loaded.
+    match maestro_forge::current_repo(gh, &main).map_err(|e| e.to_string())? {
+        Ok(name) if name.eq_ignore_ascii_case(&pr.repo) => {}
+        Ok(name) => {
+            return Err(format!(
+                "{} is a clone of {name}, not of {}; nothing was checked out",
+                main.display(),
+                pr.repo
+            ));
+        }
+        Err(why) => {
+            return Err(format!(
+                "{} is not a GitHub repository ({why}); nothing was checked out",
+                main.display()
+            ));
+        }
+    }
     let path = worktree_path(&main, pr);
     let branch = pr_branch(pr);
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());

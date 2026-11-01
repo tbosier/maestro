@@ -75,6 +75,14 @@ pwd > "$d/calls/$i.cwd"
             .collect()
     }
 
+    /// Calls to `gh api`.
+    fn calls_to_api(&self) -> Vec<(Vec<String>, String)> {
+        self.calls()
+            .into_iter()
+            .filter(|(a, _)| a[0] == "api")
+            .collect()
+    }
+
     /// The working directory of call `i`.
     fn cwd(&self, i: usize) -> PathBuf {
         let stem = &self.call_files()[i];
@@ -108,29 +116,58 @@ fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+/// Answers a head check with commit `h1` and every other call with success.
+const HEAD_H1: &str = r#"case "$*" in
+  "pr view"*"--json headRefOid") echo '{"headRefOid":"h1"}' ;;
+  "pr view"*"--json state") echo '{"state":"MERGED"}' ;;
+  *) echo ok ;;
+esac"#;
+
 #[test]
-fn approve_sends_exactly_the_review() {
-    let f = Fake::new("echo ok");
-    let out = WriteAction::Approve.run(&f.gh(), &PR()).unwrap();
-    assert_eq!(out, "ok");
+fn approve_checks_the_head_then_posts_a_review_on_that_commit() {
+    let f = Fake::new(HEAD_H1);
+    let out = WriteAction::Approve { head: "h1".into() }
+        .run(&f.gh(), &PR())
+        .unwrap();
+    assert_eq!(out, Outcome::Done);
     let calls = f.calls();
-    assert_eq!(calls.len(), 1);
+    assert_eq!(calls.len(), 2);
     assert_eq!(
         calls[0].0,
-        args(&["pr", "review", "41", "--repo", "octo/demo", "--approve"])
+        args(&[
+            "pr",
+            "view",
+            "41",
+            "--repo",
+            "octo/demo",
+            "--json",
+            "headRefOid"
+        ])
     );
-    assert_eq!(calls[0].1, "");
+    assert_eq!(
+        calls[1].0,
+        args(&[
+            "api",
+            "--method",
+            "POST",
+            "repos/octo/demo/pulls/41/reviews",
+            "--input",
+            "-"
+        ])
+    );
+    assert_eq!(calls[1].1, r#"{"commit_id":"h1","event":"APPROVE"}"#);
 }
 
 #[test]
-fn comment_and_request_changes_send_the_body_on_stdin() {
-    let f = Fake::new("exit 0");
+fn comment_and_request_changes_send_the_text_on_stdin() {
+    let f = Fake::new(HEAD_H1);
     let body = "Two lines,\n--and a leading dash 'quoted' $HOME";
     WriteAction::Comment { body: body.into() }
         .run(&f.gh(), &PR())
         .unwrap();
     WriteAction::RequestChanges {
         body: "please fix".into(),
+        head: "h1".into(),
     }
     .run(&f.gh(), &PR())
     .unwrap();
@@ -148,35 +185,32 @@ fn comment_and_request_changes_send_the_body_on_stdin() {
         ])
     );
     assert_eq!(calls[0].1, body);
+    let api = f.calls_to_api();
+    assert_eq!(api.len(), 1);
     assert_eq!(
-        calls[1].0,
-        args(&[
-            "pr",
-            "review",
-            "41",
-            "--repo",
-            "octo/demo",
-            "--request-changes",
-            "--body-file",
-            "-"
-        ])
+        api[0].1,
+        r#"{"body":"please fix","commit_id":"h1","event":"REQUEST_CHANGES"}"#
     );
-    assert_eq!(calls[1].1, "please fix");
 }
 
 #[test]
-fn merge_uses_the_method_and_pins_the_head() {
-    let f = Fake::new("exit 0");
+fn merge_uses_the_method_pins_the_head_and_reads_the_state() {
+    let f = Fake::new(HEAD_H1);
     for m in MergeMethod::ALL {
-        WriteAction::Merge {
+        let out = WriteAction::Merge {
             method: m,
-            head: Some("0123abc".into()),
+            head: "0123abc".into(),
         }
         .run(&f.gh(), &PR())
         .unwrap();
+        assert_eq!(out, Outcome::MergeState(Ok("MERGED".into())));
     }
-    let calls = f.calls();
-    for (c, flag) in calls.iter().zip(["--merge", "--squash", "--rebase"]) {
+    let merges: Vec<_> = f
+        .calls()
+        .into_iter()
+        .filter(|(a, _)| a[1] == "merge")
+        .collect();
+    for (c, flag) in merges.iter().zip(["--merge", "--squash", "--rebase"]) {
         assert_eq!(
             c.0,
             args(&[
@@ -196,14 +230,17 @@ fn merge_uses_the_method_and_pins_the_head() {
 #[test]
 fn a_refused_write_reports_gh_words() {
     let f = Fake::new(
-        "echo 'failed to create review: GraphQL: Can not approve your own pull request \
-         (addPullRequestReview)' >&2; exit 1",
+        r#"case "$*" in
+  "pr view"*) echo '{"headRefOid":"h1"}' ;;
+  *) echo 'gh: Can not approve your own pull request (HTTP 422)' >&2; exit 1 ;;
+esac"#,
     );
-    let e = WriteAction::Approve.run(&f.gh(), &PR()).unwrap_err();
+    let e = WriteAction::Approve { head: "h1".into() }
+        .run(&f.gh(), &PR())
+        .unwrap_err();
     assert_eq!(
         e.to_string(),
-        "gh pr review failed: failed to create review: GraphQL: Can not approve your own \
-         pull request (addPullRequestReview)"
+        "gh api failed: gh: Can not approve your own pull request (HTTP 422)"
     );
 }
 
@@ -446,4 +483,73 @@ fn unparsable_output_is_a_parse_error() {
         matches!(e, ForgeError::Parse { ref command, .. } if command == "gh search prs"),
         "{e}"
     );
+}
+
+#[test]
+fn detail_and_diff_must_describe_one_head() {
+    // The head reads A, the detail says A, then the head reads B: a push
+    // happened while loading, so the detail is refused.
+    let f = Fake::new(
+        r#"case "$*" in
+  "pr view 14716 --repo cli/cli --json headRefOid")
+    if [ -e "$d/seen" ]; then echo '{"headRefOid":"b"}'; else touch "$d/seen"; echo '{"headRefOid":"936921fa9e67cdbf78fb25abc6252afabafef056"}'; fi ;;
+  "pr view"*) cat "$f/pr_detail.json" ;;
+  "pr diff"*) cat "$f/pr_diff.patch" ;;
+esac"#,
+    );
+    let pr = PrRef::new("cli/cli", 14716);
+    let (d, diff) = pr_detail_and_diff(&f.gh(), &pr);
+    assert!(
+        matches!(d, Err(ForgeError::HeadMoved { ref now, .. }) if now == "b"),
+        "{d:?}"
+    );
+    assert!(diff.is_ok());
+    // The same answers without the push: accepted.
+    let f = Fake::new(
+        r#"case "$*" in
+  "pr view 14716 --repo cli/cli --json headRefOid") echo '{"headRefOid":"936921fa9e67cdbf78fb25abc6252afabafef056"}' ;;
+  "pr view"*) cat "$f/pr_detail.json" ;;
+  "pr diff"*) cat "$f/pr_diff.patch" ;;
+esac"#,
+    );
+    let (d, _) = pr_detail_and_diff(&f.gh(), &pr);
+    assert_eq!(d.unwrap().reference.number, 14716);
+}
+
+#[test]
+fn a_review_is_not_sent_when_the_head_moved() {
+    let f = Fake::new(
+        r#"case "$*" in
+  "pr view"*) echo '{"headRefOid":"new"}' ;;
+  *) echo sent ;;
+esac"#,
+    );
+    let e = WriteAction::Approve { head: "old".into() }
+        .run(&f.gh(), &PR())
+        .unwrap_err();
+    assert_eq!(
+        e,
+        ForgeError::HeadMoved {
+            shown: "old".into(),
+            now: "new".into()
+        }
+    );
+    assert!(f.calls_to_api().is_empty());
+}
+
+#[test]
+fn a_merge_reports_the_state_github_gives_afterward() {
+    let f = Fake::new(
+        r#"case "$*" in
+  "pr view"*) echo '{"state":"OPEN"}' ;;
+  *) exit 0 ;;
+esac"#,
+    );
+    let out = WriteAction::Merge {
+        method: MergeMethod::Merge,
+        head: "h".into(),
+    }
+    .run(&f.gh(), &PR())
+    .unwrap();
+    assert_eq!(out, Outcome::MergeState(Ok("OPEN".into())));
 }

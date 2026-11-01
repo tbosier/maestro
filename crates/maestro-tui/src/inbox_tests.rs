@@ -251,7 +251,13 @@ fn write_dialogs_show_the_command() {
     let text = screen(&draw(&ed, 150, 40)).join("\n");
     assert!(text.contains("approve cli/cli#14846"), "{text}");
     assert!(
-        text.contains("gh pr review 14846 --repo cli/cli --approve"),
+        text.contains("gh api --method POST repos/cli/cli/pulls/14846/reviews --input -"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            r#"{"commit_id":"aaf296326df06cbafd523c12efa0112cdc53c10c","event":"APPROVE"}"#
+        ),
         "{text}"
     );
     assert!(text.contains("y send to GitHub"), "{text}");
