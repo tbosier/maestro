@@ -182,7 +182,7 @@ pub fn listen(editor: &Editor, path: &Path) -> io::Result<Listener> {
     };
 
     let hub: SharedHub = Arc::new(Mutex::new(Hub {
-        server: Server::new(editor),
+        server: Server::with_reviewer(editor),
         conns: HashMap::new(),
     }));
     let idle = editor.idle_job_sender();

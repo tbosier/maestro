@@ -41,7 +41,10 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     draw_hover(ed, surface);
     draw_completion(ed, surface);
     let mut cursor = CursorShape::Hidden;
-    if ed.agents.panel_open() {
+    if ed.proposals.review_open() {
+        // The proposal review covers the editor area (crate::proposals).
+        cursor = crate::proposals::draw(ed, surface);
+    } else if ed.agents.panel_open() {
         // The agent panel covers the editor area (crate::agents).
         cursor = crate::agents::draw(ed, surface);
     } else if ed.mode == Mode::Insert && ed.prompt.is_none() && ed.picker.is_none() {
@@ -754,6 +757,15 @@ fn draw_statusline(ed: &Editor, view: &View, s: &mut Surface, area: Rect) {
     }
     if focused && let Some((reg, _)) = &ed.recording {
         flags.push_str(&format!("  recording @{reg}"));
+    }
+    // Edit proposals waiting for the user (crate::proposals), on every
+    // focused status line until they are decided.
+    let waiting = ed.proposals.pending_count();
+    if focused && waiting > 0 {
+        flags.push_str(&format!(
+            "  {waiting} proposal{} waiting: space e",
+            if waiting == 1 { "" } else { "s" }
+        ));
     }
     let name = doc
         .path()

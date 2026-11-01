@@ -243,3 +243,116 @@ fn listen_never_replaces_files_and_bounds_request_lines() {
     drop(listener);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+#[ignore = "needs AF_UNIX sockets; run with --ignored outside sandboxes that block them"]
+fn proposal_over_the_socket_is_reviewed_applied_verified_and_recorded() {
+    let dir = std::env::temp_dir().join(format!("maestro-sock3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ed.sock");
+    let file = dir.join("greet.txt");
+    std::fs::write(&file, "hello world\n").unwrap();
+
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 100, 30));
+    ed.cwd = dir.clone();
+    ed.open(&file).unwrap();
+    let d = ed.view().doc.0;
+    let listener = socket::listen(&ed, &path).unwrap();
+
+    // A client proposes a change with a verification command that checks
+    // the file on disk.
+    let stream = UnixStream::connect(&path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":"1.1"}}),
+        );
+        let init = read_msg(&mut r);
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":2,"method":"events.subscribe"}),
+        );
+        let _ = read_msg(&mut r);
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":3,"method":"proposal.create","params":{
+                "doc": d, "base_version": 0, "encoding": "char",
+                "edits": [{"range": {"start": 6, "end": 11}, "text": "there"}],
+                "actor": {"name": "agent:sock", "agent_id": "sock-1"},
+                "description": "greet someone closer",
+                "verification": {"program": "sh", "args": ["-c", "grep -qx 'hello there' greet.txt"]}
+            }}),
+        );
+        let created = loop {
+            if let ServerMessage::Response(resp) = read_msg(&mut r) {
+                break resp;
+            }
+        };
+        tx.send((init, created, w, r)).unwrap();
+    });
+    let (init, created, mut w, mut r) = drive(&mut ed, &rx);
+    let ServerMessage::Response(init) = init else {
+        panic!("{init:?}")
+    };
+    assert!(
+        init.result().unwrap()["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("proposal.review"))
+    );
+    let created = created.result().cloned().expect("created");
+    assert_eq!(created["state"], "pending");
+    let id = created["id"].as_u64().unwrap();
+    assert_eq!(ed.doc().text().to_string(), "hello world\n");
+
+    // The person reviews and approves it with keys.
+    for k in [' ', 'e', 'a', 'y'] {
+        ed.handle_key(KeyEvent::char(k));
+    }
+    assert_eq!(ed.doc().text().to_string(), "hello there\n");
+
+    // The client hears that it resolved, then reads the history.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let resolved = loop {
+            if let ServerMessage::Notification(n) = read_msg(&mut r)
+                && n.method == "proposal.resolved"
+            {
+                break n.params;
+            }
+        };
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":4,"method":"document.history","params":{"doc": d}}),
+        );
+        let hist = loop {
+            if let ServerMessage::Response(resp) = read_msg(&mut r) {
+                break resp;
+            }
+        };
+        tx.send((resolved, hist)).unwrap();
+    });
+    let (resolved, hist) = drive(&mut ed, &rx);
+    assert_eq!(resolved["id"], id);
+    assert_eq!(resolved["decision"], "approved");
+    assert_eq!(
+        resolved["verification_result"]["status"], "passed",
+        "{resolved}"
+    );
+    assert_eq!(resolved["verification_result"]["exit_code"], 0);
+    let hist = hist.result().cloned().unwrap();
+    assert_eq!(hist["edits"][0]["proposal"], id);
+    assert_eq!(hist["edits"][0]["actor"], "agent:sock");
+    assert_eq!(hist["proposals"][0], resolved);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello there\n");
+
+    drop(listener);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
