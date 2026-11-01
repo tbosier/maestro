@@ -189,3 +189,14 @@ crates = ["maestro-git", "maestro-editor", "maestro-tasks", "maestro-automation"
 branch = "feat/hardening"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "workspaces"
+title = "Projects and worktrees sidebar, worktree switching, jump palette, agent attention and notifications"
+crates = ["maestro-editor", "maestro-tui", "maestro-config", "maestro-cli"]
+branch = "feat/workspaces"
+owner = "agent"
+status = "done"
+# space s sidebar, space j palette, switching saves and restores per-worktree
+# sessions (unsaved buffers stay open), notifications once per change,
+# language servers stopped for roots left unused. See ROADMAP.md.
