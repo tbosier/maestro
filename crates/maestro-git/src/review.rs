@@ -86,6 +86,11 @@ pub enum IntegrateError {
     /// forward). The text says what was found and what was done about it.
     #[error("git reported success, but {0}")]
     Unexpected(String),
+    /// [`Repository::integrate_reviewed`]: the branch no longer points at
+    /// the reviewed commit (new commits, a reset, a rebase). Nothing was
+    /// integrated.
+    #[error("the branch is at {found}, not at the reviewed commit {expected}")]
+    SourceMoved { expected: String, found: String },
 }
 
 /// A worktree's files as an unreferenced commit, from
@@ -96,6 +101,18 @@ pub struct WorkSnapshot {
     pub commit: String,
     /// The tree of every tracked and untracked (not ignored) file.
     pub tree: String,
+    /// The worktree's `HEAD` the files were taken on, the commit's parent.
+    pub head: String,
+}
+
+/// A commit's tree and parents, from [`Repository::commit_shape`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitShape {
+    /// The commit's full id.
+    pub commit: String,
+    pub tree: String,
+    /// Full ids, in order.
+    pub parents: Vec<String>,
 }
 
 /// `git merge-tree` accepts trees, not only commits, with `--merge-base`
@@ -330,7 +347,34 @@ impl Repository {
             ));
         }
         let commit = self.commit_tree(&tree, &[&head], "maestro work snapshot")?;
-        Ok(WorkSnapshot { commit, tree })
+        Ok(WorkSnapshot { commit, tree, head })
+    }
+
+    /// The tree and parents of the commit `rev` names, read with
+    /// `cat-file`, which no configuration changes.
+    pub fn commit_shape(&self, rev: &str) -> Result<CommitShape> {
+        let commit = self.resolve(rev)?;
+        let out = self.run(&["cat-file", "commit", &commit], Access::ReadOnly)?;
+        let text = String::from_utf8_lossy(&out);
+        let mut tree = None;
+        let mut parents = Vec::new();
+        // The header ends at the first empty line.
+        for line in text.lines().take_while(|l| !l.is_empty()) {
+            if let Some(t) = line.strip_prefix("tree ") {
+                tree = Some(t.trim().to_string());
+            } else if let Some(p) = line.strip_prefix("parent ") {
+                parents.push(p.trim().to_string());
+            }
+        }
+        let tree = tree.ok_or_else(|| GitError::Parse {
+            args: format!("cat-file commit {commit}"),
+            detail: "no tree line".into(),
+        })?;
+        Ok(CommitShape {
+            commit,
+            tree,
+            parents,
+        })
     }
 
     /// Writes a commit object for `tree` with `parents` and returns its id,
@@ -630,9 +674,40 @@ impl Repository {
     ///
     /// Like `git merge`, it may overwrite ignored files that the branch
     /// adds as tracked files.
+    ///
+    /// Whatever commit `branch` points at when the checks start is what
+    /// gets integrated. To integrate only what someone reviewed, use
+    /// [`Repository::integrate_reviewed`].
     pub fn integrate(
         &self,
         branch: &str,
+        how: Integration,
+    ) -> Result<IntegrateOutcome, IntegrateError> {
+        self.integrate_inner(branch, None, how)
+    }
+
+    /// [`Repository::integrate`], but only the commit `reviewed` (a commit
+    /// id or any revision naming one): refuses with
+    /// [`IntegrateError::SourceMoved`], changing nothing, when `branch`
+    /// does not point at it, both before the checks and again just before
+    /// git runs. Git is given the commit id, never the branch name, so a
+    /// branch that moves after that last check still cannot bring in
+    /// anything but `reviewed` and the commits before it (for a cherry-pick,
+    /// those since the merge base with the target, as the checks listed).
+    pub fn integrate_reviewed(
+        &self,
+        branch: &str,
+        reviewed: &str,
+        how: Integration,
+    ) -> Result<IntegrateOutcome, IntegrateError> {
+        let reviewed = self.resolve(reviewed)?;
+        self.integrate_inner(branch, Some(&reviewed), how)
+    }
+
+    fn integrate_inner(
+        &self,
+        branch: &str,
+        reviewed: Option<&str>,
         how: Integration,
     ) -> Result<IntegrateOutcome, IntegrateError> {
         check_branch_name(self, branch)?;
@@ -642,7 +717,18 @@ impl Repository {
         if let Some(op) = self.operation_in_progress()? {
             return Err(IntegrateError::InProgress(op));
         }
-        let source = self.resolve(&format!("refs/heads/{branch}"))?;
+        let branch_ref = format!("refs/heads/{branch}");
+        let source = self.resolve(&branch_ref)?;
+        let moved = |found: String| -> Result<(), IntegrateError> {
+            match reviewed {
+                Some(r) if r != found => Err(IntegrateError::SourceMoved {
+                    expected: r.to_string(),
+                    found,
+                }),
+                _ => Ok(()),
+            }
+        };
+        moved(source.clone())?;
         let old_head = self.resolve("HEAD")?;
 
         let dirty: Vec<PathBuf> = self
@@ -726,6 +812,9 @@ impl Repository {
         {
             return Err(IntegrateError::TargetChanged);
         }
+        // And that the branch still points at the reviewed commit. A move
+        // after this cannot change what is integrated: git gets `source`.
+        moved(self.resolve(&branch_ref)?)?;
 
         let (out, shown) = writer.run_status(&args, Access::Write)?;
         if !out.status.success() {

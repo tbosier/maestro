@@ -135,6 +135,10 @@ fn main() {
             "a_verification_that_leaves_a_process_behind_ends_it",
             a_verification_that_leaves_a_process_behind_ends_it,
         ),
+        (
+            "a_branch_that_moved_after_the_dialog_is_not_integrated",
+            a_branch_that_moved_after_the_dialog_is_not_integrated,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -2740,4 +2744,89 @@ fn a_verification_that_leaves_a_process_behind_ends_it() {
         !survived,
         "the verification's background sleep {pid} outlived the run"
     );
+}
+
+/// Confirms the open integrate dialog with `keys` and waits for the
+/// refusal, which it returns.
+fn confirm_refused(ed: &mut Editor, keys: &str) -> String {
+    run(ed, keys);
+    poll_until(ed, "the refusal", |ed| {
+        status_text(ed).contains("not integrated")
+    });
+    status_text(ed)
+}
+
+/// The agent's branch moves while the integrate dialog is up, without
+/// changing the files the dialog was about: a commit of the same files,
+/// then history that adds and removes a file. Neither reaches main, for
+/// merge or cherry-pick; integrating again after a fresh check does.
+fn a_branch_that_moved_after_the_dialog_is_not_integrated() {
+    let f = Fixture::new();
+    let mut ed = f.editor(config(&[(
+        "writer",
+        sh_provider("printf 'notes\\n' > notes.txt"),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write the notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+
+    // The agent commits the very files the dialog showed.
+    open_integrate(&mut ed);
+    f.git(&wt, &["add", "-A"]);
+    f.git(&wt, &["commit", "-q", "-m", "the agent's own commit"]);
+    let msg = confirm_refused(&mut ed, "y");
+    assert!(
+        msg.contains("the agent's branch moved after the dialog was checked"),
+        "{msg}"
+    );
+    assert!(msg.contains("nothing was integrated"), "{msg}");
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    assert!(!f.repo.join("notes.txt").exists());
+    assert_ne!(status(&ed, 0), Status::Integrated);
+
+    // History only: a file added and removed again, while a cherry-pick
+    // dialog is up.
+    open_integrate(&mut ed);
+    run(&mut ed, "<tab><tab>");
+    assert!(dialog(&ed).0.contains("cherry-pick"), "{}", dialog(&ed).0);
+    std::fs::write(wt.join("secret.txt"), "token\n").unwrap();
+    f.git(&wt, &["add", "-A"]);
+    f.git(&wt, &["commit", "-q", "-m", "add secret"]);
+    f.git(&wt, &["rm", "-q", "secret.txt"]);
+    f.git(&wt, &["commit", "-q", "-m", "remove secret"]);
+    let msg = confirm_refused(&mut ed, "y");
+    assert!(
+        msg.contains("the agent's branch moved after the dialog was checked"),
+        "{msg}"
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+
+    // Uncommitted work, part of which the agent commits while the dialog
+    // is up: Maestro's commit of the rest holds the same files, but sits
+    // on a commit nobody reviewed.
+    std::fs::write(wt.join("extra1.txt"), "1\n").unwrap();
+    std::fs::write(wt.join("extra2.txt"), "2\n").unwrap();
+    open_integrate(&mut ed);
+    f.git(&wt, &["add", "extra1.txt"]);
+    f.git(&wt, &["commit", "-q", "-m", "half of it"]);
+    let msg = confirm_refused(&mut ed, "y");
+    assert!(
+        msg.contains("the agent's branch moved after the dialog was checked"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("the agent's work was committed on its branch"),
+        "{msg}"
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+
+    // Checked again, it integrates what the new dialog was about.
+    open_integrate(&mut ed);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert!(f.repo.join("notes.txt").exists());
 }
