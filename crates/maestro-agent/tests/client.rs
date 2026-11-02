@@ -691,6 +691,7 @@ fn assert_gone(pid: u32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn child_pid(events: &[AcpEvent]) -> u32 {
     said(events)
         .iter()

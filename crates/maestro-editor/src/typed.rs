@@ -217,6 +217,42 @@ static TYPED: &[TypedCommand] = &[
         fun: crate::structural::insert_above_cmd,
     },
     TypedCommand {
+        name: "insert-below",
+        aliases: &[],
+        doc: "Insert a line below each selection with its indentation, as one undo step",
+        fun: crate::structural::insert_below_cmd,
+    },
+    TypedCommand {
+        name: "replace-text",
+        aliases: &[],
+        doc: "Replace regex matches inside each selection ($1 for groups), as one undo step",
+        fun: crate::structural::replace_text_cmd,
+    },
+    TypedCommand {
+        name: "delete",
+        aliases: &[],
+        doc: "Delete the selected text, as one undo step (a pipeline step)",
+        fun: crate::structural::delete_cmd,
+    },
+    TypedCommand {
+        name: "wrap",
+        aliases: &[],
+        doc: "Put text before and after each selection, as one undo step",
+        fun: crate::structural::wrap_cmd,
+    },
+    TypedCommand {
+        name: "prepend",
+        aliases: &[],
+        doc: "Insert text at the start of each selection, as one undo step",
+        fun: crate::structural::prepend_cmd,
+    },
+    TypedCommand {
+        name: "append",
+        aliases: &[],
+        doc: "Insert text at the end of each selection, as one undo step",
+        fun: crate::structural::append_cmd,
+    },
+    TypedCommand {
         name: "goto",
         aliases: &["g"],
         doc: "Go to a line number",

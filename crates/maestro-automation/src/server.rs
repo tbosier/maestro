@@ -22,6 +22,7 @@ use maestro_core::pos::{LspPosition as CoreLsp, char_to_lsp, lsp_to_char};
 use maestro_core::text::line_end_excluding_terminator;
 use maestro_core::{Change, ChangeSet, Document, DocumentVersion, Range, Rope, Selection};
 use maestro_editor::proposals::{self as props, ProposalId};
+use maestro_editor::structural::{self, IntentError, StepCount};
 use maestro_editor::{DocumentId, Editor, KeyCode, KeyEvent, ViewId};
 use maestro_protocol::{self as p, ErrorCode, Request, RequestId, Response, RpcError, methods};
 use serde::Serialize;
@@ -36,6 +37,7 @@ pub const CAPABILITIES: &[&str] = &[
     "document.history",
     "events.document_changed",
     "events.editor_status",
+    "intent_edits",
 ];
 
 /// Reported by `initialize` only when a person can review proposals (the
@@ -326,6 +328,88 @@ fn build_changes(
     Ok(cs)
 }
 
+/// The protocol's form of step counts.
+fn step_counts(counts: &[StepCount]) -> Vec<p::StepCount> {
+    counts
+        .iter()
+        .map(|c| p::StepCount {
+            step: c.step.clone(),
+            count: c.count as u64,
+        })
+        .collect()
+}
+
+/// An invalid pipeline is `-32602` with where it is wrong; one that ran
+/// and cannot be used is `-32021` with why. `version` is the version it
+/// ran on.
+fn intent_error(e: IntentError, version: u64) -> RpcError {
+    match e {
+        IntentError::Invalid(pe) => {
+            invalid(format!("invalid pipeline: {pe}")).with_data(p::PipelineErrorData {
+                step: pe.step as u64,
+                name: pe.name.clone(),
+                column: pe.column.map(|c| c as u64),
+            })
+        }
+        IntentError::Failed {
+            failure,
+            message,
+            counts,
+        } => {
+            let (step, expected, actual) = match failure {
+                structural::IntentFailure::NoSelections { step }
+                | structural::IntentFailure::Refused { step } => (Some(step as u64), None, None),
+                structural::IntentFailure::Expect { expected, actual } => {
+                    (None, Some(expected as u64), Some(actual as u64))
+                }
+                _ => (None, None, None),
+            };
+            err(ErrorCode::PipelineFailed, message).with_data(p::PipelineFailedData {
+                reason: failure.code().to_string(),
+                step,
+                expected,
+                actual,
+                version,
+                step_counts: step_counts(&counts),
+            })
+        }
+    }
+}
+
+/// Checks a pipeline request's document and versions: writable, and
+/// `base_version` not newer than the document. Returns the current
+/// version. `expect`, when given, must be at least 1.
+fn check_pipeline_request(
+    ed: &Editor,
+    id: DocumentId,
+    pipeline: &str,
+    base_version: u64,
+    expect: Option<u64>,
+) -> Res<u64> {
+    if pipeline.trim().is_empty() {
+        return Err(invalid("pipeline must not be empty"));
+    }
+    if expect == Some(0) {
+        return Err(invalid(
+            "expect must be at least 1: a pipeline that selects nothing is refused anyway",
+        ));
+    }
+    let doc = &ed.buffers[&id].doc;
+    if let Some(r) = doc.read_only() {
+        return Err(err(
+            ErrorCode::ReadOnly,
+            format!("document is read-only: {}", r.describe()),
+        ));
+    }
+    let current = doc.version().0;
+    if base_version > current {
+        return Err(invalid(format!(
+            "base_version {base_version} is newer than the document, which is at version {current}"
+        )));
+    }
+    Ok(current)
+}
+
 fn edit_error(e: EditError) -> RpcError {
     match e {
         EditError::ReadOnly(r) => err(
@@ -381,6 +465,9 @@ impl Server {
                         new_version: pr.applied_version?.0,
                         timestamp_ms: pr.decided_ms.unwrap_or(pr.created_ms),
                         proposal: Some(pr.id.0),
+                        pipeline: pr.intent.as_ref().map(|i| i.pipeline.clone()),
+                        rebased: pr.intent.as_ref().map(|_| pr.rebased()),
+                        step_counts: pr.intent.as_ref().map(|i| step_counts(&i.counts)),
                     })
                 }),
         );
@@ -508,6 +595,7 @@ impl Server {
             methods::DOCUMENT_TEXT => to_value(text(ed, params(raw)?)?),
             methods::DOCUMENT_SAVE => to_value(save(ed, params(raw)?)?),
             methods::DOCUMENT_APPLY_EDIT => to_value(self.apply_edit(ed, params(raw)?)?),
+            methods::DOCUMENT_APPLY_PIPELINE => to_value(self.apply_pipeline(ed, params(raw)?)?),
             methods::DOCUMENT_HISTORY => {
                 let p: p::DocParams = params(raw)?;
                 let id = doc_id(ed, p.doc)?;
@@ -660,23 +748,95 @@ impl Server {
         let version = props::apply_versioned(ed, id, DocumentVersion(p.base_version), &cs)
             .map_err(edit_error)?
             .0;
-        let log = self.log.entry(id).or_default();
-        log.push(p::EditRecord {
-            actor: p.actor,
-            description: p.description,
-            base_version: p.base_version,
-            new_version: version,
-            timestamp_ms: now_ms(),
-            proposal: None,
-        });
-        if log.len() > HISTORY_LIMIT {
-            let excess = log.len() - HISTORY_LIMIT;
-            log.drain(..excess);
-        }
+        self.record(
+            id,
+            p::EditRecord {
+                actor: p.actor,
+                description: p.description,
+                base_version: p.base_version,
+                new_version: version,
+                timestamp_ms: now_ms(),
+                proposal: None,
+                pipeline: None,
+                rebased: None,
+                step_counts: None,
+            },
+        );
         Ok(p::ApplyEditResult {
             doc: p.doc,
             base_version: p.base_version,
             version,
+        })
+    }
+
+    fn record(&mut self, id: DocumentId, rec: p::EditRecord) {
+        let log = self.log.entry(id).or_default();
+        log.push(rec);
+        if log.len() > HISTORY_LIMIT {
+            let excess = log.len() - HISTORY_LIMIT;
+            log.drain(..excess);
+        }
+    }
+
+    /// Runs a structural pipeline on a document and applies its change at
+    /// once, as one undo step. A document that moved on from
+    /// `base_version` is refused as stale unless `allow_rebase` is set;
+    /// then the pipeline runs on the current text.
+    pub fn apply_pipeline(
+        &mut self,
+        ed: &mut Editor,
+        p: p::ApplyPipelineParams,
+    ) -> Res<p::ApplyPipelineResult> {
+        if p.actor.trim().is_empty() {
+            return Err(invalid("actor must not be empty"));
+        }
+        let id = doc_id(ed, p.doc)?;
+        let current = check_pipeline_request(ed, id, &p.pipeline, p.base_version, p.expect)?;
+        if current != p.base_version && !p.allow_rebase {
+            return Err(err(
+                ErrorCode::StaleVersion,
+                format!(
+                    "the pipeline was written against version {} but the document is at \
+                     {current}; nothing was changed. Pass allow_rebase to run it on the current \
+                     text",
+                    p.base_version
+                ),
+            )
+            .with_data(p::StaleData {
+                expected: p.base_version,
+                current,
+            }));
+        }
+        let expect = p.expect.map(|n| n as usize);
+        let run = structural::run_intent(ed, id, &p.pipeline, expect)
+            .map_err(|e| intent_error(e, current))?;
+        let version = props::apply_versioned(ed, id, run.version, &run.changes)
+            .map_err(edit_error)?
+            .0;
+        let rebased = run.version.0 != p.base_version;
+        let counts = step_counts(&run.counts);
+        self.record(
+            id,
+            p::EditRecord {
+                actor: p.actor,
+                description: p.description,
+                base_version: p.base_version,
+                new_version: version,
+                timestamp_ms: now_ms(),
+                proposal: None,
+                pipeline: Some(p.pipeline),
+                rebased: Some(rebased),
+                step_counts: Some(counts.clone()),
+            },
+        );
+        Ok(p::ApplyPipelineResult {
+            doc: p.doc,
+            base_version: p.base_version,
+            ran_on_version: run.version.0,
+            version,
+            rebased,
+            step_counts: counts,
+            edit_count: run.edit_count as u64,
         })
     }
 
@@ -704,8 +864,13 @@ impl Server {
         if p.description.trim().is_empty() {
             return Err(invalid("description must not be empty"));
         }
-        if p.edits.is_empty() {
-            return Err(invalid("edits must not be empty"));
+        match (&p.pipeline, p.edits.is_empty()) {
+            (Some(_), false) => return Err(invalid("give exactly one of edits and pipeline")),
+            (None, true) => return Err(invalid("edits must not be empty (or give a pipeline)")),
+            _ => {}
+        }
+        if p.pipeline.is_none() && p.expect.is_some() {
+            return Err(invalid("expect goes with a pipeline"));
         }
         if let Some(v) = &p.verification
             && v.program.trim().is_empty()
@@ -739,22 +904,54 @@ impl Server {
                  has no path",
             ));
         }
-        let cs = build_changes(ed, id, p.base_version, p.encoding, &p.edits)?;
-        let pid = props::submit(
-            ed,
-            props::NewProposal {
-                doc: id,
-                base_version: DocumentVersion(p.base_version),
-                changes: cs,
-                edit_count: p.edits.len(),
-                actor: props::Actor {
-                    name: p.actor.name,
-                    agent_id: p.actor.agent_id,
-                },
-                description: p.description,
-                verify: p.verification.map(|v| (v.program, v.args)),
-            },
-        );
+        let actor = props::Actor {
+            name: p.actor.name,
+            agent_id: p.actor.agent_id,
+        };
+        let verify = p.verification.map(|v| (v.program, v.args));
+        let pid = match p.pipeline {
+            None => {
+                let encoding = p
+                    .encoding
+                    .ok_or_else(|| invalid("encoding is required with edits"))?;
+                let cs = build_changes(ed, id, p.base_version, encoding, &p.edits)?;
+                props::submit(
+                    ed,
+                    props::NewProposal {
+                        doc: id,
+                        base_version: DocumentVersion(p.base_version),
+                        changes: cs,
+                        edit_count: p.edits.len(),
+                        actor,
+                        description: p.description,
+                        verify,
+                    },
+                )
+            }
+            Some(pipeline) => {
+                // The preview runs on the current text, which may already be
+                // newer than what the client looked at: that is a rebase at
+                // creation, and the review says so.
+                let current = check_pipeline_request(ed, id, &pipeline, p.base_version, p.expect)?;
+                let expect = p.expect.map(|n| n as usize);
+                let run = structural::run_intent(ed, id, &pipeline, expect)
+                    .map_err(|e| intent_error(e, current))?;
+                let intent = props::Intent::new(pipeline, expect, &run);
+                props::submit_intent(
+                    ed,
+                    props::NewProposal {
+                        doc: id,
+                        base_version: DocumentVersion(p.base_version),
+                        changes: run.changes,
+                        edit_count: run.edit_count,
+                        actor,
+                        description: p.description,
+                        verify,
+                    },
+                    intent,
+                )
+            }
+        };
         // Forget the owners of proposals the editor no longer keeps.
         self.owners
             .retain(|id, _| ed.proposals.get(ProposalId(*id)).is_some());
@@ -908,6 +1105,20 @@ pub fn proposal_info(pr: &props::Proposal) -> p::ProposalInfo {
         created_ms: pr.created_ms,
         decided_ms: pr.decided_ms,
         resolved_ms: pr.resolved_ms,
+        pipeline: pr.intent.as_ref().map(|i| i.pipeline.clone()),
+        expect: pr.intent.as_ref().and_then(|i| i.expect).map(|n| n as u64),
+        rebased: pr
+            .intent
+            .as_ref()
+            .map(|i| i.failed.as_ref().map_or(i.preview_version, |f| f.version) != pr.base_version),
+        ran_on_version: pr
+            .intent
+            .as_ref()
+            .map(|i| i.failed.as_ref().map_or(i.preview_version, |f| f.version).0),
+        step_counts: pr
+            .intent
+            .as_ref()
+            .map(|i| step_counts(i.failed.as_ref().map_or(&i.counts, |f| &f.counts))),
     }
 }
 
