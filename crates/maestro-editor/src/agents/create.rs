@@ -219,6 +219,11 @@ pub fn relaunch(ed: &mut Editor, id: AgentId) {
     };
     let refusal = if a.origin == super::Origin::Found {
         Some("this worktree has no record; a adopts it, then R can start an agent in it".into())
+    } else if a.origin == super::Origin::Composed {
+        Some(format!(
+            "{} is a composed result; no agent runs in it to start again",
+            a.name
+        ))
     } else if a.is_running() {
         Some(format!("{} is already running", a.name))
     } else if a.archived {

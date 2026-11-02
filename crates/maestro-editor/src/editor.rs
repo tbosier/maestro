@@ -803,12 +803,14 @@ impl Editor {
         if self.presentation == Presentation::Focus {
             return 0;
         }
+        // A blame column (`space h B`) sits left of the sign column.
+        let blame = crate::git_hunks::blame_width(self, view.doc);
         if self.config.editor.line_numbers == LineNumbers::Off {
-            return 1;
+            return blame + 1;
         }
         let lines = crate::motion::last_line(self.buffers[&view.doc].doc.text().slice(..)) + 1;
         let digits = lines.to_string().len().max(3) as u16;
-        1 + digits + 1
+        blame + 1 + digits + 1
     }
 
     pub fn text_width(&self, view: &View) -> usize {
@@ -904,6 +906,7 @@ impl Editor {
 
         self.status_clear_on_key(key);
         crate::lsp::on_key(self);
+        crate::git_hunks::on_key(self);
         self.dispatch(key);
 
         // Mode-transition bookkeeping.
@@ -1095,6 +1098,10 @@ impl Editor {
             crate::forge::screen::handle_key(self, key);
             return;
         }
+        if self.git.screen_open() {
+            crate::git_screen::handle_key(self, key);
+            return;
+        }
         if self.proposals.review_open() {
             crate::proposals::review::handle_key(self, key);
             return;
@@ -1214,6 +1221,7 @@ impl Editor {
             || self.agents.panel_open()
             || self.proposals.review_open()
             || self.forge.screen_open()
+            || self.git.screen_open()
         {
             return;
         }
@@ -1298,6 +1306,10 @@ impl Editor {
         }
         if self.agents.panel_open() {
             crate::agents::panel::paste(self, text);
+            return;
+        }
+        if self.git.screen_open() {
+            // The status screen has no text input; a paste does nothing.
             return;
         }
         if self.pending_char.is_some() || self.awaiting_register || !self.pending.is_empty() {
