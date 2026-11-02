@@ -1,5 +1,6 @@
 //! Git for Maestro: repository discovery, status, line-level diffs for gutter
-//! signs, a unified diff model, worktree lifecycle and merge checks.
+//! signs, a unified diff model, worktree lifecycle, merge checks, and
+//! commits built from chosen hunks.
 //!
 //! Everything goes through the `git` command-line program with argument
 //! vectors; nothing is ever passed through a shell. ADR 0005 explains why the
@@ -11,6 +12,7 @@
 
 mod blame;
 mod diff;
+mod hunks;
 mod intraline;
 mod linediff;
 mod log;
@@ -31,6 +33,7 @@ use std::process::{Command, Output, Stdio};
 
 pub use blame::{BlameCommit, BlameLine};
 pub use diff::{DiffFile, DiffLine, DiffLineKind, DiffSpec, FileChange, Hunk};
+pub use hunks::{HunkPick, HunksError, PickFailure, changed_lines};
 pub use intraline::{INTRALINE_MAX_LINE, intraline};
 pub use linediff::{LineHunk, LineHunkKind, Sign, SignMap, diff_lines};
 pub use log::{CommitDetail, LogCommit, LogEntry};
