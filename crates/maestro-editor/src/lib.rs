@@ -34,6 +34,7 @@ pub mod structural;
 pub mod syntax;
 pub mod syntax_commands;
 pub mod typed;
+pub mod workspaces;
 
 pub use editor::{DocumentId, Editor, Mode, MouseKind, Presentation, Severity, View, ViewId};
 pub use key::{KeyCode, KeyEvent, Modifiers};

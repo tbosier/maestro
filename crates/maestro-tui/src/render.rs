@@ -19,9 +19,36 @@ pub enum CursorShape {
 pub fn split_screen(width: u16, height: u16, ed: &Editor) -> (Option<Rect>, Rect, Rect) {
     let tabline = ed.presentation != Presentation::Focus && height > 3;
     let top = u16::from(tabline);
-    let views = Rect::new(0, top, width, height.saturating_sub(top + 1));
+    let mut views = Rect::new(0, top, width, height.saturating_sub(top + 1));
+    // The sidebar and its divider column come off the left of the views.
+    if let Some(side) = sidebar_area(width, height, ed) {
+        let used = side.width + 1;
+        views = Rect::new(used, top, width.saturating_sub(used), views.height);
+    }
     let cmdline = Rect::new(0, height.saturating_sub(1), width, 1);
     (tabline.then(|| Rect::new(0, 0, width, 1)), views, cmdline)
+}
+
+/// The sidebar's column (`space s`), when it is open and the screen has
+/// room for it next to at least as many columns of text. Its divider is
+/// the column just right of it.
+pub fn sidebar_area(width: u16, height: u16, ed: &Editor) -> Option<Rect> {
+    if !ed.workspaces.sidebar.open {
+        return None;
+    }
+    sidebar_room(width, height, ed)
+}
+
+/// Where the sidebar would go, open or not; `None` when the screen has
+/// no room for it.
+pub fn sidebar_room(width: u16, height: u16, ed: &Editor) -> Option<Rect> {
+    let tabline = ed.presentation != Presentation::Focus && height > 3;
+    let top = u16::from(tabline);
+    let w = ed.config.sidebar.width.min(width / 2);
+    if w < 12 || height < top + 3 {
+        return None;
+    }
+    Some(Rect::new(0, top, w, height - top - 1))
 }
 
 pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
@@ -38,6 +65,9 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
         }
     }
     draw_dividers(ed, surface, &placements);
+    if let Some(area) = sidebar_area(surface.width, surface.height, ed) {
+        crate::sidebar::draw(ed, surface, area);
+    }
     draw_hover(ed, surface);
     draw_signature(ed, surface);
     draw_completion(ed, surface);
@@ -816,6 +846,11 @@ fn draw_statusline(ed: &Editor, view: &View, s: &mut Surface, area: Rect) {
         // The agent whose worktree holds this file (crate::agents).
         if let Some(a) = doc.path().and_then(|p| ed.agents.owner_of(p)) {
             right.push_str(&format!("agent {} worktree  ", a.name));
+        }
+        // The project and worktree the editor is in, once a scan knows
+        // them (crate::workspaces).
+        if let Some(label) = maestro_editor::workspaces::status_label(ed) {
+            right.push_str(&format!("{label}  "));
         }
         // Git branch (maestro-git), shortened so it never crowds out the rest.
         if let Some(branch) = ed.git.branch_label(view.doc) {

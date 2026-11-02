@@ -43,6 +43,9 @@ pub struct NavState {
     /// The directory the session belongs to: the working directory at
     /// startup, so `:cd` does not move the session elsewhere.
     pub session_cwd: Option<PathBuf>,
+    /// Set by the first switch between worktrees (`crate::workspaces`):
+    /// from then on a saved session holds only the files of its worktree.
+    pub scoped: bool,
     /// Recently opened files, most recent first.
     pub recent: Vec<PathBuf>,
     /// Set while a session is restored, so reopening its files does not

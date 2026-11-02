@@ -33,6 +33,11 @@ maestro-agent = { workspace = true, features = ["fake-agent"] }
 name = "lsp"
 harness = false
 
+# Runs its own main so the test binary can double as the fake server.
+[[test]]
+name = "workspaces"
+harness = false
+
 # Runs its own main so the test binary can double as the fake ACP agent.
 [[test]]
 name = "agents"
