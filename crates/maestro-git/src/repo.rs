@@ -179,6 +179,15 @@ impl Repository {
         self.git.run(Some(&self.root), args, access)
     }
 
+    pub(crate) fn run_input<S: AsRef<std::ffi::OsStr>>(
+        &self,
+        args: &[S],
+        input: &[u8],
+        access: Access,
+    ) -> Result<Vec<u8>> {
+        self.git.run_input(Some(&self.root), args, input, access)
+    }
+
     pub(crate) fn run_status<S: AsRef<std::ffi::OsStr>>(
         &self,
         args: &[S],

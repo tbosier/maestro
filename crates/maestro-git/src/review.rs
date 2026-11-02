@@ -149,14 +149,14 @@ pub struct CommitShape {
 pub const MERGE_TREE_TREES: GitVersion = GitVersion::new(2, 45, 0);
 
 /// A temporary file removed on drop, along with git's lock file for it.
-struct TempFile(PathBuf);
+pub(crate) struct TempFile(pub(crate) PathBuf);
 
 impl TempFile {
     /// Creates a new file holding `contents` in the system temp directory.
     /// `create_new` (O_EXCL) refuses an existing path, so a file or symlink
     /// planted at the name in a shared temp directory is never written
     /// through.
-    fn create(tag: &str, contents: &[u8]) -> std::io::Result<Self> {
+    pub(crate) fn create(tag: &str, contents: &[u8]) -> std::io::Result<Self> {
         Self::create_at(tag, contents, None)
     }
 
@@ -448,7 +448,7 @@ impl Repository {
 
     /// Fails with [`GitError::NoIdentity`] when git has no author or
     /// committer name and email (and would refuse to commit).
-    fn check_identity(&self) -> Result<()> {
+    pub(crate) fn check_identity(&self) -> Result<()> {
         for var in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
             let (out, _) = self.run_status(&["var", var], Access::ReadOnly)?;
             if !out.status.success() {

@@ -19,7 +19,7 @@ use super::{AgentId, Origin, ProviderKind, ProviderSpec, Runtime, Status, TestFi
 use crate::editor::{Editor, normalize_path};
 
 /// Lists at most five paths, then how many more.
-fn list_paths(paths: &[PathBuf]) -> String {
+pub(crate) fn list_paths(paths: &[PathBuf]) -> String {
     let mut s: Vec<String> = paths
         .iter()
         .take(5)
@@ -311,6 +311,10 @@ fn feedback_blocker(a: &super::Agent) -> Option<String> {
         return Some(why);
     }
     match &a.runtime {
+        Runtime::None if a.origin == Origin::Composed => Some(format!(
+            "{} is a composed result: no agent runs in it to take feedback",
+            a.name
+        )),
         Runtime::None if a.origin == Origin::Loaded => Some(match a.kind() {
             ProviderKind::Terminal => format!(
                 "{} is from an earlier session and its program is not running, so feedback cannot \
@@ -533,7 +537,7 @@ pub fn answer_permission(
 // ----- reject and archive --------------------------------------------------
 
 /// Why an action cannot run while Git work for the agent is in flight.
-fn busy(a: &super::Agent) -> Option<String> {
+pub(crate) fn busy(a: &super::Agent) -> Option<String> {
     a.git_busy
         .map(|what| format!("{} is busy ({what}); wait for it to finish", a.name))
 }
@@ -1132,6 +1136,11 @@ pub struct IntegrateFacts {
     /// at it right before the merge. Anything else (the agent committed,
     /// reset or rebased after the dialog was checked) integrates nothing.
     pub checked_head: String,
+    /// Set when only the hunks marked in the review are integrated: they
+    /// become a commit of their own on a new branch, and that commit is
+    /// integrated. `checked_tree` is then that commit's tree and
+    /// `checked_head` the commit the review was computed on.
+    pub part: Option<Box<super::parts::PartPlan>>,
 }
 
 /// The net change of `commit` since its fork point from `base`, as the
@@ -1156,7 +1165,7 @@ fn diff_since_fork(
 /// it touches, since a file changed and changed back is invisible in the
 /// net diff but a cherry-pick applies each commit. `commit` is a snapshot
 /// of the worktree for the dialog and the branch's commit afterward.
-fn contract_violations(
+pub(crate) fn contract_violations(
     c: &super::contract::Contract,
     wt: &maestro_git::Repository,
     base: &str,
@@ -1247,7 +1256,10 @@ fn verification_warnings(
 
 /// The repository whose root is exactly `path`. Discovery alone would
 /// climb to a parent repository when the worktree directory is gone.
-fn open_exact(git: &maestro_git::Git, path: &Path) -> Result<maestro_git::Repository, String> {
+pub(crate) fn open_exact(
+    git: &maestro_git::Git,
+    path: &Path,
+) -> Result<maestro_git::Repository, String> {
     let gone = || format!("{} is no longer a worktree", path.display());
     let repo = git
         .discover(path)
@@ -1306,7 +1318,7 @@ pub(crate) fn open_agent_worktree(
 /// worktree is clean, and the agent's base commit is on the target branch
 /// (so integrating brings only what the review showed, plus later commits
 /// on the agent's branch). Returns the agent's and the main repositories.
-fn check_before_commit(
+pub(crate) fn check_before_commit(
     git: &maestro_git::Git,
     f: &IntegrateFacts,
 ) -> Result<(maestro_git::Repository, maestro_git::Repository), String> {
@@ -1394,6 +1406,11 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
         ed.error(msg);
         return;
     }
+    // With marked hunks, only they are integrated.
+    if !a.marks.is_empty() {
+        super::parts::prepare(ed, id);
+        return;
+    }
     let message = format!(
         "{}\n\nTask: {}\nMaestro agent: {} ({})",
         super::task_summary(&a.task),
@@ -1454,6 +1471,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 own_conflicts: Vec::new(),
                 checked_tree: String::new(),
                 checked_head: String::new(),
+                part: None,
             };
             let (wt, main) = check_before_commit(&git, &facts)?;
             // One snapshot of the agent's files, from Git now rather than
@@ -1577,7 +1595,7 @@ fn conflicts_after(
 }
 
 /// Unsaved buffers that integration would leave out or overwrite.
-fn unsaved_block(ed: &Editor, w: &super::WorktreeInfo) -> Option<String> {
+pub(crate) fn unsaved_block(ed: &Editor, w: &super::WorktreeInfo) -> Option<String> {
     let mut unsaved = unsaved_under(ed, &w.path);
     unsaved.extend(unsaved_under(ed, &w.main_root));
     unsaved.dedup();
@@ -1589,7 +1607,7 @@ fn unsaved_block(ed: &Editor, w: &super::WorktreeInfo) -> Option<String> {
     })
 }
 
-fn how_label(how: Integration) -> &'static str {
+pub(crate) fn how_label(how: Integration) -> &'static str {
     match how {
         Integration::Merge => "merge",
         Integration::FastForwardOnly => "fast-forward",
@@ -1651,6 +1669,10 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
     for v in &facts.verification {
         lines.push(format!("Warning: {v}"));
     }
+    if let Some(part) = &facts.part {
+        lines.extend(super::parts::steps(&facts, part, how));
+        return finish_dialog(agent, how, facts, lines);
+    }
     let subject = facts.message.lines().next().unwrap_or_default();
     if facts.uncommitted.is_empty() {
         lines.push(format!(
@@ -1709,6 +1731,16 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
                 .into(),
         );
     }
+    finish_dialog(agent, how, facts, lines)
+}
+
+/// The dialog's keys and title around `lines`.
+fn finish_dialog(
+    agent: AgentId,
+    how: Integration,
+    facts: IntegrateFacts,
+    lines: Vec<String>,
+) -> Confirm {
     let go = if facts.out_of_scope.is_empty() {
         ("y".into(), format!("integrate by {}", how_label(how)))
     } else {
@@ -1720,8 +1752,9 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
             ),
         )
     };
+    let what = if facts.part.is_some() { "part of " } else { "" };
     Confirm {
-        title: format!("integrate {} ({})", facts.name, how_label(how)),
+        title: format!("integrate {what}{} ({})", facts.name, how_label(how)),
         lines,
         keys: vec![
             go,
@@ -1754,12 +1787,28 @@ pub fn integrate(ed: &mut Editor, id: AgentId, how: Integration, facts: Integrat
         ed.error(msg);
         return;
     }
+    // A part integrates the hunks as marked when the dialog was checked;
+    // the marks must still be exactly those (a refresh drops the mark of a
+    // hunk the agent changed since).
+    if let Some(p) = &facts.part
+        && let Some(why) = super::parts::marks_changed(a, p)
+    {
+        ed.error(format!("not integrated, nothing changed: {why}"));
+        return;
+    }
     if let Some(a) = ed.agents.get_mut(id) {
         a.git_busy = Some("integrating");
     }
     let spawned = ed.spawn_background("agent-integrate", move |tx| {
-        let result = run_integration(&git, &facts, how);
-        tx.send(move |ed| integrated(ed, id, how, result));
+        let result = match &facts.part {
+            Some(p) => super::parts::run(&git, &facts, p, how),
+            None => run_integration(&git, &facts, how),
+        };
+        let part = facts.part;
+        tx.send(move |ed| match part {
+            Some(p) => super::parts::integrated(ed, id, how, *p, result),
+            None => integrated(ed, id, how, result),
+        });
     });
     if let Err(e) = spawned {
         if let Some(a) = ed.agents.get_mut(id) {
@@ -1771,29 +1820,36 @@ pub fn integrate(ed: &mut Editor, id: AgentId, how: Integration, facts: Integrat
 
 /// The result of an integration attempt.
 #[derive(Debug)]
-struct Integrated {
-    /// The commit made in the agent's worktree, if one was.
-    committed: Option<String>,
-    target: String,
-    outcome: Result<maestro_git::IntegrateOutcome, String>,
+pub(crate) struct Integrated {
+    /// The commit made in the agent's worktree, or of the marked hunks, if
+    /// one was.
+    pub(crate) committed: Option<String>,
+    pub(crate) target: String,
+    pub(crate) outcome: Result<maestro_git::IntegrateOutcome, String>,
     /// Files outside the task contract that a successful integration
     /// changed on the target and the dialog did not list.
-    late_out_of_scope: Vec<PathBuf>,
+    pub(crate) late_out_of_scope: Vec<PathBuf>,
     /// Why that check of the target could not run, if it could not.
-    audit_error: Option<String>,
+    pub(crate) audit_error: Option<String>,
     /// Files outside the contract the user let in with `O`.
-    accepted: Vec<PathBuf>,
+    pub(crate) accepted: Vec<PathBuf>,
+}
+
+impl Integrated {
+    pub(crate) fn new(f: &IntegrateFacts) -> Self {
+        Self {
+            committed: None,
+            target: f.target.clone(),
+            outcome: Err(String::new()),
+            late_out_of_scope: Vec::new(),
+            audit_error: None,
+            accepted: f.out_of_scope.iter().map(|(p, _)| p.clone()).collect(),
+        }
+    }
 }
 
 fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration) -> Integrated {
-    let mut out = Integrated {
-        committed: None,
-        target: f.target.clone(),
-        outcome: Err(String::new()),
-        late_out_of_scope: Vec::new(),
-        audit_error: None,
-        accepted: f.out_of_scope.iter().map(|(p, _)| p.clone()).collect(),
-    };
+    let mut out = Integrated::new(f);
     let (wt, main) = match check_before_commit(git, f) {
         Ok(r) => r,
         Err(e) => {
@@ -1838,11 +1894,29 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             return out;
         }
     };
+    land(&wt, &main, f, &f.branch, &reviewed, how, &mut out);
+    out
+}
+
+/// Checks `reviewed` (the commit `branch` points at) against the task
+/// contract, history included, and integrates exactly it into the main
+/// worktree's branch with [`maestro_git::Repository::integrate_reviewed`],
+/// then checks what reached the target against the contract once more.
+/// `wt` is any worktree of the repository holding `reviewed`.
+pub(crate) fn land(
+    wt: &maestro_git::Repository,
+    main: &maestro_git::Repository,
+    f: &IntegrateFacts,
+    branch: &str,
+    reviewed: &str,
+    how: Integration,
+    out: &mut Integrated,
+) {
     // Judged against the contract again, history included: a file outside
     // it that the dialog did not list stops the integration.
     let accepted = |p: &PathBuf| f.out_of_scope.iter().any(|(q, _)| q == p);
     if let Some(c) = &f.contract {
-        match contract_violations(c, &wt, &f.base, &reviewed) {
+        match contract_violations(c, wt, &f.base, reviewed) {
             Ok(v) => {
                 let new: Vec<PathBuf> = v
                     .into_iter()
@@ -1855,7 +1929,7 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
                          {}; nothing was integrated. Press I again to see them",
                         list_paths(&new)
                     ));
-                    return out;
+                    return;
                 }
             }
             Err(e) => {
@@ -1863,7 +1937,7 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
                     "could not check the work against the task contract ({e}); nothing was \
                      integrated"
                 ));
-                return out;
+                return;
             }
         }
     }
@@ -1871,16 +1945,16 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
         Ok(h) => h,
         Err(e) => {
             out.outcome = Err(format!("could not read {} ({e})", f.target));
-            return out;
+            return;
         }
     };
     // Only that commit: `maestro-git` refuses if the branch no longer
     // points at it, and gives git the commit id, not the branch name.
     out.outcome = main
         .integrate_reviewed(
-            &f.branch,
+            branch,
             maestro_git::Reviewed {
-                commit: &reviewed,
+                commit: reviewed,
                 target: &f.target,
                 base: &f.base,
             },
@@ -1909,7 +1983,6 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             Err(e) => out.audit_error = Some(e.to_string()),
         }
     }
-    out
 }
 
 /// The commit to integrate, after Maestro's commit of the agent's work

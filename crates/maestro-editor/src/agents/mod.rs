@@ -17,10 +17,13 @@
 //! threads started with [`Editor::spawn_background`].
 
 pub mod actions;
+pub mod compose;
 pub mod conflicts;
 pub mod contract;
 pub mod create;
+pub mod marks;
 pub mod panel;
+pub mod parts;
 pub mod persist;
 pub mod review;
 
@@ -199,6 +202,10 @@ pub enum Origin {
     /// directory that no record names. Its task and provider are unknown;
     /// it can be reviewed, archived or adopted, nothing else. Not saved.
     Found,
+    /// A result composed from hunks of several agents of one task, in a
+    /// worktree of its own. No agent runs in it: it is reviewed, tested,
+    /// integrated, rejected or archived like an agent's work.
+    Composed,
 }
 
 /// The worktree an agent works in.
@@ -447,6 +454,12 @@ pub struct Agent {
     /// `session/load` is replaying the saved conversation: updates go to
     /// the transcript only.
     replaying: bool,
+    /// Hunks marked in the review, for integrating only them.
+    pub marks: Vec<marks::Mark>,
+    /// Parts of the work integrated on their own, oldest first.
+    pub parts: Vec<marks::Part>,
+    /// For a composed result: where its hunks came from.
+    pub composition: Option<compose::Composition>,
 }
 
 impl Agent {
@@ -486,6 +499,9 @@ impl Agent {
             load_session: false,
             worktree_note: None,
             replaying: false,
+            marks: Vec::new(),
+            parts: Vec::new(),
+            composition: None,
         }
     }
 
@@ -493,14 +509,14 @@ impl Agent {
     /// process runs for it: the panel says "not running (from an earlier
     /// session)" next to its status.
     pub fn from_earlier_session(&self) -> bool {
-        self.origin != Origin::New && !self.is_running()
+        !matches!(self.origin, Origin::New | Origin::Composed) && !self.is_running()
     }
 
     /// `R` would start the agent again: it has a record, no process, a
     /// worktree that is still its own, and no decision yet. (The provider
     /// is checked when `R` is pressed.)
     pub fn can_relaunch(&self) -> bool {
-        self.origin != Origin::Found
+        !matches!(self.origin, Origin::Found | Origin::Composed)
             && !self.is_running()
             && !self.archived
             && !self.base_status().is_decided()

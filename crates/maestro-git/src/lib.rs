@@ -1,5 +1,6 @@
 //! Git for Maestro: repository discovery, status, line-level diffs for gutter
-//! signs, a unified diff model, worktree lifecycle and merge checks.
+//! signs, a unified diff model, worktree lifecycle, merge checks, and
+//! commits built from chosen hunks.
 //!
 //! Everything goes through the `git` command-line program with argument
 //! vectors; nothing is ever passed through a shell. ADR 0005 explains why the
@@ -9,12 +10,20 @@
 //! Every call blocks while `git` runs. Callers on an interactive thread
 //! should run them on a background thread.
 
+mod blame;
 mod diff;
+mod hunks;
 mod intraline;
 mod linediff;
+mod log;
 mod merge;
+mod patch;
+mod remote;
 mod repo;
 mod review;
+mod stage;
+mod stash;
+mod state;
 mod status;
 mod worktree;
 
@@ -22,15 +31,23 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+pub use blame::{BlameCommit, BlameLine};
 pub use diff::{DiffFile, DiffLine, DiffLineKind, DiffSpec, FileChange, Hunk, parse_unified_diff};
+pub use hunks::{HunkPick, HunksError, PickFailure, changed_lines};
 pub use intraline::{INTRALINE_MAX_LINE, intraline};
 pub use linediff::{LineHunk, LineHunkKind, Sign, SignMap, diff_lines};
+pub use log::{CommitDetail, LogCommit, LogEntry};
 pub use merge::MergeCheck;
+pub use patch::{FilePatch, PatchError, Picks, Side, TextPatch, parse_patches};
+pub use remote::{Branch, RemoteCommand, RemoteOp};
 pub use repo::{Base, Head, Repository};
 pub use review::{
     CommitShape, IntegrateError, IntegrateOutcome, Integration, MERGE_TREE_TREES, Reviewed,
     WorkSnapshot,
 };
+pub use stage::ApplyTo;
+pub use stash::Stash;
+pub use state::Operation;
 pub use status::{BranchInfo, ChangeKind, ConflictKind, EntryState, Status, StatusEntry};
 pub use worktree::{RemoveError, RemoveRefusal, Worktree};
 
@@ -265,6 +282,47 @@ impl Git {
     ) -> Result<Vec<u8>> {
         let args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
         let (out, shown) = self.output(dir, &args, access)?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(command_error(shown, &out))
+        }
+    }
+
+    /// Runs `git` with `input` on its standard input and returns stdout, or
+    /// an error carrying stderr. The input is written from another thread,
+    /// so a large input cannot deadlock against git's output.
+    fn run_input<S: AsRef<OsStr>>(
+        &self,
+        dir: Option<&Path>,
+        args: &[S],
+        input: &[u8],
+        access: Access,
+    ) -> Result<Vec<u8>> {
+        use std::io::Write;
+        let args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
+        let shown = args
+            .iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut cmd = self.command(dir, &args, access);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => GitError::NotInstalled,
+            _ => GitError::Io(e),
+        })?;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || {
+            // Git may exit before reading everything (an early error); a
+            // broken pipe here is reported through its exit status.
+            let _ = stdin.write_all(&input);
+        });
+        let out = child.wait_with_output()?;
+        let _ = writer.join();
         if out.status.success() {
             Ok(out.stdout)
         } else {

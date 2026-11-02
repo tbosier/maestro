@@ -15,6 +15,8 @@ pub mod commands;
 pub mod editor;
 pub mod forge;
 pub mod git;
+pub mod git_hunks;
+pub mod git_screen;
 pub mod key;
 pub mod keymap;
 pub mod layout;
