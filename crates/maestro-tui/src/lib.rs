@@ -8,6 +8,7 @@ mod inbox;
 mod preview;
 mod proposals;
 pub mod render;
+mod sidebar;
 pub mod surface;
 pub mod terminal;
 
@@ -200,9 +201,21 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
     loop {
         // Presentation changes (focus mode) move the view area.
         let (_, views, _) = split_screen(w, h, &editor);
+        // A sidebar the screen has no room for takes no keys.
+        let narrow = render::sidebar_room(w, h, &editor).is_none();
+        if editor.workspaces.sidebar.too_narrow != narrow {
+            editor.workspaces.sidebar.too_narrow = narrow;
+            dirty = true;
+        }
         if editor.area != views {
             editor.resize(views);
             dirty = true;
+        }
+        // An agent that started needing you: the bell or an OSC 9
+        // notification (crate::terminal::notify), once per change.
+        let notes = editor.workspaces.take_notifications();
+        if !notes.is_empty() {
+            terminal::notify(&mut out, &notes)?;
         }
         if dirty {
             // Intent edits whose document moved on show their rerun.

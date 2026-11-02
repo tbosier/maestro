@@ -39,6 +39,10 @@ Status: milestone M0 is done (a working terminal editor). M1 is in progress. M2 
 - Agent records survive a restart: they are saved per repository with the editor sessions and come back when the panel opens, marked "not running (from an earlier session)". Review, tests, integrate and archive work on them; `R` starts one again in its worktree (an ACP agent gets its saved session back when it supports `session/load`; a terminal agent starts without its task). Worktrees on `maestro/` branches that no record names are listed as found worktrees to review, archive or adopt (`a`).
 
 - A GitHub inbox (`space i` or `:inbox`), through the GitHub CLI (`gh`) and the account it is logged in to: pull requests that ask for your review, pull requests assigned to you, your own open pull requests, issues assigned to you, and the open pull requests of the repository you are in. Each row shows `owner/repo#number`, the title, the author, the checks (`✓ passed 6`, `✗ failed 3/13`, `● pending 1/4`) and the age. It loads in the background and shows when it last did; `r` reloads, and `[github] refresh-secs` reloads on an interval (off by default). `Enter` on a pull request shows its checks by name, reviews, description as plain text, labels, and each changed file's diff in the agent review's layout. `o` opens it in the browser, `w` checks a pull request of the current repository out into a new worktree next to it and opens a file there. `a` approves, `c` comments and `R` requests changes (both written in a buffer of their own and sent with `:pr-send`), and `m` merges after you pick merge, squash or rebase. Each of those first shows the exact `gh` command and the text it sends, with warnings for drafts, failed or unfinished checks, conflicts and missing reviews; nothing is sent until you press `y`. Approvals and change requests are submitted on the head commit the screen showed, and are not sent if the pull request got new commits since; a merge is refused by GitHub in that case, and afterward the status line says whether it merged or a merge queue or auto-merge took it. The pull request's details and diff are checked to be of one commit. When `gh` is missing or logged out, the screen says so and how to fix it (`gh auth login`). The status line shows how many reviews wait for you, as of the last load. The searches cover gh's default host (github.com unless you changed it); "This repository" also works for a GitHub Enterprise remote.
+- Projects and worktrees in a sidebar (`space s`). The top lists every agent grouped by what it needs from you: needs you (a permission request, work ready for review, failed tests, a failure, a blocked turn), then working, idle and done. Each row has a mark and a word, never color alone. Below that are the projects: the Git repositories in `[projects] paths`, the directories of earlier sessions and the one you are in. Each unfolds to its worktrees with the branch, the number of changed files, ahead and behind of the upstream when there is one, and the agent working there. `ret` on a worktree or an agent switches the editor to it: the working directory moves (the file finder, workspace search, the agent panel and new language servers follow), your files and splits are saved as that worktree's session, and the target's session comes back. Buffers with unsaved changes are never closed: they stay open, the status line names them, and the sidebar counts them on their worktree's row. The status line names the project and worktree (`alpha:main`). Git runs on a background thread and the sidebar rescans every five seconds while it is open.
+- A jump palette (`space j`): one fuzzy list of projects, worktrees, agents (by name and task) and open buffers. Choosing one goes there, switching worktree when needed.
+- When an agent starts needing you, the status line says so once, and the terminal gets a bell or an OSC 9 desktop notification (`[notify] method`).
+- Language servers start for the worktree you switch into when its files open. Servers of roots you left stop after five unused minutes, or when more than three roots have servers; a server with an open buffer is never stopped.
 
 Not built yet: an OS sandbox for agents (a worktree keeps their files apart, not their permissions; see [docs/security.md](docs/security.md)). That is tracked in the roadmap.
 
@@ -89,6 +93,8 @@ cargo build --release
 | `space i` / `:inbox` | the GitHub inbox: `j`/`k` move, `ret` details, `o` browser, `w` worktree, `a` approve, `c` comment, `R` request changes, `m` merge, `r` reload |
 | in a pull request's details | `j`/`k` scroll, `tab` the next file's diff, `]`/`[` hunks, `h`/`l` sideways, `s` side by side, `esc` back to the list; the inbox keys above work here too |
 | `:pr-send` | in a comment or change-request buffer: show exactly what will be sent, then `y` sends it |
+| `space s` | the sidebar: opens and focuses it, focuses it, or hides it. In it: `j`/`k` move, `ret` switch to a worktree or agent (on a project: fold or unfold), `l`/`h` unfold or fold, `r` rescan, `q` hide, `esc` back to the editor with the sidebar still shown, `space ...` the usual space keys |
+| `space j` | jump to a project, worktree, agent or open buffer |
 
 The full model is in [docs/editor-model.md](docs/editor-model.md).
 
@@ -124,6 +130,19 @@ args = ["--prompt", "{task}"]         # without {task}, the task is typed in aft
 kind = "terminal"
 command = "codex"
 enabled = false                       # hides a built-in provider
+
+[projects]
+paths = ["~/src/maestro", "~/src/site"]   # listed in the sidebar and the jump palette
+
+[sidebar]
+width = 36
+
+[notify]
+method = "bell"                       # "osc" for an OSC 9 desktop notification, "off"
+
+[lsp]
+stop-unused-after-secs = 300          # stop servers of worktrees you left; 0 never does
+max-live-roots = 3                    # 0 means no limit
 
 [github]
 gh = "gh"                             # the GitHub CLI: a path or a name on PATH

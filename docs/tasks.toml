@@ -236,3 +236,14 @@ owner = "agent"
 status = "done"
 # See the GitHub inbox row in ROADMAP.md. Write actions are tested against
 # a fake gh only; none was run against real GitHub.
+
+[[task]]
+id = "workspaces"
+title = "Projects and worktrees sidebar, worktree switching, jump palette, agent attention and notifications"
+crates = ["maestro-editor", "maestro-tui", "maestro-config", "maestro-cli"]
+branch = "feat/workspaces"
+owner = "agent"
+status = "done"
+# space s sidebar, space j palette, switching saves and restores per-worktree
+# sessions (unsaved buffers stay open), notifications once per change,
+# language servers stopped for roots left unused. See ROADMAP.md.
