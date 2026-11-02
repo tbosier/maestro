@@ -37,7 +37,7 @@ crates = ["maestro-editor"]
 branch = "feat/navigation"
 owner = "agent"
 status = "done"
-notes = "Finder, workspace search, picker preview, session restore without splits, recent files. See ROADMAP M1."
+notes = "Finder, workspace search, picker preview, session restore with splits, recent files. See ROADMAP M1."
 
 [[task]]
 id = "m1-lsp"
@@ -75,7 +75,7 @@ status = "in-progress"
 # Done: maestro-git crate (status, line and unified diffs, worktree
 # add/list/remove/prune with safety checks, fast-forward and merge-tree
 # checks), gutter signs, branch in the status line, :git-status and
-# :worktrees pickers. Not started: agent orchestration, review and merge UI.
+# :worktrees pickers. The agent panel, review and integration are tracked below.
 
 [[task]]
 id = "m3-protocol"
@@ -171,7 +171,8 @@ status = "in-progress"
 # Agent sessions across restarts (feat/agent-sessions): records saved per
 # repository, loaded on the panel's first open, relaunch with session/load,
 # found worktrees.
-# Open: a real agent run through the panel.
+# Real agents: Claude Code and Codex run through the panel on October 30
+# and 31, 2026 (ROADMAP M2). Open: session/load against a real ACP agent.
 
 [[task]]
 id = "m3-pipelines"

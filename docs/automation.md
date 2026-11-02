@@ -403,10 +403,12 @@ In the editor, `space e` showed the diff (`-    return a + b`, `+    return a * 
 
 ```
 <-- {"jsonrpc":"2.0","method":"document.changed","params":{"doc":3,"version":1,"actor":"agent:m3demo"}}
-<-- {"jsonrpc":"2.0","method":"proposal.resolved","params":{"id":1,"doc":3,"path":"<dir>/calc.py","actor":{"name":"agent:m3demo","agent_id":"m3demo-1"},"description":"fix mul: it added instead of multiplying","base_version":0,"edit_count":1,"verification":{"program":"sh","args":["-c","python3 -c 'import calc; assert calc.mul(3, 4) == 12' && echo mul ok"],"cwd":"<dir>"},"state":"resolved","decision":"approved","decided_by":{"kind":"user","name":"taylo"},"reason":null,"applied_version":1,"saved":true,"verification_result":{"status":"passed","exit_code":0,"duration_ms":32,"output_tail":["mul ok"],"output_lines_dropped":0,"error":null},"created_ms":1793508168617,"decided_ms":1793508185727,"resolved_ms":1793508185781}}
+<-- {"jsonrpc":"2.0","method":"proposal.resolved","params":{"id":1,"doc":3,"path":"<dir>/calc.py","actor":{"name":"agent:m3demo","agent_id":"m3demo-1"},"description":"fix mul: it added instead of multiplying","base_version":0,"edit_count":1,"verification":{"program":"sh","args":["-c","python3 -c 'import calc; assert calc.mul(3, 4) == 12' && echo mul ok"],"cwd":"<dir>"},"state":"resolved","decision":"approved","decided_by":{"kind":"user","name":"user"},"reason":null,"applied_version":1,"saved":true,"verification_result":{"status":"passed","exit_code":0,"duration_ms":32,"output_tail":["mul ok"],"output_lines_dropped":0,"error":null},"created_ms":1793508168617,"decided_ms":1793508185727,"resolved_ms":1793508185781}}
 --> {"jsonrpc":"2.0","id":6,"method":"document.history","params":{"doc":3}}
 <-- {"jsonrpc":"2.0","id":6,"result":{"doc":3,"edits":[{"actor":"agent:m3demo","description":"fix mul: it added instead of multiplying","base_version":0,"new_version":1,"timestamp_ms":1793508185727,"proposal":1}],"proposals":[{"id":1, ... the same record as in proposal.resolved ...}]}}
 ```
+
+The login name in `decided_by` is shown as `user` here; the editor sends the real one.
 
 In the same session a proposal against version 0, sent after the first was applied, was refused at once with -32010. A second proposal against version 1 went stale when the user typed a line before approving it: `a` resolved it as `stale` ("the document is at version 21, the proposal was made against version 1"), and its command (`touch late-ran`) never ran. A third was rejected with the reason "unused import". Two `u` presses then undid the typed line and the approved proposal, one each.
 

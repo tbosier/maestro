@@ -51,7 +51,7 @@ Selections follow Kakoune: a range covers whole graphemes from `min(anchor, head
 
 ## Commands
 
-Every action is a named command in `maestro_editor::commands::COMMANDS` or a typed command in `maestro_editor::typed`. Keymaps bind key sequences to names, the palette lists names, and user config binds names. The automation API (`command.run`, see `docs/automation.md`) calls the same names. Adding a command means adding one function and one line in the `commands!` table; a test fails if a default binding names a command that does not exist.
+Editing actions are named commands in `maestro_editor::commands::COMMANDS` or typed commands in `maestro_editor::typed`. The keys inside the agent panel, its review and the proposal review are handled by those screens directly and are not commands yet. Keymaps bind key sequences to names, the palette lists names, and user config binds names. The automation API (`command.run`, see `docs/automation.md`) calls the same names. Adding a command means adding one function and one line in the `commands!` table; a test fails if a default binding names a command that does not exist.
 
 ## Rendering
 
