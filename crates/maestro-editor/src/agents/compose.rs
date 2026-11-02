@@ -354,10 +354,22 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             ed.agents.panel.compose = None;
             return;
         }
+        // Down and up the column the cursor is in: items are ordered band
+        // by band, so the next item may be another agent's.
         KeyCode::Char('j') | KeyCode::Down if !ctrl => {
-            v.cursor = (v.cursor + 1).min(items.len().saturating_sub(1));
+            if let Some(col) = items.get(v.cursor).map(|i| i.col)
+                && let Some(n) = (v.cursor + 1..items.len()).find(|&n| items[n].col == col)
+            {
+                v.cursor = n;
+            }
         }
-        KeyCode::Char('k') | KeyCode::Up if !ctrl => v.cursor = v.cursor.saturating_sub(1),
+        KeyCode::Char('k') | KeyCode::Up if !ctrl => {
+            if let Some(col) = items.get(v.cursor).map(|i| i.col)
+                && let Some(n) = (0..v.cursor).rev().find(|&n| items[n].col == col)
+            {
+                v.cursor = n;
+            }
+        }
         KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right if !ctrl => {
             let right = matches!(key.code, KeyCode::Char('l') | KeyCode::Right);
             if let Some(cur) = items.get(v.cursor) {
