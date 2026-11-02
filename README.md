@@ -89,7 +89,7 @@ cargo build --release
 | `]h` `[h`, `space h` | next and previous change; `space h s` stage, `r` reset, `p` preview, `b` blame the line, `B` blame column |
 | `space a` | the agent panel: `n` new task (with `@allow`, `@forbid`, `@verify`, `@accept` or `@contract` lines for a task contract), `N` same task with another provider, `C` compose hunks of the agents on one task, `ret` review, `t` test, `f` feedback, `p` permission, `I` integrate (`O` instead of `y` when files are outside the contract), `X` reject, `A` archive, `R` relaunch, `a` adopt a found worktree, `v` history or test output, `C-\` keys to the agent's terminal and back |
 | in the review | `j`/`k` lines, `]`/`[` hunks, `tab` files, `s` side by side, `c` comment, `space` mark or unmark the hunk, `v` then `j`/`k` and `space` mark lines (`esc` drops the range), `D` drop the file's change, `ret` open the file there; with marks, `I` integrates only them |
-| in the compose view (`C`) | `j`/`k` hunks, `h`/`l` agents, `tab` files, `space` mark, `ret` check and compose, `r` refresh, `esc` back |
+| in the compose view (`C`) | `j`/`k` hunks down and up the agent's column, `h`/`l` the next agent's column, `tab` files, `space` mark, `ret` check and compose, `r` refresh, `esc` back |
 | `space i` / `:inbox` | the GitHub inbox: `j`/`k` move, `ret` details, `o` browser, `w` worktree, `a` approve, `c` comment, `R` request changes, `m` merge, `r` reload |
 | in a pull request's details | `j`/`k` scroll, `tab` the next file's diff, `]`/`[` hunks, `h`/`l` sideways, `s` side by side, `esc` back to the list; the inbox keys above work here too |
 | `:pr-send` | in a comment or change-request buffer: show exactly what will be sent, then `y` sends it |
