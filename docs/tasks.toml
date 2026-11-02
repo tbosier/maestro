@@ -184,6 +184,17 @@ status = "done"
 # A narrow slice of the spec's Experiment A; see the M3 row in ROADMAP.md.
 
 [[task]]
+id = "compose"
+title = "Integrate marked hunks of an agent alone, and compose one result from several agents' hunks"
+crates = ["maestro-git", "maestro-editor", "maestro-tui"]
+branch = "feat/compose"
+owner = "agent"
+status = "done"
+# maestro-git/src/hunks.rs builds the trees; the editor marks hunks in the
+# review (agents/marks.rs), integrates parts (agents/parts.rs) and composes
+# (agents/compose.rs). See the After M3 section in ROADMAP.md.
+
+[[task]]
 id = "hardening"
 title = "Integrate only the reviewed commit, end leftover verification processes, withdraw by the creating connection only"
 crates = ["maestro-git", "maestro-editor", "maestro-tasks", "maestro-automation", "maestro-protocol"]

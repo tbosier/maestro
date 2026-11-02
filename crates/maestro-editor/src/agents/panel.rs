@@ -109,6 +109,9 @@ pub enum ConfirmAction {
         request_id: serde_json::Value,
         option: String,
     },
+    /// `y` commits the checked hunks of several agents as a composed
+    /// result with a worktree of its own.
+    Compose(Box<super::compose::ComposePlan>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +151,8 @@ pub struct Panel {
     pub view: DetailView,
     /// The review screen, when open.
     pub review: Option<ReviewView>,
+    /// The compose view, when open.
+    pub compose: Option<super::compose::ComposeView>,
     pub overlay: Option<Overlay>,
     /// Lines scrolled back from the bottom of a transcript or log.
     pub scroll: usize,
@@ -277,6 +282,10 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     }
     if ed.agents.panel.overlay.is_some() {
         overlay_key(ed, key);
+        return;
+    }
+    if ed.agents.panel.compose.is_some() {
+        super::compose::handle_key(ed, key);
         return;
     }
     if ed.agents.panel.review.is_some() {
@@ -435,6 +444,11 @@ fn list_key(ed: &mut Editor, key: KeyEvent) {
         (KeyCode::Char('a'), false) => {
             if let Some(id) = selected_id(ed) {
                 super::actions::ask_adopt(ed, id);
+            }
+        }
+        (KeyCode::Char('C'), false) => {
+            if let Some(id) = selected_id(ed) {
+                super::compose::open(ed, id);
             }
         }
         _ => {}
@@ -916,6 +930,9 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
             Some('y'),
             _,
         ) => super::actions::answer_permission(ed, *agent, request_id.clone(), option),
+        (ConfirmAction::Compose(plan), Some('y'), _) => {
+            super::compose::create(ed, (**plan).clone())
+        }
         _ => {
             // Any other key leaves the dialog up.
             ed.agents.panel.overlay = Some(Overlay::Confirm(c));
@@ -943,6 +960,9 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         }
         Some(Overlay::Confirm(_)) => return vec![("esc/n", "cancel")],
         None => {}
+    }
+    if p.compose.is_some() {
+        return super::compose::hints();
     }
     if p.review.is_some() {
         return super::review::hints();
@@ -976,11 +996,23 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     }
     out.extend([("ret", "review"), ("t", "test")]);
     // Feedback cannot reach an agent with no process; R comes first instead.
-    if !a.from_earlier_session() {
+    // A composed result has no agent at all.
+    if !a.from_earlier_session() && a.origin != super::Origin::Composed {
         out.push(("f", "feedback"));
     }
+    out.push(("N", "compete"));
+    let group = a.group;
+    if ed
+        .agents
+        .agents
+        .iter()
+        .filter(|x| x.group == group && !matches!(x.origin, super::Origin::Composed))
+        .count()
+        >= 2
+    {
+        out.push(("C", "compose"));
+    }
     out.extend([
-        ("N", "compete"),
         ("v", "view"),
         ("I", "integrate"),
         ("X", "reject"),

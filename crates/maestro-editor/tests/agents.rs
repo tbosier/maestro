@@ -143,6 +143,18 @@ fn main() {
             "a_target_that_changed_during_the_commit_is_not_integrated_into",
             a_target_that_changed_during_the_commit_is_not_integrated_into,
         ),
+        (
+            "marked_hunks_integrate_alone_and_the_rest_stays",
+            marked_hunks_integrate_alone_and_the_rest_stays,
+        ),
+        (
+            "a_marked_hunk_that_needs_an_unmarked_one_is_refused",
+            a_marked_hunk_that_needs_an_unmarked_one_is_refused,
+        ),
+        (
+            "composing_hunks_of_two_agents_tests_and_integrates_the_result",
+            composing_hunks_of_two_agents_tests_and_integrates_the_result,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -2873,4 +2885,432 @@ fn a_target_that_changed_during_the_commit_is_not_integrated_into() {
     assert_eq!(f.git(&f.repo, &["rev-parse", "main"]), main_head);
     assert_eq!(f.git(&f.repo, &["rev-parse", "elsewhere"]), main_head);
     assert!(!f.repo.join("notes.txt").exists());
+}
+
+// ----- marked hunks and composing ----------------------------------------------
+
+/// Thirty lines, `line 1` to `line 30`.
+fn thirty() -> String {
+    (1..=30).map(|i| format!("line {i}\n")).collect()
+}
+
+/// A fixture whose repository also has `calc.txt` with [`thirty`] lines.
+fn calc_fixture() -> Fixture {
+    let f = Fixture::new();
+    std::fs::write(f.repo.join("calc.txt"), thirty()).unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "calc"]);
+    f
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn review_rows(ed: &Editor) -> Vec<Row> {
+    maestro_editor::agents::review::current_rows(ed)
+}
+
+/// Waits for the agent's Git work (an integration) to finish.
+fn wait_idle(ed: &mut Editor, i: usize) {
+    poll_until(ed, "the agent's Git work", |ed| {
+        agent(ed, i).git_busy.is_none()
+    });
+}
+
+fn marked_hunks_integrate_alone_and_the_rest_stays() {
+    use maestro_editor::agents::marks::{self, HunkState};
+    let f = calc_fixture();
+    let c = config(&[(
+        "sh",
+        sh_provider(
+            "sed 's/^line 2$/line two/; s/^line 28$/line twenty-eight/' calc.txt > calc.tmp && mv calc.tmp calc.txt && \
+             printf 'a\\nb\\nc\\n' > notes.txt",
+        ),
+    )]);
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "tidy the calculator", 0);
+    wait_files(&mut ed, 0, &["calc.txt", "notes.txt"]);
+    let wt = worktree(&ed, 0);
+    run(&mut ed, "\n");
+    assert!(ed.agents.panel.review.is_some());
+    // space marks the hunk under the cursor (the first one of calc.txt).
+    assert!(matches!(review_rows(&ed)[0], Row::Hunk { index: 0, .. }));
+    run(&mut ed, " ");
+    assert_eq!(marks::counts(agent(&ed, 0)), (1, 2));
+    // In notes.txt, v then j marks the first two of its three lines.
+    run(&mut ed, "<tab>jvj ");
+    assert_eq!(marks::counts(agent(&ed, 0)), (2, 4));
+    assert!(
+        marks::describe(agent(&ed, 0))
+            .unwrap()
+            .starts_with("2 hunks (4 lines) marked")
+    );
+    // I opens the dialog for only them.
+    open_integrate(&mut ed);
+    let (text, keys) = dialog(&ed);
+    assert!(
+        text.contains("Only the 2 marked hunk(s) of sh-1:"),
+        "{text}"
+    );
+    assert!(text.contains("  calc.txt -1,5 +1,5\n"), "{text}");
+    assert!(
+        text.contains("  notes.txt -0,0 +1,3 (2 of 3 changed lines)"),
+        "{text}"
+    );
+    let agent_branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    assert!(
+        text.contains(&format!(
+            "The rest of the work stays on {agent_branch} and in its worktree"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("to the new branch maestro/sh-1-part-1"),
+        "{text}"
+    );
+    assert_eq!(keys[0], ("y".into(), "integrate by merge".into()));
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the part's integration", |ed| {
+        agent(ed, 0).git_busy.is_none() && !agent(ed, 0).parts.is_empty()
+    });
+    // Main has exactly the marked hunks; the agent keeps all its work.
+    assert_eq!(
+        read(&f.repo.join("calc.txt")),
+        thirty().replace("line 2\n", "line two\n")
+    );
+    assert_eq!(read(&f.repo.join("notes.txt")), "a\nb\n");
+    assert_eq!(
+        read(&wt.join("calc.txt")),
+        thirty()
+            .replace("line 2\n", "line two\n")
+            .replace("line 28\n", "line twenty-eight\n")
+    );
+    assert_eq!(read(&wt.join("notes.txt")), "a\nb\nc\n");
+    assert_ne!(status(&ed, 0), Status::Integrated);
+    assert!(agent(&ed, 0).marks.is_empty());
+    let part = f.git(
+        &f.repo,
+        &["log", "-1", "--format=%B", "maestro/sh-1-part-1"],
+    );
+    assert!(part.contains("- calc.txt -1,5 +1,5"), "{part}");
+    assert!(
+        part.contains("- notes.txt -0,0 +1,3 (2 of 3 changed lines)"),
+        "{part}"
+    );
+    assert!(
+        f.git(&f.repo, &["status", "--porcelain"]).is_empty(),
+        "main is clean"
+    );
+    // The review shows which hunks went in.
+    poll_until(&mut ed, "the refreshed review", |ed| {
+        !agent(ed, 0).review.running
+    });
+    let a = agent(&ed, 0);
+    let calc = &a.review.files[0];
+    assert_eq!(
+        marks::hunk_state(a, calc, 0),
+        HunkState::Integrated {
+            part: 1,
+            whole: true
+        }
+    );
+    assert_eq!(marks::hunk_state(a, calc, 1), HunkState::None);
+    let notes = &a.review.files[1];
+    assert_eq!(
+        marks::hunk_state(a, notes, 0),
+        HunkState::Integrated {
+            part: 1,
+            whole: false
+        }
+    );
+    // An integrated hunk cannot be marked again.
+    run(&mut ed, "{g ");
+    assert!(
+        status_text(&ed).contains("integrated in part 1"),
+        "{:?}",
+        ed.status
+    );
+    // The rest can be integrated later: the second hunk of calc.txt.
+    run(&mut ed, "] ");
+    assert_eq!(marks::counts(agent(&ed, 0)), (1, 2));
+    // A dirty main worktree is refused before anything is committed, as
+    // for a whole agent.
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    std::fs::write(f.repo.join("README.md"), "# dirty\n").unwrap();
+    run(&mut ed, "I");
+    poll_until(&mut ed, "the refusal", |ed| {
+        status_text(ed).contains("not integrated")
+    });
+    assert!(
+        status_text(&ed).contains("the main worktree has uncommitted changes in README.md"),
+        "{:?}",
+        ed.status
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    assert!(
+        !f.git(&f.repo, &["branch", "--list", "maestro/sh-1-part-2"])
+            .contains("part-2")
+    );
+    f.git(&f.repo, &["checkout", "-q", "--", "README.md"]);
+    // The agent changes the marked hunk while the dialog is up: the refresh
+    // unmarks it, and y integrates nothing.
+    open_integrate(&mut ed);
+    let full = read(&wt.join("calc.txt"));
+    std::fs::write(
+        wt.join("calc.txt"),
+        full.replace("line twenty-eight", "line XXVIII"),
+    )
+    .unwrap();
+    let first = id(&ed, 0);
+    maestro_editor::agents::review::request(&mut ed, first);
+    poll_until(&mut ed, "the refresh that drops the mark", |ed| {
+        agent(ed, 0).marks.is_empty()
+    });
+    let msg = confirm_refused(&mut ed, "y");
+    assert!(
+        msg.contains("the marked hunks changed after the dialog was checked"),
+        "{msg}"
+    );
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
+    std::fs::write(wt.join("calc.txt"), &full).unwrap();
+    let first = id(&ed, 0);
+    maestro_editor::agents::review::request(&mut ed, first);
+    poll_until(&mut ed, "the refresh", |ed| {
+        !agent(ed, 0).review.running
+            && agent(ed, 0).review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "line twenty-eight"))
+    });
+    run(&mut ed, "g] ");
+    assert_eq!(marks::counts(agent(&ed, 0)), (1, 2));
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(text.contains("  calc.txt -25,6 +25,6\n"), "{text}");
+    assert!(text.contains("maestro/sh-1-part-2"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the second part", |ed| {
+        agent(ed, 0).git_busy.is_none() && agent(ed, 0).parts.len() == 2
+    });
+    assert_eq!(read(&f.repo.join("calc.txt")), read(&wt.join("calc.txt")));
+    assert_eq!(read(&f.repo.join("notes.txt")), "a\nb\n");
+    // The parts survive a restart.
+    quit(&mut ed);
+    drop(ed);
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    let a = agent(&ed, 0);
+    assert_eq!(a.parts.len(), 2);
+    assert_eq!(a.parts[0].branch, "maestro/sh-1-part-1");
+    poll_until(&mut ed, "the loaded review", |ed| {
+        agent(ed, 0).review.computed.is_some() && !agent(ed, 0).review.running
+    });
+    let a = agent(&ed, 0);
+    assert!(matches!(
+        marks::hunk_state(a, &a.review.files[0], 1),
+        HunkState::Integrated { part: 2, .. }
+    ));
+}
+
+/// A dependency: the marked hunk adds `lib/mod.rs` where the base has the
+/// file `lib`, whose removal is not marked. Nothing is integrated, and the
+/// refusal names the hunk.
+fn a_marked_hunk_that_needs_an_unmarked_one_is_refused() {
+    let f = Fixture::new();
+    std::fs::write(f.repo.join("lib"), "a file\n").unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "lib"]);
+    let head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    let mut ed = f.editor(config(&[(
+        "sh",
+        sh_provider("rm lib && mkdir lib && printf 'pub fn x() {}\\n' > lib/mod.rs"),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "make lib a module", 0);
+    wait_files(&mut ed, 0, &["lib", "lib/mod.rs"]);
+    run(&mut ed, "\n");
+    // The second file is lib/mod.rs.
+    run(&mut ed, "<tab> ");
+    assert_eq!(agent(&ed, 0).marks.len(), 1);
+    run(&mut ed, "I");
+    poll_until(&mut ed, "the refusal", |ed| {
+        status_text(ed).contains("not integrated")
+    });
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("lib/mod.rs -0,0 +1,1 from sh-1: it adds lib/mod.rs, but lib is a file"),
+        "{msg}"
+    );
+    assert!(ed.agents.panel.overlay.is_none());
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), head);
+}
+
+fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
+    use maestro_editor::agents::Origin;
+    use maestro_editor::agents::compose;
+    let f = calc_fixture();
+    // Not `sed -i`: its syntax differs between GNU and BSD (macOS) sed.
+    let sed = |s: &str| {
+        sh_provider(&format!(
+            "sed '{s}' calc.txt > calc.tmp && mv calc.tmp calc.txt"
+        ))
+    };
+    let mut c = config(&[
+        // alpha changes lines 2 and 28; beta changes lines 3 (next to
+        // alpha's line 2) and 15.
+        ("alpha", sed("s/^line 2$/alpha 2/; s/^line 28$/alpha 28/")),
+        ("beta", sed("s/^line 3$/beta 3/; s/^line 15$/beta 15/")),
+    ]);
+    c.agents.test_command = vec!["sh".into(), "-c".into(), "grep -c line calc.txt".into()];
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_contract_task(&mut ed, "improve the calculator\n@allow calc.txt", 0);
+    wait_files(&mut ed, 0, &["calc.txt"]);
+    // N starts beta on the same task, in the same group.
+    run(&mut ed, "N");
+    run(&mut ed, "\n");
+    wait_files(&mut ed, 1, &["calc.txt"]);
+    assert_eq!(agent(&ed, 1).group, agent(&ed, 0).group);
+    verify(&mut ed, 1);
+    // C on alpha opens the compose view for the group.
+    select(&mut ed, 0);
+    run(&mut ed, "C");
+    let v = ed.agents.panel.compose.clone().expect("the compose view");
+    assert_eq!(v.agents, vec![id(&ed, 0), id(&ed, 1)]);
+    assert_eq!(compose::files(&ed, &v), [PathBuf::from("calc.txt")]);
+    // The hunks side by side: alpha's line 2 and beta's line 3 share a
+    // band; then beta's line 15; then alpha's line 28.
+    let items = compose::items(&ed, &v);
+    let shape: Vec<(usize, usize, usize)> = items.iter().map(|i| (i.col, i.hunk, i.band)).collect();
+    assert_eq!(shape, [(0, 0, 0), (1, 0, 0), (1, 1, 1), (0, 1, 2)]);
+    // Marking alpha's and beta's neighboring hunks: the check names both.
+    run(&mut ed, " l \n");
+    poll_until(&mut ed, "the check", |ed| {
+        ed.agents
+            .panel
+            .compose
+            .as_ref()
+            .is_some_and(|c| !c.checking)
+    });
+    let msg = status_text(&ed);
+    assert!(
+        msg.contains("not composed: the marked hunks do not apply together"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(
+            "calc.txt -1,5 +1,5 from alpha-1: it conflicts with calc.txt -1,6 +1,6 from beta-2"
+        ),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(
+            "calc.txt -1,6 +1,6 from beta-2: it conflicts with calc.txt -1,5 +1,5 from alpha-1"
+        ),
+        "{msg}"
+    );
+    assert_eq!(ed.agents.panel.compose.as_ref().unwrap().problems.len(), 2);
+    assert!(ed.agents.panel.overlay.is_none());
+    // Beta's line 15 instead of its line 3: they apply together.
+    // Beta changes its marked hunk: the refresh drops that mark from the
+    // compose view too, so it cannot block the next check.
+    let beta_wt = worktree(&ed, 1);
+    let beta_text = read(&beta_wt.join("calc.txt"));
+    std::fs::write(
+        beta_wt.join("calc.txt"),
+        beta_text.replace("beta 3", "beta three"),
+    )
+    .unwrap();
+    let beta = id(&ed, 1);
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "the refresh that drops beta's mark", |ed| {
+        ed.agents.panel.compose.as_ref().unwrap().marks.len() == 1
+    });
+    assert!(status_text(&ed).contains("unmarked"), "{:?}", ed.status);
+    run(&mut ed, "j \n");
+    poll_until(&mut ed, "the compose dialog", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Compose(_)))
+    });
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains("  calc.txt -1,5 +1,5 from alpha-1 (no tests run)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  calc.txt -12,7 +12,7 from beta-2 (tests ok)"),
+        "{text}"
+    );
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the composed result", |ed| {
+        ed.agents.agents.len() == 3 && agent(ed, 2).git_busy.is_none()
+    });
+    let want = thirty()
+        .replace("line 2\n", "alpha 2\n")
+        .replace("line 15\n", "beta 15\n");
+    let composed = agent(&ed, 2);
+    assert_eq!(composed.origin, Origin::Composed, "{:?}", composed.errors);
+    assert_eq!(composed.name, "compose-3");
+    assert_eq!(composed.task, agent(&ed, 0).task);
+    assert_eq!(composed.contract, agent(&ed, 0).contract);
+    assert_eq!(composed.group, agent(&ed, 0).group);
+    assert_eq!(composed.status(), Status::ReadyForReview);
+    let w = composed.worktree.clone().unwrap();
+    assert_eq!(w.branch, "maestro/compose-3");
+    assert_eq!(w.base, agent(&ed, 0).worktree.as_ref().unwrap().base);
+    assert_eq!(read(&w.path.join("calc.txt")), want);
+    // The agents' worktrees are untouched, and so is main.
+    assert!(read(&worktree(&ed, 0).join("calc.txt")).contains("alpha 28"));
+    assert!(read(&worktree(&ed, 1).join("calc.txt")).contains("beta three"));
+    assert_eq!(read(&f.repo.join("calc.txt")), thirty());
+    let message = f.git(&f.repo, &["log", "-1", "--format=%B", "maestro/compose-3"]);
+    assert!(
+        message.contains("- calc.txt -1,5 +1,5 from alpha-1 (no tests run)"),
+        "{message}"
+    );
+    assert!(
+        message.contains("- calc.txt -12,7 +12,7 from beta-2 (tests ok)"),
+        "{message}"
+    );
+
+    // The composition survives a restart.
+    let sources = composed.composition.clone().unwrap();
+    quit(&mut ed);
+    drop(ed);
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 3);
+    let i = index_of(&ed, "compose-3");
+    let composed = agent(&ed, i);
+    assert_eq!(composed.origin, Origin::Composed);
+    assert_eq!(composed.composition.as_ref(), Some(&sources));
+    assert!(!composed.from_earlier_session());
+    // It is tested and integrated like any agent, through the same path.
+    select(&mut ed, i);
+    assert!(hint_keys(&ed).contains(&("t", "test")));
+    assert!(!hint_keys(&ed).contains(&("f", "feedback")));
+    run(&mut ed, "f");
+    assert!(
+        status_text(&ed).contains("composed result"),
+        "{:?}",
+        ed.status
+    );
+    verify(&mut ed, i);
+    assert_eq!(agent(&ed, i).latest_test().unwrap().passed(), Some(true));
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("Warning:"), "{text}");
+    assert!(!text.contains("OUTSIDE"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, i) == Status::Integrated
+    });
+    wait_idle(&mut ed, i);
+    assert_eq!(read(&f.repo.join("calc.txt")), want);
+    let merged = f.git(&f.repo, &["log", "-1", "--format=%B", "HEAD^2"]);
+    assert!(
+        merged.contains("from alpha-1") && merged.contains("from beta-2"),
+        "{merged}"
+    );
 }
