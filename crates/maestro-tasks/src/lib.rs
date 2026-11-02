@@ -620,7 +620,7 @@ pub fn parse_cargo_test(output: &str) -> Option<TestSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::path::Path;
 
     #[test]
@@ -682,7 +682,7 @@ mod tests {
     }
 
     /// A path for a ready flag no other test uses.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn flag(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "maestro-tasks-{name}-{}-{:?}",
@@ -695,7 +695,7 @@ mod tests {
 
     /// Runs `script` (with `$1` set to `arg`) and collects its lines and
     /// exit code.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn run_script(script: &str, arg: &str) -> (TaskHandle, Vec<String>, Option<i32>) {
         let (tx, rx) = mpsc::channel();
         let spec = TaskSpec {
@@ -723,7 +723,9 @@ mod tests {
         // The background loop cleans up on SIGHUP: the grace period lets
         // its handler run before SIGKILL. The shell exits only once the
         // handler is in place.
-        let script = "(trap 'echo cleaned; exit 0' HUP; : > \"$1\"; while :; do sleep 0.05; done) & \
+        // The loop's stderr is dropped: dash reports the `sleep` the
+        // hangup killed ("Hangup"), bash does not.
+        let script = "(trap 'echo cleaned; exit 0' HUP; : > \"$1\"; while :; do sleep 0.05; done) 2>/dev/null & \
                       while [ ! -e \"$1\" ]; do sleep 0.01; done; echo started";
         let (tx, rx) = mpsc::channel();
         let spec = TaskSpec {
@@ -777,12 +779,12 @@ mod tests {
         }
         assert!(!sigchld_ignored());
         // The same test binary, run with SIGCHLD ignored (which survives
-        // exec), running only the part below.
+        // exec), running only the part below. `env --ignore-signal` rather
+        // than a shell's `trap '' CHLD`, which dash does not pass on.
         let exe = std::env::current_exe().unwrap();
-        let out = Command::new("sh")
+        let out = Command::new("env")
             .args([
-                "-c",
-                "trap '' CHLD; exec \"$0\" \"$@\"",
+                "--ignore-signal=CHLD",
                 &exe.display().to_string(),
                 "--exact",
                 "tests::with_sigchld_ignored_no_group_is_signaled",

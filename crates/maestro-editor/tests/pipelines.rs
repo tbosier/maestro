@@ -1,5 +1,6 @@
-//! Structural pipelines (`:select-nodes`, filters, `:expand-to`,
-//! `:insert-above`), driven through keys.
+//! Structural pipelines (`:select-nodes`, filters, `:expand-to`, and the
+//! text steps `:insert-above`, `:insert-below`, `:replace-text`, `:delete`,
+//! `:wrap`, `:prepend`, `:append`), driven through keys.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -336,80 +337,84 @@ fn invalid_queries_report_the_position_and_change_nothing() {
     let mut ed = open(&dir.join("service.rs"), FIXTURE);
     let before = ed.view().selection.clone();
 
+    // Errors name the step and the column on the line (one-based chars).
     command(&mut ed, "select-nodes (function_item (nope))");
     assert_eq!(
         status(&ed),
         (
             Severity::Error,
-            "select-nodes: invalid query at column 17: unknown node kind \"nope\"".into()
+            "select-nodes, column 30: invalid query: unknown node kind \"nope\"".into()
         )
     );
     command(&mut ed, "select-nodes (function_item");
     let (sev, msg) = status(&ed);
     assert_eq!(sev, Severity::Error);
-    assert!(
-        msg.starts_with("select-nodes: invalid query at column"),
-        "{msg}"
-    );
-    assert!(msg.contains("syntax error"), "{msg}");
+    assert!(msg.starts_with("select-nodes, column "), "{msg}");
+    assert!(msg.contains("invalid query: syntax error"), "{msg}");
 
     // A bad third step stops the pipeline before the first one runs.
-    command(
-        &mut ed,
-        "select-nodes fn | keep-nodes returns-result | remove-nodes (attribute_item (bogus)) | insert-above x",
-    );
+    let line = "select-nodes fn | keep-nodes returns-result | remove-nodes (attribute_item (bogus)) | insert-above x";
+    command(&mut ed, line);
     assert_eq!(
         status(&ed),
         (
             Severity::Error,
-            "step 3 (remove-nodes): invalid query at column 18: unknown node kind \"bogus\"".into()
+            format!(
+                "step 3 (remove-nodes), column {}: invalid query: unknown node kind \"bogus\"",
+                line.find("bogus").unwrap() + 1
+            )
         )
     );
     command(&mut ed, "select-nodes nonsense");
     let (_, msg) = status(&ed);
     assert!(
         msg.starts_with(
-            "select-nodes: no rust shortcut named \"nonsense\" (shortcuts: fn, pub-fn,"
+            "select-nodes, column 14: no rust shortcut named \"nonsense\" (shortcuts: fn, pub-fn,"
         ),
         "{msg}"
     );
-    command(&mut ed, "expand-to fn");
+    command(&mut ed, "expand-to function_item fn");
     let (_, msg) = status(&ed);
-    assert!(msg.contains("rust has no node kind \"fn\""), "{msg}");
+    assert!(
+        msg.starts_with("expand-to, column 25: rust has no node kind \"fn\""),
+        "{msg}"
+    );
     command(&mut ed, "keep-matching (unclosed");
     let (_, msg) = status(&ed);
-    assert!(msg.starts_with("keep-matching: invalid regex"), "{msg}");
+    assert!(
+        msg.starts_with("keep-matching, column 15: invalid regex"),
+        "{msg}"
+    );
     command(
         &mut ed,
         "select-nodes fn | insert-above x | keep-matching y",
     );
     assert_eq!(
         status(&ed).1,
-        "step 2 (insert-above): insert-above changes the text, so it must be the last step"
+        "step 2 (insert-above), column 19: insert-above changes the text, so it must be the last step"
     );
-    command(
-        &mut ed,
-        r#"select-nodes (function_item name: (identifier) @n (#equal? @n "fetch")) @select | insert-above #[inline]"#,
-    );
+    let line = r#"select-nodes (function_item name: (identifier) @n (#equal? @n "fetch")) @select | insert-above #[inline]"#;
+    command(&mut ed, line);
     assert!(
-        status(&ed).1.starts_with(
-            "step 1 (select-nodes): invalid query at column 39: unsupported predicate #equal?"
-        ),
+        status(&ed).1.starts_with(&format!(
+            "step 1 (select-nodes), column {}: invalid query: unsupported predicate #equal?",
+            line.find("#equal?").unwrap() + 1
+        )),
         "{:?}",
         status(&ed)
     );
     ed.execute_line("select-nodes fn | insert-above // one\n// two");
     assert_eq!(
         status(&ed).1,
-        "step 2 (insert-above): takes one line of text, without line breaks"
+        "step 2 (insert-above), column 32: takes one line of text, without line breaks"
     );
     command(&mut ed, "select-nodes fn | | keep-matching y");
-    assert_eq!(status(&ed).1, "step 2 is empty");
+    assert_eq!(status(&ed).1, "step 2, column 19: the step is empty");
     command(&mut ed, "select-nodes fn | write");
     assert!(
         status(&ed)
             .1
-            .starts_with("step 2 (write): write cannot be a pipeline step"),
+            .starts_with("step 2 (write), column 19: write cannot be a pipeline step"),
         "{:?}",
         status(&ed)
     );
@@ -708,7 +713,10 @@ fn buffers_without_a_tree_say_why() {
         "select-nodes: no syntax tree: file type not recognized"
     );
     ed.run_command("insert-above");
-    assert_eq!(status(&ed).1, "insert-above: needs the text to insert");
+    assert_eq!(
+        status(&ed).1,
+        "insert-above, column 13: needs the text to insert"
+    );
 }
 
 #[test]
@@ -799,6 +807,291 @@ fn regex_filters_count_empty_matches() {
         status(&ed).1,
         "step 2 (remove-matching) left no selections (after select-nodes 1); nothing changed"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn replace_text_uses_capture_groups_inside_the_selections_only() {
+    let dir = temp_dir("replace");
+    let src = "fn load_old(a: u32) -> u32 {\n    helper_old(a) + helper_old(1)\n}\n\nfn other() {}\n// helper_old stays\n";
+    let mut ed = open(&dir.join("x.rs"), src);
+    command(
+        &mut ed,
+        r#"select-nodes fn | replace-text "(\w+)_old" "${1}_new""#,
+    );
+    assert_eq!(
+        status(&ed),
+        (
+            Severity::Info,
+            "select-nodes 2 | replace-text 2: replaced 3 matches in 1 selection (u undoes)".into()
+        )
+    );
+    assert_eq!(
+        text(&ed),
+        "fn load_new(a: u32) -> u32 {\n    helper_new(a) + helper_new(1)\n}\n\nfn other() {}\n// helper_old stays\n"
+    );
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+    // Named groups; bare arguments are taken literally.
+    command(
+        &mut ed,
+        r#"select-nodes fn | replace-text (?P<base>\w+)_old $base"#,
+    );
+    assert!(text(&ed).starts_with("fn load(a: u32)"), "{}", text(&ed));
+    run(&mut ed, "u");
+    // Smart case: an uppercase letter makes the regex case-sensitive, so
+    // this matches nothing and nothing changes.
+    command(&mut ed, "select-nodes fn | replace-text OLD new");
+    assert_eq!(
+        status(&ed),
+        (
+            Severity::Error,
+            "step 2 (replace-text) changed nothing (replaced 0 matches in 0 selections); nothing changed".into()
+        )
+    );
+    assert_eq!(text(&ed), src);
+    // An empty match inserts: a prefix on every line of the selection.
+    command(
+        &mut ed,
+        r#"select-nodes fn | keep-matching load | replace-text ^ "// ""#,
+    );
+    assert_eq!(
+        text(&ed),
+        "// fn load_old(a: u32) -> u32 {\n//     helper_old(a) + helper_old(1)\n// }\n\nfn other() {}\n// helper_old stays\n"
+    );
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_selection_replaced_whole_still_covers_the_new_text() {
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 0, 80, 24));
+    run(&mut ed, "ifoo tail<esc>");
+    ed.set_selection(maestro_core::Selection::single(0, 2));
+    assert_eq!(selections(&ed), ["foo"]);
+    command(&mut ed, "replace-text foo longer");
+    assert_eq!(text(&ed), "longer tail");
+    assert_eq!(selections(&ed), ["longer"]);
+    // So the next step acts on all of it.
+    command(&mut ed, "append _suffix");
+    assert_eq!(text(&ed), "longer_suffix tail");
+    // A replacement inside the selection keeps both ends where they were.
+    ed.set_selection(maestro_core::Selection::single(0, 12));
+    command(&mut ed, "replace-text suf SUF");
+    assert_eq!(selections(&ed), ["longer_SUFfix"]);
+}
+
+#[test]
+fn delete_wrap_prepend_and_append_change_each_selection_as_one_undo_step() {
+    let dir = temp_dir("edits");
+    let src = "fn a() {\n    let s = \"x\";\n    let t = \"y\";\n}\nfn b() {}\n";
+    let mut ed = open(&dir.join("x.rs"), src);
+
+    command(&mut ed, "select-nodes string | delete");
+    assert_eq!(
+        status(&ed).1,
+        "select-nodes 2 | delete 2: deleted 2 selections (u undoes)"
+    );
+    assert_eq!(
+        text(&ed),
+        "fn a() {\n    let s = ;\n    let t = ;\n}\nfn b() {}\n"
+    );
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+
+    command(&mut ed, r#"select-nodes string | wrap "String::from(" )"#);
+    assert_eq!(
+        status(&ed).1,
+        "select-nodes 2 | wrap 2: wrapped 2 selections (u undoes)"
+    );
+    assert_eq!(
+        text(&ed),
+        "fn a() {\n    let s = String::from(\"x\");\n    let t = String::from(\"y\");\n}\nfn b() {}\n"
+    );
+    // The selections still cover the strings, not the added text.
+    assert_eq!(selections(&ed), ["\"x\"", "\"y\""]);
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+
+    command(&mut ed, r#"select-nodes fn | prepend "pub ""#);
+    assert_eq!(
+        status(&ed).1,
+        "select-nodes 2 | prepend 2: prepended to 2 selections (u undoes)"
+    );
+    assert!(text(&ed).starts_with("pub fn a() {"));
+    assert!(text(&ed).ends_with("pub fn b() {}\n"));
+    assert!(selections(&ed).iter().all(|s| s.starts_with("fn ")));
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+
+    command(
+        &mut ed,
+        r#"select-nodes fn | keep-matching b | append " // b""#,
+    );
+    assert_eq!(
+        status(&ed).1,
+        "select-nodes 2 | keep-matching 1 | append 1: appended to 1 selection (u undoes)"
+    );
+    assert!(text(&ed).ends_with("fn b() {} // b\n"));
+    assert_eq!(selections(&ed), ["fn b() {}"]);
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn insert_below_follows_the_last_line_with_the_first_lines_indentation() {
+    let dir = temp_dir("below");
+    let src = "mod m {\n    fn a() {\n        x();\n    }\n    fn b() {} fn c() {}\n}\n";
+    let mut ed = open(&dir.join("x.rs"), src);
+    command(
+        &mut ed,
+        "select-nodes fn | keep-matching fn a | insert-below // after a",
+    );
+    assert_eq!(
+        status(&ed).1,
+        "select-nodes 3 | keep-matching 1 | insert-below 1: inserted 1 line (u undoes)"
+    );
+    assert_eq!(
+        text(&ed),
+        "mod m {\n    fn a() {\n        x();\n    }\n    // after a\n    fn b() {} fn c() {}\n}\n"
+    );
+    run(&mut ed, "u");
+    // A selection that ends before other text on its line is refused.
+    command(
+        &mut ed,
+        "select-nodes fn | keep-matching fn b | insert-below // x",
+    );
+    assert_eq!(
+        status(&ed),
+        (
+            Severity::Error,
+            "insert-below: the selection on line 5 ends before other text on that line, so a line below it would not belong to it; nothing changed".into()
+        )
+    );
+    assert_eq!(text(&ed), src);
+    // As a whole line (`x`), b and c share one new line.
+    command(&mut ed, "select-nodes fn | keep-matching fn [bc]");
+    run(&mut ed, "x");
+    command(&mut ed, "insert-below // two");
+    assert_eq!(
+        text(&ed),
+        "mod m {\n    fn a() {\n        x();\n    }\n    fn b() {} fn c() {}\n    // two\n}\n"
+    );
+
+    // CRLF, and a last line without a line break.
+    let mut ed = open(&dir.join("crlf.rs"), "fn a() {}\r\nfn b() {}");
+    command(&mut ed, "select-nodes fn | insert-below // x");
+    assert_eq!(text(&ed), "fn a() {}\r\n// x\r\nfn b() {}\r\n// x");
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), "fn a() {}\r\nfn b() {}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn text_step_arguments_quote_and_escape_simply() {
+    const UNCLOSED: &str = "this quote is never closed, so the rest of the line would be text; close it, or write a quote character inside a quoted text as \\\"";
+    let dir = temp_dir("quoting");
+    let src = "fn a() {}\n";
+    let mut ed = open(&dir.join("x.rs"), src);
+    // A bar inside quotes is text, not a new step.
+    command(&mut ed, r#"select-nodes fn | append " | x""#);
+    assert_eq!(text(&ed), "fn a() {} | x\n");
+    run(&mut ed, "u");
+    // \n and \t in quotes; a bare text keeps its backslashes.
+    command(&mut ed, r#"select-nodes fn | prepend "// one\n""#);
+    assert_eq!(text(&ed), "// one\nfn a() {}\n");
+    run(&mut ed, "u");
+    command(&mut ed, r"select-nodes fn | append \t");
+    assert_eq!(text(&ed), "fn a() {}\\t\n");
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+    // Paired quotes inside a bare text keep a bar from splitting and stay
+    // as written; a lone quote character is written quoted.
+    command(&mut ed, r#"select-nodes fn | insert-above #[doc = "a|b"]"#);
+    assert_eq!(text(&ed), "#[doc = \"a|b\"]\nfn a() {}\n");
+    run(&mut ed, "u");
+    command(&mut ed, r#"select-nodes fn | append "\"""#);
+    assert_eq!(text(&ed), "fn a() {}\"\n");
+    run(&mut ed, "u");
+    assert_eq!(text(&ed), src);
+
+    let refused = [
+        (
+            r#"select-nodes fn | append "open"#,
+            format!("step 2 (append), column 26: {UNCLOSED}"),
+        ),
+        (
+            // A quote inside a bare text must not swallow the next step.
+            r#"select-nodes fn | append foo" | delete"#,
+            format!("step 2 (append), column 29: {UNCLOSED}"),
+        ),
+        (
+            "select-nodes fn | prepend x | append y",
+            "step 2 (prepend), column 19: prepend changes the text, so it must be the last step".to_string(),
+        ),
+        (
+            "select-nodes fn | delete now",
+            "step 2 (delete), column 26: takes no argument".to_string(),
+        ),
+        (
+            "select-nodes fn | wrap a b c",
+            "step 2 (wrap), column 28: takes two arguments (<before> <after>); quote an argument that has spaces".to_string(),
+        ),
+        (
+            "select-nodes fn | wrap a",
+            "step 2 (wrap), column 25: needs two arguments: <before> <after>".to_string(),
+        ),
+        (
+            r#"select-nodes fn | wrap "" """#,
+            "step 2 (wrap), column 24: needs a text before or after".to_string(),
+        ),
+        (
+            // As printed in docs/editor-model.md.
+            "wrap x",
+            "wrap, column 7: needs two arguments: <before> <after>".to_string(),
+        ),
+        (
+            r#"select-nodes fn | insert-below "a\nb""#,
+            "step 2 (insert-below), column 32: takes one line of text, without line breaks".to_string(),
+        ),
+        (
+            r#"select-nodes fn | prepend """#,
+            "step 2 (prepend), column 27: needs the text to insert".to_string(),
+        ),
+        (
+            r#"select-nodes fn | append "a" b"#,
+            "step 2 (append), column 30: takes one text; put the whole text inside the quotes".to_string(),
+        ),
+    ];
+    for (line, want) in refused {
+        command(&mut ed, line);
+        assert_eq!(status(&ed), (Severity::Error, want), "{line}");
+        assert_eq!(text(&ed), src, "{line}");
+    }
+    let line = r#"select-nodes fn | replace-text "(a)" "$2""#;
+    command(&mut ed, line);
+    let (sev, msg) = status(&ed);
+    assert_eq!(sev, Severity::Error);
+    assert!(
+        msg.starts_with(&format!(
+            "step 2 (replace-text), column {}: the replacement refers to group $2",
+            line.find("\"$2").unwrap() + 1
+        )),
+        "{msg}"
+    );
+    let line = r#"select-nodes fn | replace-text "(" x"#;
+    command(&mut ed, line);
+    assert!(
+        status(&ed)
+            .1
+            .starts_with("step 2 (replace-text), column 32: invalid regex"),
+        "{:?}",
+        status(&ed)
+    );
+    assert_eq!(text(&ed), src);
+    assert!(!ed.doc().is_modified());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

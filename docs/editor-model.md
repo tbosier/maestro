@@ -57,7 +57,7 @@ There is no separate Helix profile yet. The Maestro profile already follows Heli
 
 ## Structural pipelines
 
-These `:` commands select syntax nodes with tree-sitter queries, filter and grow those selections, and add a line above each one. They work on the multiple selections like any other command, so after a pipeline `c`, `i`, `a` or `d` act on every selection it left. The ones that read the tree need a recognized file type and a finished parse; otherwise the status line says why ("no syntax tree: file type not recognized", "rust syntax tree is still being built").
+These `:` commands select syntax nodes with tree-sitter queries, filter and grow those selections, and change the text at each one. They work on the multiple selections like any other command, so after a pipeline `c`, `i`, `a` or `d` act on every selection it left. The ones that read the tree need a recognized file type and a finished parse; otherwise the status line says why ("no syntax tree: file type not recognized", "rust syntax tree is still being built").
 
 | Command | Does |
 |---|---|
@@ -68,12 +68,19 @@ These `:` commands select syntax nodes with tree-sitter queries, filter and grow
 | `:keep-matching <regex>`, `:remove-matching <regex>` | Keep, or remove, the selections whose text matches a regex, with smart case like `K` and `A-K`. An empty match counts (`^` matches every selection). |
 | `:expand-to <kind>...` | Grows each selection to the smallest node of one of the given kinds that contains it (a selection that already is such a node stays). Selections inside no such node are dropped. Kinds are grammar names such as `function_item`. |
 | `:insert-above <text>` | Inserts `<text>` (one line, no line breaks) on a new line above the line where each selection starts, with that line's indentation and the document's line ending. Lines end at `\n` here, as they do for compilers, not at the other characters the editor also breaks lines at (a lone CR, form feed, U+2028), so the new line cannot end a `//` comment early. One transaction, one undo step, also when run in the middle of an insert session. Several selections on one line get one new line. If a selection starts after other text on its line (`impl X { pub fn a() {} }`), the line above would belong to other code, so nothing is inserted and the status line names the line. |
+| `:insert-below <text>` | The same, on a new line below the line where each selection ends, indented like the line where it starts (so a function's closing `}` line gets a line under it at the function's indentation). A selection that ends before other text on its line is refused the same way. At the end of a file without a final line break, the new line gets its line break in front. |
+| `:replace-text <regex> <replacement>` | Replaces every match of the regex inside each selection, never outside it. Smart case as for `keep-matching`, and `^` and `$` match at the selection's start and end and at line starts and ends inside it. `$1`, `${1}` and `${name}` put in a capture group (write `${1}x` when a letter or digit follows, since `$1x` names a group `1x`), and `$$` is a literal `$`. A replacement that names a group the regex does not have is refused. An empty match inserts: `replace-text ^ "// "` comments out every line of each selection. |
+| `:delete` | Deletes the selected text exactly, and nothing around it (the line break and indentation stay). |
+| `:wrap <before> <after>` | Puts `<before>` in front of each selection and `<after>` after it: `wrap "Some(" )`. Either may be `""`, not both. |
+| `:prepend <text>`, `:append <text>` | Inserts `<text>` at the start, or the end, of each selection. The text may have line breaks (`"\n"` in quotes). |
+
+The last seven change text. `insert-above` and `insert-below` work line by line on every selection the steps left, nested ones too; the other five work on the selections after nested ones merged, which never overlap. A text step that would leave the text as it was (`replace-text` with no match) is an error and changes nothing. After the edit the selections still cover the same text: what `wrap` and `prepend` put in front of a selection lands outside it.
 
 `keep-nodes` looks at the selection's own node and `keep-containing` at anything inside it. On a function, `keep-nodes returns-result` asks about that function's return type, while `keep-containing returns-result` is also true when a function nested in its body returns `Result`.
 
 ### Queries and shortcuts
 
-A query argument is either a shortcut name or raw tree-sitter query syntax, which starts with `(`, `[`, `"` or `_`. A raw query selects the nodes of its capture named `@select`; without one, of its only capture; and a single pattern with no capture selects the node the whole pattern matches. The predicates `#eq?`, `#match?`, `#any-of?` and their `#not-` and `#any-` forms work. Any other predicate (a misspelled `#equal?`, or `#is?`) is refused, because tree-sitter would ignore it and the query would match more than it says. An invalid query changes nothing and reports where it went wrong: `select-nodes: invalid query at column 17: unknown node kind "nope"`.
+A query argument is either a shortcut name or raw tree-sitter query syntax, which starts with `(`, `[`, `"` or `_`. A raw query selects the nodes of its capture named `@select`; without one, of its only capture; and a single pattern with no capture selects the node the whole pattern matches. The predicates `#eq?`, `#match?`, `#any-of?` and their `#not-` and `#any-` forms work. Any other predicate (a misspelled `#equal?`, or `#is?`) is refused, because tree-sitter would ignore it and the query would match more than it says. An invalid query changes nothing and reports where it went wrong, as a column on the command line: `:select-nodes (function_item (nope))` says `select-nodes, column 30: invalid query: unknown node kind "nope"`.
 
 | Language | Shortcuts |
 |---|---|
@@ -105,16 +112,27 @@ The status line shows the selection count after each step: `select-nodes 9 | kee
 
 Rules:
 
-- A `|` splits steps unless it is inside parentheses, inside a `[...]` bracket (a regex character class such as `[)|]`, or a query alternation), inside a double-quoted string within parentheses (a predicate's argument), or after a backslash. A regex alternation therefore goes in parentheses: `keep-matching (foo|bar)`.
-- The whole line is checked before anything runs: step names, queries, regexes and node kinds. Only the commands in the table above can be steps, and `insert-above` only as the last one.
+- In a selection step, a `|` splits steps unless it is inside parentheses, inside a `[...]` bracket (a regex character class such as `[)|]`, or a query alternation), inside a double-quoted string within parentheses (a predicate's argument), or after a backslash. A regex alternation therefore goes in parentheses: `keep-matching (foo|bar)`.
+- In a text step, only double quotes and a backslash keep a `|` from splitting. Parentheses and brackets are plain characters there, so an unbalanced `(` in a text cannot swallow the rest of the line. Write a text with a `|` in quotes: `append " | x"`.
+- The whole line is checked before anything runs: step names, queries, regexes, node kinds, quotes and capture groups. Only the commands in the table above can be steps, and at most one changes text, as the last step.
+- An error names the step and the column on the line where it is (one-based, in characters): `step 3 (remove-nodes), column 77: invalid query: unknown node kind "bogus"`. A pipeline of one step says just its name: `:wrap x` says `wrap, column 7: needs two arguments: <before> <after>`.
 - If a step fails or leaves no selections, nothing changes (selections and text stay as they were) and the status line names the step: `step 3 (remove-nodes) left no selections (after select-nodes 9 | keep-nodes 8); nothing changed`.
 - A pipeline is one `:` command, so its edit is one undo step.
 
-Through the automation API, `editor.execute` runs a pipeline line and returns the status message; a failing step returns error `-32016` with the same message. `command.run` with a step's name runs it without an argument, which only reports what argument it needs.
+#### Text arguments
+
+The text steps take their arguments in one of two forms.
+
+- Bare: `insert-above`, `insert-below`, `prepend` and `append` take the rest of the step, trimmed, exactly as written, backslashes included. `insert-above #[derive(Debug)]` inserts `#[derive(Debug)]`. `wrap` and `replace-text` take two bare words, split at spaces.
+- Quoted: an argument that starts with `"` runs to the next `"` that is not escaped. Inside, `\"` is a quote, `\\` a backslash, `\n` a line break and `\t` a tab. Any other backslash stays as written, so a regex keeps its escapes: `replace-text "(\w+)_old" "${1}_new"`. Quotes must pair up in a text step, also inside a bare text (`insert-above #[doc = "a|b"]` is fine); an unpaired one is an error, since it would turn the rest of the line into text. A lone quote character goes in quotes: `append "\""`. Use quotes for leading or trailing spaces (`prepend "pub "`), for spaces inside a `wrap` or `replace-text` argument, for a `|`, and for an empty argument (`""`).
+
+`insert-above` and `insert-below` refuse a text with a line break. A quote that is never closed, a quoted argument followed by more text, and a wrong number of arguments are errors with their column.
+
+Through the automation API, `editor.execute` runs a pipeline line and returns the status message; a failing step returns error `-32016` with the same message. `command.run` with a step's name runs it without an argument, which only reports what argument it needs, except `delete`, which takes none: it deletes the current selections, the character under a collapsed cursor included, as `d` does. An agent can also send a pipeline as an intent edit (`proposal.create` with `pipeline`, or `document.apply_pipeline`), which runs on the whole document and is run again when the document moved on; see [Intent edits](automation.md#intent-edits).
 
 Cost: each query step runs its query over the whole tree. On a generated 10,003-line, 165 KB Rust file with 527 matching functions, the spec's pipeline took a median of 44 ms for the three selection steps and 50 ms with the insertion (21 runs each, release build, timed from Enter to return in `measure_spec_pipeline_on_10k_lines` in `crates/maestro-editor/tests/pipelines.rs`). About 2 to 4 ms of each query step is compiling the query, which is not cached.
 
-Not built: a filter on the text of an enclosing node (use `expand-to` and then `keep-matching`, which changes the selections), other text-changing steps (edit the selections afterward with the usual commands), and key bindings for these commands.
+Not built: a filter on the text of an enclosing node (use `expand-to` and then `keep-matching`, which changes the selections), more than one text step in a pipeline, and key bindings for these commands.
 
 ## Invariants the tests hold
 

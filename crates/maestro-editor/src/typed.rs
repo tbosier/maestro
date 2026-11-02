@@ -61,6 +61,12 @@ static TYPED: &[TypedCommand] = &[
         fun: agents,
     },
     TypedCommand {
+        name: "git",
+        aliases: &[],
+        doc: "Open the Git status screen (also space g)",
+        fun: git_screen,
+    },
+    TypedCommand {
         name: "proposals",
         aliases: &[],
         doc: "Show or hide the review of edit proposals from automation clients",
@@ -209,6 +215,42 @@ static TYPED: &[TypedCommand] = &[
         aliases: &[],
         doc: "Insert a line above each selection with its indentation, as one undo step",
         fun: crate::structural::insert_above_cmd,
+    },
+    TypedCommand {
+        name: "insert-below",
+        aliases: &[],
+        doc: "Insert a line below each selection with its indentation, as one undo step",
+        fun: crate::structural::insert_below_cmd,
+    },
+    TypedCommand {
+        name: "replace-text",
+        aliases: &[],
+        doc: "Replace regex matches inside each selection ($1 for groups), as one undo step",
+        fun: crate::structural::replace_text_cmd,
+    },
+    TypedCommand {
+        name: "delete",
+        aliases: &[],
+        doc: "Delete the selected text, as one undo step (a pipeline step)",
+        fun: crate::structural::delete_cmd,
+    },
+    TypedCommand {
+        name: "wrap",
+        aliases: &[],
+        doc: "Put text before and after each selection, as one undo step",
+        fun: crate::structural::wrap_cmd,
+    },
+    TypedCommand {
+        name: "prepend",
+        aliases: &[],
+        doc: "Insert text at the start of each selection, as one undo step",
+        fun: crate::structural::prepend_cmd,
+    },
+    TypedCommand {
+        name: "append",
+        aliases: &[],
+        doc: "Insert text at the end of each selection, as one undo step",
+        fun: crate::structural::append_cmd,
     },
     TypedCommand {
         name: "goto",
@@ -581,6 +623,11 @@ fn finish_quit(ed: &mut Editor) {
 
 fn agents(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     ed.run_command("agent_panel");
+    Ok(())
+}
+
+fn git_screen(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    ed.run_command("git_screen");
     Ok(())
 }
 

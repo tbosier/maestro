@@ -1,5 +1,7 @@
 //! Git in the editor: gutter signs, the branch for the status line, and the
-//! `git_status` and `worktrees` pickers.
+//! `git_status` and `worktrees` pickers. The status screen is in
+//! [`crate::git_screen`]; hunk keys, blame and the hunk popup in
+//! [`crate::git_hunks`].
 //!
 //! All Git work runs on background threads through [`Editor::spawn_background`].
 //! Each buffer has at most one worker thread at a time. Edits are debounced:
@@ -14,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use maestro_core::{DocumentVersion, ReadOnlyReason, Rope};
-pub use maestro_git::{Base, Sign, SignMap};
-use maestro_git::{Git, Head, Repository};
+pub use maestro_git::Git;
+pub use maestro_git::{Base, LineHunk, Sign, SignMap};
+use maestro_git::{Head, Repository, diff_lines};
 
 use crate::editor::{DocumentId, Editor};
 use crate::picker::{Picker, PickerAction, PickerItem};
@@ -43,6 +46,14 @@ pub struct GitState {
     /// Bumped each time a Git picker opens, so a slow result for a picker
     /// the user already closed is dropped.
     picker_seq: u64,
+    /// The status screen (`space g`), when open.
+    pub screen: Option<crate::git_screen::Screen>,
+    /// A hunk diff or blame popup in a buffer; closes on the next key.
+    pub popup: Option<crate::git_hunks::Popup>,
+    /// Blame columns, by buffer.
+    pub blame: HashMap<DocumentId, crate::git_hunks::BlameColumn>,
+    /// A commit message being written (`c c` / `c a` on the status screen).
+    pub commit_message: Option<crate::git_screen::CommitMessage>,
 }
 
 #[derive(Default)]
@@ -51,6 +62,11 @@ struct DocGit {
     /// Number of the latest request; only its result is applied.
     seq: u64,
     signs: SignMap,
+    /// The changes the signs show, and the buffer version and base text
+    /// they were computed from.
+    hunks: Vec<LineHunk>,
+    hunks_version: Option<DocumentVersion>,
+    base_text: Option<Arc<str>>,
     /// Root of the repository holding the file, once known.
     root: Option<PathBuf>,
     slot: Arc<Mutex<Slot>>,
@@ -100,7 +116,7 @@ struct BaseCache {
     base: Base,
     epoch: u64,
     repo: Option<Repository>,
-    text: Option<String>,
+    text: Option<Arc<str>>,
     untracked: bool,
     head: Option<Head>,
     /// The repository's watched files and their times, read before the
@@ -119,6 +135,8 @@ struct Outcome {
     watch: Vec<PathBuf>,
     stamp: Vec<Option<SystemTime>>,
     signs: SignMap,
+    hunks: Vec<LineHunk>,
+    base_text: Option<Arc<str>>,
 }
 
 impl Default for GitState {
@@ -135,7 +153,23 @@ impl GitState {
             docs: HashMap::new(),
             repos: HashMap::new(),
             picker_seq: 0,
+            screen: None,
+            popup: None,
+            blame: HashMap::new(),
+            commit_message: None,
         }
+    }
+
+    /// True while the status screen is open; it takes every key.
+    pub fn screen_open(&self) -> bool {
+        self.screen.is_some()
+    }
+
+    /// The changes a buffer's signs show, with the buffer version and base
+    /// text they were computed from. `None` until signs arrive.
+    pub fn hunks(&self, doc: DocumentId) -> Option<(&[LineHunk], DocumentVersion, Arc<str>)> {
+        let d = self.docs.get(&doc)?;
+        Some((&d.hunks, d.hunks_version?, d.base_text.clone()?))
     }
 
     pub fn git(&self) -> &Git {
@@ -164,9 +198,27 @@ impl GitState {
         self.repos.get(root)?.head.as_ref().map(Head::label)
     }
 
+    /// How many times the repository holding a buffer has changed (index,
+    /// `HEAD`), as far as the editor has noticed; 0 when unknown.
+    pub(crate) fn epoch_of(&self, doc: DocumentId) -> u64 {
+        self.root_of(doc)
+            .and_then(|r| self.repos.get(r))
+            .map_or(0, |i| i.epoch)
+    }
+
     /// The repository root holding a buffer, once known.
     pub fn root_of(&self, doc: DocumentId) -> Option<&Path> {
         self.docs.get(&doc)?.root.as_deref()
+    }
+}
+
+/// Marks a repository as changed (the editor staged, committed or
+/// switched branches in it), so its buffers re-read their base and branch
+/// on the next refresh instead of waiting for the next tick.
+pub fn repository_changed(ed: &mut Editor, root: &Path) {
+    if let Some(info) = ed.git.repos.get_mut(root) {
+        info.epoch += 1;
+        info.stamp = stamp(&info.watch);
     }
 }
 
@@ -174,8 +226,11 @@ impl GitState {
 /// or repository changed since the last request. Cheap when nothing
 /// changed; called from [`Editor::poll_background`].
 pub fn refresh(ed: &mut Editor) {
+    crate::git_screen::check_commit_message(ed);
+    crate::git_hunks::refresh_blame(ed);
     let live: Vec<DocumentId> = ed.buffers.keys().copied().collect();
     ed.git.docs.retain(|id, _| live.contains(id));
+    ed.git.blame.retain(|id, _| live.contains(id));
     let now = Instant::now();
     let base = ed.git.base;
     for id in live {
@@ -193,6 +248,8 @@ pub fn refresh(ed: &mut Editor) {
             // at lines that have since moved; show none instead.
             if let Some(entry) = ed.git.docs.get_mut(&id) {
                 entry.signs = Default::default();
+                entry.hunks.clear();
+                entry.hunks_version = None;
             }
             continue;
         }
@@ -316,8 +373,12 @@ fn worker(git: Git, slot: Arc<Mutex<Slot>>, tx: crate::editor::JobSender) {
             _ => load_base(&git, snap.base, &snap.path, snap.epoch),
         };
         let text = snap.text.to_string();
+        let hunks = match &cache.text {
+            Some(b) => diff_lines(b, &text),
+            None => Vec::new(),
+        };
         let signs = match (&cache.text, cache.untracked) {
-            (Some(b), _) => SignMap::diff(b, &text),
+            (Some(_), _) => SignMap::from_hunks(&hunks),
             (None, true) => SignMap::all_added(&text),
             (None, false) => SignMap::default(),
         };
@@ -331,6 +392,8 @@ fn worker(git: Git, slot: Arc<Mutex<Slot>>, tx: crate::editor::JobSender) {
             watch: cache.watch.clone(),
             stamp: cache.stamp.clone(),
             signs,
+            hunks,
+            base_text: cache.text.clone(),
         };
         slot.lock().unwrap_or_else(|e| e.into_inner()).cache = Some(cache);
         if !tx.send(move |ed| apply(ed, outcome)) {
@@ -365,7 +428,7 @@ fn load_base(git: &Git, base: Base, path: &Path, epoch: u64) -> BaseCache {
             // unchanged file compares equal to its buffer.
             let (rope, _, problem) = maestro_core::io::decode(&bytes);
             if problem.is_none() {
-                cache.text = Some(rope.to_string());
+                cache.text = Some(Arc::from(rope.to_string()));
             }
         }
         Ok(None) => cache.untracked = repo.is_untracked(path).unwrap_or(false),
@@ -413,6 +476,9 @@ fn apply(ed: &mut Editor, out: Outcome) {
         return;
     };
     d.signs = out.signs;
+    d.hunks = out.hunks;
+    d.hunks_version = Some(out.version);
+    d.base_text = out.base_text;
     if d.root != root {
         d.root = root;
         // The request was keyed before the repository was known. If this
@@ -429,14 +495,14 @@ fn apply(ed: &mut Editor, out: Outcome) {
 
 /// Where to look for a repository: the focused file's directory, else the
 /// working directory.
-fn start_dir(ed: &Editor) -> PathBuf {
+pub(crate) fn start_dir(ed: &Editor) -> PathBuf {
     ed.doc()
         .path()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| ed.cwd.clone())
 }
 
-fn find_repo(git: &Git, start: &Path) -> Result<Repository, String> {
+pub(crate) fn find_repo(git: &Git, start: &Path) -> Result<Repository, String> {
     match git.discover(start) {
         Ok(Some(r)) => Ok(r),
         Ok(None) => Err(format!("{} is not in a Git repository", start.display())),
@@ -611,6 +677,8 @@ mod tests {
             watch: Vec::new(),
             stamp: Vec::new(),
             signs: SignMap::all_added("a\nb\n"),
+            hunks: Vec::new(),
+            base_text: None,
         };
         apply(&mut ed, outcome(DocumentVersion(current.0 + 1)));
         assert!(ed.git.signs(id).unwrap().is_empty());

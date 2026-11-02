@@ -3,6 +3,7 @@
 
 mod agents;
 pub mod clipboard;
+mod git;
 mod preview;
 mod proposals;
 pub mod render;
@@ -203,6 +204,10 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
             dirty = true;
         }
         if dirty {
+            // Intent edits whose document moved on show their rerun.
+            if editor.proposals.review_open() {
+                maestro_editor::proposals::refresh_all(&mut editor);
+            }
             let t0 = Instant::now();
             let mut surface = Surface::new(w, h, editor.theme.ui.text);
             let cursor = render::render(&editor, &mut surface);
