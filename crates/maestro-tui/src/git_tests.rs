@@ -162,8 +162,11 @@ fn status_screen_draws_head_sections_hunks_and_hints() {
     feed(&mut ed, "\t");
     let rows = draw(&ed, w, h);
     let text = rows.join("\n");
+    // The path may be cut from the left to leave room for the keys badge
+    // (macOS temp paths are long), but its end is always there.
+    let name = r.root.file_name().unwrap().to_string_lossy().into_owned();
     assert!(
-        rows[1].contains(&format!(" git status: {} ", r.root.display())),
+        rows[1].starts_with(" git status: ") && rows[1].contains(&format!("{name} ")),
         "{}",
         rows[1]
     );
@@ -320,4 +323,20 @@ fn blame_column_and_hunk_popup_in_a_buffer() {
     let second = &rows[2];
     assert!(second.starts_with("not committed yet"), "{second:?}");
     assert!(second.contains("~  2 TWO"), "{second:?}");
+}
+
+#[test]
+fn a_long_path_is_cut_from_the_left_and_the_keys_badge_stays() {
+    let path = "/private/var/folders/n6/hn37q6pj7sj_9dmqqc2113800000gn/T/maestro-tui-git-1/repo";
+    let title = format!(" git status: {path} ");
+    let room = 60;
+    let short = super::shorten_left(&title, path, room);
+    assert_eq!(short.chars().count(), room, "{short}");
+    assert!(short.starts_with(" git status: …"), "{short}");
+    assert!(short.ends_with("maestro-tui-git-1/repo "), "{short}");
+    // Short enough already: unchanged.
+    assert_eq!(
+        super::shorten_left(" git status: /r ", "/r", 60),
+        " git status: /r "
+    );
 }
