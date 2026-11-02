@@ -43,7 +43,10 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     draw_completion(ed, surface);
     crate::git::draw_popup(ed, surface);
     let mut cursor = CursorShape::Hidden;
-    if ed.git.screen_open() {
+    if ed.forge.screen_open() {
+        // The GitHub inbox covers the editor area (crate::inbox).
+        cursor = crate::inbox::draw(ed, surface);
+    } else if ed.git.screen_open() {
         // The Git status screen covers the editor area (crate::git).
         cursor = crate::git::draw_screen(ed, surface);
     } else if ed.proposals.review_open() {
@@ -867,6 +870,14 @@ fn draw_statusline(ed: &Editor, view: &View, s: &mut Surface, area: Rect) {
         flags.push_str(&format!(
             "  {waiting} proposal{} waiting: space e",
             if waiting == 1 { "" } else { "s" }
+        ));
+    }
+    // Pull requests waiting for the user's review, as of the GitHub
+    // inbox's last refresh (crate::inbox).
+    if focused && let Some(n) = maestro_editor::forge::review_requests(ed).filter(|n| *n > 0) {
+        flags.push_str(&format!(
+            "  {n} review request{}: space i",
+            if n == 1 { "" } else { "s" }
         ));
     }
     let name = doc

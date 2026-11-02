@@ -73,6 +73,18 @@ static TYPED: &[TypedCommand] = &[
         fun: proposals,
     },
     TypedCommand {
+        name: "inbox",
+        aliases: &[],
+        doc: "Show the GitHub inbox: pull requests and issues waiting on you",
+        fun: inbox,
+    },
+    TypedCommand {
+        name: "pr-send",
+        aliases: &[],
+        doc: "Review and send the GitHub comment or change request in this buffer",
+        fun: pr_send,
+    },
+    TypedCommand {
         name: "open",
         aliases: &["e", "edit"],
         doc: "Open a file (e! reloads the current one)",
@@ -634,6 +646,15 @@ fn git_screen(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
 fn proposals(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     ed.run_command("proposal_review");
     Ok(())
+}
+
+fn inbox(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    ed.run_command("github_inbox");
+    Ok(())
+}
+
+fn pr_send(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::forge::actions::send_draft(ed)
 }
 
 fn write_quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {

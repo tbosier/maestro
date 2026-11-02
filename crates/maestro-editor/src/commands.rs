@@ -46,6 +46,7 @@ pub static TABLES: &[&[Command]] = &[
     crate::git_hunks::COMMANDS,
     crate::agents::COMMANDS,
     crate::proposals::COMMANDS,
+    crate::forge::COMMANDS,
     crate::lsp_commands::COMMANDS,
     crate::navigation::COMMANDS,
     crate::syntax_commands::COMMANDS,

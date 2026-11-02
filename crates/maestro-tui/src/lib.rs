@@ -4,6 +4,7 @@
 mod agents;
 pub mod clipboard;
 mod git;
+mod inbox;
 mod preview;
 mod proposals;
 pub mod render;

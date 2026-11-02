@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 pub use blame::{BlameCommit, BlameLine};
-pub use diff::{DiffFile, DiffLine, DiffLineKind, DiffSpec, FileChange, Hunk};
+pub use diff::{DiffFile, DiffLine, DiffLineKind, DiffSpec, FileChange, Hunk, parse_unified_diff};
 pub use hunks::{HunkPick, HunksError, PickFailure, changed_lines};
 pub use intraline::{INTRALINE_MAX_LINE, intraline};
 pub use linediff::{LineHunk, LineHunkKind, Sign, SignMap, diff_lines};

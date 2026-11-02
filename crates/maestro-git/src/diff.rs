@@ -244,6 +244,13 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// Parses unified diff text in `git diff` format with `a/` and `b/`
+/// prefixes, such as the output of `gh pr diff`. The error says which line
+/// was not understood.
+pub fn parse_unified_diff(out: &[u8]) -> std::result::Result<Vec<DiffFile>, String> {
+    parse_unified(out)
+}
+
 /// Parses `git diff` output with `a/` and `b/` prefixes.
 pub(crate) fn parse_unified(out: &[u8]) -> std::result::Result<Vec<DiffFile>, String> {
     let mut files: Vec<DiffFile> = Vec::new();
