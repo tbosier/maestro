@@ -382,6 +382,7 @@ impl Keymaps {
         for (k, c) in crate::agents::DEFAULT_KEYS
             .iter()
             .chain(crate::proposals::DEFAULT_KEYS)
+            .chain(crate::forge::DEFAULT_KEYS)
             .chain(crate::git_screen::DEFAULT_KEYS)
         {
             g(&mut normal, k, "space", c);
@@ -519,6 +520,7 @@ mod tests {
                     ("space a", "agent_panel"),
                     ("space r", "recent_files"),
                     ("space e", "proposal_review"),
+                    ("space i", "github_inbox"),
                     ("space k", "hover"),
                     ("g d", "goto_definition"),
                     ("g r", "goto_references"),
