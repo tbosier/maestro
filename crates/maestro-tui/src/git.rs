@@ -51,13 +51,17 @@ pub(crate) fn draw_screen(ed: &Editor, s: &mut Surface) -> CursorShape {
         }
         None => format!(" git status: {root} "),
     };
-    let x = s.print(h.x, h.y, &title, ui.statusline.bold(), h.right());
     let state = match (&sc.busy, sc.loading) {
         (Some(b), _) => format!(" running: {b} "),
         (None, true) => " loading ".to_string(),
         (None, false) => " KEYS: GIT ".to_string(),
     };
     let sw = state.chars().count() as u16;
+    // A long path is cut from the left, so the state on the right (which
+    // says whose keys these are) always fits.
+    let room = usize::from(h.width.saturating_sub(sw + 1));
+    let title = shorten_left(&title, &root, room);
+    let x = s.print(h.x, h.y, &title, ui.statusline.bold(), h.right());
     let style = if sc.busy.is_some() || sc.loading {
         ui.mode_insert
     } else {
@@ -528,3 +532,20 @@ pub(crate) fn draw_blame(
 #[cfg(test)]
 #[path = "git_tests.rs"]
 mod tests;
+
+/// `title` with `path` inside it cut from the left (`…` marks the cut) so
+/// the whole fits in `room` columns. Unchanged when it already fits or the
+/// path is not in it.
+fn shorten_left(title: &str, path: &str, room: usize) -> String {
+    let len = title.chars().count();
+    if len <= room || path.is_empty() {
+        return title.to_string();
+    }
+    let Some(at) = title.find(path) else {
+        return title.to_string();
+    };
+    let over = len - room;
+    let keep = path.chars().count().saturating_sub(over + 1);
+    let tail: String = path.chars().skip(path.chars().count() - keep).collect();
+    format!("{}…{tail}{}", &title[..at], &title[at + path.len()..])
+}
