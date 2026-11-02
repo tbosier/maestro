@@ -205,13 +205,22 @@ fn draw_summary(ed: &Editor, s: &mut Surface, sm: Rect, p: &Proposal) {
         let mut x = s.print(sm.x + 1, sm.y + 1, &line, ui.text, r);
         let moved = current != Some(p.base_version.0);
         if p.state == State::Pending && moved {
-            x = s.print(
-                x + 2,
-                sm.y + 1,
-                "stale: approving will refuse it",
-                ui.message_error,
-                r,
-            );
+            // An intent edit is rebased rather than refused.
+            let (word, style) = match &p.intent {
+                None => (
+                    "stale: approving will refuse it".to_string(),
+                    ui.message_error,
+                ),
+                Some(i) if i.failed.is_some() => (
+                    "its pipeline no longer applies: approving resolves it as stale".into(),
+                    ui.message_error,
+                ),
+                Some(i) => (
+                    format!("rebased onto version {}", i.preview_version.0),
+                    ui.message_warning,
+                ),
+            };
+            x = s.print(x + 2, sm.y + 1, &word, style, r);
         }
         s.print(x + 2, sm.y + 1, &p.file_label(), ui.text_muted, r);
     }

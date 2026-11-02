@@ -10,7 +10,7 @@ pub mod theme;
 
 pub use config::{
     AgentProviderConfig, AgentProviderKind, AgentsConfig, Config, ConfigError, EditorConfig,
-    IconMode, IndentStyle, LanguageServerConfig, LineNumbers, LspConfig, NotifyConfig,
-    NotifyMethod, Profile, ProjectsConfig, SidebarConfig,
+    GithubConfig, IconMode, IndentStyle, LanguageServerConfig, LineNumbers, LspConfig,
+    NotifyConfig, NotifyMethod, Profile, ProjectsConfig, SidebarConfig,
 };
 pub use theme::{Rgb, Style, Theme};

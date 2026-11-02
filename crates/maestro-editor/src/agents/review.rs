@@ -24,6 +24,22 @@ pub struct ReviewView {
     /// First row shown.
     pub top: usize,
     pub side_by_side: bool,
+    /// Where a line range started (`v`), while one is being chosen.
+    pub anchor: Option<usize>,
+}
+
+impl ReviewView {
+    /// The review of `agent`'s first file, at the top.
+    pub fn new(agent: AgentId) -> Self {
+        Self {
+            agent,
+            file: 0,
+            cursor: 0,
+            top: 0,
+            side_by_side: false,
+            anchor: None,
+        }
+    }
 }
 
 /// One line of a diff as the review screen shows it.
@@ -37,6 +53,9 @@ pub struct RowLine {
     pub marks: Vec<Range<usize>>,
     /// The new-file line this row sits at, for opening the file there.
     pub anchor: usize,
+    /// The hunk it belongs to, and its index in the hunk's lines.
+    pub hunk: usize,
+    pub line: usize,
 }
 
 impl RowLine {
@@ -155,13 +174,18 @@ pub fn rows(file: &DiffFile, side_by_side: bool, comments: &[Comment]) -> Vec<Ro
         let lines = &h.lines;
         let mut next_new = h.new_start.max(1);
         let mut i = 0;
-        let mk = |l: &maestro_git::DiffLine, marks, anchor| RowLine {
-            kind: l.kind,
-            old: l.old_line,
-            new: l.new_line,
-            text: l.text.clone(),
-            marks,
-            anchor,
+        let mk = |at: usize, marks, anchor| {
+            let l: &maestro_git::DiffLine = &lines[at];
+            RowLine {
+                kind: l.kind,
+                old: l.old_line,
+                new: l.new_line,
+                text: l.text.clone(),
+                marks,
+                anchor,
+                hunk: index,
+                line: at,
+            }
         };
         while i < lines.len() {
             match lines[i].kind {
@@ -171,11 +195,11 @@ pub fn rows(file: &DiffFile, side_by_side: bool, comments: &[Comment]) -> Vec<Ro
                     next_new = anchor + 1;
                     if side_by_side {
                         out.push(Row::Pair(
-                            Some(mk(l, Vec::new(), anchor)),
-                            Some(mk(l, Vec::new(), anchor)),
+                            Some(mk(i, Vec::new(), anchor)),
+                            Some(mk(i, Vec::new(), anchor)),
                         ));
                     } else {
-                        out.push(Row::Line(mk(l, Vec::new(), anchor)));
+                        out.push(Row::Line(mk(i, Vec::new(), anchor)));
                     }
                     i += 1;
                 }
@@ -198,17 +222,15 @@ pub fn rows(file: &DiffFile, side_by_side: bool, comments: &[Comment]) -> Vec<Ro
                         new_marks[k] = n;
                     }
                     let removed_anchor = next_new;
-                    let left: Vec<RowLine> = removed
-                        .iter()
+                    let left: Vec<RowLine> = (rs..added_start)
                         .zip(old_marks)
-                        .map(|(l, m)| mk(l, m, removed_anchor))
+                        .map(|(at, m)| mk(at, m, removed_anchor))
                         .collect();
-                    let right: Vec<RowLine> = added
-                        .iter()
+                    let right: Vec<RowLine> = (added_start..i)
                         .zip(new_marks)
-                        .map(|(l, m)| {
-                            let anchor = l.new_line.unwrap_or(next_new);
-                            mk(l, m, anchor)
+                        .map(|(at, m)| {
+                            let anchor = lines[at].new_line.unwrap_or(next_new);
+                            mk(at, m, anchor)
                         })
                         .collect();
                     if let Some(last) = right.last() {
@@ -360,12 +382,40 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<(Vec<DiffFile>, Option<S
         }
         Err(e) => a.review.error = Some(e),
     }
+    // Marks follow the diff: a hunk the agent changed since is unmarked.
+    let mut dropped = super::marks::prune(a);
+    // The compose view's marks of this agent follow its diff the same way.
+    let keys: std::collections::BTreeSet<super::marks::HunkKey> = a
+        .review
+        .files
+        .iter()
+        .flat_map(|f| f.hunks.iter().map(move |h| super::marks::HunkKey::of(f, h)))
+        .collect();
+    if let Some(c) = &mut ed.agents.panel.compose {
+        let before = c.marks.len();
+        c.marks
+            .retain(|(agent, m)| *agent != id || keys.contains(&m.key));
+        dropped += before - c.marks.len();
+    }
+    let Some(a) = ed.agents.get_mut(id) else {
+        return;
+    };
     let again = a.review.again && !a.archived;
     if again {
         request(ed, id);
     }
     if changed {
         super::conflicts::refresh(ed);
+    }
+    if dropped > 0 {
+        let name = ed
+            .agents
+            .get(id)
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        ed.info(format!(
+            "{dropped} marked hunk(s) of {name} changed in its worktree and were unmarked"
+        ));
     }
     let n = ed.agents.get(id).map(|a| a.review.files.len()).unwrap_or(0);
     if let Some(v) = &mut ed.agents.panel.review
@@ -388,13 +438,7 @@ pub fn open(ed: &mut Editor, id: AgentId) {
         ed.error("the agent's worktree was archived; there is nothing to review");
         return;
     }
-    ed.agents.panel.review = Some(ReviewView {
-        agent: id,
-        file: 0,
-        cursor: 0,
-        top: 0,
-        side_by_side: false,
-    });
+    ed.agents.panel.review = Some(ReviewView::new(id));
     request(ed, id);
 }
 
@@ -435,6 +479,23 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     let last = rows.len().saturating_sub(1);
     let ctrl = key.mods.ctrl;
     match key.code {
+        // A line range being chosen: esc drops it, space or v marks it.
+        KeyCode::Esc if v.anchor.is_some() => v.anchor = None,
+        KeyCode::Char(' ' | 'v') if !ctrl && v.anchor.is_some() => {
+            let anchor = v.anchor.take().unwrap_or(v.cursor);
+            super::marks::toggle_range(ed, id, v.file, &rows, anchor, v.cursor);
+        }
+        KeyCode::Char(' ') if !ctrl => {
+            super::marks::toggle_hunk(ed, id, v.file, &rows, v.cursor);
+        }
+        KeyCode::Char('v') if !ctrl => {
+            if matches!(rows.get(v.cursor), Some(Row::Line(_) | Row::Pair(..))) {
+                v.anchor = Some(v.cursor);
+                ed.info("choose the lines with j/k; space or v marks them, esc cancels");
+            } else {
+                ed.error("put the cursor on a diff line to start a range");
+            }
+        }
         KeyCode::Esc | KeyCode::Char('q') if !ctrl => {
             ed.agents.panel.review = None;
             return;
@@ -449,11 +510,13 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             v.file = (v.file + 1) % nfiles;
             v.cursor = 0;
             v.top = 0;
+            v.anchor = None;
         }
         KeyCode::BackTab | KeyCode::Char('{') if nfiles > 0 => {
             v.file = (v.file + nfiles - 1) % nfiles;
             v.cursor = 0;
             v.top = 0;
+            v.anchor = None;
         }
         KeyCode::Char(']') if !ctrl => {
             if let Some(i) = rows
@@ -482,6 +545,7 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             // Keep the cursor on the same file line across layouts.
             let target = rows.get(v.cursor).and_then(Row::target_line);
             v.side_by_side = !v.side_by_side;
+            v.anchor = None;
             ed.agents.panel.review = Some(v.clone());
             let new_rows = current_rows(ed);
             v.cursor = target
@@ -624,6 +688,8 @@ pub fn hints() -> Vec<(&'static str, &'static str)> {
     vec![
         ("j/k", "line"),
         ("]/[", "hunk"),
+        ("space", "mark hunk"),
+        ("v", "mark lines"),
         ("tab", "file"),
         ("s", "side by side"),
         ("c", "comment"),

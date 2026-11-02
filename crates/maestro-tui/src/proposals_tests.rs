@@ -158,3 +158,61 @@ fn text_past_the_right_edge_is_marked_and_reachable() {
     }
     panic!("scrolling right never showed the end of the line");
 }
+
+#[test]
+fn a_rebased_intent_edit_says_so_in_the_summary_and_above_the_diff() {
+    use maestro_editor::KeyCode;
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 120, 28));
+    let mut doc = Document::from_text("pub fn a() -> Result<(), E> {\n    Ok(())\n}\n");
+    doc.set_path(std::env::temp_dir().join("maestro-tui-intent.rs"));
+    let id = ed.add_document(doc);
+    ed.switch_to(id);
+    let pipe = "select-nodes pub-fn | insert-above #[must_use]";
+    let run = maestro_editor::structural::run_intent(&ed, id, pipe, Some(1)).unwrap();
+    proposals::submit_intent(
+        &mut ed,
+        NewProposal {
+            doc: id,
+            base_version: DocumentVersion(0),
+            changes: run.changes.clone(),
+            edit_count: run.edit_count,
+            actor: Actor {
+                name: "agent:intent".into(),
+                agent_id: None,
+            },
+            description: "mark it".into(),
+            verify: None,
+        },
+        proposals::Intent::new(pipe.into(), Some(1), &run),
+    );
+    // The user types a line at the top before reviewing.
+    ed.handle_key(KeyEvent::char('i'));
+    for c in "// note".chars() {
+        ed.handle_key(KeyEvent::char(c));
+    }
+    ed.handle_key(KeyEvent::plain(KeyCode::Enter));
+    ed.handle_key(KeyEvent::plain(KeyCode::Esc));
+    let v = ed.doc().version().0;
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('e'));
+    let mut s = Surface::new(120, 30, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let text = screen(&s).join("\n");
+    assert!(
+        text.contains(&format!("base version 0, document at {v}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("rebased onto version {v}")),
+        "{text}"
+    );
+    assert!(!text.contains("stale: approving will refuse it"), "{text}");
+    assert!(text.contains(&format!("intent edit: {pipe}")), "{text}");
+    assert!(
+        text.contains(&format!(
+            "rebased onto version {v}: changed since version 0, which agent:intent looked at"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("+#[must_use]"), "{text}");
+}

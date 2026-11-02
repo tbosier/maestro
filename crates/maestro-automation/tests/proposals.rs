@@ -27,13 +27,26 @@ impl Harness {
     /// An interactive editor (a reviewer is present) working in a fresh
     /// directory.
     fn new(name: &str) -> Self {
+        Self::with_reviewer(name, true)
+    }
+
+    /// A headless editor: nobody reviews proposals.
+    fn headless(name: &str) -> Self {
+        Self::with_reviewer(name, false)
+    }
+
+    fn with_reviewer(name: &str, reviewer: bool) -> Self {
         let dir =
             std::env::temp_dir().join(format!("maestro-proposals-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 100, 30));
         ed.cwd = dir.clone();
-        let server = Server::with_reviewer(&ed);
+        let server = if reviewer {
+            Server::with_reviewer(&ed)
+        } else {
+            Server::new(&ed)
+        };
         let mut h = Self {
             ed,
             server,
@@ -43,9 +56,16 @@ impl Harness {
             events: Vec::new(),
         };
         let init = h.ok("initialize", json!({"protocol_version": "1.1"}));
-        assert_eq!(init["protocol_version"], "1.2");
+        assert_eq!(init["protocol_version"], "1.3");
         let caps = init["capabilities"].as_array().unwrap();
-        assert!(caps.contains(&json!("proposal.review")), "{init}");
+        assert_eq!(caps.contains(&json!("proposal.review")), reviewer, "{init}");
+        assert!(caps.contains(&json!("intent_edits")), "{init}");
+        assert!(
+            init["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("document.apply_pipeline"))
+        );
         assert!(
             init["methods"]
                 .as_array()
@@ -233,6 +253,16 @@ fn create_queues_without_changing_anything_and_announces_it() {
     let id = info["id"].as_u64().unwrap();
     assert_eq!(info["state"], "pending");
     assert_eq!(info["decision"], Value::Null);
+    // A text-diff proposal has none of the intent-edit fields.
+    for k in [
+        "pipeline",
+        "expect",
+        "rebased",
+        "ran_on_version",
+        "step_counts",
+    ] {
+        assert!(info.get(k).is_none(), "{k} in {info}");
+    }
     assert_eq!(info["doc"], doc);
     assert_eq!(info["base_version"], v0);
     assert_eq!(info["edit_count"], 1);
@@ -1037,4 +1067,501 @@ fn a_headless_server_refuses_proposals() {
     assert_eq!(e.kind(), Some(ErrorCode::ReviewUnavailable));
     assert!(e.message.contains("headless"), "{}", e.message);
     assert_eq!(ed.proposals.items.len(), 0);
+}
+
+// ----- intent edits ---------------------------------------------------------
+
+/// A Rust file with one public function that returns `Result`: `load`.
+const LIB: &str = "pub fn helper() -> u32 {\n    1\n}\n\npub fn load(path: &str) -> Result<String, Error> {\n    read(path)\n}\n\nfn private() -> Result<(), Error> {\n    Ok(())\n}\n";
+
+const PIPE: &str = "select-nodes pub-fn | keep-nodes returns-result | insert-above #[must_use]";
+
+/// `text` with `#[must_use]` on its own line above `pub fn load`.
+fn with_attr(text: &str) -> String {
+    text.replace("pub fn load", "#[must_use]\npub fn load")
+}
+
+fn intent(doc: u64, base: u64, pipeline: &str, expect: Option<u64>) -> Value {
+    let mut p = json!({
+        "doc": doc, "base_version": base, "pipeline": pipeline,
+        "actor": {"name": "agent:intent"}, "description": "mark load must_use",
+    });
+    if let Some(n) = expect {
+        p["expect"] = json!(n);
+    }
+    p
+}
+
+fn notes(h: &Harness) -> Vec<String> {
+    maestro_editor::proposals::review::current_rows(&h.ed)
+        .into_iter()
+        .filter_map(|r| match r {
+            maestro_editor::agents::review::Row::Note(n) => Some(n),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The new-side line numbers of the lines the proposal's diff adds.
+fn added_lines(h: &Harness, id: u64) -> Vec<(usize, String)> {
+    h.ed.proposals
+        .get(maestro_editor::proposals::ProposalId(id))
+        .unwrap()
+        .diff
+        .hunks
+        .iter()
+        .flat_map(|hk| &hk.lines)
+        .filter(|l| format!("{:?}", l.kind) == "Added")
+        .map(|l| (l.new_line.unwrap(), l.text.clone()))
+        .collect()
+}
+
+/// Types `line` and a line break at the very start of the document.
+fn type_at_top(h: &mut Harness, line: &str) {
+    h.keys("gg");
+    h.keys("i");
+    h.keys(line);
+    h.enter();
+    h.esc();
+}
+
+#[test]
+fn a_pipeline_proposal_approved_unchanged_applies_its_preview() {
+    let mut h = Harness::new("intent-plain");
+    let doc = h.file("lib.rs", LIB);
+    let info = create(&mut h, intent(doc, 0, PIPE, Some(1)));
+    let id = info["id"].as_u64().unwrap();
+    assert_eq!(info["state"], "pending");
+    assert_eq!(info["pipeline"], PIPE);
+    assert_eq!(info["expect"], 1);
+    assert_eq!(info["rebased"], false);
+    assert_eq!(info["ran_on_version"], 0);
+    assert_eq!(info["edit_count"], 1);
+    assert_eq!(
+        info["step_counts"],
+        json!([{"step": "select-nodes", "count": 2}, {"step": "keep-nodes", "count": 1},
+               {"step": "insert-above", "count": 1}])
+    );
+    // Nothing changed yet.
+    assert_eq!(h.text(doc), (LIB.into(), 0));
+
+    h.open_review();
+    let n = notes(&h);
+    assert_eq!(n[0], format!("intent edit: {PIPE}"));
+    assert_eq!(
+        n[1],
+        "selections: select-nodes 2 | keep-nodes 1 | insert-above 1 (expected 1)"
+    );
+    assert!(!n.iter().any(|l| l.contains("rebased")), "{n:?}");
+    assert_eq!(added_lines(&h, id), [(5, "#[must_use]".to_string())]);
+    h.keys("a");
+    let d = h.dialog_text();
+    assert!(d.contains(&format!("Intent edit: {PIPE}")), "{d}");
+    assert!(d.contains("against version 0"), "{d}");
+    assert!(!d.contains("Rebased"), "{d}");
+    h.keys("y");
+    let (text, v1) = h.text(doc);
+    assert_eq!(text, with_attr(LIB));
+    assert_eq!(v1, 1);
+
+    let notes = h.resolved();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["decision"], "approved");
+    assert_eq!(notes[0]["rebased"], false);
+    assert_eq!(notes[0]["pipeline"], PIPE);
+    assert_eq!(notes[0]["applied_version"], 1);
+    let hist = h.ok("document.history", json!({"doc": doc}));
+    let e = &hist["edits"][0];
+    assert_eq!(e["pipeline"], PIPE);
+    assert_eq!(e["rebased"], false);
+    assert_eq!(e["proposal"], id);
+    assert_eq!(e["step_counts"], info["step_counts"]);
+
+    // One undo step.
+    h.esc();
+    h.keys("u");
+    assert_eq!(h.text(doc).0, LIB);
+}
+
+#[test]
+fn a_pipeline_proposal_is_rebased_after_the_user_types_above_its_target() {
+    let mut h = Harness::new("intent-rebase");
+    let doc = h.file("lib.rs", LIB);
+    let id = create(&mut h, intent(doc, 0, PIPE, Some(1)))["id"]
+        .as_u64()
+        .unwrap();
+    // The user adds a function above everything; it does not match.
+    type_at_top(&mut h, "fn typed() {}");
+    let (typed, v) = h.text(doc);
+    assert_eq!(typed, format!("fn typed() {{}}\n{LIB}"));
+    assert!(v > 0);
+
+    h.open_review();
+    // The review shows the rerun's diff, one line further down, and says
+    // why and against which version.
+    let n = notes(&h);
+    assert_eq!(
+        n[2..4],
+        [
+            format!(
+                "rebased onto version {v}: changed since version 0, which agent:intent looked at"
+            ),
+            format!("the pipeline ran again on version {v}; this diff is from that run"),
+        ],
+        "{n:?}"
+    );
+    assert_eq!(added_lines(&h, id), [(6, "#[must_use]".to_string())]);
+    h.keys("a");
+    let d = h.dialog_text();
+    assert!(
+        d.contains(&format!(
+            "Rebased: agent:intent looked at version 0, and the document is at version {v} now, so the pipeline ran again on version {v}."
+        )),
+        "{d}"
+    );
+    assert!(d.contains(&format!("against version {v}")), "{d}");
+    h.keys("y");
+    let (text, v2) = h.text(doc);
+    assert_eq!(text, with_attr(&typed));
+    assert_eq!(v2, v + 1);
+    assert!(
+        h.status().contains("rebased onto version"),
+        "{}",
+        h.status()
+    );
+
+    let notes = h.resolved();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["decision"], "approved");
+    assert_eq!(notes[0]["rebased"], true);
+    assert_eq!(notes[0]["base_version"], 0);
+    assert_eq!(notes[0]["ran_on_version"], v);
+    assert_eq!(notes[0]["applied_version"], v2);
+    let hist = h.ok("document.history", json!({"doc": doc}));
+    let e = &hist["edits"][0];
+    assert_eq!(
+        (e["base_version"].as_u64(), e["new_version"].as_u64()),
+        (Some(0), Some(v2))
+    );
+    assert_eq!(e["rebased"], true);
+
+    // Undo removes the attribute only; the typed line stays.
+    h.esc();
+    h.keys("u");
+    assert_eq!(h.text(doc).0, typed);
+
+    // A proposal made against an old version is rebased at creation.
+    let late = create(&mut h, intent(doc, 0, PIPE, Some(1)));
+    assert_eq!(late["rebased"], true);
+    assert_eq!(late["base_version"], 0);
+    assert!(late["ran_on_version"].as_u64().unwrap() > v);
+}
+
+#[test]
+fn a_pipeline_proposal_whose_target_was_deleted_resolves_stale() {
+    let mut h = Harness::new("intent-deleted");
+    let doc = h.file("lib.rs", LIB);
+    let id = create(&mut h, intent(doc, 0, PIPE, None))["id"]
+        .as_u64()
+        .unwrap();
+    // The user selects the target function and deletes it.
+    h.keys(":select-nodes pub-fn | keep-nodes returns-result");
+    h.enter();
+    h.keys("d");
+    let (after, v) = h.text(doc);
+    assert!(!after.contains("pub fn load"), "{after}");
+
+    h.open_review();
+    let n = notes(&h);
+    assert_eq!(
+        n[2..6],
+        [
+            "no longer applies: changed since version 0, which agent:intent looked at".to_string(),
+            format!(
+                "the pipeline ran again on version {v} and failed: step 2 (keep-nodes) left no selections (after select-nodes 1); nothing changed"
+            ),
+            "approving resolves it as stale; nothing changes".to_string(),
+            "below: the earlier change, against version 0, which no longer applies".to_string(),
+        ],
+        "{n:?}"
+    );
+    // `a` resolves it as stale without a dialog; nothing changes.
+    h.keys("a");
+    let st = h.ok("proposal.status", json!({"proposal": id}));
+    assert_eq!(st["decision"], "stale", "{st}");
+    assert!(
+        st["reason"]
+            .as_str()
+            .unwrap()
+            .contains("left no selections"),
+        "{st}"
+    );
+    assert_eq!(st["applied_version"], Value::Null);
+    assert_eq!(st["ran_on_version"], v);
+    assert_eq!(
+        st["step_counts"],
+        json!([{"step": "select-nodes", "count": 1}])
+    );
+    assert_eq!(h.text(doc), (after, v));
+    let notes = h.resolved();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["decision"], "stale");
+}
+
+#[test]
+fn a_pipeline_proposal_whose_expect_no_longer_holds_resolves_stale() {
+    let mut h = Harness::new("intent-expect");
+    let doc = h.file("lib.rs", LIB);
+    let id = create(&mut h, intent(doc, 0, PIPE, Some(1)))["id"]
+        .as_u64()
+        .unwrap();
+    // A second public function returning Result appears.
+    type_at_top(&mut h, "pub fn more() -> Result<(), Error> { Ok(()) }");
+    let (typed, v) = h.text(doc);
+    h.open_review();
+    h.keys("a");
+    let st = h.ok("proposal.status", json!({"proposal": id}));
+    assert_eq!(st["decision"], "stale", "{st}");
+    assert!(
+        st["reason"].as_str().unwrap().contains(
+            "the pipeline selected 2 where 1 was expected (select-nodes 3 | keep-nodes 2)"
+        ),
+        "{st}"
+    );
+    assert_eq!(h.text(doc), (typed, v));
+}
+
+#[test]
+fn a_change_while_the_dialog_is_open_needs_a_second_look() {
+    let mut h = Harness::new("intent-dialog");
+    let doc = h.file("lib.rs", LIB);
+    let id = create(&mut h, intent(doc, 0, PIPE, Some(1)))["id"]
+        .as_u64()
+        .unwrap();
+    h.open_review();
+    h.keys("a");
+    assert!(!h.dialog_text().contains("Rebased"));
+    // Another client edits the document while the dialog is up.
+    h.ok(
+        "document.apply_edit",
+        json!({"doc": doc, "base_version": 0, "encoding": "char",
+               "edits": [{"range": {"start": 0, "end": 0}, "text": "// c\n"}], "actor": "other"}),
+    );
+    // `y` does not apply a change the dialog did not show, and `a y` typed
+    // ahead in the same burst cannot approve it either.
+    h.keys("y");
+    assert!(
+        h.status()
+            .contains("changed while the approval dialog was open"),
+        "{}",
+        h.status()
+    );
+    h.keys("a");
+    assert!(h.ed.proposals.review.as_ref().unwrap().dialog.is_none());
+    assert!(
+        h.status().contains("the diff just changed"),
+        "{}",
+        h.status()
+    );
+    h.keys("y");
+    let st = h.ok("proposal.status", json!({"proposal": id}));
+    assert_eq!(st["state"], "pending", "{st}");
+    assert_eq!(h.text(doc), (format!("// c\n{LIB}"), 1));
+    // Half a second later (simulated), a second look shows the rebase, and
+    // `y` applies it.
+    h.ed.proposals
+        .get_mut(maestro_editor::proposals::ProposalId(id))
+        .unwrap()
+        .intent
+        .as_mut()
+        .unwrap()
+        .refused_ms = Some(0);
+    h.keys("a");
+    assert!(h.dialog_text().contains("Rebased"), "{}", h.dialog_text());
+    h.keys("y");
+    assert_eq!(h.text(doc).0, with_attr(&format!("// c\n{LIB}")));
+}
+
+#[test]
+fn invalid_or_useless_pipelines_are_refused_and_nothing_is_queued() {
+    let mut h = Harness::new("intent-invalid");
+    let doc = h.file("lib.rs", LIB);
+    let (code, msg, data) = h.fails(
+        "proposal.create",
+        intent(
+            doc,
+            0,
+            "select-nodes (function_item (nope)) | insert-above x",
+            None,
+        ),
+    );
+    assert_eq!(code, ErrorCode::InvalidParams);
+    assert_eq!(
+        msg,
+        "invalid pipeline: step 1 (select-nodes), column 30: invalid query: unknown node kind \"nope\""
+    );
+    assert_eq!(
+        data,
+        Some(json!({"step": 1, "name": "select-nodes", "column": 30}))
+    );
+
+    let (code, msg, data) = h.fails(
+        "proposal.create",
+        intent(doc, 0, "select-nodes fn | wrap a", None),
+    );
+    assert_eq!(code, ErrorCode::InvalidParams);
+    assert!(msg.contains("step 2 (wrap), column 25"), "{msg}");
+    assert_eq!(data.unwrap()["step"], 2);
+
+    let (code, msg, _) = h.fails("proposal.create", intent(doc, 0, "select-nodes fn", None));
+    assert_eq!(code, ErrorCode::InvalidParams);
+    assert!(msg.contains("the pipeline changes no text"), "{msg}");
+
+    let (code, msg, data) = h.fails(
+        "proposal.create",
+        intent(doc, 0, "select-nodes struct | delete", None),
+    );
+    assert_eq!(code, ErrorCode::PipelineFailed);
+    assert_eq!(
+        msg,
+        "step 1 (select-nodes) left no selections; nothing changed"
+    );
+    let data = data.unwrap();
+    assert_eq!(data["reason"], "no_selections");
+    assert_eq!(data["step"], 1);
+    assert_eq!(data["version"], 0);
+
+    let (code, msg, data) = h.fails(
+        "proposal.create",
+        intent(doc, 0, "select-nodes fn | replace-text zzz yyy", None),
+    );
+    assert_eq!(code, ErrorCode::PipelineFailed);
+    assert!(msg.starts_with("the pipeline changed nothing"), "{msg}");
+    assert_eq!(data.unwrap()["reason"], "no_change");
+
+    let (code, msg, data) = h.fails("proposal.create", intent(doc, 0, PIPE, Some(2)));
+    assert_eq!(code, ErrorCode::PipelineFailed);
+    assert_eq!(
+        msg,
+        "the pipeline selected 1 where 2 were expected (select-nodes 2 | keep-nodes 1); nothing changed"
+    );
+    let data = data.unwrap();
+    assert_eq!(data["reason"], "expect_mismatch");
+    assert_eq!(
+        (data["expected"].as_u64(), data["actual"].as_u64()),
+        (Some(2), Some(1))
+    );
+    assert_eq!(
+        data["step_counts"],
+        json!([{"step": "select-nodes", "count": 2}, {"step": "keep-nodes", "count": 1},
+               {"step": "insert-above", "count": 1}])
+    );
+
+    let mut both = intent(doc, 0, PIPE, None);
+    both["encoding"] = json!("char");
+    both["edits"] = json!([{"range": {"start": 0, "end": 1}, "text": "x"}]);
+    let (code, msg, _) = h.fails("proposal.create", both);
+    assert_eq!(code, ErrorCode::InvalidParams);
+    assert_eq!(msg, "give exactly one of edits and pipeline");
+
+    let (code, msg, data) = h.fails(
+        "proposal.create",
+        intent(doc, 0, "select-nodes fn |\n insert-above x", None),
+    );
+    assert_eq!(code, ErrorCode::InvalidParams);
+    assert!(msg.contains("a pipeline is one line"), "{msg}");
+    assert_eq!(data.unwrap()["column"], 18);
+
+    for (params, want) in [
+        (
+            intent(doc, 5, PIPE, None),
+            "base_version 5 is newer than the document",
+        ),
+        (intent(doc, 0, PIPE, Some(0)), "expect must be at least 1"),
+        (intent(doc, 0, "  ", None), "pipeline must not be empty"),
+    ] {
+        let (code, msg, _) = h.fails("proposal.create", params);
+        assert_eq!(code, ErrorCode::InvalidParams);
+        assert!(msg.contains(want), "{msg}");
+    }
+    let mut no_pipeline = edit(doc, 0, 0, 1, "x");
+    no_pipeline["expect"] = json!(1);
+    let (_, msg, _) = h.fails("proposal.create", no_pipeline);
+    assert_eq!(msg, "expect goes with a pipeline");
+
+    assert_eq!(h.ed.proposals.items.len(), 0);
+    assert_eq!(h.text(doc), (LIB.into(), 0));
+}
+
+#[test]
+fn apply_pipeline_headless_needs_allow_rebase_to_rebase() {
+    let mut h = Harness::headless("intent-headless");
+    let doc = h.file("lib.rs", LIB);
+    let apply = |base: u64, expect: Option<u64>, rebase: bool| {
+        let mut p = json!({"doc": doc, "base_version": base, "pipeline": PIPE,
+                           "actor": "script", "description": "must_use"});
+        if let Some(n) = expect {
+            p["expect"] = json!(n);
+        }
+        if rebase {
+            p["allow_rebase"] = json!(true);
+        }
+        p
+    };
+    let r = h.ok("document.apply_pipeline", apply(0, Some(1), false));
+    assert_eq!(
+        r,
+        json!({"doc": doc, "base_version": 0, "ran_on_version": 0, "version": 1,
+               "rebased": false, "edit_count": 1,
+               "step_counts": [{"step": "select-nodes", "count": 2},
+                               {"step": "keep-nodes", "count": 1},
+                               {"step": "insert-above", "count": 1}]})
+    );
+    assert_eq!(h.text(doc), (with_attr(LIB), 1));
+    // One undo step.
+    h.ok("command.run", json!({"name": "undo"}));
+    let (_, v2) = h.text(doc);
+    assert_eq!(h.text(doc).0, LIB);
+
+    // Someone else edits; the script's view is now old.
+    h.ok(
+        "document.apply_edit",
+        json!({"doc": doc, "base_version": v2, "encoding": "char",
+               "edits": [{"range": {"start": 0, "end": 0}, "text": "fn typed() {}\n"}],
+               "actor": "other"}),
+    );
+    let (typed, v3) = h.text(doc);
+    let (code, msg, data) = h.fails("document.apply_pipeline", apply(v2, Some(1), false));
+    assert_eq!(code, ErrorCode::StaleVersion);
+    assert!(msg.contains("Pass allow_rebase"), "{msg}");
+    assert_eq!(data, Some(json!({"expected": v2, "current": v3})));
+    assert_eq!(h.text(doc), (typed.clone(), v3));
+
+    let r = h.ok("document.apply_pipeline", apply(v2, Some(1), true));
+    assert_eq!(r["rebased"], true);
+    assert_eq!(r["ran_on_version"], v3);
+    assert_eq!(r["version"], v3 + 1);
+    assert_eq!(h.text(doc).0, with_attr(&typed));
+
+    // expect is checked on a rebase too.
+    let (code, _, data) = h.fails("document.apply_pipeline", apply(v3, Some(2), true));
+    assert_eq!(code, ErrorCode::PipelineFailed);
+    assert_eq!(data.unwrap()["reason"], "expect_mismatch");
+    assert_eq!(h.text(doc), (with_attr(&typed), v3 + 1));
+
+    let hist = h.ok("document.history", json!({"doc": doc}));
+    let edits = hist["edits"].as_array().unwrap();
+    let piped: Vec<_> = edits.iter().filter(|e| e["pipeline"] == PIPE).collect();
+    assert_eq!(piped.len(), 2, "{hist}");
+    assert_eq!(piped[0]["rebased"], false);
+    assert_eq!(piped[1]["rebased"], true);
+    assert_eq!(piped[1]["base_version"], v2);
+    assert_eq!(piped[1]["new_version"], v3 + 1);
+    assert_eq!(piped[1]["step_counts"], r["step_counts"]);
+    // The plain edit has no pipeline fields.
+    let plain = edits.iter().find(|e| e["actor"] == "other").unwrap();
+    assert!(plain.get("pipeline").is_none(), "{plain}");
+    // Proposals stay refused headless.
+    let (code, _, _) = h.fails("proposal.create", intent(doc, v3 + 1, PIPE, None));
+    assert_eq!(code, ErrorCode::ReviewUnavailable);
 }

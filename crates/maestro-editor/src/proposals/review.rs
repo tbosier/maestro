@@ -69,6 +69,7 @@ pub fn open(ed: &mut Editor) {
         output: false,
         dialog: None,
     });
+    super::refresh_all(ed);
 }
 
 pub fn close(ed: &mut Editor) {
@@ -149,6 +150,28 @@ pub fn current_rows(ed: &Editor) -> Vec<Row> {
         return out;
     }
     let mut rows = Vec::new();
+    if let Some(i) = &p.intent {
+        rows.push(Row::Note(format!(
+            "intent edit: {}",
+            super::visible(&i.pipeline)
+        )));
+        let counts = match &i.failed {
+            Some(f) => &f.counts,
+            None => &i.counts,
+        };
+        let mut line = format!("selections: {}", crate::structural::counts_label(counts));
+        if let Some(n) = i.expect {
+            line.push_str(&format!(" (expected {n})"));
+        }
+        rows.push(Row::Note(line));
+        rows.extend(p.rebase_notes().into_iter().map(Row::Note));
+        if i.failed.is_some() {
+            rows.push(Row::Note(format!(
+                "below: the earlier change, against version {}, which no longer applies",
+                i.preview_version.0
+            )));
+        }
+    }
     // A change to the final newline shows as two lines with the same text;
     // say what differs.
     let ends = |t: &maestro_core::Rope| t.len_chars() == 0 || t.char(t.len_chars() - 1) == '\n';
@@ -354,14 +377,34 @@ pub fn approve_dialog(ed: &Editor, id: ProposalId) -> Option<Dialog> {
     let buf = ed.buffers.get(&p.doc)?;
     let (add, rem) = p.counts();
     let file = p.file_label();
-    let mut lines = vec![
-        format!("From {}: {}", p.actor.label(), p.description),
-        format!(
+    let mut lines = vec![format!("From {}: {}", p.actor.label(), p.description)];
+    match &p.intent {
+        None => lines.push(format!(
             "Applies {} edit(s) (+{add} -{rem} lines) to {file} as one undo step, \
              against version {} (the document is at that version now).",
             p.edit_count, p.base_version.0
-        ),
-    ];
+        )),
+        Some(i) => {
+            lines.push(format!("Intent edit: {}", super::visible(&i.pipeline)));
+            let mut sel = format!("Selections: {}", crate::structural::counts_label(&i.counts));
+            if let Some(n) = i.expect {
+                sel.push_str(&format!(" (expected {n})"));
+            }
+            lines.push(sel);
+            if p.rebased() {
+                lines.push(format!(
+                    "Rebased: {} looked at version {}, and the document is at version {} now, \
+                     so the pipeline ran again on version {}. The diff shown is from that run.",
+                    p.actor.name, p.base_version.0, i.preview_version.0, i.preview_version.0
+                ));
+            }
+            lines.push(format!(
+                "Applies {} edit(s) (+{add} -{rem} lines) to {file} as one undo step, \
+                 against version {} (the document is at that version now).",
+                p.edit_count, i.preview_version.0
+            ));
+        }
+    }
     match &p.verify {
         Some(v) => {
             lines.push(format!(
@@ -435,6 +478,9 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
         ed.error("the proposal review takes keys typed by hand; replayed keys are ignored");
         return;
     }
+    // Intent edits whose document moved on run their pipeline again, so
+    // what the keys act on is the change shown.
+    super::refresh_all(ed);
     let ctrl = key.mods.ctrl;
     match v.dialog.take() {
         Some(Dialog::Approve {
@@ -595,8 +641,19 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
                 ed.proposals.review = Some(v);
                 super::approve(ed, id);
                 return;
+            } else if ed
+                .proposals
+                .get(id)
+                .and_then(|p| p.intent.as_ref()?.refused_ms)
+                .is_some_and(|t| super::now_ms().saturating_sub(t) < super::RESHOW_MS)
+            {
+                ed.error(
+                    "the diff just changed; look at it before approving (a is ignored for half \
+                     a second)",
+                );
             } else {
                 v.dialog = approve_dialog(ed, id);
+                super::mark_shown(ed, id);
             }
         }
         KeyCode::Char('x' | 'X') if !ctrl => match sel.and_then(|id| ed.proposals.get(id)) {
