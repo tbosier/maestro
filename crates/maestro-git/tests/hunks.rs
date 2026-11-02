@@ -218,10 +218,10 @@ fn whole_hunks_added_and_deleted_files_make_a_subset_commit() {
     assert_eq!(f.git(&wt, &["status", "--porcelain"]), status_before);
     assert_eq!(f.git(&f.repo, &["status", "--porcelain"]), "");
     // A branch names it; an existing branch is never moved.
-    main.create_branch("maestro/agent-part-1", &c).unwrap();
+    main.create_branch_at("maestro/agent-part-1", &c).unwrap();
     assert!(main.branch_exists("maestro/agent-part-1").unwrap());
     let err = main
-        .create_branch("maestro/agent-part-1", &base)
+        .create_branch_at("maestro/agent-part-1", &base)
         .unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
     let at = f.git(&f.repo, &["rev-parse", "maestro/agent-part-1"]);
