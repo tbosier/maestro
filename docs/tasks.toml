@@ -37,7 +37,7 @@ crates = ["maestro-editor"]
 branch = "feat/navigation"
 owner = "agent"
 status = "done"
-notes = "Finder, workspace search, picker preview, session restore without splits, recent files. See ROADMAP M1."
+notes = "Finder, workspace search, picker preview, session restore with splits, recent files. See ROADMAP M1."
 
 [[task]]
 id = "m1-lsp"
@@ -75,7 +75,7 @@ status = "in-progress"
 # Done: maestro-git crate (status, line and unified diffs, worktree
 # add/list/remove/prune with safety checks, fast-forward and merge-tree
 # checks), gutter signs, branch in the status line, :git-status and
-# :worktrees pickers. Not started: agent orchestration, review and merge UI.
+# :worktrees pickers. The agent panel, review and integration are tracked below.
 
 [[task]]
 id = "m3-protocol"
@@ -171,7 +171,8 @@ status = "in-progress"
 # Agent sessions across restarts (feat/agent-sessions): records saved per
 # repository, loaded on the panel's first open, relaunch with session/load,
 # found worktrees.
-# Open: a real agent run through the panel.
+# Real agents: Claude Code and Codex run through the panel on October 30
+# and 31, 2026 (ROADMAP M2). Open: session/load against a real ACP agent.
 
 [[task]]
 id = "m3-pipelines"
@@ -183,12 +184,58 @@ status = "done"
 # A narrow slice of the spec's Experiment A; see the M3 row in ROADMAP.md.
 
 [[task]]
+id = "compose"
+title = "Integrate marked hunks of an agent alone, and compose one result from several agents' hunks"
+crates = ["maestro-git", "maestro-editor", "maestro-tui"]
+branch = "feat/compose"
+owner = "agent"
+status = "done"
+# maestro-git/src/hunks.rs builds the trees; the editor marks hunks in the
+# review (agents/marks.rs), integrates parts (agents/parts.rs) and composes
+# (agents/compose.rs). See the After M3 section in ROADMAP.md.
+
+[[task]]
 id = "hardening"
 title = "Integrate only the reviewed commit, end leftover verification processes, withdraw by the creating connection only"
 crates = ["maestro-git", "maestro-editor", "maestro-tasks", "maestro-automation", "maestro-protocol"]
 branch = "feat/hardening"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "wave1-git"
+title = "Git status screen (space g) and buffer hunk keys (]h, [h, space h)"
+crates = ["maestro-git", "maestro-editor", "maestro-tui"]
+branch = "feat/git"
+owner = "agent"
+status = "done"
+# Partial patches (maestro-git patch.rs), staging, commit, log, blame,
+# stash, branches and remote commands; the status screen with line
+# staging, commit and amend buffers, branch picker, stash, fetch, pull
+# (fast-forward only), push (never forced), log and commit pages; hunk
+# navigation, stage, reset, preview, blame popup and blame column.
+# Not built: rebase, cherry-pick and revert from the screen.
+
+[[task]]
+id = "intent-edits"
+title = "Intent edits: proposals and headless edits as structural pipelines, rebased by running them again"
+crates = ["maestro-protocol", "maestro-automation", "maestro-editor", "maestro-tui"]
+branch = "feat/intent-edits"
+owner = "agent"
+status = "done"
+# Protocol 1.3: pipeline and expect in proposal.create, document.apply_pipeline
+# (rebase only with allow_rebase), -32021. New text steps: insert-below,
+# replace-text, delete, wrap, prepend, append. Errors name step and column.
+
+[[task]]
+id = "github-inbox"
+title = "GitHub inbox through gh: review requests, assigned and own PRs, issues, PR detail and diff, approve, comment, request changes, merge, worktree checkout"
+crates = ["maestro-forge", "maestro-editor", "maestro-tui", "maestro-config", "maestro-git"]
+branch = "feat/github"
+owner = "agent"
+status = "done"
+# See the GitHub inbox row in ROADMAP.md. Write actions are tested against
+# a fake gh only; none was run against real GitHub.
 
 [[task]]
 id = "workspaces"

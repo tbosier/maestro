@@ -21,6 +21,7 @@ serde_json.workspace = true
 maestro-agent.workspace = true
 maestro-term.workspace = true
 maestro-tasks.workspace = true
+maestro-forge.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

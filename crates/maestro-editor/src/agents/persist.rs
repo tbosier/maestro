@@ -111,6 +111,52 @@ pub struct AgentRecord {
     /// The task contract, checked like a typed one when loaded.
     #[serde(default)]
     pub contract: Option<super::contract::Contract>,
+    /// `composed` for a result composed from several agents' hunks;
+    /// absent for an agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// For a composed result: which hunk came from which agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<SavedComposition>,
+    /// Parts of the work integrated on their own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<SavedPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedComposition {
+    /// The composed commit; empty if it was never made.
+    pub commit: String,
+    pub sources: Vec<SavedComposedHunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedComposedHunk {
+    pub agent: String,
+    pub label: String,
+    pub test: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPart {
+    pub n: usize,
+    pub branch: String,
+    pub commit: String,
+    pub hunks: Vec<SavedPartHunk>,
+}
+
+/// A hunk of a part, as [`super::marks::HunkKey`] holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPartHunk {
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    #[serde(default)]
+    pub new_mode: Option<String>,
+    pub old_start: usize,
+    pub old_len: usize,
+    pub body: String,
+    /// The changed lines taken; absent for the whole hunk.
+    pub lines: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +339,24 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
             return Err(format!("test tree {tree:?} is not an object id"));
         }
     }
+    match r.origin.as_deref() {
+        None | Some("composed") => {}
+        Some(o) => return Err(format!("unknown origin {o:?}")),
+    }
+    if let Some(c) = &r.composition
+        && !c.commit.is_empty()
+        && !is_object_id(&c.commit)
+    {
+        return Err(format!("composed commit {:?} is not a commit id", c.commit));
+    }
+    for p in &r.parts {
+        if !p.branch.starts_with("maestro/") || !is_object_id(&p.commit) {
+            return Err(format!(
+                "part {} ({:?} at {:?}) is not a maestro/ branch and a commit id",
+                p.n, p.branch, p.commit
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -375,6 +439,34 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
             })
         })
         .collect();
+    let parts = a
+        .parts
+        .iter()
+        .map(|p| SavedPart {
+            n: p.n,
+            branch: p.branch.clone(),
+            commit: p.commit.clone(),
+            hunks: p
+                .hunks
+                .iter()
+                .filter_map(|(k, lines)| {
+                    let path = |x: &Option<PathBuf>| match x {
+                        Some(p) => p.to_str().map(|s| Some(s.to_string())),
+                        None => Some(None),
+                    };
+                    Some(SavedPartHunk {
+                        old_path: path(&k.old_path)?,
+                        new_path: path(&k.new_path)?,
+                        new_mode: k.new_mode.clone(),
+                        old_start: k.old_start,
+                        old_len: k.old_len,
+                        body: k.body.clone(),
+                        lines: lines.as_ref().map(|s| s.iter().copied().collect()),
+                    })
+                })
+                .collect(),
+        })
+        .collect();
     Some(AgentRecord {
         id: a.id.0,
         name: a.name.clone(),
@@ -400,6 +492,20 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
         load_session: a.load_session,
         created: millis(a.created),
         contract: a.contract.clone(),
+        origin: (a.origin == Origin::Composed).then(|| "composed".to_string()),
+        composition: a.composition.as_ref().map(|c| SavedComposition {
+            commit: c.commit.clone(),
+            sources: c
+                .sources
+                .iter()
+                .map(|s| SavedComposedHunk {
+                    agent: s.agent.clone(),
+                    label: s.label.clone(),
+                    test: s.test.clone(),
+                })
+                .collect(),
+        }),
+        parts,
     })
 }
 
@@ -436,6 +542,47 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
     a.session_id = r.session_id.clone();
     a.load_session = r.load_session;
     a.contract = r.contract.clone();
+    if r.origin.as_deref() == Some("composed") {
+        a.origin = Origin::Composed;
+    }
+    a.composition = r.composition.as_ref().map(|c| super::compose::Composition {
+        commit: c.commit.clone(),
+        sources: c
+            .sources
+            .iter()
+            .map(|s| super::compose::ComposedHunk {
+                agent: s.agent.clone(),
+                label: s.label.clone(),
+                test: s.test.clone(),
+            })
+            .collect(),
+    });
+    a.parts = r
+        .parts
+        .iter()
+        .map(|p| super::marks::Part {
+            n: p.n,
+            branch: p.branch.clone(),
+            commit: p.commit.clone(),
+            hunks: p
+                .hunks
+                .iter()
+                .map(|h| {
+                    (
+                        super::marks::HunkKey {
+                            old_path: h.old_path.as_ref().map(PathBuf::from),
+                            new_path: h.new_path.as_ref().map(PathBuf::from),
+                            new_mode: h.new_mode.clone(),
+                            old_start: h.old_start,
+                            old_len: h.old_len,
+                            body: h.body.clone(),
+                        },
+                        h.lines.as_ref().map(|l| l.iter().copied().collect()),
+                    )
+                })
+                .collect(),
+        })
+        .collect();
     a.history = r
         .history
         .iter()
@@ -573,6 +720,8 @@ fn fingerprint(ed: &Editor) -> u64 {
         a.tests.last().map(|t| t.finished.is_some()).hash(&mut h);
         a.tests.last().map(|t| &t.tree).hash(&mut h);
         a.contract.as_ref().map(|c| c.brief()).hash(&mut h);
+        a.composition.as_ref().map(|c| &c.commit).hash(&mut h);
+        a.parts.len().hash(&mut h);
     }
     h.finish()
 }
@@ -1035,6 +1184,11 @@ pub fn save(ed: &mut Editor, durable: bool) {
                 if r.comments.len() < a.comments.len() {
                     unsaved.push(format!("comments of {} on files", a.name));
                 }
+                let kept: usize = r.parts.iter().map(|p| p.hunks.len()).sum();
+                let all: usize = a.parts.iter().map(|p| p.hunks.len()).sum();
+                if kept < all {
+                    unsaved.push(format!("integrated hunks of {} in files", a.name));
+                }
                 groups
                     .entry(normalize_path(&w.main_root))
                     .or_default()
@@ -1131,6 +1285,9 @@ mod tests {
             load_session: false,
             created: 1_000,
             contract: None,
+            origin: None,
+            composition: None,
+            parts: vec![],
         }
     }
 

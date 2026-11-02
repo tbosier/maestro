@@ -111,6 +111,9 @@ fn record(id: u64, status: &str) -> maestro_editor::agents::persist::AgentRecord
         load_session: false,
         created: 0,
         contract: None,
+        origin: None,
+        composition: None,
+        parts: vec![],
     }
 }
 
@@ -231,11 +234,8 @@ fn contracts_and_conflicts_are_shown_in_words() {
     assert!(text.contains("overlaps sh-1 in notes.txt"), "{text}");
     // The review marks the file outside the contract with ! and words.
     ed.agents.panel.review = Some(ReviewView {
-        agent: one,
         file: 1,
-        cursor: 0,
-        top: 0,
-        side_by_side: false,
+        ..ReviewView::new(one)
     });
     let rows = screen(&ed);
     let text = rows.join("\n");
@@ -290,11 +290,8 @@ fn side_by_side_numbers_each_side_from_its_own_file() {
     ed.handle_key(KeyEvent::char(' '));
     ed.handle_key(KeyEvent::char('a'));
     ed.agents.panel.review = Some(ReviewView {
-        agent: id,
-        file: 0,
-        cursor: 0,
-        top: 0,
         side_by_side: true,
+        ..ReviewView::new(id)
     });
     let rows = screen(&ed);
     let text = rows.join("\n");
@@ -316,4 +313,226 @@ fn side_by_side_numbers_each_side_from_its_own_file() {
         added_row.rsplit_once('│').unwrap().1.contains("  23 "),
         "{added_row}"
     );
+}
+
+/// A modified file with one hunk at each of `at`: a kept line, then
+/// `old N` replaced by `new N` and `more N`.
+fn modified(path: &str, at: &[usize]) -> maestro_editor::agents::DiffFile {
+    use maestro_editor::agents::{DiffLine, Hunk};
+    let line = |kind, old, new, text: String| DiffLine {
+        kind,
+        old_line: old,
+        new_line: new,
+        text,
+        no_newline: false,
+    };
+    let mut f = added(path);
+    f.old_path = Some(path.into());
+    f.change = FileChange::Modified;
+    f.hunks = at
+        .iter()
+        .map(|&n| Hunk {
+            old_start: n,
+            old_len: 2,
+            new_start: n,
+            new_len: 3,
+            section: String::new(),
+            lines: vec![
+                line(DiffLineKind::Context, Some(n), Some(n), format!("keep {n}")),
+                line(DiffLineKind::Removed, Some(n + 1), None, format!("old {n}")),
+                line(DiffLineKind::Added, None, Some(n + 1), format!("new {n}")),
+                line(DiffLineKind::Added, None, Some(n + 2), format!("more {n}")),
+            ],
+        })
+        .collect();
+    f
+}
+
+/// The symbol in column `x` of row `y`.
+fn cell(s: &Surface, x: u16, y: u16) -> String {
+    s.cell(x, y).map(|c| c.symbol.clone()).unwrap_or_default()
+}
+
+#[test]
+fn marks_show_in_the_gutter_with_symbols_and_the_header_counts_them() {
+    use maestro_editor::agents::marks::{HunkKey, Part};
+    use maestro_editor::agents::persist::from_record;
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 120, 28));
+    let mut a = from_record(&record(1, "ready-for-review"), &[]);
+    let file = modified("calc.rs", &[1, 20, 40]);
+    // The third hunk went in with an earlier part.
+    a.parts = vec![Part {
+        n: 1,
+        branch: "maestro/sh-1-part-1".into(),
+        commit: "0123abcd".into(),
+        hunks: vec![(HunkKey::of(&file, &file.hunks[2]), None)],
+    }];
+    a.review.files = vec![file];
+    a.review.computed = Some(std::time::Instant::now());
+    ed.agents.agents.push(a);
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    ed.handle_key(KeyEvent::plain(KeyCode::Enter));
+    assert!(ed.agents.panel.review.is_some());
+    // space marks the first hunk; in the second, v marks two lines.
+    for k in " ]jjvj ".chars() {
+        ed.handle_key(KeyEvent::char(k));
+    }
+    let mut s = Surface::new(120, 30, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let rows: Vec<String> = (0..30).map(|y| row(&s, y)).collect();
+    let text = rows.join("\n");
+    let gutter = panel::agent_layout(ed.area).content.x + 1;
+    let find = |needle: &str| -> u16 {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} in\n{text}")) as u16
+    };
+    // Hunks: a symbol in the gutter and the state in words.
+    let h1 = find("@@ -1,2 +1,3 @@");
+    assert_eq!(cell(&s, gutter, h1), "*");
+    assert!(rows[h1 as usize].contains("[marked]"), "{text}");
+    let h2 = find("@@ -20,2 +20,3 @@");
+    assert_eq!(cell(&s, gutter, h2), "*");
+    assert!(
+        rows[h2 as usize].contains("[2 of 3 lines marked]"),
+        "{text}"
+    );
+    let h3 = find("@@ -40,2 +40,3 @@");
+    assert_eq!(cell(&s, gutter, h3), "=");
+    assert!(
+        rows[h3 as usize].contains("[integrated in part 1]"),
+        "{text}"
+    );
+    // Lines: marked, unmarked, integrated.
+    assert_eq!(cell(&s, gutter, find("old 20")), "*");
+    assert_eq!(cell(&s, gutter, find("new 20")), "*");
+    assert_eq!(cell(&s, gutter, find("more 20")), " ");
+    assert_eq!(cell(&s, gutter, find("keep 20")), " ");
+    assert_eq!(cell(&s, gutter, find("more 1")), "*");
+    assert_eq!(cell(&s, gutter, find("new 40")), "=");
+    // The header counts them and says what the symbols mean.
+    assert!(
+        text.contains("2 hunks (5 lines) marked: I integrates only them (*)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 part(s) integrated on their own (=), the last on maestro/sh-1-part-1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("space mark hunk") && text.contains("v mark lines"),
+        "{text}"
+    );
+    // A range being chosen shows with `~` until it is marked.
+    for k in "gjvj".chars() {
+        ed.handle_key(KeyEvent::char(k));
+    }
+    let mut s = Surface::new(120, 30, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let y = (0..30).find(|y| row(&s, *y).contains("keep 1")).unwrap();
+    assert_eq!(cell(&s, gutter, y), "~");
+}
+
+#[test]
+fn the_compose_view_shows_each_agents_hunks_side_by_side() {
+    use maestro_editor::agents::persist::from_record;
+    use maestro_editor::agents::{TestFinish, TestRun};
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 140, 28));
+    let mut one = from_record(&record(1, "ready-for-review"), &[]);
+    one.review.files = vec![modified("calc.rs", &[1, 40])];
+    one.review.computed = Some(std::time::Instant::now());
+    let mut two = from_record(&record(2, "ready-for-review"), &[]);
+    two.group = one.group;
+    // A file turned into a symlink: a deletion and an addition of `link`.
+    let mut gone = added("link");
+    gone.old_path = Some("link".into());
+    gone.new_path = None;
+    gone.change = FileChange::Deleted;
+    gone.hunks = modified("link", &[0]).hunks;
+    let mut link = added("link");
+    link.hunks = modified("link", &[0]).hunks;
+    two.review.files = vec![modified("calc.rs", &[2]), gone, link];
+    two.review.computed = Some(std::time::Instant::now());
+    two.tests.push(TestRun {
+        command: "t".into(),
+        started: std::time::Instant::now(),
+        output: Default::default(),
+        dropped: 0,
+        finished: Some(TestFinish {
+            code: Some(0),
+            duration: std::time::Duration::ZERO,
+            summary: None,
+        }),
+        tree: None,
+        agent_was_running: false,
+    });
+    ed.agents.agents.push(one);
+    ed.agents.agents.push(two);
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    assert!(screen(&ed).join("\n").contains("C compose"));
+    ed.handle_key(KeyEvent::char('C'));
+    assert!(ed.agents.panel.compose.is_some(), "{:?}", ed.status);
+    // space marks the hunk under the cursor: sh-1's first.
+    ed.handle_key(KeyEvent::char(' '));
+    let render = |ed: &Editor| -> Vec<String> {
+        let mut s = Surface::new(140, 30, ed.theme.ui.text);
+        crate::render::render(ed, &mut s);
+        (0..30).map(|y| row(&s, y)).collect()
+    };
+    let rows = render(&ed);
+    let text = rows.join("\n");
+    assert!(rows[1].contains("compose: task #1"), "{text}");
+    // A column per agent with its name and test result.
+    let heads = rows
+        .iter()
+        .find(|r| r.contains("sh-1  no tests run"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(heads.contains("sh-2  tests ok"), "{heads}");
+    // The two agents' hunks over the same lines side by side, marked or not.
+    let band = rows
+        .iter()
+        .find(|r| r.contains("[x] @@ -1,2 +1,3 @@"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(band.contains("[ ] @@ -2,2 +2,3 @@"), "{band}");
+    assert!(band.contains('│'), "{band}");
+    assert!(text.contains("old 1") && text.contains("new 2"), "{text}");
+    // sh-1's later hunk sits in a band of its own.
+    let later = rows
+        .iter()
+        .find(|r| r.contains("@@ -40,2 +40,3 @@"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(!later.contains("@@ -2,2"), "{later}");
+    assert!(
+        text.contains("1 hunk(s) marked from sh-1 ([x]): ret checks that they apply together"),
+        "{text}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("calc.rs") && r.contains("1 marked")),
+        "{text}"
+    );
+    assert!(text.contains("ret check and compose"), "{text}");
+    // A hunk the last check refused is marked [!] and counted.
+    let id = ed.agents.agents[1].id;
+    let f = &ed.agents.agents[1].review.files[0];
+    let key = maestro_editor::agents::marks::HunkKey::of(f, &f.hunks[0]);
+    ed.agents.panel.compose.as_mut().unwrap().problems = vec![(id, key, "conflicts".into())];
+    let text = render(&ed).join("\n");
+    assert!(text.contains("[!] @@ -2,2 +2,3 @@"), "{text}");
+    assert!(
+        text.contains("! 1 marked hunk(s) do not apply together"),
+        "{text}"
+    );
+    // Both halves of the type change are hunks to mark.
+    ed.handle_key(KeyEvent::plain(KeyCode::Tab));
+    let v = ed.agents.panel.compose.clone().unwrap();
+    assert_eq!(
+        compose::files(&ed, &v)[v.file],
+        std::path::PathBuf::from("link")
+    );
+    let files: Vec<usize> = compose::items(&ed, &v).iter().map(|i| i.file).collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert_ne!(files[0], files[1]);
 }

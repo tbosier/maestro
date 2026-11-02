@@ -188,6 +188,28 @@ pub struct AgentsConfig {
     pub provider: BTreeMap<String, AgentProviderConfig>,
 }
 
+/// `[github]`: the GitHub inbox (`space i`), which runs the GitHub CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GithubConfig {
+    /// The `gh` program: a path, or a name looked up on `PATH`. `~`
+    /// expands to the home directory.
+    pub gh: String,
+    /// Reload the inbox in the background this often, in seconds, whether
+    /// or not it is open. 0 (the default) loads it only when it is opened
+    /// or `r` is pressed.
+    pub refresh_secs: u64,
+}
+
+impl Default for GithubConfig {
+    fn default() -> Self {
+        Self {
+            gh: "gh".into(),
+            refresh_secs: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
@@ -203,6 +225,7 @@ pub struct Config {
     pub projects: ProjectsConfig,
     pub notify: NotifyConfig,
     pub lsp: LspConfig,
+    pub github: GithubConfig,
 }
 
 impl Default for Config {
@@ -218,6 +241,7 @@ impl Default for Config {
             projects: ProjectsConfig::default(),
             notify: NotifyConfig::default(),
             lsp: LspConfig::default(),
+            github: GithubConfig::default(),
         }
     }
 }
@@ -507,5 +531,19 @@ enabled = false
         );
         assert!(c.language_servers("cobol").is_empty());
         assert!(Config::parse("[language-server.rust]\ncmd = \"x\"\n", Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn parses_github_settings() {
+        let c = Config::parse(
+            "[github]\ngh = \"~/bin/gh\"\nrefresh-secs = 300\n",
+            Path::new("x"),
+        )
+        .unwrap();
+        assert_eq!(c.github.gh, "~/bin/gh");
+        assert_eq!(c.github.refresh_secs, 300);
+        let d = Config::default();
+        assert_eq!((d.github.gh.as_str(), d.github.refresh_secs), ("gh", 0));
+        assert!(Config::parse("[github]\ntoken = \"x\"\n", Path::new("x")).is_err());
     }
 }

@@ -42,8 +42,11 @@ macro_rules! commands {
 pub static TABLES: &[&[Command]] = &[
     COMMANDS,
     crate::git::COMMANDS,
+    crate::git_screen::COMMANDS,
+    crate::git_hunks::COMMANDS,
     crate::agents::COMMANDS,
     crate::proposals::COMMANDS,
+    crate::forge::COMMANDS,
     crate::lsp_commands::COMMANDS,
     crate::navigation::COMMANDS,
     crate::syntax_commands::COMMANDS,

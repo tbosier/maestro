@@ -226,6 +226,8 @@ pub struct Editor {
     /// Projects, worktrees, the sidebar, agent attention and switching
     /// between worktrees (see [`crate::workspaces`]).
     pub workspaces: crate::workspaces::Workspaces,
+    /// The GitHub inbox (see [`crate::forge`]).
+    pub forge: crate::forge::Forge,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -279,6 +281,7 @@ impl Editor {
             agents: Default::default(),
             proposals: Default::default(),
             workspaces: Default::default(),
+            forge: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -804,12 +807,14 @@ impl Editor {
         if self.presentation == Presentation::Focus {
             return 0;
         }
+        // A blame column (`space h B`) sits left of the sign column.
+        let blame = crate::git_hunks::blame_width(self, view.doc);
         if self.config.editor.line_numbers == LineNumbers::Off {
-            return 1;
+            return blame + 1;
         }
         let lines = crate::motion::last_line(self.buffers[&view.doc].doc.text().slice(..)) + 1;
         let digits = lines.to_string().len().max(3) as u16;
-        1 + digits + 1
+        blame + 1 + digits + 1
     }
 
     pub fn text_width(&self, view: &View) -> usize {
@@ -905,6 +910,7 @@ impl Editor {
 
         self.status_clear_on_key(key);
         crate::lsp::on_key(self);
+        crate::git_hunks::on_key(self);
         self.dispatch(key);
 
         // Mode-transition bookkeeping.
@@ -1098,6 +1104,14 @@ impl Editor {
         if sidebar && self.pending.is_empty() && crate::workspaces::sidebar::handle_key(self, key) {
             return;
         }
+        if !sidebar && self.forge.screen_open() {
+            crate::forge::screen::handle_key(self, key);
+            return;
+        }
+        if !sidebar && self.git.screen_open() {
+            crate::git_screen::handle_key(self, key);
+            return;
+        }
         if !sidebar && self.proposals.review_open() {
             crate::proposals::review::handle_key(self, key);
             return;
@@ -1220,6 +1234,8 @@ impl Editor {
             || self.prompt.is_some()
             || self.agents.panel_open()
             || self.proposals.review_open()
+            || self.forge.screen_open()
+            || self.git.screen_open()
         {
             return;
         }
@@ -1300,12 +1316,20 @@ impl Editor {
             self.info("paste ignored: the sidebar has the keys (esc returns to the editor)");
             return;
         }
+        if self.forge.screen_open() {
+            // The inbox has no text input; messages are written in buffers.
+            return;
+        }
         if self.proposals.review_open() {
             crate::proposals::review::paste(self, text);
             return;
         }
         if self.agents.panel_open() {
             crate::agents::panel::paste(self, text);
+            return;
+        }
+        if self.git.screen_open() {
+            // The status screen has no text input; a paste does nothing.
             return;
         }
         if self.pending_char.is_some() || self.awaiting_register || !self.pending.is_empty() {
@@ -1489,6 +1513,7 @@ impl Editor {
         crate::lsp::stop_unused(self, now);
         crate::agents::tick(self, now);
         crate::workspaces::tick(self, now);
+        crate::forge::tick(self, now);
     }
 
     fn check_disk_changes(&mut self) {
