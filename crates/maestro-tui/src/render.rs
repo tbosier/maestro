@@ -41,8 +41,12 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     draw_hover(ed, surface);
     draw_signature(ed, surface);
     draw_completion(ed, surface);
+    crate::git::draw_popup(ed, surface);
     let mut cursor = CursorShape::Hidden;
-    if ed.proposals.review_open() {
+    if ed.git.screen_open() {
+        // The Git status screen covers the editor area (crate::git).
+        cursor = crate::git::draw_screen(ed, surface);
+    } else if ed.proposals.review_open() {
         // The proposal review covers the editor area (crate::proposals).
         cursor = crate::proposals::draw(ed, surface);
     } else if ed.agents.panel_open() {
@@ -143,6 +147,10 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
     let focused = view.id == ed.focus;
     let area = view.area;
     let gutter = ed.gutter_width(view);
+    // A blame column, when shown, takes the gutter's first cells; line
+    // numbers and signs follow it.
+    let blame_w = maestro_editor::git_hunks::blame_width(ed, view.doc).min(gutter);
+    let (gx, gw) = (area.x + blame_w, gutter - blame_w);
     let text_h = view.text_height();
     let text_x = area.x + gutter;
     let right = area.right();
@@ -184,7 +192,8 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
                 base,
             );
         }
-        draw_gutter(ed, s, area.x, y, gutter, line, primary_line, focused);
+        crate::git::draw_blame(ed, s, area.x, y, blame_w, view, line);
+        draw_gutter(ed, s, gx, y, gw, line, primary_line, focused);
         // One sign cell, three sources. Errors and warnings win; a Git
         // change wins over an info or hint, which is drawn only when the
         // line has no Git sign.
@@ -193,11 +202,11 @@ fn draw_view(ed: &Editor, view: &View, s: &mut Surface) {
             matches!(sev, DiagnosticSeverity::Error | DiagnosticSeverity::Warning)
         };
         if let Some(sev) = diag.filter(|d| !urgent(d)) {
-            draw_diagnostic_sign(ed, s, area.x, y, gutter, sev);
+            draw_diagnostic_sign(ed, s, gx, y, gw, sev);
         }
-        draw_git_sign(ed, s, area.x, y, gutter, view, line, primary_line);
+        draw_git_sign(ed, s, gx, y, gw, view, line, primary_line);
         if let Some(sev) = diag.filter(urgent) {
-            draw_diagnostic_sign(ed, s, area.x, y, gutter, sev);
+            draw_diagnostic_sign(ed, s, gx, y, gw, sev);
         }
 
         // Text.
