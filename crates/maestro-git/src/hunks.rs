@@ -7,7 +7,7 @@
 //! checks that every line they expect is there and that no two of them
 //! change the same or neighboring lines, and writes the result as a tree
 //! through a temporary index. Nothing here touches a working tree, the real
-//! index or a ref, except [`Repository::create_branch`], which only ever
+//! index or a ref, except [`Repository::create_branch_at`], which only ever
 //! creates a new branch.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -646,7 +646,7 @@ impl Repository {
     /// Writes a commit of `tree` with the single parent `parent` and
     /// `message`, authored and committed by the user's configured identity
     /// (refused with [`GitError::NoIdentity`] without one). No ref moves;
-    /// [`Repository::create_branch`] names it.
+    /// [`Repository::create_branch_at`] names it.
     pub fn commit_on(&self, tree: &str, parent: &str, message: &str) -> Result<String> {
         check_rev(tree)?;
         check_rev(parent)?;
@@ -682,7 +682,7 @@ impl Repository {
 
     /// Creates the local branch `branch` at `commit`. Refuses, changing
     /// nothing, when the branch already exists: it never moves one.
-    pub fn create_branch(&self, branch: &str, commit: &str) -> Result<()> {
+    pub fn create_branch_at(&self, branch: &str, commit: &str) -> Result<()> {
         check_branch_name(self, branch)?;
         check_rev(commit)?;
         let name = format!("refs/heads/{branch}");

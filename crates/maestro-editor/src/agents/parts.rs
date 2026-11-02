@@ -332,7 +332,7 @@ pub(crate) fn run(
             return out;
         }
     };
-    if let Err(e) = main.create_branch(&p.branch, &commit) {
+    if let Err(e) = main.create_branch_at(&p.branch, &commit) {
         out.outcome = Err(format!(
             "could not create {}: {e}; nothing changed",
             p.branch
