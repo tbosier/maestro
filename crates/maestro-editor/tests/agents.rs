@@ -155,6 +155,10 @@ fn main() {
             "composing_hunks_of_two_agents_tests_and_integrates_the_result",
             composing_hunks_of_two_agents_tests_and_integrates_the_result,
         ),
+        (
+            "compose_view_j_and_k_stay_in_the_agents_column",
+            compose_view_j_and_k_stay_in_the_agents_column,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -3313,4 +3317,47 @@ fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
         merged.contains("from alpha-1") && merged.contains("from beta-2"),
         "{merged}"
     );
+}
+
+fn compose_view_j_and_k_stay_in_the_agents_column() {
+    use maestro_editor::agents::compose;
+    let f = calc_fixture();
+    let sed = |s: &str| {
+        sh_provider(&format!(
+            "sed '{s}' calc.txt > calc.tmp && mv calc.tmp calc.txt"
+        ))
+    };
+    let c = config(&[
+        ("alpha", sed("s/^line 2$/alpha 2/; s/^line 28$/alpha 28/")),
+        ("beta", sed("s/^line 3$/beta 3/; s/^line 15$/beta 15/")),
+    ]);
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 0);
+    start_contract_task(&mut ed, "improve the calculator\n@allow calc.txt", 0);
+    wait_files(&mut ed, 0, &["calc.txt"]);
+    run(&mut ed, "N");
+    run(&mut ed, "\n");
+    wait_files(&mut ed, 1, &["calc.txt"]);
+    select(&mut ed, 0);
+    run(&mut ed, "C");
+    // Items band by band: alpha's line 2 and beta's line 3 share band 0,
+    // then beta's line 15, then alpha's line 28.
+    let at = |ed: &Editor| {
+        let v = ed.agents.panel.compose.as_ref().expect("the compose view");
+        let it = &compose::items(ed, v)[v.cursor];
+        (it.col, it.hunk)
+    };
+    assert_eq!(at(&ed), (0, 0));
+    run(&mut ed, "l");
+    assert_eq!(at(&ed), (1, 0), "l moves to beta's first hunk");
+    // j goes down beta's column, not to the next band's alpha hunk.
+    run(&mut ed, "j");
+    assert_eq!(at(&ed), (1, 1), "j stays in beta's column");
+    run(&mut ed, "j");
+    assert_eq!(at(&ed), (1, 1), "j at the column's end stays");
+    run(&mut ed, "k");
+    assert_eq!(at(&ed), (1, 0), "k goes up beta's column");
+    run(&mut ed, "h");
+    run(&mut ed, "j");
+    assert_eq!(at(&ed), (0, 1), "j goes down alpha's column");
 }
