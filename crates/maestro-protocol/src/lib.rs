@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The protocol version this crate describes, as `MAJOR.MINOR`.
-pub const PROTOCOL_VERSION: &str = "1.2";
+pub const PROTOCOL_VERSION: &str = "1.3";
 pub const PROTOCOL_MAJOR: u64 = 1;
-pub const PROTOCOL_MINOR: u64 = 2;
+pub const PROTOCOL_MINOR: u64 = 3;
 /// The `jsonrpc` member of every message.
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -50,6 +50,8 @@ pub mod methods {
     pub const PROPOSAL_STATUS: &str = "proposal.status";
     pub const PROPOSAL_LIST: &str = "proposal.list";
     pub const PROPOSAL_WITHDRAW: &str = "proposal.withdraw";
+    /// Since 1.3.
+    pub const DOCUMENT_APPLY_PIPELINE: &str = "document.apply_pipeline";
 
     /// Every request method, in the order `initialize` reports them.
     pub const ALL: &[&str] = &[
@@ -71,6 +73,7 @@ pub mod methods {
         PROPOSAL_STATUS,
         PROPOSAL_LIST,
         PROPOSAL_WITHDRAW,
+        DOCUMENT_APPLY_PIPELINE,
     ];
 }
 
@@ -269,6 +272,12 @@ pub enum ErrorCode {
     /// `proposal.withdraw` from a connection other than the one that
     /// created the proposal. Nothing changed.
     NotOwner,
+    /// A pipeline (`proposal.create`, `document.apply_pipeline`) ran but
+    /// cannot be used: it selected nothing, changed nothing, its text step
+    /// refused, there was no syntax tree, or the selection count differs
+    /// from `expect`. `data` is [`PipelineFailedData`]. Nothing changed.
+    /// Since 1.3.
+    PipelineFailed,
 }
 
 impl ErrorCode {
@@ -292,6 +301,7 @@ impl ErrorCode {
             ErrorCode::ReviewUnavailable => -32018,
             ErrorCode::NotPending => -32019,
             ErrorCode::NotOwner => -32020,
+            ErrorCode::PipelineFailed => -32021,
         }
     }
 
@@ -314,6 +324,7 @@ impl ErrorCode {
         ErrorCode::ReviewUnavailable,
         ErrorCode::NotPending,
         ErrorCode::NotOwner,
+        ErrorCode::PipelineFailed,
     ];
 
     pub fn from_code(code: i64) -> Option<Self> {
@@ -620,6 +631,80 @@ pub struct DocParams {
     pub doc: DocId,
 }
 
+/// How many selections a pipeline step left (for the text-changing step:
+/// how many it was given). Since 1.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepCount {
+    pub step: String,
+    pub count: u64,
+}
+
+/// `document.apply_pipeline` (since 1.3): run a structural pipeline and
+/// apply its change at once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyPipelineParams {
+    pub doc: DocId,
+    /// The version the client looked at.
+    pub base_version: u64,
+    /// The same line syntax as the `:` command line, ending in a step
+    /// that changes text.
+    pub pipeline: String,
+    /// The selection count expected after the selection steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<u64>,
+    /// When the document is no longer at `base_version`, run the pipeline
+    /// on the current text instead of refusing with a stale error.
+    #[serde(default)]
+    pub allow_rebase: bool,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyPipelineResult {
+    pub doc: DocId,
+    pub base_version: u64,
+    /// The version the pipeline ran on: `base_version`, or the newer
+    /// version it was rebased onto.
+    pub ran_on_version: u64,
+    /// The version after the change.
+    pub version: u64,
+    pub rebased: bool,
+    pub step_counts: Vec<StepCount>,
+    /// Separate changes made (insertions, deletions, replacements).
+    pub edit_count: u64,
+}
+
+/// `data` of an invalid pipeline (`-32602`): where it is wrong. Since 1.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineErrorData {
+    /// One-based step number.
+    pub step: u64,
+    /// The step's name as written; empty for an empty step.
+    pub name: String,
+    /// One-based character column in the pipeline, when the error has a
+    /// place.
+    pub column: Option<u64>,
+}
+
+/// `data` of [`ErrorCode::PipelineFailed`]. Since 1.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineFailedData {
+    /// `no_selections`, `no_change`, `expect_mismatch`, `refused` or
+    /// `no_tree`.
+    pub reason: String,
+    /// The step that stopped it (`no_selections`, `refused`).
+    pub step: Option<u64>,
+    /// For `expect_mismatch`.
+    pub expected: Option<u64>,
+    pub actual: Option<u64>,
+    /// The version it ran on.
+    pub version: u64,
+    /// The steps that ran.
+    pub step_counts: Vec<StepCount>,
+}
+
 /// One edit applied through `document.apply_edit`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditRecord {
@@ -633,6 +718,15 @@ pub struct EditRecord {
     /// `proposal.create` rather than `document.apply_edit`. Since 1.1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ProposalId>,
+    /// The pipeline, for an edit made by `document.apply_pipeline` or an
+    /// approved intent edit. Since 1.3, like the two fields after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// True when the pipeline ran on a newer version than `base_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebased: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_counts: Option<Vec<StepCount>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -778,11 +872,26 @@ pub struct ProposalCreateParams {
     pub doc: Option<DocId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// The document version the edits were computed against.
+    /// The document version the client looked at: the edits were computed
+    /// against it, or the pipeline was written for it.
     pub base_version: u64,
-    pub encoding: Encoding,
-    /// The same shapes `document.apply_edit` takes.
+    /// Required with `edits`. Since 1.3 it may be left out with
+    /// `pipeline`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<Encoding>,
+    /// The same shapes `document.apply_edit` takes. Give exactly one of
+    /// `edits` and `pipeline`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<TextEdit>,
+    /// An intent edit (since 1.3): a structural pipeline in the `:` line
+    /// syntax, ending in a step that changes text. A document that moved
+    /// on is rebased by running it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// With `pipeline`: the selection count expected after the selection
+    /// steps, at creation and again on a rebase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<u64>,
     pub actor: Actor,
     /// What the change does, shown to the person reviewing it. Must not be
     /// empty.
@@ -925,6 +1034,24 @@ pub struct ProposalInfo {
     pub created_ms: u64,
     pub decided_ms: Option<u64>,
     pub resolved_ms: Option<u64>,
+    /// For an intent edit (since 1.3, like the fields after it): the
+    /// pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<u64>,
+    /// True when its change was computed on a newer version than
+    /// `base_version`: at creation, or because the document moved on
+    /// before approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebased: Option<bool>,
+    /// The version the pipeline last ran on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_on_version: Option<u64>,
+    /// Selection counts per step of that run. For a rerun that failed,
+    /// the steps that ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_counts: Option<Vec<StepCount>>,
 }
 
 #[cfg(test)]
@@ -1101,6 +1228,9 @@ mod tests {
                 new_version: 1,
                 timestamp_ms: 5,
                 proposal: None,
+                pipeline: None,
+                rebased: None,
+                step_counts: None,
             }],
             proposals: Vec::new(),
         };
@@ -1150,8 +1280,24 @@ mod tests {
             created_ms: 1,
             decided_ms: Some(2),
             resolved_ms: Some(3),
+            pipeline: None,
+            expect: None,
+            rebased: None,
+            ran_on_version: None,
+            step_counts: None,
         };
         assert_eq!(round_trip(&info), info);
+        // A text-diff proposal has none of the 1.3 intent fields.
+        let v = serde_json::to_value(&info).unwrap();
+        for k in [
+            "pipeline",
+            "expect",
+            "rebased",
+            "ran_on_version",
+            "step_counts",
+        ] {
+            assert!(v.get(k).is_none(), "{k} in {v}");
+        }
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["state"], "resolved");
         assert_eq!(v["decided_by"]["kind"], "user");
@@ -1165,11 +1311,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(create.actor.agent_id, None);
+        assert_eq!(create.encoding, Some(Encoding::Char));
+        assert_eq!(create.pipeline, None);
         assert_eq!(
             create.verification.as_ref().unwrap().args,
             Vec::<String>::new()
         );
         assert_eq!(round_trip(&create), create);
+        let intent: ProposalCreateParams = serde_json::from_value(json!({
+            "doc": 1, "base_version": 0, "pipeline": "select-nodes fn | delete",
+            "expect": 2, "actor": {"name": "a"}, "description": "d"
+        }))
+        .unwrap();
+        assert_eq!(intent.encoding, None);
+        assert!(intent.edits.is_empty());
+        assert_eq!(intent.expect, Some(2));
+        assert_eq!(round_trip(&intent), intent);
+        let apply: ApplyPipelineParams = serde_json::from_value(json!({
+            "doc": 1, "base_version": 0, "pipeline": "delete", "actor": "a"
+        }))
+        .unwrap();
+        assert!(!apply.allow_rebase);
+        assert_eq!(round_trip(&apply), apply);
 
         let list = CommandListResult {
             commands: vec![CommandInfo {
