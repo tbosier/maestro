@@ -2924,7 +2924,7 @@ fn marked_hunks_integrate_alone_and_the_rest_stays() {
     let c = config(&[(
         "sh",
         sh_provider(
-            "sed -i 's/^line 2$/line two/; s/^line 28$/line twenty-eight/' calc.txt && \
+            "sed 's/^line 2$/line two/; s/^line 28$/line twenty-eight/' calc.txt > calc.tmp && mv calc.tmp calc.txt && \
              printf 'a\\nb\\nc\\n' > notes.txt",
         ),
     )]);
@@ -3151,7 +3151,12 @@ fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
     use maestro_editor::agents::Origin;
     use maestro_editor::agents::compose;
     let f = calc_fixture();
-    let sed = |s: &str| sh_provider(&format!("sed -i '{s}' calc.txt"));
+    // Not `sed -i`: its syntax differs between GNU and BSD (macOS) sed.
+    let sed = |s: &str| {
+        sh_provider(&format!(
+            "sed '{s}' calc.txt > calc.tmp && mv calc.tmp calc.txt"
+        ))
+    };
     let mut c = config(&[
         // alpha changes lines 2 and 28; beta changes lines 3 (next to
         // alpha's line 2) and 15.
