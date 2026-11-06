@@ -25,6 +25,10 @@ pub fn split_screen(width: u16, height: u16, ed: &Editor) -> (Option<Rect>, Rect
         let used = side.width + 1;
         views = Rect::new(used, top, width.saturating_sub(used), views.height);
     }
+    // The file tree and its divider come off the right.
+    if let Some(tree) = tree_area(width, height, ed) {
+        views.width = views.width.saturating_sub(tree.width + 1);
+    }
     let cmdline = Rect::new(0, height.saturating_sub(1), width, 1);
     (tabline.then(|| Rect::new(0, 0, width, 1)), views, cmdline)
 }
@@ -51,6 +55,39 @@ pub fn sidebar_room(width: u16, height: u16, ed: &Editor) -> Option<Rect> {
     Some(Rect::new(0, top, w, height - top - 1))
 }
 
+/// Columns the views always keep when the file tree is open.
+const TREE_MIN_VIEWS: u16 = 20;
+
+/// The file tree's column (`space t`), when it is open and there is room
+/// for it. Its divider is the column just left of it.
+pub fn tree_area(width: u16, height: u16, ed: &Editor) -> Option<Rect> {
+    if !ed.workspaces.tree.open {
+        return None;
+    }
+    tree_room(width, height, ed)
+}
+
+/// Where the file tree would go, open or not: right of the views, after
+/// the sidebar has its share. At most half of what the sidebar leaves,
+/// leaving the views at least [`TREE_MIN_VIEWS`] columns; `None` when that
+/// is under 12 columns.
+pub fn tree_room(width: u16, height: u16, ed: &Editor) -> Option<Rect> {
+    let tabline = ed.presentation != Presentation::Focus && height > 3;
+    let top = u16::from(tabline);
+    let left = sidebar_area(width, height, ed).map_or(0, |s| s.width + 1);
+    let avail = width.saturating_sub(left);
+    let w = ed
+        .config
+        .tree
+        .width
+        .min(avail / 2)
+        .min(avail.saturating_sub(1 + TREE_MIN_VIEWS));
+    if w < 12 || height < top + 3 {
+        return None;
+    }
+    Some(Rect::new(width - w, top, w, height - top - 1))
+}
+
 pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     let theme = &ed.theme;
     surface.reset(theme.ui.text);
@@ -68,12 +105,18 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     if let Some(area) = sidebar_area(surface.width, surface.height, ed) {
         crate::sidebar::draw(ed, surface, area);
     }
+    if let Some(area) = tree_area(surface.width, surface.height, ed) {
+        crate::tree::draw(ed, surface, area);
+    }
     draw_hover(ed, surface);
     draw_signature(ed, surface);
     draw_completion(ed, surface);
     crate::git::draw_popup(ed, surface);
     let mut cursor = CursorShape::Hidden;
-    if ed.forge.screen_open() {
+    if ed.workspaces.tree.diff_shown() {
+        // A file's diff from the file tree covers the editor area.
+        crate::tree::draw_diff(ed, surface);
+    } else if ed.forge.screen_open() {
         // The GitHub inbox covers the editor area (crate::inbox).
         cursor = crate::inbox::draw(ed, surface);
     } else if ed.git.screen_open() {

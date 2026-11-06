@@ -247,3 +247,11 @@ status = "done"
 # space s sidebar, space j palette, switching saves and restores per-worktree
 # sessions (unsaved buffers stay open), notifications once per change,
 # language servers stopped for roots left unused. See ROADMAP.md.
+
+[[task]]
+id = "ux-file-tree"
+title = "File tree right of the views with changed-vs-base marks, changed-only view and per-file diff"
+crates = ["maestro-editor", "maestro-tui", "maestro-git", "maestro-config"]
+branch = "feat/file-tree"
+owner = "agent"
+status = "done"

@@ -11,6 +11,7 @@ pub mod render;
 mod sidebar;
 pub mod surface;
 pub mod terminal;
+mod tree;
 
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -205,6 +206,11 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
         let narrow = render::sidebar_room(w, h, &editor).is_none();
         if editor.workspaces.sidebar.too_narrow != narrow {
             editor.workspaces.sidebar.too_narrow = narrow;
+            dirty = true;
+        }
+        let narrow = render::tree_room(w, h, &editor).is_none();
+        if editor.workspaces.tree.too_narrow != narrow {
+            editor.workspaces.tree.too_narrow = narrow;
             dirty = true;
         }
         if editor.area != views {

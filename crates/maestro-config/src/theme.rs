@@ -679,6 +679,39 @@ mod tests {
         assert!(failing.is_empty(), "under 4.5:1: {failing:?}");
     }
 
+    /// The file tree draws change letters in the Git sign colors and
+    /// directory names in `file_dir` on the text background and, for the
+    /// selected row without the keys, on the current-line background. Muted
+    /// text (fold marks, notes, deleted names) is drawn only on the text
+    /// background: the selected row draws it in `text`, because
+    /// `text_muted` on the current line is 4.36:1. With the keys, the
+    /// selected row is all `popup_selected` (checked above).
+    #[test]
+    fn file_tree_colors_meet_contrast() {
+        let t = Theme::duskfox();
+        let d = &t.diff;
+        let ui = &t.ui;
+        let text = ("text", ui.text.bg.unwrap());
+        let line = ("cursorline", ui.cursorline.bg.unwrap());
+        let mut failing = Vec::new();
+        for (name, s, surfaces) in [
+            ("git_add", d.git_add, vec![text, line]),
+            ("git_changed", d.git_changed, vec![text, line]),
+            ("git_removed", d.git_removed, vec![text, line]),
+            ("file_dir", ui.file_dir, vec![text, line]),
+            ("text", ui.text, vec![text, line]),
+            ("text_muted", ui.text_muted, vec![text]),
+        ] {
+            for (surface, bg) in surfaces {
+                let r = s.fg.unwrap().contrast(bg);
+                if r < 4.5 {
+                    failing.push((name, surface, r));
+                }
+            }
+        }
+        assert!(failing.is_empty(), "under 4.5:1: {failing:?}");
+    }
+
     #[test]
     fn term_colors_follow_xterm() {
         let t = Theme::duskfox();

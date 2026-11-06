@@ -99,6 +99,7 @@ pub fn switch(ed: &mut Editor, target: &Path) -> bool {
     let restored = restore_session(ed, &target);
     crate::lsp::reconcile(ed);
     super::scan::request(ed);
+    super::tree::follow_root(ed);
 
     let name = label(ed, &target);
     let mut msg = format!("switched to {name}");

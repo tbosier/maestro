@@ -11,6 +11,7 @@
 //! should run them on a background thread.
 
 mod blame;
+mod compare;
 mod diff;
 mod hunks;
 mod intraline;
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 pub use blame::{BlameCommit, BlameLine};
+pub use compare::{PathChange, PathChangeKind, short_ref};
 pub use diff::{DiffFile, DiffLine, DiffLineKind, DiffSpec, FileChange, Hunk, parse_unified_diff};
 pub use hunks::{HunkPick, HunksError, PickFailure, changed_lines};
 pub use intraline::{INTRALINE_MAX_LINE, intraline};

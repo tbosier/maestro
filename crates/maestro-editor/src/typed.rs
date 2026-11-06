@@ -67,6 +67,12 @@ static TYPED: &[TypedCommand] = &[
         fun: git_screen,
     },
     TypedCommand {
+        name: "tree",
+        aliases: &[],
+        doc: "Show and focus the file tree, focus it, or hide it (also space t)",
+        fun: tree,
+    },
+    TypedCommand {
         name: "proposals",
         aliases: &[],
         doc: "Show or hide the review of edit proposals from automation clients",
@@ -381,6 +387,11 @@ fn rename(ed: &mut Editor, args: &[&str], _: bool) -> Result<(), String> {
         [name] => crate::lsp::actions::rename(ed, Some(name)),
         _ => return Err("usage: :rename [new-name]".into()),
     }
+    Ok(())
+}
+
+fn tree(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::workspaces::tree::toggle(ed);
     Ok(())
 }
 

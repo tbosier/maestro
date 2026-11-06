@@ -11,6 +11,6 @@ pub mod theme;
 pub use config::{
     AgentProviderConfig, AgentProviderKind, AgentsConfig, Config, ConfigError, EditorConfig,
     GithubConfig, IconMode, IndentStyle, LanguageServerConfig, LineNumbers, LspConfig,
-    NotifyConfig, NotifyMethod, Profile, ProjectsConfig, SidebarConfig,
+    NotifyConfig, NotifyMethod, Profile, ProjectsConfig, SidebarConfig, TreeConfig,
 };
 pub use theme::{Rgb, Style, Theme};

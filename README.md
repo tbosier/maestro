@@ -62,6 +62,7 @@ cargo build --release
 | `space a` | agents: `n` new task, `ret` review, `I` integrate |
 | `space g` | Git status |
 | `space s` | projects and worktrees |
+| `space t` | file tree, with the files your branch changed marked (`c` only those, `d` diff) |
 | `space j` | jump to a project, worktree, agent or buffer |
 | `space i` | GitHub inbox |
 

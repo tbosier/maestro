@@ -1098,11 +1098,20 @@ impl Editor {
             self.selected_register = None;
             return;
         }
-        // The focused sidebar takes its own keys; anything else (a `space`
-        // sequence) goes to the normal keymap, never to what is behind it.
-        let sidebar = self.workspaces.sidebar.has_focus();
-        if sidebar && self.pending.is_empty() && crate::workspaces::sidebar::handle_key(self, key) {
-            return;
+        // The focused sidebar or file tree takes its own keys; anything
+        // else (a `space` sequence) goes to the normal keymap, never to
+        // what is behind it.
+        let tree = self.workspaces.tree.has_focus() && !self.workspaces.sidebar.has_focus();
+        let sidebar = self.workspaces.sidebar.has_focus() || tree;
+        if sidebar && self.pending.is_empty() {
+            let taken = if tree {
+                crate::workspaces::tree::handle_key(self, key)
+            } else {
+                crate::workspaces::sidebar::handle_key(self, key)
+            };
+            if taken {
+                return;
+            }
         }
         if !sidebar && self.forge.screen_open() {
             crate::forge::screen::handle_key(self, key);
@@ -1152,9 +1161,10 @@ impl Editor {
         match self.keymaps.lookup(self.mode, &self.pending) {
             Lookup::Command(name) => {
                 self.pending.clear();
-                if sidebar && name != "toggle_sidebar" {
+                if sidebar && name != "toggle_sidebar" && name != "toggle_file_tree" {
                     // A command typed from the sidebar acts on the editor.
                     self.workspaces.sidebar.focused = false;
+                    crate::workspaces::tree::blur(self);
                 }
                 self.run_command(&name);
                 if self.pending_char.is_none() {
@@ -1230,6 +1240,21 @@ impl Editor {
 
     /// Handles a mouse event at screen cell (x, y).
     pub fn handle_mouse(&mut self, kind: MouseKind, x: u16, y: u16) {
+        // The file tree's column, and its diff over the views.
+        if self.picker.is_none()
+            && self.prompt.is_none()
+            && crate::workspaces::tree::handle_mouse(self, kind, x, y)
+        {
+            if self.workspaces.tree.has_focus() {
+                // Keys go to the tree now: drop a half-typed sequence (`r`
+                // waiting for its character) so it cannot reach the buffer.
+                self.pending_char = None;
+                self.awaiting_register = false;
+                self.pending.clear();
+                self.count = None;
+            }
+            return;
+        }
         if self.picker.is_some()
             || self.prompt.is_some()
             || self.agents.panel_open()
@@ -1314,6 +1339,10 @@ impl Editor {
         if self.workspaces.sidebar.has_focus() {
             // Never into the document behind the focused sidebar.
             self.info("paste ignored: the sidebar has the keys (esc returns to the editor)");
+            return;
+        }
+        if self.workspaces.tree.has_focus() {
+            self.info("paste ignored: the file tree has the keys (esc returns to the editor)");
             return;
         }
         if self.forge.screen_open() {
