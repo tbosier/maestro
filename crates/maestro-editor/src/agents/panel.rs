@@ -112,7 +112,7 @@ pub enum ConfirmAction {
     /// `y` commits the checked hunks of several agents as a composed
     /// result with a worktree of its own.
     Compose(Box<super::compose::ComposePlan>),
-    /// The `?` list of every key on the current screen. Any key closes it.
+    /// The `?` box: the current screen's hints in full. Any key closes it.
     Keys,
 }
 

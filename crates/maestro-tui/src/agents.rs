@@ -191,7 +191,7 @@ fn draw_hints(ed: &Editor, s: &mut Surface, area: Rect) {
         x = s.print(x + 1, area.y, d, ui.text_muted, area.right());
         x += 2;
     }
-    if cut {
+    if cut && panel::keys_box_available(ed) {
         x = s.print(x, area.y, more.0, ui.text.bold(), area.right());
         s.print(x + 1, area.y, more.1, ui.text_muted, area.right());
     }
