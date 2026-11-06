@@ -49,13 +49,16 @@ pub(crate) fn draw(ed: &Editor, s: &mut Surface, area: Rect) {
     );
     if footer {
         let y = area.bottom() - 1;
-        s.print(
-            area.x,
-            y,
-            " ret open  h/l fold  esc editor",
-            ui.text_muted,
-            area.right(),
-        );
+        // The fold keys go first when the column is narrow; the unknown-key
+        // message still lists them.
+        let full = " ret open  h/l fold  a add project  esc editor";
+        let short = " ret open  a add project  esc editor";
+        let hint = if full.chars().count() <= area.width as usize {
+            full
+        } else {
+            short
+        };
+        s.print(area.x, y, hint, ui.text_muted, area.right());
     }
 
     let rows = sidebar::rows(ed);

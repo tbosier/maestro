@@ -5,6 +5,8 @@
 //! Projects and worktrees come from the last scan. Before the first scan
 //! finishes the palette shows agents and buffers, says it is loading, and
 //! the rest is added when the scan arrives (if the palette is still open).
+//! The last entry, "add a project", asks for a path to add
+//! ([`super::manage`]).
 
 use std::path::PathBuf;
 
@@ -48,7 +50,8 @@ pub(crate) fn scan_finished(ed: &mut Editor) {
 }
 
 /// Every entry, in the order shown before typing: agents by attention,
-/// then projects with their worktrees, then buffers.
+/// then projects with their worktrees, then buffers, then "add a project"
+/// (once a scan has listed the projects, so it stays last).
 pub fn items(ed: &Editor) -> Vec<PickerItem> {
     let mut out = Vec::new();
     for a in super::agent_entries(ed) {
@@ -140,6 +143,13 @@ pub fn items(ed: &Editor) -> Vec<PickerItem> {
             label: format!("buffer {shown}"),
             detail,
             action: PickerAction::Jump(Jump::Buffer(b.id)),
+        });
+    }
+    if ed.workspaces.scanned {
+        out.push(PickerItem {
+            label: "add a project".into(),
+            detail: "a path in a Git repository".into(),
+            action: PickerAction::Command("project-add".into()),
         });
     }
     out
