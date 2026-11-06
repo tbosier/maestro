@@ -258,3 +258,11 @@ status = "done"
 # a in the sidebar asks for a path (tab completes directories), d forgets a
 # project after y/n. Kept in <state>/projects.toml (added and hidden lists),
 # never in config.toml; --clean neither reads nor writes it.
+
+[[task]]
+id = "ux-file-tree"
+title = "File tree right of the views with changed-vs-base marks, changed-only view and per-file diff"
+crates = ["maestro-editor", "maestro-tui", "maestro-git", "maestro-config"]
+branch = "feat/file-tree"
+owner = "agent"
+status = "done"

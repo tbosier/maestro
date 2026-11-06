@@ -16,6 +16,10 @@
 //!   and the front end rings the bell or sends an OSC 9 notification
 //!   ([`check_attention`]).
 //!
+//! * The file tree (`space t`, [`tree`]) shows the current worktree's
+//!   files right of the views, with the files that differ from the base
+//!   branch marked.
+//!
 //! Git runs only in the background scan ([`scan`]); the sidebar and the
 //! palette draw what the last scan found plus the live agent records.
 
@@ -24,6 +28,7 @@ pub mod manage;
 pub mod scan;
 pub mod sidebar;
 pub mod switch;
+pub mod tree;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,11 +44,15 @@ use crate::editor::{Editor, Severity};
 crate::commands! {
     toggle_sidebar => "Show and focus the projects and worktrees sidebar, focus it, or hide it",
     jump_palette => "Jump to a project, worktree, agent or open buffer",
+    toggle_file_tree => "Show and focus the file tree with changes vs the base branch, focus it, or hide it",
 }
 
 /// Default key bindings, added to the `space` group.
-pub const DEFAULT_KEYS: &[(&str, &str)] =
-    &[("space s", "toggle_sidebar"), ("space j", "jump_palette")];
+pub const DEFAULT_KEYS: &[(&str, &str)] = &[
+    ("space s", "toggle_sidebar"),
+    ("space j", "jump_palette"),
+    ("space t", "toggle_file_tree"),
+];
 
 /// Notifications kept for the front end before the oldest are dropped.
 const MAX_NOTIFICATIONS: usize = 32;
@@ -58,6 +67,8 @@ pub struct Workspaces {
     /// either way.
     pub enabled: bool,
     pub sidebar: sidebar::Sidebar,
+    /// The file tree right of the views.
+    pub tree: tree::FileTree,
     /// What the last scan found, in display order.
     pub projects: Vec<Project>,
     /// A scan has finished at least once.
@@ -369,6 +380,7 @@ pub fn tick(ed: &mut Editor, now: Instant) {
     if (ws.enabled && !ws.scanned && ws.scan.last.is_none()) || (ws.sidebar.open && due) {
         scan::request(ed);
     }
+    tree::tick(ed, now);
     check_attention(ed);
 }
 
@@ -485,14 +497,21 @@ fn toggle_sidebar(ed: &mut Editor) {
                 "the window is too narrow to show the sidebar ([sidebar] width, or widen it)",
             );
         }
+        // One column takes the keys at a time.
+        tree::blur(ed);
         scan::request(ed);
         sidebar::pin_selection(ed);
     } else if !s.focused {
         s.focused = true;
+        tree::blur(ed);
     } else {
         s.open = false;
         s.focused = false;
     }
+}
+
+fn toggle_file_tree(ed: &mut Editor) {
+    tree::toggle(ed);
 }
 
 fn jump_palette(ed: &mut Editor) {

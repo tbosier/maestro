@@ -222,6 +222,7 @@ pub struct Config {
     pub language_server: BTreeMap<String, LanguageServerConfig>,
     pub agents: AgentsConfig,
     pub sidebar: SidebarConfig,
+    pub tree: TreeConfig,
     pub projects: ProjectsConfig,
     pub notify: NotifyConfig,
     pub lsp: LspConfig,
@@ -238,6 +239,7 @@ impl Default for Config {
             language_server: BTreeMap::new(),
             agents: AgentsConfig::default(),
             sidebar: SidebarConfig::default(),
+            tree: TreeConfig::default(),
             projects: ProjectsConfig::default(),
             notify: NotifyConfig::default(),
             lsp: LspConfig::default(),
@@ -258,6 +260,22 @@ pub struct SidebarConfig {
 impl Default for SidebarConfig {
     fn default() -> Self {
         Self { width: 36 }
+    }
+}
+
+/// `[tree]`: the file tree column right of the views (`space t`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TreeConfig {
+    /// Columns the file tree takes when open. It never takes more than
+    /// half of what the sidebar leaves, and always leaves the views 20
+    /// columns.
+    pub width: u16,
+}
+
+impl Default for TreeConfig {
+    fn default() -> Self {
+        Self { width: 32 }
     }
 }
 
@@ -477,6 +495,8 @@ line-numbers = "relative"
             r#"
 [sidebar]
 width = 40
+[tree]
+width = 28
 [projects]
 paths = ["~/src/a", "/work/b"]
 [notify]
@@ -489,6 +509,7 @@ max-live-roots = 2
         )
         .unwrap();
         assert_eq!(c.sidebar.width, 40);
+        assert_eq!(c.tree.width, 28);
         assert_eq!(c.projects.paths, ["~/src/a", "/work/b"]);
         assert_eq!(c.notify.method, NotifyMethod::Osc);
         assert_eq!(c.lsp.stop_unused_after_secs, 60);
@@ -497,8 +518,10 @@ max-live-roots = 2
         assert_eq!(d.notify.method, NotifyMethod::Bell);
         assert_eq!(d.lsp.stop_unused_after_secs, 300);
         assert_eq!(d.sidebar.width, 36);
+        assert_eq!(d.tree.width, 32);
         assert!(Config::parse("[notify]\nmethod = \"loud\"\n", Path::new("x")).is_err());
         assert!(Config::parse("[sidebar]\nwidht = 3\n", Path::new("x")).is_err());
+        assert!(Config::parse("[tree]\nwidht = 3\n", Path::new("x")).is_err());
     }
 
     #[test]

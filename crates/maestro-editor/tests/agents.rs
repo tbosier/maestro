@@ -749,6 +749,17 @@ fn terminal_agent_takes_keys_through_i_and_a_click() {
     ed.handle_mouse(MouseKind::Down, l.content.x + 2, l.content.y + 1);
     assert!(!ed.workspaces.sidebar.focused);
     assert_eq!(ed.agents.panel.terminal_focus, Some(id(&ed, 0)));
+    // Likewise with the file tree, the column right of the panel: a click
+    // there takes the keys from the terminal, and a click back in the
+    // terminal takes them from the tree.
+    ed.workspaces.tree.open = true;
+    ed.handle_mouse(MouseKind::Down, ed.area.right() + 2, ed.area.y + 3);
+    assert!(ed.workspaces.tree.has_focus());
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    ed.handle_mouse(MouseKind::Down, l.content.x + 2, l.content.y + 1);
+    assert!(!ed.workspaces.tree.focused);
+    assert_eq!(ed.agents.panel.terminal_focus, Some(id(&ed, 0)));
+    ed.workspaces.tree.open = false;
     ed.handle_key(KeyEvent::ctrl('\\'));
     assert!(ed.agents.panel.terminal_focus.is_none());
     ed.handle_mouse(MouseKind::Down, l.content.x, l.content.y);

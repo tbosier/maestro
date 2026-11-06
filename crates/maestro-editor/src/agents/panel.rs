@@ -505,8 +505,10 @@ pub fn handle_mouse(ed: &mut Editor, kind: MouseKind, x: u16, y: u16) {
             }
         }
         MouseKind::Down => {
-            // A click in the panel takes the keys from the sidebar.
+            // A click in the panel takes the keys from the sidebar and the
+            // file tree.
             ed.workspaces.sidebar.focused = false;
+            ed.workspaces.tree.focused = false;
             if l.content.contains(x, y) {
                 if ed.agents.panel.terminal_focus.is_some() {
                     return;
