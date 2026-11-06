@@ -645,7 +645,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "maestro-agent"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "agent-client-protocol-schema",
  "maestro-agent",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-automation"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "maestro-config",
  "maestro-core",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-cli"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "crossterm",
  "maestro-automation",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-config"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-core"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "proptest",
  "ropey",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-editor"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "ignore",
  "maestro-agent",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-forge"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "maestro-git",
  "serde",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-git"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "similar",
  "thiserror 2.0.21",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-lsp"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "maestro-core",
  "maestro-lsp",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-protocol"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-syntax"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "maestro-core",
  "tree-sitter",
@@ -775,11 +775,11 @@ dependencies = [
 
 [[package]]
 name = "maestro-tasks"
-version = "0.6.2"
+version = "0.7.0"
 
 [[package]]
 name = "maestro-term"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "portable-pty",
  "vt100",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "maestro-tui"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "crossterm",
  "maestro-config",
