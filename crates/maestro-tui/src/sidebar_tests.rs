@@ -174,3 +174,48 @@ fn before_the_first_scan_it_says_so() {
     // Not focused: no footer.
     assert!(!row(&s, 28).contains("esc editor"));
 }
+
+#[test]
+fn the_sidebar_says_how_to_add_a_project() {
+    let mut ed = editor(100, 30);
+    ed.workspaces.projects.clear();
+    let mut s = Surface::new(100, 30, ed.theme.ui.text);
+    render(&ed, &mut s);
+    let text: Vec<String> = (1..29).map(|y| row(&s, y)).collect();
+    assert!(
+        text.iter()
+            .any(|r| r.contains("no projects yet: a adds one")),
+        "{text:#?}"
+    );
+    // The default width keeps the add key in the footer.
+    let footer: String = row(&s, 28).chars().take(36).collect();
+    assert_eq!(footer, " ret open  a add project  esc editor");
+    // `a` asks for the path, and the prompt says what it is for.
+    ed.handle_key(KeyEvent::char('a'));
+    let mut s = Surface::new(100, 30, ed.theme.ui.text);
+    render(&ed, &mut s);
+    assert!(
+        row(&s, 29).starts_with("add project: "),
+        "{:?}",
+        row(&s, 29)
+    );
+}
+
+#[test]
+fn a_wide_sidebar_footer_keeps_the_fold_keys() {
+    let mut config = Config::default();
+    config.sidebar.width = 50;
+    let mut ed = Editor::new(config, Rect::new(0, 1, 120, 28));
+    ed.workspaces.scanned = true;
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('s'));
+    let (_, views, _) = split_screen(120, 30, &ed);
+    ed.resize(views);
+    let mut s = Surface::new(120, 30, ed.theme.ui.text);
+    render(&ed, &mut s);
+    assert!(
+        row(&s, 28).starts_with(" ret open  h/l fold  a add project  esc editor"),
+        "{:?}",
+        row(&s, 28)
+    );
+}

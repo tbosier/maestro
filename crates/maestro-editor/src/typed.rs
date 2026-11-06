@@ -67,6 +67,18 @@ static TYPED: &[TypedCommand] = &[
         fun: git_screen,
     },
     TypedCommand {
+        name: "project-add",
+        aliases: &[],
+        doc: "Add a project to the sidebar and the jump palette (no path: asks for one)",
+        fun: crate::workspaces::manage::project_add_command,
+    },
+    TypedCommand {
+        name: "project-remove",
+        aliases: &[],
+        doc: "Forget a project added to the sidebar, by name or path; no files are deleted",
+        fun: crate::workspaces::manage::project_remove_command,
+    },
+    TypedCommand {
         name: "proposals",
         aliases: &[],
         doc: "Show or hide the review of edit proposals from automation clients",
@@ -363,7 +375,16 @@ static TYPED: &[TypedCommand] = &[
 ];
 
 /// Commands whose argument is a single path that may contain spaces.
-const PATH_COMMANDS: &[&str] = &["write", "write-quit", "open", "split", "vsplit", "cd"];
+const PATH_COMMANDS: &[&str] = &[
+    "write",
+    "write-quit",
+    "open",
+    "split",
+    "vsplit",
+    "cd",
+    "project-add",
+    "project-remove",
+];
 
 fn lsp_restart(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     crate::lsp::restart(ed);

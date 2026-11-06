@@ -2,12 +2,16 @@
 //! projects there are, their worktrees, each worktree's branch, changed
 //! files and ahead/behind counts, and the agents their saved records name.
 //!
-//! Projects come from `[projects] paths`, the working directory, the
-//! directories of saved sessions (`<state>/sessions/*.toml`) and the
-//! repositories of this editor's agents. A configured path that is missing
-//! or not in a repository is listed with the reason; other candidates that
-//! are not repositories are left out. Everything here runs `git` and reads
-//! files, so it only runs on a background thread started by [`request`].
+//! Projects come from `[projects] paths`, the projects added in the
+//! editor (`<state>/projects.toml`, see [`super::manage`]), the working
+//! directory, the directories of saved sessions
+//! (`<state>/sessions/*.toml`) and the repositories of this editor's
+//! agents. A configured or added path that is missing or not in a
+//! repository is listed with the reason; other candidates that are not
+//! repositories are left out. Projects you forgot (`hidden` in
+//! `projects.toml`) are left out when only a saved session or an earlier
+//! scan names them. Everything here runs `git` and reads files, so it
+//! only runs on a background thread started by [`request`].
 //! One scan runs at a time; a request while one runs queues one more.
 
 use std::path::{Path, PathBuf};
@@ -118,6 +122,9 @@ pub(crate) struct ScanState {
     running: bool,
     again: bool,
     pub(crate) last: Option<Instant>,
+    /// Bumped when a project is added or forgotten, so a scan that started
+    /// before the change does not put the old list back.
+    pub(crate) generation: u64,
 }
 
 /// What a scan needs from the editor, copied so it can run elsewhere.
@@ -129,12 +136,48 @@ struct Input {
     /// switched away from stays listed without a saved session.
     known: Vec<PathBuf>,
     agent_roots: Vec<PathBuf>,
+    /// Projects added in the editor.
+    added: Vec<PathBuf>,
+    /// Projects forgotten in the editor.
+    hidden: Vec<PathBuf>,
     state: Option<PathBuf>,
     records: bool,
 }
 
+/// What a scan found.
+struct Found {
+    projects: Vec<Project>,
+    /// The roots of the projects listed because of `[projects] paths`.
+    configured: Vec<PathBuf>,
+}
+
+/// Where a candidate directory came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// `[projects] paths`: listed first, in config order, with the reason
+    /// when it cannot be used.
+    Configured,
+    /// Added in the editor: listed with the reason when it cannot be used.
+    Added,
+    /// The working directory or an agent's repository: always listed when
+    /// it is a repository.
+    Live,
+    /// An earlier scan or a saved session: left out when forgotten.
+    Remembered,
+}
+
+/// Why a directory cannot be listed as a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unusable {
+    Missing,
+    NotDirectory,
+    NotRepository,
+    Git(String),
+}
+
 /// Starts a scan, or queues one if a scan is running.
 pub fn request(ed: &mut Editor) {
+    super::manage::load(ed);
     if ed.workspaces.scan.running {
         ed.workspaces.scan.again = true;
         return;
@@ -165,12 +208,15 @@ pub fn request(ed: &mut Editor) {
             .iter()
             .filter_map(|a| a.worktree.as_ref().map(|w| w.main_root.clone()))
             .collect(),
+        added: ed.workspaces.saved.added.clone(),
+        hidden: ed.workspaces.saved.hidden.clone(),
         state: ed.navigation.state_dir.clone(),
         records: crate::agents::persist::enabled(ed).is_some(),
     };
+    let generation = ed.workspaces.scan.generation;
     let spawned = ed.spawn_background("workspace-scan", move |tx| {
-        let projects = run(&input);
-        tx.send(move |ed| apply(ed, projects));
+        let found = run(&input);
+        tx.send(move |ed| apply(ed, generation, found));
     });
     if let Err(e) = spawned {
         ed.workspaces.scan.running = false;
@@ -178,10 +224,24 @@ pub fn request(ed: &mut Editor) {
     }
 }
 
-fn apply(ed: &mut Editor, projects: Vec<Project>) {
+fn apply(ed: &mut Editor, generation: u64, found: Found) {
     ed.workspaces.scan.running = false;
+    if generation != ed.workspaces.scan.generation {
+        // A project was added or forgotten while this scan ran: its list
+        // is out of date. Scan again instead.
+        ed.workspaces.scan.again = false;
+        request(ed);
+        return;
+    }
     ed.workspaces.scan_error = None;
-    ed.workspaces.projects = projects;
+    ed.workspaces.projects = found.projects;
+    ed.workspaces.configured = found.configured;
+    if let Some(root) = ed.workspaces.select_after_scan.take()
+        && ed.workspaces.projects.iter().any(|p| p.root == root)
+    {
+        ed.workspaces.sidebar.expanded.insert(root.clone());
+        ed.workspaces.sidebar.selected = Some(super::sidebar::RowKey::Project(root));
+    }
     let first = !ed.workspaces.scanned;
     ed.workspaces.scanned = true;
     if first {
@@ -205,104 +265,147 @@ fn apply(ed: &mut Editor, projects: Vec<Project>) {
 }
 
 /// Runs on a background thread.
-fn run(input: &Input) -> Vec<Project> {
+fn run(input: &Input) -> Found {
     let mut configured: Vec<Project> = Vec::new();
     let mut others: Vec<Project> = Vec::new();
     let mut seen_dirs: Vec<PathBuf> = Vec::new();
-    let mut candidates: Vec<(PathBuf, bool)> =
-        input.configured.iter().map(|p| (p.clone(), true)).collect();
-    candidates.push((input.cwd.clone(), false));
-    candidates.extend(input.known.iter().map(|p| (p.clone(), false)));
-    candidates.extend(input.agent_roots.iter().map(|p| (p.clone(), false)));
+    let mut candidates: Vec<(PathBuf, Source)> = input
+        .configured
+        .iter()
+        .map(|p| (p.clone(), Source::Configured))
+        .collect();
+    candidates.extend(input.added.iter().map(|p| (p.clone(), Source::Added)));
+    candidates.push((input.cwd.clone(), Source::Live));
+    candidates.extend(input.agent_roots.iter().map(|p| (p.clone(), Source::Live)));
+    candidates.extend(input.known.iter().map(|p| (p.clone(), Source::Remembered)));
     if let Some(state) = &input.state {
-        candidates.extend(session_dirs(state).into_iter().map(|p| (p, false)));
+        candidates.extend(
+            session_dirs(state)
+                .into_iter()
+                .map(|p| (p, Source::Remembered)),
+        );
     }
-    for (dir, is_configured) in candidates {
+    for (dir, source) in candidates {
         let dir = normalize_path(&dir);
         if seen_dirs.contains(&dir) {
             continue;
         }
         seen_dirs.push(dir.clone());
-        let failed = |why: String| Project {
-            name: dir_name(&dir),
-            root: dir.clone(),
-            worktrees: Vec::new(),
-            records: Vec::new(),
-            error: Some(why),
-            records_note: None,
-        };
-        if !dir.is_dir() {
-            if is_configured {
-                configured.push(failed(format!("{} is not a directory", dir.display())));
-            }
-            continue;
-        }
-        let repo = match input.git.discover(&dir) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                if is_configured {
-                    configured.push(failed(format!(
-                        "{} is not in a Git repository",
-                        dir.display()
-                    )));
-                }
-                continue;
-            }
-            Err(e) => {
-                if is_configured {
-                    configured.push(failed(e.to_string()));
-                }
-                continue;
-            }
-        };
-        let list = match repo.worktrees() {
-            Ok(l) => l,
-            Err(e) => {
-                if is_configured {
-                    configured.push(failed(format!("git worktree list failed: {e}")));
+        let (main, list) = match locate(&input.git, &dir) {
+            Ok(found) => found,
+            Err(why) => {
+                if matches!(source, Source::Configured | Source::Added) {
+                    let why = match why {
+                        Unusable::Missing | Unusable::NotDirectory => {
+                            format!("{} is not a directory", dir.display())
+                        }
+                        Unusable::NotRepository => {
+                            format!("{} is not in a Git repository", dir.display())
+                        }
+                        Unusable::Git(e) => e,
+                    };
+                    let project = Project {
+                        name: dir_name(&dir),
+                        root: dir.clone(),
+                        worktrees: Vec::new(),
+                        records: Vec::new(),
+                        error: Some(why),
+                        records_note: None,
+                    };
+                    if source == Source::Configured {
+                        configured.push(project);
+                    } else {
+                        others.push(project);
+                    }
                 }
                 continue;
             }
         };
-        let main = list
-            .iter()
-            .find(|w| w.is_main)
-            .map(|w| w.path.clone())
-            .unwrap_or_else(|| repo.root().to_path_buf());
-        let main = normalize_path(&main);
         let known = configured
             .iter()
             .chain(others.iter())
             .any(|p| p.root == main);
-        if known {
+        if known || (source == Source::Remembered && input.hidden.contains(&main)) {
             continue;
         }
-        let worktrees = list
-            .iter()
-            .filter(|w| !w.bare)
-            .map(|w| worktree_row(&input.git, w))
-            .collect();
-        let (records, records_note) = match (&input.state, input.records) {
-            (Some(state), true) => read_records(state, &main),
-            _ => (Vec::new(), None),
-        };
-        let project = Project {
-            name: dir_name(&main),
-            root: main,
-            worktrees,
-            records,
-            error: None,
-            records_note,
-        };
-        if is_configured {
+        let project = build(
+            &input.git,
+            main,
+            &list,
+            input.state.as_deref(),
+            input.records,
+        );
+        if source == Source::Configured {
             configured.push(project);
         } else {
             others.push(project);
         }
     }
     others.sort_by(|a, b| (&a.name, &a.root).cmp(&(&b.name, &b.root)));
+    let roots = configured.iter().map(|p| p.root.clone()).collect();
     configured.extend(others);
-    configured
+    Found {
+        projects: configured,
+        configured: roots,
+    }
+}
+
+/// The main worktree (canonical) of the repository holding `dir`, and the
+/// repository's worktrees. Runs `git`: background threads only.
+pub(crate) fn locate(
+    git: &Git,
+    dir: &Path,
+) -> Result<(PathBuf, Vec<maestro_git::Worktree>), Unusable> {
+    if !dir.exists() {
+        return Err(Unusable::Missing);
+    }
+    if !dir.is_dir() {
+        return Err(Unusable::NotDirectory);
+    }
+    let dir = normalize_path(dir);
+    let repo = match git.discover(&dir) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err(Unusable::NotRepository),
+        Err(e) => return Err(Unusable::Git(e.to_string())),
+    };
+    let list = repo
+        .worktrees()
+        .map_err(|e| Unusable::Git(format!("git worktree list failed: {e}")))?;
+    let main = list
+        .iter()
+        .find(|w| w.is_main)
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| repo.root().to_path_buf());
+    Ok((normalize_path(&main), list))
+}
+
+/// The project for the repository whose main worktree is `main`: each
+/// worktree's facts and, with `records`, the agents its saved records
+/// name. Runs `git`: background threads only.
+pub(crate) fn build(
+    git: &Git,
+    main: PathBuf,
+    list: &[maestro_git::Worktree],
+    state: Option<&Path>,
+    records: bool,
+) -> Project {
+    let worktrees = list
+        .iter()
+        .filter(|w| !w.bare)
+        .map(|w| worktree_row(git, w))
+        .collect();
+    let (records, records_note) = match (state, records) {
+        (Some(state), true) => read_records(state, &main),
+        _ => (Vec::new(), None),
+    };
+    Project {
+        name: dir_name(&main),
+        root: main,
+        worktrees,
+        records,
+        error: None,
+        records_note,
+    }
 }
 
 fn dir_name(p: &Path) -> String {

@@ -247,3 +247,14 @@ status = "done"
 # space s sidebar, space j palette, switching saves and restores per-worktree
 # sessions (unsaved buffers stay open), notifications once per change,
 # language servers stopped for roots left unused. See ROADMAP.md.
+
+[[task]]
+id = "add-projects"
+title = "Add and forget projects from the sidebar, :project-add, :project-remove and the jump palette"
+crates = ["maestro-editor", "maestro-tui", "maestro-cli"]
+branch = "feat/add-projects"
+owner = "agent"
+status = "done"
+# a in the sidebar asks for a path (tab completes directories), d forgets a
+# project after y/n. Kept in <state>/projects.toml (added and hidden lists),
+# never in config.toml; --clean neither reads nor writes it.
