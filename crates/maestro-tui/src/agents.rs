@@ -114,24 +114,54 @@ fn draw_header(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
             ed.agents.agents.len()
         ),
     };
-    let x = s.print(h.x, h.y, &title, ui.statusline.bold(), h.right());
-    // Who has the keys, always on screen.
-    let (badge, style) = match ed.agents.panel.terminal_focus {
-        Some(id) => (
-            format!(
-                " KEYS: {} TERMINAL (C-\\ takes them back) ",
-                ed.agents
-                    .get(id)
-                    .map(|a| a.name.as_str())
-                    .unwrap_or("agent")
-            ),
-            ui.mode_insert,
+    // Who has the keys, before the title: the badge is drawn first and
+    // the title gives way, and a narrow header gets a shorter badge.
+    let (badges, style): (Vec<String>, Style) = match ed.agents.panel.terminal_focus {
+        Some(id) => {
+            let name = ed
+                .agents
+                .get(id)
+                .map(|a| a.name.as_str())
+                .unwrap_or("agent");
+            (
+                vec![
+                    format!(" KEYS: TYPING INTO {name} (C-\\ or a click outside returns) "),
+                    format!(" KEYS: TYPING INTO {name} (C-\\ returns) "),
+                    " KEYS: TERMINAL ".to_string(),
+                    " TERMINAL ".to_string(),
+                ],
+                ui.mode_insert,
+            )
+        }
+        None if ed.agents.panel.review.is_none()
+            && ed.agents.panel.compose.is_none()
+            && ed.agents.selected().is_some_and(accepts_typing) =>
+        {
+            (
+                vec![
+                    " KEYS: PANEL (i or a click types into the agent) ".to_string(),
+                    " KEYS: PANEL (i types) ".to_string(),
+                    " KEYS: PANEL ".to_string(),
+                    " PANEL ".to_string(),
+                ],
+                ui.mode_normal,
+            )
+        }
+        None => (
+            vec![" KEYS: PANEL ".to_string(), " PANEL ".to_string()],
+            ui.mode_normal,
         ),
-        None => (" KEYS: PANEL ".to_string(), ui.mode_normal),
     };
+    let title_w = title.chars().count() as u16;
+    let fits = |b: &String| b.chars().count() as u16 + title_w.min(12) <= h.width;
+    let badge = badges
+        .iter()
+        .find(|b| fits(b))
+        .unwrap_or(&badges[badges.len() - 1]);
     let w = badge.chars().count() as u16;
-    let bx = h.right().saturating_sub(w).max(x + 1);
-    s.print(bx, h.y, &badge, style, h.right());
+    let bx = h.right().saturating_sub(w).max(h.x);
+    s.print(bx, h.y, badge, style, h.right());
+    s.print(h.x, h.y, &title, ui.statusline.bold(), bx);
 }
 
 fn draw_hints(ed: &Editor, s: &mut Surface, area: Rect) {
@@ -140,16 +170,37 @@ fn draw_hints(ed: &Editor, s: &mut Surface, area: Rect) {
     }
     let ui = &ed.theme.ui;
     s.fill(area, ui.text);
+    let hints = panel::hints(ed);
+    let width = |k: &str, d: &str| (k.chars().count() + d.chars().count() + 3) as u16;
+    let total: u16 = hints.iter().map(|(k, d)| width(k, d)).sum();
+    // When they do not all fit, the last place says where the rest are.
+    let more = ("?", "all keys");
+    let room = if area.x + 1 + total > area.right() && panel::keys_box_available(ed) {
+        area.right().saturating_sub(width(more.0, more.1))
+    } else {
+        area.right()
+    };
     let mut x = area.x + 1;
-    for (k, d) in panel::hints(ed) {
-        let need = (k.chars().count() + d.chars().count() + 3) as u16;
-        if x + need > area.right() {
+    let mut cut = false;
+    for (k, d) in &hints {
+        if x + width(k, d) > room {
+            cut = true;
             break;
         }
         x = s.print(x, area.y, k, ui.text.bold(), area.right());
         x = s.print(x + 1, area.y, d, ui.text_muted, area.right());
         x += 2;
     }
+    if cut && panel::keys_box_available(ed) {
+        x = s.print(x, area.y, more.0, ui.text.bold(), area.right());
+        s.print(x + 1, area.y, more.1, ui.text_muted, area.right());
+    }
+}
+
+/// A terminal agent whose program still runs: `i` or a click gives it the
+/// keys.
+fn accepts_typing(a: &Agent) -> bool {
+    matches!(&a.runtime, Runtime::Terminal(t) if t.exit_status().is_none())
 }
 
 /// What the list shows after the name: the status, or for a found
@@ -212,9 +263,8 @@ fn list_facts(a: &Agent) -> String {
 fn draw_list(ed: &Editor, s: &mut Surface, area: Rect) {
     let ui = &ed.theme.ui;
     let sel = ed.agents.panel.selected;
-    let per = 2usize;
-    let visible = (area.height as usize / per).max(1);
-    let first = if sel >= visible { sel + 1 - visible } else { 0 };
+    let per = panel::LIST_ROW_HEIGHT as usize;
+    let (first, visible) = panel::list_window(sel, area.height);
     for (i, a) in ed
         .agents
         .agents
@@ -435,7 +485,11 @@ fn draw_content(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) -> Option<C
                 let screen = t.snapshot();
                 draw_screen(&ed.theme, s, area, &screen);
                 if screen.scrolled {
-                    let msg = " scrolled back: pagedown returns ";
+                    let msg = if ed.agents.panel.terminal_focus == Some(a.id) {
+                        " scrolled back: typing returns "
+                    } else {
+                        " scrolled back: pagedown returns "
+                    };
                     s.print(
                         area.right().saturating_sub(msg.len() as u16),
                         area.y,

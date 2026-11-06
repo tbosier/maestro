@@ -1,4 +1,4 @@
-//! What the user can do with an agent: run its tests, send feedback,
+//! What the user can do with an agent: run its tests, send it a message,
 //! answer permission requests, reject, integrate and archive.
 //!
 //! Consequential actions go through a confirmation dialog that says what
@@ -303,69 +303,72 @@ fn on_test_event(ed: &mut Editor, id: AgentId, event: TaskEvent) {
     }
 }
 
-// ----- feedback ----------------------------------------------------------
+// ----- message -----------------------------------------------------------
 
-/// Why feedback cannot reach the agent now, if it cannot.
-fn feedback_blocker(a: &super::Agent) -> Option<String> {
+/// Why a message cannot reach the agent now, if it cannot.
+fn message_blocker(a: &super::Agent) -> Option<String> {
     if let Some(why) = found_refusal(a) {
         return Some(why);
     }
     match &a.runtime {
         Runtime::None if a.origin == Origin::Composed => Some(format!(
-            "{} is a composed result: no agent runs in it to take feedback",
+            "{} is a composed result: no agent runs in it to take a message",
             a.name
         )),
         Runtime::None if a.origin == Origin::Loaded => Some(match a.kind() {
             ProviderKind::Terminal => format!(
-                "{} is from an earlier session and its program is not running, so feedback cannot \
-                 reach it. R relaunches it without its task; then type into it with C-\\",
+                "{} is from an earlier session and its program is not running, so a message cannot \
+                 reach it. R relaunches it without its task; then i types into it",
                 a.name
             ),
             ProviderKind::Acp => format!(
-                "{} is from an earlier session and not running, so feedback cannot reach it. \
-                 R relaunches it; then f sends the feedback",
+                "{} is from an earlier session and not running, so a message cannot reach it. \
+                 R relaunches it; then m sends the message",
                 a.name
             ),
         }),
-        Runtime::None => Some("the agent is not running; feedback cannot reach it".into()),
+        Runtime::None => Some("the agent is not running; a message cannot reach it".into()),
         Runtime::Acp(_) if a.exited.is_some() => {
-            Some("the agent process has exited; feedback cannot reach it".into())
+            Some("the agent process has exited; a message cannot reach it".into())
         }
         Runtime::Acp(_) if a.turn_running => {
-            Some("the agent is still working on a turn; send feedback when it ends".into())
+            Some("the agent is still working on a turn; send the message when it ends".into())
         }
         Runtime::Terminal(t) if t.exit_status().is_some() => {
-            Some("the agent's program has exited; feedback cannot reach it".into())
+            Some("the agent's program has exited; a message cannot reach it".into())
         }
         _ => None,
     }
 }
 
-/// `f`: asks for feedback text to send with the review comments.
-pub fn ask_feedback(ed: &mut Editor, id: AgentId) {
+/// `m`: asks for a message to send the agent, with the unsent review
+/// comments.
+pub fn ask_message(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    if let Some(why) = feedback_blocker(a) {
+    if let Some(why) = message_blocker(a) {
         ed.error(why);
         return;
     }
     let comments = a.comments.iter().filter(|c| !c.sent).count();
     let label = match a.kind() {
-        ProviderKind::Acp => format!("feedback (a new prompt, with {comments} comment(s))"),
+        ProviderKind::Acp => {
+            format!("message to the agent (a new prompt, with {comments} comment(s))")
+        }
         ProviderKind::Terminal => format!(
-            "feedback (typed into the terminal with {comments} comment(s); that is all Maestro can do)"
+            "message to the agent (typed into its terminal with {comments} comment(s), then Enter)"
         ),
     };
     ed.agents.panel.overlay = Some(Overlay::Input {
-        purpose: InputPurpose::Feedback(id),
+        purpose: InputPurpose::Message(id),
         label,
         text: String::new(),
     });
 }
 
-/// The message feedback sends: unsent comments, then the typed text.
-pub fn feedback_message(a: &super::Agent, text: &str) -> String {
+/// What `m` sends: unsent comments, then the typed text.
+pub fn message_text(a: &super::Agent, text: &str) -> String {
     let mut msg = String::new();
     let comments: Vec<&super::Comment> = a.comments.iter().filter(|c| !c.sent).collect();
     if !comments.is_empty() {
@@ -387,15 +390,15 @@ pub fn feedback_message(a: &super::Agent, text: &str) -> String {
     msg.trim_end().to_string()
 }
 
-pub fn send_feedback(ed: &mut Editor, id: AgentId, text: &str) {
+pub fn send_message(ed: &mut Editor, id: AgentId, text: &str) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
-    if let Some(why) = feedback_blocker(a) {
+    if let Some(why) = message_blocker(a) {
         ed.error(why);
         return;
     }
-    let msg = feedback_message(a, text);
+    let msg = message_text(a, text);
     if msg.is_empty() {
         ed.error("nothing to send: no comments and no text");
         return;
@@ -406,13 +409,13 @@ pub fn send_feedback(ed: &mut Editor, id: AgentId, text: &str) {
             a.transcript
                 .push(maestro_agent::TranscriptEntry::User(msg.clone()));
             a.set_status(Status::Working);
-            "sent the feedback as a new prompt".to_string()
+            "sent the message as a new prompt".to_string()
         }),
         Runtime::Terminal(t) => {
             let mut bytes = maestro_term::encode_paste(&msg, t.bracketed_paste());
             bytes.push(b'\r');
             t.write(&bytes).map(|()| {
-                "typed the feedback into the terminal; Maestro cannot tell whether the program reads it"
+                "typed the message into the terminal; Maestro cannot tell whether the program reads it"
                     .to_string()
             })
         }
@@ -427,7 +430,7 @@ pub fn send_feedback(ed: &mut Editor, id: AgentId, text: &str) {
             ed.info(done);
         }
         Err(e) => {
-            let msg = format!("feedback was not sent: {e}");
+            let msg = format!("the message was not sent: {e}");
             a.log(msg.clone());
             ed.error(msg);
         }

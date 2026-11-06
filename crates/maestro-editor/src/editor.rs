@@ -1252,7 +1252,22 @@ impl Editor {
                 self.awaiting_register = false;
                 self.pending.clear();
                 self.count = None;
+                // And not to an agent's terminal: the panel's header would
+                // still say it has them.
+                self.agents.panel.terminal_focus = None;
             }
+            return;
+        }
+        // The panel takes the mouse only when it is the screen on top:
+        // the inbox, the Git screen and the proposal review draw over it.
+        if self.agents.panel_open()
+            && self.picker.is_none()
+            && self.prompt.is_none()
+            && !self.forge.screen_open()
+            && !self.git.screen_open()
+            && !self.proposals.review_open()
+        {
+            crate::agents::panel::handle_mouse(self, kind, x, y);
             return;
         }
         if self.picker.is_some()

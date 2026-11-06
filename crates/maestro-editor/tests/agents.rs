@@ -31,6 +31,10 @@ fn main() {
             terminal_agent_takes_keys_and_paste_through_ctrl_backslash,
         ),
         (
+            "terminal_agent_takes_keys_through_i_and_a_click",
+            terminal_agent_takes_keys_through_i_and_a_click,
+        ),
+        (
             "terminal_agent_gets_the_task_typed_in",
             terminal_agent_gets_the_task_typed_in,
         ),
@@ -583,7 +587,7 @@ fn acp_agent_permission_feedback_and_review() {
             .iter()
             .any(|r| matches!(r, Row::Comment { text, .. } if text == "name it better"))
     );
-    run(&mut ed, "f");
+    run(&mut ed, "m");
     ed.paste_text("say feedback received");
     run(&mut ed, "\n");
     assert!(agent(&ed, 0).comments[0].sent);
@@ -684,6 +688,94 @@ fn terminal_agent_takes_keys_and_paste_through_ctrl_backslash() {
         review_paths(ed, 0) == ["typed.txt"]
     });
     assert!(agent(&ed, 0).exited.as_deref().unwrap().contains("0"));
+}
+
+fn terminal_agent_takes_keys_through_i_and_a_click() {
+    use maestro_editor::MouseKind;
+    use maestro_editor::agents::panel::agent_layout;
+    let f = Fixture::new();
+    let script =
+        "printf 'ready\\n'; read line; printf '%s\\n' \"$line\" > typed.txt; printf 'got it\\n'";
+    let mut ed = f.editor(config(&[(
+        "shell",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", script, "sh", "{task}"],
+        ),
+    )]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "type a line", 0);
+    poll_until(&mut ed, "the script's prompt", |ed| {
+        ed.agents
+            .agents
+            .first()
+            .is_some_and(|a| a.runtime.terminal().is_some())
+            && screen_text(ed, 0).contains("ready")
+    });
+    // The way in is the first hint, so a narrow panel never cuts it off.
+    assert_eq!(hint_keys(&ed)[0], ("i", "type into agent"));
+    assert!(hint_keys(&ed).contains(&("m", "message")));
+    // `i` gives the running terminal the keys; C-\ takes them back.
+    run(&mut ed, "i");
+    assert_eq!(ed.agents.panel.terminal_focus, Some(id(&ed, 0)));
+    run(&mut ed, "hel");
+    ed.handle_key(KeyEvent::ctrl('\\'));
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    // A click in the live screen gives the keys too; a click on the list
+    // takes them back and selects the row clicked.
+    let l = agent_layout(ed.area);
+    ed.handle_mouse(MouseKind::Down, l.content.x + 2, l.content.y + 1);
+    assert_eq!(ed.agents.panel.terminal_focus, Some(id(&ed, 0)));
+    run(&mut ed, "lo");
+    ed.handle_mouse(MouseKind::Down, l.list.x + 2, l.list.y);
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    assert_eq!(ed.agents.panel.selected, 0);
+    // A click in the summary, outside the terminal, does not give keys.
+    ed.handle_mouse(MouseKind::Down, l.summary.x + 2, l.summary.y);
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    // The Git screen draws over the panel: a click where the terminal was
+    // must not give the hidden agent the keys, nor a paste reach it.
+    run(&mut ed, ":git\n");
+    assert!(ed.git.screen_open());
+    ed.handle_mouse(MouseKind::Down, l.content.x + 2, l.content.y + 1);
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    run(&mut ed, "q");
+    assert!(!ed.git.screen_open() && ed.agents.panel_open());
+    // A click takes the keys from a focused sidebar: they go where the
+    // header says.
+    run(&mut ed, ":toggle-sidebar\n");
+    assert!(ed.workspaces.sidebar.focused);
+    ed.handle_mouse(MouseKind::Down, l.content.x + 2, l.content.y + 1);
+    assert!(!ed.workspaces.sidebar.focused);
+    assert_eq!(ed.agents.panel.terminal_focus, Some(id(&ed, 0)));
+    // Likewise with the file tree, the column right of the panel: a click
+    // there takes the keys from the terminal, and a click back in the
+    // terminal takes them from the tree.
+    ed.workspaces.tree.open = true;
+    ed.handle_mouse(MouseKind::Down, ed.area.right() + 2, ed.area.y + 3);
+    assert!(ed.workspaces.tree.has_focus());
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    ed.handle_mouse(MouseKind::Down, l.content.x + 2, l.content.y + 1);
+    assert!(!ed.workspaces.tree.focused);
+    assert_eq!(ed.agents.panel.terminal_focus, Some(id(&ed, 0)));
+    ed.workspaces.tree.open = false;
+    ed.handle_key(KeyEvent::ctrl('\\'));
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    ed.handle_mouse(MouseKind::Down, l.content.x, l.content.y);
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "the program's exit", |ed| {
+        status(ed, 0) == Status::ReadyForReview
+    });
+    let wt = worktree(&ed, 0);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("typed.txt")).unwrap(),
+        "hello\n"
+    );
+    // The program has exited: `i` now explains instead of taking keys.
+    run(&mut ed, "i");
+    assert!(ed.agents.panel.terminal_focus.is_none());
+    assert!(!hint_keys(&ed).contains(&("i", "type into agent")));
 }
 
 fn terminal_agent_gets_the_task_typed_in() {
@@ -1777,7 +1869,7 @@ fn a_loaded_acp_agent_relaunches_into_its_saved_session() {
     run(&mut ed, "f");
     let msg = status_text(&ed);
     assert!(
-        msg.contains("R relaunches it; then f sends the feedback"),
+        msg.contains("R relaunches it; then m sends the message"),
         "{msg}"
     );
     run(&mut ed, "R");
@@ -3293,7 +3385,7 @@ fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
     // It is tested and integrated like any agent, through the same path.
     select(&mut ed, i);
     assert!(hint_keys(&ed).contains(&("t", "test")));
-    assert!(!hint_keys(&ed).contains(&("f", "feedback")));
+    assert!(!hint_keys(&ed).contains(&("m", "message")));
     run(&mut ed, "f");
     assert!(
         status_text(&ed).contains("composed result"),
