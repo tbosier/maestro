@@ -147,11 +147,11 @@ fn loaded_agents_say_they_are_not_running_and_found_worktrees_have_no_status() {
         "{text}"
     );
     assert!(text.contains("not running, earlier session"), "{text}");
-    assert!(
-        text.contains("R relaunch") && text.contains("A archive"),
-        "{text}"
-    );
-    assert!(!text.contains("f feedback"), "feedback cannot reach it");
+    assert!(text.contains("R relaunch"), "{text}");
+    // Archive is past the hint line's width here; `?` lists it.
+    assert!(panel::hints(&ed).contains(&("A", "archive")));
+    assert!(text.contains("? all keys"), "{text}");
+    assert!(!text.contains("m message"), "a message cannot reach it");
     // The found worktree shows that it has no record instead of a status.
     ed.handle_key(KeyEvent::char('j'));
     let text = screen(&ed).join("\n");
@@ -535,4 +535,82 @@ fn the_compose_view_shows_each_agents_hunks_side_by_side() {
     let files: Vec<usize> = compose::items(&ed, &v).iter().map(|i| i.file).collect();
     assert_eq!(files.len(), 2, "{files:?}");
     assert_ne!(files[0], files[1]);
+}
+
+#[test]
+fn cut_hints_point_at_the_full_key_list() {
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 30, 20));
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    let mut s = Surface::new(30, 22, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let hints = row(&s, 20);
+    assert!(hints.contains("n new task"), "{hints:?}");
+    assert!(hints.contains("? all keys"), "{hints:?}");
+    assert!(!hints.contains("esc close"), "{hints:?}");
+    // The header still says who has the keys.
+    assert!(row(&s, 1).contains("PANEL"), "{:?}", row(&s, 1));
+    // `?` lists every key in a box; any key closes it, the panel stays.
+    ed.handle_key(KeyEvent::char('?'));
+    let mut s = Surface::new(30, 22, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let text = (0..22).map(|y| row(&s, y)).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("esc") && text.contains("close"), "{text}");
+    ed.handle_key(KeyEvent::char('x'));
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(ed.agents.panel_open());
+    // Wide enough, every hint shows and nothing points elsewhere.
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 100, 20));
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    let mut s = Surface::new(100, 22, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let hints = row(&s, 20);
+    assert!(
+        hints.contains("esc close") && !hints.contains("all keys"),
+        "{hints:?}"
+    );
+}
+
+#[test]
+fn clicks_select_the_agent_drawn_there_and_the_key_box_holds_every_hint() {
+    use maestro_editor::MouseKind;
+    use maestro_editor::agents::persist::from_record;
+    // 19 list lines: nine agents fit, the last line is blank.
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 120, 21));
+    for i in 1..=12 {
+        ed.agents
+            .agents
+            .push(from_record(&record(i, "stopped"), &[]));
+    }
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    let l = panel::agent_layout(ed.area);
+    assert_eq!(l.list.height, 19);
+    // Each agent takes two lines; the second line selects it too.
+    ed.handle_mouse(MouseKind::Down, l.list.x + 3, l.list.y + 5);
+    assert_eq!(ed.agents.panel.selected, 2);
+    // The blank last line selects nothing.
+    ed.handle_mouse(MouseKind::Down, l.list.x + 3, l.list.y + 18);
+    assert_eq!(ed.agents.panel.selected, 2);
+    // Scrolled: the list starts at the fourth agent, and a click on its
+    // first row selects that one, as drawn.
+    for _ in 0..9 {
+        ed.handle_key(KeyEvent::char('j'));
+    }
+    assert_eq!(ed.agents.panel.selected, 11);
+    let rows = screen(&ed);
+    assert!(rows[2].contains("sh-4"), "{:?}", rows[2]);
+    ed.handle_mouse(MouseKind::Down, l.list.x + 3, l.list.y);
+    assert_eq!(ed.agents.panel.selected, 3);
+    // The wheel over the list moves the selection.
+    ed.handle_mouse(MouseKind::ScrollDown, l.list.x + 3, l.list.y);
+    assert_eq!(ed.agents.panel.selected, 4);
+    // `?` in a short window: every hint is in the box, several to a line.
+    ed.handle_key(KeyEvent::char('?'));
+    let text = screen(&ed).join("\n");
+    for (k, d) in [("A", "archive"), (":", "command"), ("esc", "close")] {
+        assert!(text.contains(&format!("{k} {d}")), "{k} {d}:\n{text}");
+    }
+    assert!(!text.contains("too small"), "{text}");
 }

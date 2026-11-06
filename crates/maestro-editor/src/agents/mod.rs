@@ -261,7 +261,7 @@ pub struct Comment {
     pub line: usize,
     pub old: bool,
     pub text: String,
-    /// Sent to the agent with feedback.
+    /// Sent to the agent with the next message (`m`).
     pub sent: bool,
 }
 

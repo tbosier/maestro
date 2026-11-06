@@ -289,15 +289,15 @@ pub fn relaunch(ed: &mut Editor, id: AgentId) {
     {
         let msg = match (a.kind(), a.replaying) {
             (ProviderKind::Terminal, _) => format!(
-                "relaunched {} without its task: C-\\ gives it the keys to type what it should do",
+                "relaunched {} without its task: i gives it the keys to type what it should do",
                 a.name
             ),
             (ProviderKind::Acp, true) => format!(
-                "relaunched {}: loading its saved session; f sends it a prompt",
+                "relaunched {}: loading its saved session; m sends it a message",
                 a.name
             ),
             (ProviderKind::Acp, false) => format!(
-                "relaunched {} in a new session without the earlier conversation; f sends it a prompt",
+                "relaunched {} in a new session without the earlier conversation; m sends it a message",
                 a.name
             ),
         };

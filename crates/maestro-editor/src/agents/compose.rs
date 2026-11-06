@@ -354,6 +354,10 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             ed.agents.panel.compose = None;
             return;
         }
+        KeyCode::Char('?') => {
+            super::panel::show_keys(ed);
+            return;
+        }
         // Down and up the column the cursor is in: items are ordered band
         // by band, so the next item may be another agent's.
         KeyCode::Char('j') | KeyCode::Down if !ctrl => {
@@ -788,6 +792,8 @@ pub fn hints() -> Vec<(&'static str, &'static str)> {
         ("space", "mark"),
         ("ret", "check and compose"),
         ("r", "refresh"),
+        ("S-tab", "previous file"),
+        (":", "command"),
         ("esc", "back"),
     ]
 }

@@ -1230,6 +1230,18 @@ impl Editor {
 
     /// Handles a mouse event at screen cell (x, y).
     pub fn handle_mouse(&mut self, kind: MouseKind, x: u16, y: u16) {
+        // The panel takes the mouse only when it is the screen on top:
+        // the inbox, the Git screen and the proposal review draw over it.
+        if self.agents.panel_open()
+            && self.picker.is_none()
+            && self.prompt.is_none()
+            && !self.forge.screen_open()
+            && !self.git.screen_open()
+            && !self.proposals.review_open()
+        {
+            crate::agents::panel::handle_mouse(self, kind, x, y);
+            return;
+        }
         if self.picker.is_some()
             || self.prompt.is_some()
             || self.agents.panel_open()
