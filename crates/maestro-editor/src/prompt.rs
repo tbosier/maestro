@@ -22,6 +22,9 @@ pub enum PromptKind {
     GlobalSearch,
     /// A new name for the symbol at the cursor (`crate::lsp::actions`).
     Rename,
+    /// The path of a project to add (`crate::workspaces::manage`); `tab`
+    /// completes directory names.
+    ProjectAdd,
 }
 
 impl PromptKind {
@@ -36,6 +39,7 @@ impl PromptKind {
             PromptKind::Keep { remove: true } => "remove: ",
             PromptKind::GlobalSearch => "search workspace: ",
             PromptKind::Rename => "rename to: ",
+            PromptKind::ProjectAdd => "add project: ",
         }
     }
 
@@ -43,6 +47,7 @@ impl PromptKind {
         match self {
             PromptKind::Command => ':',
             PromptKind::Rename => 'n',
+            PromptKind::ProjectAdd => 'p',
             _ => '/',
         }
     }
@@ -158,7 +163,9 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) {
                 p.cursor = p.input.len();
             }
         }
-        KeyCode::Tab | KeyCode::BackTab if p.kind == PromptKind::Command => {
+        KeyCode::Tab | KeyCode::BackTab
+            if matches!(p.kind, PromptKind::Command | PromptKind::ProjectAdd) =>
+        {
             complete(editor, &mut p, key.code == KeyCode::BackTab);
             editor.prompt = Some(p);
             return;
@@ -238,6 +245,7 @@ fn finish(editor: &mut Editor, p: Prompt) {
             }
         }
         PromptKind::Rename => crate::lsp::actions::rename_prompt_done(editor, &p.input),
+        PromptKind::ProjectAdd => crate::workspaces::manage::prompt_done(editor, &p.input),
         PromptKind::SelectRegex | PromptKind::SplitRegex | PromptKind::Keep { .. } => {
             if let Some(f) = p.feedback {
                 editor.set_status(Severity::Error, f);
@@ -250,7 +258,10 @@ fn finish(editor: &mut Editor, p: Prompt) {
 /// Recomputes the live preview for regex prompts.
 fn preview(editor: &mut Editor, p: &mut Prompt) {
     p.feedback = None;
-    if matches!(p.kind, PromptKind::Command | PromptKind::Rename) {
+    if matches!(
+        p.kind,
+        PromptKind::Command | PromptKind::Rename | PromptKind::ProjectAdd
+    ) {
         return;
     }
     // The document may have changed since the prompt opened (an automatic
@@ -326,13 +337,22 @@ fn preview(editor: &mut Editor, p: &mut Prompt) {
                 None => p.feedback = Some("no selections would remain".into()),
             }
         }
-        PromptKind::Command | PromptKind::GlobalSearch | PromptKind::Rename => {}
+        PromptKind::Command
+        | PromptKind::GlobalSearch
+        | PromptKind::Rename
+        | PromptKind::ProjectAdd => {}
     }
 }
 
 fn complete(editor: &Editor, p: &mut Prompt, backward: bool) {
+    // The project prompt is one path, spaces and all.
+    let whole = p.kind == PromptKind::ProjectAdd;
     if p.completions.is_empty() {
-        p.completions = completions_for(editor, &p.input);
+        p.completions = if whole {
+            path_completions(editor, &p.input, true)
+        } else {
+            completions_for(editor, &p.input)
+        };
         p.completion_idx = None;
         if p.completions.is_empty() {
             return;
@@ -346,7 +366,11 @@ fn complete(editor: &Editor, p: &mut Prompt, backward: bool) {
         (Some(i), true) => (i + n - 1) % n,
     };
     p.completion_idx = Some(next);
-    let (head, _) = split_last_word(&p.input);
+    let (head, _) = if whole {
+        ("", "")
+    } else {
+        split_last_word(&p.input)
+    };
     p.input = format!("{head}{}", p.completions[next]);
     p.cursor = p.input.len();
 }
@@ -372,6 +396,13 @@ fn completions_for(editor: &Editor, input: &str) -> Vec<String> {
         return names;
     }
     // Path completion for every other argument.
+    path_completions(editor, word, false)
+}
+
+/// Completions of the path `word`: the entries of the directory it names
+/// that start with its last part, directories with a trailing `/`. Hidden
+/// entries only when the last part starts with `.`.
+fn path_completions(editor: &Editor, word: &str, dirs_only: bool) -> Vec<String> {
     let (dir_part, file_part) = match word.rfind('/') {
         Some(i) => (&word[..=i], &word[i + 1..]),
         None => ("", word),
@@ -393,11 +424,14 @@ fn completions_for(editor: &Editor, input: &str) -> Vec<String> {
             {
                 return None;
             }
-            let slash = if e.file_type().is_ok_and(|t| t.is_dir()) {
-                "/"
-            } else {
-                ""
-            };
+            // For a project, a link to a directory completes as one.
+            let is_dir = e
+                .file_type()
+                .is_ok_and(|t| t.is_dir() || (dirs_only && t.is_symlink() && e.path().is_dir()));
+            if dirs_only && !is_dir {
+                return None;
+            }
+            let slash = if is_dir { "/" } else { "" };
             Some(format!("{dir_part}{name}{slash}"))
         })
         .collect();

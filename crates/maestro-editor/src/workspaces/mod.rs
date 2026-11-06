@@ -5,6 +5,9 @@
 //!   changed files and ahead/behind counts.
 //! * The jump palette (`space j`, [`jump`]) is one fuzzy list of projects,
 //!   worktrees, agents and open buffers.
+//! * `a` in the sidebar (or `:project-add`) adds a project and `d` (or
+//!   `:project-remove`) forgets one; the list is kept in the state
+//!   directory ([`manage`]).
 //! * Choosing a worktree in either switches the editor to it ([`switch`]):
 //!   the working directory moves, the current files and layout are saved as
 //!   that worktree's session and the target's session is restored.
@@ -21,6 +24,7 @@
 //! palette draw what the last scan found plus the live agent records.
 
 pub mod jump;
+pub mod manage;
 pub mod scan;
 pub mod sidebar;
 pub mod switch;
@@ -83,6 +87,22 @@ pub struct Workspaces {
     pub(crate) memory_sessions: HashMap<PathBuf, crate::navigation::session::SessionFile>,
     /// The worktree last switched to.
     pub active_root: Option<PathBuf>,
+    /// Projects added and forgotten in the editor ([`manage`]), as read
+    /// from `<state>/projects.toml` on the first scan.
+    pub saved: manage::ProjectList,
+    /// [`Workspaces::saved`] was read (or there is nothing to read).
+    pub(crate) saved_loaded: bool,
+    /// The last write of [`Workspaces::saved`] failed: the list in memory
+    /// has changes the file lacks.
+    pub(crate) saved_unwritten: bool,
+    /// A project just added, selected again when the next scan lists it.
+    pub(crate) select_after_scan: Option<PathBuf>,
+    /// The roots of the projects the last scan listed because of
+    /// `[projects] paths`.
+    pub configured: Vec<PathBuf>,
+    /// The config file `[projects] paths` came from, for messages. Set by
+    /// the front end; `None` with `--clean`.
+    pub config_path: Option<PathBuf>,
 }
 
 impl Workspaces {

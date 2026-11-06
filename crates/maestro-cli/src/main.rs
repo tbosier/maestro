@@ -122,21 +122,20 @@ fn main() -> ExitCode {
     }
 
     let mut startup_errors = Vec::new();
-    let config = if args.clean {
-        Config::default()
+    let config_path = if args.clean {
+        None
     } else {
-        let path = args
-            .config
+        args.config
             .clone()
-            .or_else(|| maestro_config::config::config_dir().map(|d| d.join("config.toml")));
-        match path.map(|p| Config::load(&p)) {
-            Some(Ok(c)) => c,
-            Some(Err(e)) => {
-                startup_errors.push(e.to_string());
-                Config::default()
-            }
-            None => Config::default(),
+            .or_else(|| maestro_config::config::config_dir().map(|d| d.join("config.toml")))
+    };
+    let config = match config_path.as_deref().map(Config::load) {
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
+            startup_errors.push(e.to_string());
+            Config::default()
         }
+        None => Config::default(),
     };
 
     let (w, h) = match args.headless {
@@ -145,6 +144,9 @@ fn main() -> ExitCode {
     };
     let mut editor = Editor::new(config, Rect::new(0, 1, w, h.saturating_sub(2)));
     editor.recovery_dir = maestro_config::config::state_dir().map(|d| d.join("recovery"));
+    // Named when a project from `[projects] paths` cannot be forgotten in
+    // the sidebar.
+    editor.workspaces.config_path = config_path;
     // Language servers start for opened files in the interactive editor
     // only: not when measuring startup, and not headless, where unattended
     // runs must not start programs that can execute repository code.

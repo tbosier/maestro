@@ -15,9 +15,12 @@ use maestro_config::{
     AgentProviderConfig, AgentProviderKind, Config, LanguageServerConfig, NotifyMethod,
 };
 use maestro_editor::agents::Status;
+use maestro_editor::editor::Severity;
 use maestro_editor::git::GitState;
 use maestro_editor::navigation::session;
 use maestro_editor::picker::PickerAction;
+use maestro_editor::prompt::PromptKind;
+use maestro_editor::workspaces::manage::{self, ProjectList};
 use maestro_editor::workspaces::sidebar::{self, Row, RowKey};
 use maestro_editor::workspaces::{Attention, NeedsYou};
 use maestro_editor::{Editor, KeyCode, KeyEvent, Rect};
@@ -102,6 +105,42 @@ fn main() {
         (
             "a_nested_worktrees_server_stops_when_you_leave_it",
             a_nested_worktrees_server_stops_when_you_leave_it,
+        ),
+        (
+            "adding_a_project_lists_it_selected_and_keeps_it",
+            adding_a_project_lists_it_selected_and_keeps_it,
+        ),
+        (
+            "tab_completes_directories_in_the_add_prompt",
+            tab_completes_directories_in_the_add_prompt,
+        ),
+        (
+            "adding_refuses_missing_paths_and_directories_outside_git",
+            adding_refuses_missing_paths_and_directories_outside_git,
+        ),
+        (
+            "forgetting_asks_first_and_refuses_configured_projects",
+            forgetting_asks_first_and_refuses_configured_projects,
+        ),
+        (
+            "typed_commands_and_the_palette_add_and_forget_projects",
+            typed_commands_and_the_palette_add_and_forget_projects,
+        ),
+        (
+            "without_a_state_directory_the_list_is_neither_read_nor_written",
+            without_a_state_directory_the_list_is_neither_read_nor_written,
+        ),
+        (
+            "a_malformed_project_list_is_ignored_with_a_note",
+            a_malformed_project_list_is_ignored_with_a_note,
+        ),
+        (
+            "adding_before_the_first_scan_selects_the_project_when_it_arrives",
+            adding_before_the_first_scan_selects_the_project_when_it_arrives,
+        ),
+        (
+            "an_added_worktree_of_a_bare_repository_stays_usable",
+            an_added_worktree_of_a_bare_repository_stays_usable,
         ),
     ]);
 }
@@ -1228,4 +1267,449 @@ fn a_nested_worktrees_server_stops_when_you_leave_it() {
     assert_eq!(roots(&ed), std::slice::from_ref(&nested));
     ed.tick(Instant::now() + Duration::from_secs(301));
     assert_eq!(roots(&ed), Vec::<PathBuf>::new());
+}
+
+// ----- adding and forgetting projects --------------------------------------
+
+/// A third repository `gamma` with a linked worktree `gamma-wt` on branch
+/// `side`, a plain directory `plain` and a file `gamma-notes.txt`, none
+/// of them listed anywhere.
+fn gamma(f: &Fixture) -> (PathBuf, PathBuf) {
+    let gamma = f.tmp.join("gamma");
+    std::fs::create_dir_all(gamma.join("src")).unwrap();
+    f.git(&gamma, &["init", "-q"]);
+    std::fs::write(gamma.join("src/main.rs"), "fn main() {}\n").unwrap();
+    f.git(&gamma, &["add", "-A"]);
+    f.git(&gamma, &["commit", "-q", "-m", "initial"]);
+    let wt = f.tmp.join("gamma-wt");
+    f.git(
+        &gamma,
+        &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()],
+    );
+    std::fs::create_dir_all(f.tmp.join("plain")).unwrap();
+    std::fs::write(f.tmp.join("gamma-notes.txt"), "not a directory\n").unwrap();
+    (gamma, wt)
+}
+
+fn project_roots(ed: &Editor) -> Vec<PathBuf> {
+    sidebar::rows(ed)
+        .iter()
+        .filter_map(|r| match r {
+            Row::Project { root, .. } => Some(root.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn list_file(f: &Fixture) -> PathBuf {
+    manage::path(&f.state())
+}
+
+/// Waits until no background work runs and nothing it sent is left to
+/// apply. A job sends its result before it stops counting as running, so
+/// one more poll after it stops applies the result; that can start more
+/// work (an add starts a scan), hence the loop.
+fn drain(ed: &mut Editor) {
+    loop {
+        poll_until(ed, "background work", |ed| !ed.has_background_work());
+        if !ed.poll_background() {
+            return;
+        }
+    }
+}
+
+/// `a` in the sidebar, the prompt cleared, `path` typed and accepted;
+/// waits for the check and the scan after it.
+fn add_with_sidebar(ed: &mut Editor, path: &Path) {
+    open_sidebar(ed);
+    run(ed, "a");
+    assert_eq!(
+        ed.prompt.as_ref().map(|p| p.kind),
+        Some(PromptKind::ProjectAdd)
+    );
+    run(ed, "<C-u>");
+    run(ed, path.to_str().unwrap());
+    run(ed, "\n");
+    drain(ed);
+}
+
+fn adding_a_project_lists_it_selected_and_keeps_it() {
+    let f = Fixture::new();
+    let (gamma, wt) = gamma(&f);
+    let mut ed = f.editor(f.config(), true);
+    open_sidebar(&mut ed);
+    assert!(!project_roots(&ed).contains(&gamma));
+    // The prompt starts at the parent of the working directory.
+    run(&mut ed, "a");
+    let p = ed.prompt.as_ref().expect("the add prompt");
+    assert_eq!(p.kind, PromptKind::ProjectAdd);
+    assert!(p.input.ends_with('/'), "{:?}", p.input);
+    assert_eq!(ed.resolve_path(Path::new(&p.input)), f.tmp);
+    // A relative path into a subdirectory of a linked worktree: the
+    // project is the repository, keyed by its main worktree.
+    run(&mut ed, "<C-u>../gamma-wt/src\n");
+    drain(&mut ed);
+    assert_eq!(status_text(&ed), "added gamma");
+    assert!(
+        project_roots(&ed).contains(&gamma),
+        "{:#?}",
+        project_roots(&ed)
+    );
+    assert!(!project_roots(&ed).contains(&wt));
+    assert_eq!(
+        ed.workspaces.sidebar.selected,
+        Some(RowKey::Project(gamma.clone()))
+    );
+    let rows = sidebar::rows(&ed);
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, Row::Worktree { row, .. } if row.path == wt)),
+        "gamma is unfolded: {rows:#?}"
+    );
+    assert_eq!(
+        manage::read(&list_file(&f)),
+        Ok(Some(ProjectList {
+            added: vec![gamma.clone()],
+            hidden: Vec::new(),
+        }))
+    );
+    // Adding it again says so and changes nothing.
+    add_with_sidebar(&mut ed, &gamma);
+    assert_eq!(status_text(&ed), "gamma is already in the list");
+    // The keys are named where you look for them.
+    run(&mut ed, "z");
+    assert!(
+        status_text(&ed).contains("a add project, d forget project"),
+        "{}",
+        status_text(&ed)
+    );
+
+    // A new editor with the same state directory lists it.
+    let mut again = f.editor(f.config(), true);
+    open_sidebar(&mut again);
+    assert!(project_roots(&again).contains(&gamma));
+}
+
+fn tab_completes_directories_in_the_add_prompt() {
+    let f = Fixture::new();
+    let (gamma, _) = gamma(&f);
+    let mut ed = f.editor(f.config(), true);
+    open_sidebar(&mut ed);
+    run(&mut ed, "a<C-u>");
+    run(&mut ed, &format!("{}/gam<tab>", f.tmp.display()));
+    let input = |ed: &Editor| ed.prompt.as_ref().unwrap().input.clone();
+    // Sorted as text: `-` comes before `/`.
+    assert_eq!(input(&ed), format!("{}/gamma-wt/", f.tmp.display()));
+    // Directories only: the file gamma-notes.txt is not offered.
+    run(&mut ed, "<tab>");
+    assert_eq!(input(&ed), format!("{}/gamma/", f.tmp.display()));
+    run(&mut ed, "<tab>");
+    assert_eq!(input(&ed), format!("{}/gamma-wt/", f.tmp.display()));
+    run(&mut ed, "<S-tab>");
+    assert_eq!(input(&ed), format!("{}/gamma/", f.tmp.display()));
+    run(&mut ed, "\n");
+    drain(&mut ed);
+    assert_eq!(status_text(&ed), "added gamma");
+    assert!(project_roots(&ed).contains(&gamma));
+}
+
+fn adding_refuses_missing_paths_and_directories_outside_git() {
+    let f = Fixture::new();
+    gamma(&f);
+    let mut ed = f.editor(f.config(), true);
+    open_sidebar(&mut ed);
+    let before = project_roots(&ed);
+    for (path, want) in [
+        (f.tmp.join("nope"), "no such directory: "),
+        (f.tmp.join("plain"), "not a Git repository: "),
+        (f.tmp.join("gamma-notes.txt"), "not a directory: "),
+    ] {
+        add_with_sidebar(&mut ed, &path);
+        assert_eq!(
+            ed.status,
+            Some((Severity::Error, format!("{want}{}", path.display())))
+        );
+    }
+    assert_eq!(project_roots(&ed), before);
+    assert!(!list_file(&f).exists(), "nothing was written");
+}
+
+fn forgetting_asks_first_and_refuses_configured_projects() {
+    let f = Fixture::new();
+    let (gamma, _) = gamma(&f);
+    // Gamma is listed only because an earlier session was there.
+    let session = session::SessionFile {
+        version: 1,
+        cwd: gamma.display().to_string(),
+        focused: None,
+        buffers: Vec::new(),
+        layout: None,
+        focused_view: None,
+    };
+    let file = session::session_path(&f.state(), &gamma);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, toml::to_string(&session).unwrap()).unwrap();
+    let mut ed = f.editor(f.config(), true);
+    ed.workspaces.config_path = Some(f.tmp.join("home/config.toml"));
+    open_sidebar(&mut ed);
+    assert!(project_roots(&ed).contains(&gamma));
+
+    // On a worktree row, d says what it is for.
+    select_row(&mut ed, &RowKey::Worktree(f.alpha.clone()));
+    run(&mut ed, "d");
+    assert!(status_text(&ed).starts_with("d forgets a project"));
+    assert_eq!(ed.pending_char_label(), None);
+
+    select_row(&mut ed, &RowKey::Project(gamma.clone()));
+    run(&mut ed, "d");
+    assert_eq!(ed.pending_char_label(), Some("y/n"));
+    assert_eq!(
+        status_text(&ed),
+        "forget gamma? It only leaves this list; no files are deleted"
+    );
+    run(&mut ed, "n");
+    assert_eq!(status_text(&ed), "kept gamma");
+    assert!(project_roots(&ed).contains(&gamma));
+
+    run(&mut ed, "dy");
+    assert!(status_text(&ed).starts_with("forgot gamma; no files were touched"));
+    assert!(!project_roots(&ed).contains(&gamma), "gone at once");
+    drain(&mut ed);
+    assert!(!project_roots(&ed).contains(&gamma), "and after a scan");
+    assert!(gamma.join("src/main.rs").exists());
+    assert_eq!(
+        manage::read(&list_file(&f)),
+        Ok(Some(ProjectList {
+            added: Vec::new(),
+            hidden: vec![gamma.clone()],
+        }))
+    );
+
+    // The session is still there, but a new editor leaves gamma out until
+    // it is added again.
+    let mut again = f.editor(f.config(), true);
+    open_sidebar(&mut again);
+    assert!(!project_roots(&again).contains(&gamma));
+    add_with_sidebar(&mut again, &gamma);
+    assert_eq!(status_text(&again), "added gamma");
+    assert_eq!(
+        manage::read(&list_file(&f)).unwrap().unwrap().hidden,
+        Vec::<PathBuf>::new()
+    );
+
+    // A configured project is refused with where to remove it.
+    select_row(&mut ed, &RowKey::Project(f.beta.clone()));
+    run(&mut ed, "d");
+    assert_eq!(ed.pending_char_label(), None);
+    assert_eq!(
+        status_text(&ed),
+        format!(
+            "beta is listed in [projects] paths in {}; remove it there",
+            f.tmp.join("home/config.toml").display()
+        )
+    );
+    // So is the project the editor is in.
+    select_row(&mut ed, &RowKey::Project(f.alpha.clone()));
+    run(&mut ed, "d");
+    assert_eq!(ed.pending_char_label(), None);
+    assert!(status_text(&ed).contains("the project you are in"));
+    assert!(project_roots(&ed).contains(&f.alpha));
+}
+
+fn typed_commands_and_the_palette_add_and_forget_projects() {
+    let f = Fixture::new();
+    let (gamma, _) = gamma(&f);
+    let mut ed = f.editor(f.config(), true);
+    run(&mut ed, &format!(":project-add {}\n", gamma.display()));
+    drain(&mut ed);
+    assert_eq!(status_text(&ed), "added gamma; space s shows it");
+    // With no path it asks for one.
+    run(&mut ed, ":project-add\n");
+    assert_eq!(
+        ed.prompt.as_ref().map(|p| p.kind),
+        Some(PromptKind::ProjectAdd)
+    );
+    run(&mut ed, "<esc>");
+    // The palette's last entry asks too.
+    run(&mut ed, " j");
+    poll_until(&mut ed, "the palette", |ed| {
+        ed.picker.as_ref().is_some_and(|p| !p.loading) && !ed.has_background_work()
+    });
+    let last = ed.picker.as_ref().unwrap().items().last().cloned().unwrap();
+    assert_eq!(last.label, "add a project");
+    run(&mut ed, "add a project\n");
+    assert!(ed.picker.is_none());
+    assert_eq!(
+        ed.prompt.as_ref().map(|p| p.kind),
+        Some(PromptKind::ProjectAdd)
+    );
+    run(&mut ed, "<esc>");
+
+    run(&mut ed, ":project-remove\n");
+    assert!(status_text(&ed).starts_with("give a project name or path"));
+    run(&mut ed, ":project-remove nothing-here\n");
+    assert!(status_text(&ed).starts_with("no project named nothing-here"));
+    // By path, from inside it.
+    run(
+        &mut ed,
+        &format!(":project-remove {}/src\n", gamma.display()),
+    );
+    assert_eq!(ed.pending_char_label(), Some("y/n"));
+    run(&mut ed, "y");
+    drain(&mut ed);
+    assert!(
+        !ed.workspaces.projects.iter().any(|p| p.root == gamma),
+        "{:?}",
+        ed.workspaces.projects
+    );
+    // By name: beta is configured.
+    run(&mut ed, ":project-remove beta\n");
+    assert!(status_text(&ed).contains("[projects] paths in the config file"));
+}
+
+fn without_a_state_directory_the_list_is_neither_read_nor_written() {
+    let f = Fixture::new();
+    let (gamma, wt) = gamma(&f);
+    // A list on disk names gamma; an editor without a state directory
+    // (--clean) does not read it.
+    let text = format!("version = 1\nadded = [\"{}\"]\n", gamma.display());
+    std::fs::create_dir_all(f.state()).unwrap();
+    std::fs::write(list_file(&f), &text).unwrap();
+    let mut ed = f.editor(f.config(), false);
+    open_sidebar(&mut ed);
+    assert!(!project_roots(&ed).contains(&gamma));
+
+    add_with_sidebar(&mut ed, &wt);
+    assert_eq!(
+        status_text(&ed),
+        "added gamma (for this run only: no state directory)"
+    );
+    assert!(project_roots(&ed).contains(&gamma));
+    select_row(&mut ed, &RowKey::Project(gamma.clone()));
+    run(&mut ed, "dy");
+    drain(&mut ed);
+    assert!(!project_roots(&ed).contains(&gamma));
+    // Nothing was written.
+    assert_eq!(std::fs::read_to_string(list_file(&f)).unwrap(), text);
+    let names: Vec<_> = std::fs::read_dir(f.state())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [manage::FILE]);
+}
+
+fn a_malformed_project_list_is_ignored_with_a_note() {
+    let f = Fixture::new();
+    let (gamma, _) = gamma(&f);
+    std::fs::create_dir_all(f.state()).unwrap();
+    std::fs::write(list_file(&f), "version = 1\nadded = [[[\n").unwrap();
+    let mut ed = f.editor(f.config(), true);
+    open_sidebar(&mut ed);
+    let note = status_text(&ed);
+    assert!(
+        note.starts_with(&format!("ignored {}: ", list_file(&f).display())),
+        "{note}"
+    );
+    assert!(note.ends_with("adding or forgetting a project replaces it"));
+    assert!(project_roots(&ed).contains(&f.alpha));
+    assert!(project_roots(&ed).contains(&f.beta));
+    // The next change replaces it with a good file.
+    add_with_sidebar(&mut ed, &gamma);
+    assert_eq!(status_text(&ed), "added gamma");
+    assert_eq!(
+        manage::read(&list_file(&f)),
+        Ok(Some(ProjectList {
+            added: vec![gamma],
+            hidden: Vec::new(),
+        }))
+    );
+}
+
+fn adding_before_the_first_scan_selects_the_project_when_it_arrives() {
+    let f = Fixture::new();
+    let (gamma, _) = gamma(&f);
+    let mut ed = f.editor(f.config(), true);
+    // `space s` starts the first scan; the path is typed before it ends.
+    run(&mut ed, " s");
+    assert!(!ed.workspaces.scanned);
+    run(&mut ed, "a<C-u>");
+    run(&mut ed, gamma.to_str().unwrap());
+    run(&mut ed, "\n");
+    drain(&mut ed);
+    assert!(ed.workspaces.scanned);
+    assert!(project_roots(&ed).contains(&gamma));
+    assert_eq!(
+        ed.workspaces.sidebar.selected,
+        Some(RowKey::Project(gamma.clone()))
+    );
+    assert!(ed.workspaces.sidebar.expanded.contains(&gamma));
+    // A path through a directory that does not exist is refused, even
+    // when `..` would lead back to a real one.
+    let detour = gamma.join("no-such-dir/..");
+    add_with_sidebar(&mut ed, &detour);
+    assert_eq!(
+        ed.status,
+        Some((
+            Severity::Error,
+            format!("no such directory: {}", detour.display())
+        ))
+    );
+}
+
+fn an_added_worktree_of_a_bare_repository_stays_usable() {
+    let f = Fixture::new();
+    let bare = f.tmp.join("bare.git");
+    let linked = f.tmp.join("linked");
+    f.git(
+        &f.tmp,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            f.alpha.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    f.git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "work",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let mut ed = f.editor(f.config(), true);
+    add_with_sidebar(&mut ed, &linked);
+    assert_eq!(status_text(&ed), "added bare.git");
+    // A bare directory is not a usable project: the linked worktree is
+    // what is kept, and later scans still list its worktree.
+    assert_eq!(
+        manage::read(&list_file(&f)).unwrap().unwrap().added,
+        std::slice::from_ref(&linked)
+    );
+    let mut again = f.editor(f.config(), true);
+    open_sidebar(&mut again);
+    let project = again
+        .workspaces
+        .projects
+        .iter()
+        .find(|p| p.root == bare)
+        .unwrap_or_else(|| panic!("{:#?}", again.workspaces.projects));
+    assert_eq!(project.error, None);
+    assert!(project.worktrees.iter().any(|w| w.path == linked));
+    // Forgetting it drops the linked worktree's entry too.
+    select_row(&mut again, &RowKey::Project(bare.clone()));
+    run(&mut again, "dy");
+    drain(&mut again);
+    assert_eq!(
+        manage::read(&list_file(&f)),
+        Ok(Some(ProjectList {
+            added: Vec::new(),
+            hidden: vec![bare.clone()],
+        }))
+    );
+    assert!(!project_roots(&again).contains(&bare));
 }

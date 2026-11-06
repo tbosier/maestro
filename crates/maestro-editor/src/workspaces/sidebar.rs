@@ -7,6 +7,8 @@
 //! | `g` `G` | first, last row |
 //! | `ret` | project: fold or unfold; worktree or agent: switch to it |
 //! | `l` `h` | unfold, fold (on a worktree, `h` folds its project) |
+//! | `a` | add a project: asks for a path (`tab` completes directories) |
+//! | `d` | on a project: forget it after a y/n question (no files are deleted; see [`super::manage`]) |
 //! | `r` | scan again now |
 //! | `q` | hide the sidebar |
 //! | `esc` | back to the editor, sidebar stays |
@@ -124,9 +126,7 @@ pub fn rows(ed: &Editor) -> Vec<Row> {
         return out;
     }
     if ws.projects.is_empty() {
-        out.push(Row::Note(
-            "no projects: add [projects] paths to the config".into(),
-        ));
+        out.push(Row::Note("no projects yet: a adds one".into()));
     }
     let current = super::current_root(ed);
     for p in &ws.projects {
@@ -233,6 +233,11 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) -> bool {
         }
         KeyCode::Char('g') | KeyCode::Home => select(ed, selectable.first().copied()),
         KeyCode::Char('G') | KeyCode::End => select(ed, selectable.last().copied()),
+        KeyCode::Char('a') => super::manage::open_prompt(ed),
+        KeyCode::Char('d') => match at.map(|i| &rows[i]) {
+            Some(Row::Project { root, .. }) => super::manage::forget(ed, root),
+            _ => ed.info("d forgets a project: select the project's row first (h on a worktree)"),
+        },
         KeyCode::Char('r') => {
             super::scan::request(ed);
             ed.info("scanning projects and worktrees");
@@ -270,7 +275,10 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) -> bool {
             }
             _ => {}
         },
-        _ => ed.info("sidebar: j/k move, ret open, h/l fold, r rescan, esc editor, q hide"),
+        _ => ed.info(
+            "sidebar: j/k move, ret open, h/l fold, a add project, d forget project, r rescan, \
+             esc editor, q hide",
+        ),
     }
     true
 }
