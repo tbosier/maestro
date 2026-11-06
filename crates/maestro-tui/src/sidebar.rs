@@ -49,7 +49,7 @@ pub(crate) fn draw(ed: &Editor, s: &mut Surface, area: Rect) {
     );
     if footer {
         let y = area.bottom() - 1;
-        // The fold keys go first when the column is narrow; the unknown-key
+        // In a narrow column the fold keys are left out; the unknown-key
         // message still lists them.
         let full = " ret open  h/l fold  a add project  esc editor";
         let short = " ret open  a add project  esc editor";
