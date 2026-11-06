@@ -59,7 +59,7 @@ cargo build --release
 | `:w` / `:q` | save / quit |
 | `space ?` | every command, with its key |
 | `space f` / `space /` | find a file / search the workspace |
-| `space a` | agents: `n` new task, `ret` review, `I` integrate |
+| `space a` | agents: `n` new task, `i` or a click to type into one, `m` message it, `ret` review, `I` integrate |
 | `space g` | Git status |
 | `space s` | projects and worktrees |
 | `space j` | jump to a project, worktree, agent or buffer |

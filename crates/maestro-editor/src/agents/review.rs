@@ -612,7 +612,8 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             }
         }
         KeyCode::Char('t') if !ctrl => super::actions::run_tests(ed, id),
-        KeyCode::Char('f') if !ctrl => super::actions::ask_feedback(ed, id),
+        KeyCode::Char('m' | 'f') if !ctrl => super::actions::ask_message(ed, id),
+        KeyCode::Char('?') => super::panel::show_keys(ed),
         KeyCode::Char('I') if !ctrl => super::actions::prepare_integrate(ed, id),
         KeyCode::Char('X') if !ctrl => super::actions::confirm_reject(ed, id),
         KeyCode::Char(':') if !ctrl => crate::prompt::open(ed, crate::prompt::PromptKind::Command),
@@ -686,6 +687,7 @@ fn open_at_cursor(ed: &mut Editor, v: &ReviewView, rows: &[Row]) {
 
 pub fn hints() -> Vec<(&'static str, &'static str)> {
     vec![
+        ("esc", "back"),
         ("j/k", "line"),
         ("]/[", "hunk"),
         ("space", "mark hunk"),
@@ -695,12 +697,15 @@ pub fn hints() -> Vec<(&'static str, &'static str)> {
         ("c", "comment"),
         ("D", "drop file"),
         ("ret", "open file"),
-        ("f", "feedback"),
+        ("m", "message agent"),
         ("t", "test"),
         ("I", "integrate"),
         ("X", "reject"),
         ("r", "refresh"),
-        ("esc", "back"),
+        ("g/G", "top, bottom"),
+        ("pgup/pgdn", "page"),
+        ("S-tab", "previous file"),
+        (":", "command"),
     ]
 }
 

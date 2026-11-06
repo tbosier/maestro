@@ -9,7 +9,7 @@ use super::contract::Contract;
 use super::create::NewAgent;
 use super::review::ReviewView;
 use super::{AgentId, ProviderKind, ProviderSpec};
-use crate::editor::{Editor, Mode};
+use crate::editor::{Editor, Mode, MouseKind};
 use crate::key::{KeyCode, KeyEvent};
 use crate::layout::Rect;
 
@@ -47,7 +47,7 @@ impl DetailView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputPurpose {
     NewTask,
-    Feedback(AgentId),
+    Message(AgentId),
     Comment {
         agent: AgentId,
         path: std::path::PathBuf,
@@ -112,6 +112,8 @@ pub enum ConfirmAction {
     /// `y` commits the checked hunks of several agents as a composed
     /// result with a worktree of its own.
     Compose(Box<super::compose::ComposePlan>),
+    /// The `?` list of every key on the current screen. Any key closes it.
+    Keys,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +327,8 @@ fn send_key_to_terminal(ed: &mut Editor, id: AgentId, key: KeyEvent) {
     let Some(tk) = term_key(key.code) else {
         return;
     };
+    // As in a terminal emulator, typing returns to the live screen.
+    t.scroll(0);
     let mods = maestro_term::TermMods {
         ctrl: key.mods.ctrl,
         alt: key.mods.alt,
@@ -411,11 +415,14 @@ fn list_key(ed: &mut Editor, key: KeyEvent) {
                 super::actions::run_tests(ed, id);
             }
         }
-        (KeyCode::Char('f'), false) => {
+        // `f` was this key's name before 0.7 ("feedback"); it still works.
+        (KeyCode::Char('m' | 'f'), false) => {
             if let Some(id) = selected_id(ed) {
-                super::actions::ask_feedback(ed, id);
+                super::actions::ask_message(ed, id);
             }
         }
+        (KeyCode::Char('i'), false) => type_into(ed),
+        (KeyCode::Char('?'), _) => show_keys(ed),
         (KeyCode::Char('p'), false) => {
             if let Some(id) = selected_id(ed) {
                 super::actions::choose_permission(ed, id);
@@ -466,6 +473,91 @@ fn scroll(ed: &mut Editor, delta: isize) {
     p.scroll = (p.scroll as isize + delta).max(0) as usize;
 }
 
+/// A mouse event while the panel is open, at screen cell (x, y). Only the
+/// agent list uses the mouse: a click on a row selects that agent, a click
+/// in a running terminal agent's live screen gives it the keys, and a
+/// click anywhere else takes them back. The wheel scrolls the list or the
+/// detail under the pointer. Dialogs, the review and the compose view
+/// keep to the keyboard.
+pub fn handle_mouse(ed: &mut Editor, kind: MouseKind, x: u16, y: u16) {
+    let p = &ed.agents.panel;
+    if p.overlay.is_some() || p.review.is_some() || p.compose.is_some() {
+        return;
+    }
+    let l = agent_layout(ed.area);
+    let n = ed.agents.agents.len();
+    match kind {
+        MouseKind::ScrollUp | MouseKind::ScrollDown => {
+            let up = kind == MouseKind::ScrollUp;
+            if l.list.contains(x, y) {
+                if ed.agents.panel.terminal_focus.is_some() || n == 0 {
+                    return;
+                }
+                let p = &mut ed.agents.panel;
+                p.selected = if up {
+                    p.selected.saturating_sub(1)
+                } else {
+                    (p.selected + 1).min(n - 1)
+                };
+                p.scroll = 0;
+            } else if l.summary.contains(x, y) || l.content.contains(x, y) {
+                scroll(ed, if up { 3 } else { -3 });
+            }
+        }
+        MouseKind::Down => {
+            // A click in the panel takes the keys from the sidebar.
+            ed.workspaces.sidebar.focused = false;
+            if l.content.contains(x, y) {
+                if ed.agents.panel.terminal_focus.is_some() {
+                    return;
+                }
+                let Some(a) = ed.agents.selected() else {
+                    return;
+                };
+                let id = a.id;
+                let live_terminal = ed.agents.panel.view == DetailView::Live
+                    && a.runtime
+                        .terminal()
+                        .is_some_and(|t| t.exit_status().is_none());
+                if live_terminal {
+                    focus_terminal(ed, id);
+                }
+                return;
+            }
+            if ed.agents.panel.terminal_focus.take().is_some() {
+                ed.info("keys are back with the panel");
+            }
+            if l.list.contains(x, y) && n > 0 {
+                let p = &mut ed.agents.panel;
+                let (first, visible) = list_window(p.selected, l.list.height);
+                let row = ((y - l.list.y) / LIST_ROW_HEIGHT) as usize;
+                let i = first + row;
+                // The list's last line is blank when its height is odd.
+                if row < visible && i < n {
+                    p.selected = i;
+                    p.scroll = 0;
+                }
+            }
+        }
+        MouseKind::Drag => {}
+    }
+}
+
+/// Lines each agent takes in the list.
+pub const LIST_ROW_HEIGHT: u16 = 2;
+
+/// The first agent the list shows and how many fit, so the selected one
+/// is on screen. The front end draws with it; the mouse maps clicks with it.
+pub fn list_window(selected: usize, height: u16) -> (usize, usize) {
+    let visible = (height / LIST_ROW_HEIGHT).max(1) as usize;
+    let first = if selected >= visible {
+        selected + 1 - visible
+    } else {
+        0
+    };
+    (first, visible)
+}
+
 /// `C-\` in the list: give the keys to the selected agent's terminal.
 fn take_keys(ed: &mut Editor) {
     let Some(a) = ed.agents.selected() else {
@@ -473,19 +565,41 @@ fn take_keys(ed: &mut Editor) {
     };
     let id = a.id;
     match (&a.runtime, a.kind()) {
-        (super::Runtime::Terminal(t), _) if t.exit_status().is_none() => {
-            t.scroll(0);
-            let p = &mut ed.agents.panel;
-            p.terminal_focus = Some(id);
-            p.view = DetailView::Live;
-            ed.info("keys go to the agent's terminal; C-\\ takes them back");
-        }
+        (super::Runtime::Terminal(t), _) if t.exit_status().is_none() => focus_terminal(ed, id),
         (super::Runtime::Terminal(_), _) => ed.error("the agent's program has exited"),
         (_, ProviderKind::Acp) => {
-            ed.error("this is an ACP agent: it has no terminal; f sends it a prompt")
+            ed.error("this is an ACP agent: it has no terminal; m sends it a message")
         }
         _ => ed.error("the agent is not running"),
     }
+}
+
+/// `i` in the list: talk to the selected agent. A running terminal agent
+/// gets the keys, as with `C-\`; any other agent gets the message box
+/// (`m`), which says why when nothing can reach it.
+fn type_into(ed: &mut Editor) {
+    let Some(a) = ed.agents.selected() else {
+        ed.error("no agent selected: n starts one");
+        return;
+    };
+    let id = a.id;
+    match &a.runtime {
+        super::Runtime::Terminal(t) if t.exit_status().is_none() => focus_terminal(ed, id),
+        _ => super::actions::ask_message(ed, id),
+    }
+}
+
+/// Gives the keys to a running terminal agent and shows its live screen.
+pub(crate) fn focus_terminal(ed: &mut Editor, id: AgentId) {
+    if let Some(t) = ed.agents.get(id).and_then(|a| a.runtime.terminal()) {
+        t.scroll(0);
+    }
+    let p = &mut ed.agents.panel;
+    p.terminal_focus = Some(id);
+    p.view = DetailView::Live;
+    ed.info(
+        "you are typing into the agent's terminal; C-\\ or a click outside it takes the keys back",
+    );
 }
 
 /// `N`: the same task again with another provider.
@@ -686,7 +800,7 @@ fn submit_input(ed: &mut Editor, purpose: InputPurpose, text: String) {
                 }
             }
         }
-        InputPurpose::Feedback(id) => super::actions::send_feedback(ed, id, text.trim()),
+        InputPurpose::Message(id) => super::actions::send_message(ed, id, text.trim()),
         InputPurpose::Comment {
             agent,
             path,
@@ -862,6 +976,9 @@ pub fn dialog_fits(area: Rect, lines: &[String], keys: &[(String, String)]) -> b
 }
 
 fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
+    if c.action == ConfirmAction::Keys {
+        return;
+    }
     let ch = key.typed_char();
     if key.code == KeyCode::Esc || ch == Some('n') || (key.mods.ctrl && ch.is_none()) {
         ed.info(format!("{}: canceled, nothing changed", c.title));
@@ -940,11 +1057,49 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
     }
 }
 
+/// `?`: the current screen's keys, all of them the hint line names, in a
+/// box, for when the hint line is too narrow to show them all. Several go
+/// on each line so the box fits a short window.
+pub fn show_keys(ed: &mut Editor) {
+    let (_, inner) = dialog_width(ed.area);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for (k, d) in hints(ed) {
+        let item = format!("{k} {d}");
+        if !line.is_empty() && line.chars().count() + 3 + item.chars().count() > inner {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push_str("   ");
+        }
+        line.push_str(&item);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
+        title: "keys".into(),
+        lines,
+        keys: vec![("any key".into(), "close".into())],
+        action: ConfirmAction::Keys,
+    }));
+}
+
+/// `?` opens the key list here: the list, the review and the compose
+/// view, with no dialog open and the keys not given to a terminal.
+pub fn keys_box_available(ed: &Editor) -> bool {
+    let p = &ed.agents.panel;
+    p.terminal_focus.is_none() && p.overlay.is_none()
+}
+
 /// Key hints for the panel's last line, as (keys, what they do).
 pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     let p = &ed.agents.panel;
     if p.terminal_focus.is_some() {
-        return vec![("C-\\", "take the keys back from the terminal")];
+        return vec![
+            ("C-\\", "back to the panel"),
+            ("click", "outside the terminal also returns"),
+        ];
     }
     match &p.overlay {
         Some(Overlay::Input { .. }) => {
@@ -957,6 +1112,9 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         }
         Some(Overlay::Choice { .. }) => {
             return vec![("j/k", "move"), ("ret", "choose"), ("esc", "cancel")];
+        }
+        Some(Overlay::Confirm(c)) if c.action == ConfirmAction::Keys => {
+            return vec![("any key", "close")];
         }
         Some(Overlay::Confirm(_)) => return vec![("esc/n", "cancel")],
         None => {}
@@ -982,8 +1140,10 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         ]);
         return out;
     }
+    // First, so it is the last hint a narrow panel cuts: the way into the
+    // agent.
     if a.kind() == ProviderKind::Terminal && a.is_running() {
-        out.push(("C-\\", "keys to terminal"));
+        out.insert(0, ("i", "type into agent"));
     }
     if !a.permissions.is_empty() {
         out.push(("p", "answer permission"));
@@ -995,10 +1155,10 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         out.push(("R", "relaunch"));
     }
     out.extend([("ret", "review"), ("t", "test")]);
-    // Feedback cannot reach an agent with no process; R comes first instead.
-    // A composed result has no agent at all.
+    // A message cannot reach an agent with no process; R comes first
+    // instead. A composed result has no agent at all.
     if !a.from_earlier_session() && a.origin != super::Origin::Composed {
-        out.push(("f", "feedback"));
+        out.push(("m", "message"));
     }
     out.push(("N", "compete"));
     let group = a.group;
@@ -1021,7 +1181,7 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     if relaunchable && !a.from_earlier_session() {
         out.push(("R", "relaunch"));
     }
-    out.push(("esc", "close"));
+    out.extend([("pgup/pgdn", "scroll"), (":", "command"), ("esc", "close")]);
     out
 }
 
