@@ -593,13 +593,15 @@ fn odd_names_and_a_directory_turned_into_a_file_keep_their_own_rows() {
     f.git(&["commit", "-q", "-m", "flatten"]);
     // Untracked output that only `.ignore` hides.
     f.write("gen/out.txt", "generated\n");
-    // A name that is not UTF-8.
+    // A name that is not UTF-8, where the file system allows one (macOS
+    // refuses it with "Illegal byte sequence"; that part is then skipped).
     #[cfg(unix)]
     let odd = {
         use std::os::unix::ffi::OsStrExt;
         let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
-        std::fs::write(f.repo.join(name), "x\n").unwrap();
-        PathBuf::from(name)
+        std::fs::write(f.repo.join(name), "x\n")
+            .ok()
+            .map(|()| PathBuf::from(name))
     };
     let mut ed = f.editor();
     open_tree(&mut ed);
@@ -632,7 +634,7 @@ fn odd_names_and_a_directory_turned_into_a_file_keep_their_own_rows() {
     run(&mut ed, "q\n");
     assert_eq!(ed.doc().path(), Some(f.repo.join("thing").as_path()));
     #[cfg(unix)]
-    {
+    if let Some(odd) = odd {
         // The untracked file with a non-UTF-8 name is marked and opens
         // under its own name.
         run(&mut ed, " t");
