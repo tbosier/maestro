@@ -136,6 +136,9 @@ pub enum Overlay {
     Choice {
         purpose: ChoicePurpose,
         title: String,
+        /// Lines shown above the items: facts about the choice, and
+        /// warnings, which start with `!`.
+        notes: Vec<String>,
         /// Label and detail per item.
         items: Vec<(String, String)>,
         selected: usize,
@@ -158,6 +161,9 @@ pub struct Panel {
     pub overlay: Option<Overlay>,
     /// Lines scrolled back from the bottom of a transcript or log.
     pub scroll: usize,
+    /// Counts provider lists that check where a new task starts, so a
+    /// check that finishes after its list closed changes nothing.
+    start_check: u64,
 }
 
 /// Where the panel's parts go inside the editor area.
@@ -634,7 +640,15 @@ fn compete(ed: &mut Editor) {
     }
     // A competing implementation works under the same contract.
     let contract = a.contract.clone();
-    choose_provider(ed, task, group, base, contract, providers);
+    let notes = match &base {
+        Some(b) => vec![format!(
+            "starts from {}, the commit {} started from, so the competing agents work on the same code",
+            super::create::short(b),
+            a.name
+        )],
+        None => Vec::new(),
+    };
+    choose_provider(ed, task, group, base, contract, providers, notes);
 }
 
 pub(crate) fn choose_provider(
@@ -644,6 +658,7 @@ pub(crate) fn choose_provider(
     base: Option<String>,
     contract: Option<Contract>,
     providers: Vec<ProviderSpec>,
+    mut notes: Vec<String>,
 ) {
     if providers.is_empty() {
         ed.error(
@@ -666,6 +681,24 @@ pub(crate) fn choose_provider(
         Some(_) => "provider (task with a contract)",
         None => "provider (no task contract)",
     };
+    // Every provider list counts, so a check started for an earlier list
+    // never lands on this one.
+    ed.agents.panel.start_check += 1;
+    let check = ed.agents.panel.start_check;
+    if base.is_none() {
+        // Where the agent will start, and what it will not get, takes Git:
+        // checked on a background thread while the list is up.
+        let git = ed.git.git().clone();
+        let cwd = ed.cwd.clone();
+        let spawned = ed.spawn_background("agent-start-point", move |tx| {
+            let found = super::create::start_notes(&git, &cwd);
+            tx.send(move |ed| start_checked(ed, check, found));
+        });
+        notes.push(match spawned {
+            Ok(()) => "checking where the agent starts...".into(),
+            Err(e) => format!("! could not check where the agent starts: {e}"),
+        });
+    }
     ed.agents.panel.overlay = Some(Overlay::Choice {
         purpose: ChoicePurpose::Provider {
             task,
@@ -675,9 +708,26 @@ pub(crate) fn choose_provider(
             providers,
         },
         title: title.into(),
+        notes,
         items,
         selected: 0,
     });
+}
+
+/// The check started by [`choose_provider`] finished: its notes replace
+/// "checking" if that provider list is still up.
+fn start_checked(ed: &mut Editor, check: u64, found: Vec<String>) {
+    if ed.agents.panel.start_check != check {
+        return;
+    }
+    if let Some(Overlay::Choice {
+        purpose: ChoicePurpose::Provider { .. },
+        notes,
+        ..
+    }) = &mut ed.agents.panel.overlay
+    {
+        *notes = found;
+    }
 }
 
 fn overlay_key(ed: &mut Editor, key: KeyEvent) {
@@ -723,6 +773,7 @@ fn overlay_key(ed: &mut Editor, key: KeyEvent) {
         Overlay::Choice {
             purpose,
             title,
+            notes,
             items,
             mut selected,
         } => {
@@ -743,6 +794,7 @@ fn overlay_key(ed: &mut Editor, key: KeyEvent) {
             ed.agents.panel.overlay = Some(Overlay::Choice {
                 purpose,
                 title,
+                notes,
                 items,
                 selected,
             });
@@ -798,7 +850,7 @@ fn submit_input(ed: &mut Editor, purpose: InputPurpose, text: String) {
                 }
                 None => {
                     let providers = super::providers(ed);
-                    choose_provider(ed, parsed.task, None, None, None, providers);
+                    choose_provider(ed, parsed.task, None, None, None, providers, Vec::new());
                 }
             }
         }
@@ -1033,6 +1085,7 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
                 None,
                 Some((**contract).clone()),
                 providers,
+                Vec::new(),
             );
         }
         (ConfirmAction::Archive(id), Some('y'), _) => super::actions::archive(ed, *id, false),

@@ -79,7 +79,7 @@ pub fn prepare(
     id: u64,
     slug: &str,
     base: Option<String>,
-) -> Result<WorktreeInfo, String> {
+) -> Result<(WorktreeInfo, String), String> {
     let repo = match git.discover(cwd) {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -90,18 +90,29 @@ pub fn prepare(
         }
         Err(e) => return Err(e.to_string()),
     };
-    let main_root = repo
-        .worktrees()
-        .map_err(|e| e.to_string())?
-        .into_iter()
+    let worktrees = repo.worktrees().map_err(|e| e.to_string())?;
+    let main_root = worktrees
+        .iter()
         .find(|w| w.is_main)
-        .map(|w| w.path)
+        .map(|w| w.path.clone())
         .unwrap_or_else(|| repo.root().to_path_buf());
-    let base = match base {
-        Some(b) => b,
-        None => repo
-            .resolve("HEAD")
-            .map_err(|e| format!("the repository has no commit to start from: {e}"))?,
+    let (base, from) = match base {
+        Some(b) => {
+            let from = short(&b).to_string();
+            (b, from)
+        }
+        None => match task_base(&repo, &worktrees) {
+            TaskBase::Main { branch, commit } => {
+                let from = format!("{branch} at {}", short(&commit));
+                (commit, from)
+            }
+            TaskBase::Here { commit, why } => {
+                let commit = commit
+                    .map_err(|e| format!("the repository has no commit to start from: {e}"))?;
+                let from = format!("{} ({why})", short(&commit));
+                (commit, from)
+            }
+        },
     };
     let dir = worktree_root(&main_root, worktree_dir);
     std::fs::create_dir_all(&dir)
@@ -120,17 +131,160 @@ pub fn prepare(
         repo.add_worktree(&path, &branch, &base)
             .map_err(|e| format!("could not create the worktree: {e}"))?;
         let path = std::fs::canonicalize(&path).unwrap_or(path);
-        return Ok(WorktreeInfo {
+        let info = WorktreeInfo {
             path,
             branch,
             base,
             main_root,
-        });
+        };
+        return Ok((info, from));
     }
     Err(format!(
         "no free branch name for maestro/{slug}-{id} in {}",
         dir.display()
     ))
+}
+
+/// The commit a new task starts from when no base is given.
+enum TaskBase {
+    /// The `HEAD` of the branch checked out in the repository's main
+    /// worktree: the branch `I` integrates into.
+    Main { branch: String, commit: String },
+    /// The main worktree has no branch with a commit to start from, so the
+    /// task starts from the `HEAD` of the worktree the editor is in, as
+    /// before; `why` says why, and `commit` is what `HEAD` resolved to.
+    Here {
+        commit: Result<String, String>,
+        why: String,
+    },
+}
+
+/// Where a new task starts, from `git worktree list` and the worktree
+/// `repo` the editor is in.
+fn task_base(repo: &maestro_git::Repository, worktrees: &[maestro_git::Worktree]) -> TaskBase {
+    let main = worktrees.iter().find(|w| w.is_main);
+    let why = match main {
+        Some(w) if w.bare => "the repository's main worktree is bare".to_string(),
+        Some(w) if w.detached => "the main worktree has a detached HEAD".to_string(),
+        Some(w) => match (&w.branch, &w.head) {
+            (Some(branch), Some(commit)) => {
+                return TaskBase::Main {
+                    branch: branch.clone(),
+                    commit: commit.clone(),
+                };
+            }
+            (Some(branch), None) => format!("{branch} in the main worktree has no commits yet"),
+            (None, _) => "the main worktree is not on a branch".to_string(),
+        },
+        None => "Git listed no main worktree".to_string(),
+    };
+    TaskBase::Here {
+        commit: repo.resolve("HEAD").map_err(|e| e.to_string()),
+        why,
+    }
+}
+
+/// What the provider list says about where a new task starts: the commit
+/// and branch, whether the editor is in another worktree, and a warning,
+/// marked `!`, for uncommitted files the agent will not get. Runs Git, so
+/// it runs on a background thread.
+pub fn start_notes(git: &Git, cwd: &Path) -> Vec<String> {
+    let repo = match git.discover(cwd) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return vec![format!(
+                "! {} is not in a Git repository; agents work in worktrees of one",
+                cwd.display()
+            )];
+        }
+        Err(e) => return vec![format!("! could not find the repository: {e}")],
+    };
+    let worktrees = match repo.worktrees() {
+        Ok(w) => w,
+        Err(e) => return vec![format!("! could not list the worktrees: {e}")],
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let here = canon(repo.root());
+    let main_root = worktrees
+        .iter()
+        .find(|w| w.is_main)
+        .map(|w| canon(&w.path))
+        .unwrap_or_else(|| here.clone());
+    let mut notes = Vec::new();
+    // The worktree whose commit the agent starts from, and its name in the
+    // warning below.
+    let (source, name) = match task_base(&repo, &worktrees) {
+        TaskBase::Main { branch, commit } => {
+            notes.push(format!(
+                "starts from {branch} at {} (the branch I integrates into)",
+                short(&commit)
+            ));
+            if here != main_root {
+                let label = repo
+                    .head()
+                    .map(|h| h.label())
+                    .unwrap_or_else(|_| here.display().to_string());
+                notes.push(format!(
+                    "you are in {label}; the new agent starts from {branch}, not from here"
+                ));
+            }
+            (main_root, branch)
+        }
+        TaskBase::Here {
+            commit: Ok(commit),
+            why,
+        } => {
+            notes.push(format!(
+                "! {why}, so the agent starts from the commit checked out here, {}; \
+                 I integrates only into the branch checked out in the main worktree",
+                short(&commit)
+            ));
+            (here, "this worktree".to_string())
+        }
+        TaskBase::Here {
+            commit: Err(e),
+            why,
+        } => {
+            notes.push(format!(
+                "! {why}, and there is no commit here to start from either ({e}); \
+                 the agent will not start"
+            ));
+            return notes;
+        }
+    };
+    let status = git
+        .discover(&source)
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.ok_or_else(|| "it is not a worktree".to_string()))
+        .and_then(|r| r.status().map_err(|e| e.to_string()));
+    match status {
+        Ok(status) => {
+            let dirty: Vec<PathBuf> = status
+                .entries
+                .iter()
+                .filter(|e| e.state != maestro_git::EntryState::Ignored)
+                .map(|e| e.path.clone())
+                .collect();
+            if !dirty.is_empty() {
+                let (files, them) = if dirty.len() == 1 {
+                    ("file", "it")
+                } else {
+                    ("files", "them")
+                };
+                notes.push(format!(
+                    "! {name} has {} uncommitted {files} ({}): the agent will not see {them}; \
+                     commit {them} first if it should",
+                    dirty.len(),
+                    super::actions::list_paths(&dirty)
+                ));
+            }
+        }
+        Err(e) => notes.push(format!(
+            "! could not check {} for uncommitted files: {e}",
+            source.display()
+        )),
+    }
+    notes
 }
 
 /// `[agents] worktree-dir`, or `<repository>-worktrees` next to the main
@@ -158,20 +312,19 @@ pub fn worktree_root(main_root: &Path, setting: Option<&str>) -> PathBuf {
     }
 }
 
-fn on_worktree(ed: &mut Editor, id: AgentId, result: Result<WorktreeInfo, String>) {
+fn on_worktree(ed: &mut Editor, id: AgentId, result: Result<(WorktreeInfo, String), String>) {
     if let Some(a) = ed.agents.get_mut(id) {
         a.git_busy = None;
     }
     match result {
-        Ok(info) => {
+        Ok((info, from)) => {
             let Some(a) = ed.agents.get_mut(id) else {
                 return;
             };
             a.log(format!(
-                "worktree {} on branch {} from {}",
+                "worktree {} on branch {} from {from}",
                 info.path.display(),
                 info.branch,
-                short(&info.base)
             ));
             let main_root = info.main_root.clone();
             a.worktree = Some(info);
