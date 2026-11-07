@@ -747,6 +747,14 @@ pub struct PersistState {
     /// [`fingerprint`] at the last save, so an unchanged state is not
     /// even serialized.
     last_fingerprint: Option<u64>,
+    /// Worktrees (normalized paths) whose archived agent's record the user
+    /// forgot (`d`) in this session. Records for them in a file another
+    /// Maestro wrote are not added back, and the sidebar does not list them.
+    forgotten: HashSet<PathBuf>,
+    /// Repositories whose file must be written even when no agent of
+    /// theirs is left, because a record was forgotten. An entry stays
+    /// until a write synced to disk (on quit) holds the change.
+    rewrite: HashSet<PathBuf>,
 }
 
 /// A cheap summary of everything a record holds that changes on a
@@ -800,6 +808,22 @@ impl PersistState {
             _ => None,
         }
     }
+
+    /// The record of the agent in `worktree` was forgotten in this session.
+    pub fn is_forgotten(&self, worktree: &Path) -> bool {
+        !self.forgotten.is_empty() && self.forgotten.contains(&normalize_path(worktree))
+    }
+}
+
+/// Notes that the record of the agent in `w` was forgotten: the next save
+/// writes its repository's file without it, even when no agent of that
+/// repository is left, and records for that worktree that another Maestro
+/// saved are not added back in this session.
+pub(crate) fn forget(ed: &mut Editor, w: &WorktreeInfo) {
+    let p = &mut ed.agents.persist;
+    p.forgotten.insert(normalize_path(&w.path));
+    p.rewrite.insert(normalize_path(&w.main_root));
+    p.last_fingerprint = None;
 }
 
 /// The state directory, when agent records may be read and written: the
@@ -989,7 +1013,11 @@ fn take_file(ed: &mut Editor, root: &Path, file: ReadOutcome, seen: Seen) -> usi
 /// this session already has gets a new id, and its history says so.
 fn merge(ed: &mut Editor, records: &[AgentRecord]) -> usize {
     let providers = super::providers(ed);
-    let mut records: Vec<&AgentRecord> = records.iter().collect();
+    let forgotten = &ed.agents.persist;
+    let mut records: Vec<&AgentRecord> = records
+        .iter()
+        .filter(|r| !forgotten.is_forgotten(Path::new(&r.worktree.path)))
+        .collect();
     records.sort_by_key(|r| r.id);
     let taken: HashSet<u64> = ed.agents.agents.iter().map(|a| a.id.0).collect();
     let state = &mut ed.agents;
@@ -1202,10 +1230,12 @@ fn take_outside_changes(ed: &mut Editor, state: &Path, errors: &mut Vec<String>)
                     .filter(|a| a.origin != Origin::Found)
                     .filter_map(|a| a.worktree.as_ref().map(|w| normalize_path(&w.path)))
                     .collect();
+                // A record the user forgot here stays forgotten.
                 let new: Vec<AgentRecord> = f
                     .agents
                     .into_iter()
                     .filter(|r| !known.contains(&normalize_path(Path::new(&r.worktree.path))))
+                    .filter(|r| !ed.agents.persist.is_forgotten(Path::new(&r.worktree.path)))
                     .collect();
                 if !new.is_empty() {
                     let n = merge(ed, &new);
@@ -1230,7 +1260,7 @@ pub fn save(ed: &mut Editor, durable: bool) {
     let Some(state) = enabled(ed) else {
         return;
     };
-    if ed.agents.agents.is_empty() {
+    if ed.agents.agents.is_empty() && ed.agents.persist.rewrite.is_empty() {
         return;
     }
     let print = fingerprint(ed);
@@ -1270,10 +1300,15 @@ pub fn save(ed: &mut Editor, durable: bool) {
             unsaved.join(", ")
         ));
     }
+    // A repository whose last agent was forgotten is written with none.
+    for root in &ed.agents.persist.rewrite {
+        groups.entry(root.clone()).or_default();
+    }
     for (root, mut records) in groups {
         let Some(RepoState::Ready { written, seen }) = ed.agents.persist.repos.get_mut(&root)
         else {
             // Blocked, or never read: never written.
+            ed.agents.persist.rewrite.remove(&root);
             continue;
         };
         let Some(repository) = root.to_str() else {
@@ -1296,6 +1331,9 @@ pub fn save(ed: &mut Editor, durable: bool) {
             && *last == text
             && (*synced || !durable)
         {
+            if *synced {
+                ed.agents.persist.rewrite.remove(&root);
+            }
             continue;
         }
         let path = records_path(&state, &root);
@@ -1303,6 +1341,9 @@ pub fn save(ed: &mut Editor, durable: bool) {
             Ok(()) => {
                 *seen = Some(hash_bytes(text.as_bytes()));
                 *written = Some((text, durable));
+                if durable {
+                    ed.agents.persist.rewrite.remove(&root);
+                }
             }
             Err(e) => errors.push(format!(
                 "could not save agent records to {}: {e}",

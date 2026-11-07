@@ -16,6 +16,17 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::render::{CursorShape, draw_box, wrap};
 use crate::surface::Surface;
 
+/// The color for an agent's state: its status's, or the decided color
+/// once its worktree is archived. The mark and the word are always drawn
+/// with it, so the color is never the only signal.
+pub fn state_style(theme: &Theme, s: Status, archived: bool) -> Style {
+    if archived {
+        theme.agent.completed
+    } else {
+        status_style(theme, s)
+    }
+}
+
 /// The theme color for a status. The name is always drawn with it.
 pub fn status_style(theme: &Theme, s: Status) -> Style {
     let a = &theme.agent;
@@ -203,13 +214,11 @@ fn accepts_typing(a: &Agent) -> bool {
     matches!(&a.runtime, Runtime::Terminal(t) if t.exit_status().is_none())
 }
 
-/// What the list shows after the name: the status, or for a found
-/// worktree that it has none.
-fn list_status(a: &Agent) -> &'static str {
-    match a.origin {
-        Origin::Found => "found worktree",
-        _ => a.status().label(),
-    }
+/// The mark the list and the summary draw before an agent's name: the
+/// sidebar's mark for the same agent (`!` needs you, `~` working, `-`
+/// idle, `=` done).
+fn mark(a: &Agent) -> &'static str {
+    maestro_editor::workspaces::attention_for(a).symbol()
 }
 
 /// The marker next to the status of an agent with no process from an
@@ -237,7 +246,7 @@ fn list_facts(a: &Agent) -> String {
     let mut d = match a.origin {
         Origin::Found => "no record".to_string(),
         Origin::Composed => format!("#{} composed", a.group),
-        _ if a.from_earlier_session() => format!(
+        _ if a.from_earlier_session() && !a.archived => format!(
             "not running, earlier session  #{} {}",
             a.group,
             maestro_editor::agents::kind_label(a.kind())
@@ -249,7 +258,8 @@ fn list_facts(a: &Agent) -> String {
         ),
     };
     if a.archived {
-        d.push_str("  archived");
+        // The state word says archived; this says what it was before.
+        d.push_str(&format!("  was {}", a.base_status().label()));
     } else if a.review.computed.is_some() {
         let (f, add, rem) = a.review.totals();
         d.push_str(&format!("  {f} files +{add} -{rem}"));
@@ -295,15 +305,10 @@ fn draw_list(ed: &Editor, s: &mut Surface, area: Rect) {
                 area.x + 1,
             );
         }
-        let x = s.print(area.x + 2, y, &a.name, bg.bold(), area.right());
-        let status = a.status();
-        s.print(
-            x + 2,
-            y,
-            list_status(a),
-            bg.patch(status_style(&ed.theme, status)),
-            area.right(),
-        );
+        let style = bg.patch(state_style(&ed.theme, a.status(), a.archived));
+        let x = s.print(area.x + 2, y, &format!("{} ", mark(a)), style, area.right());
+        let x = s.print(x, y, &a.name, bg.bold(), area.right());
+        s.print(x + 2, y, a.word(), style, area.right());
         let muted = if selected {
             ui.popup_muted
         } else {
@@ -318,17 +323,14 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     let r = area.right();
     let x0 = area.x + 1;
     let mut y = area.y;
-    // Row 1: name, status, provider.
-    let mut x = s.print(x0, y, &a.name, ui.text.bold(), r);
-    let st = a.status();
-    x = s.print(
-        x + 2,
-        y,
-        list_status(a),
-        ui.text.patch(status_style(&ed.theme, st)),
-        r,
-    );
-    if a.origin != Origin::Found && a.from_earlier_session() {
+    // Row 1: mark, name, state, provider.
+    let style = ui
+        .text
+        .patch(state_style(&ed.theme, a.status(), a.archived));
+    let mut x = s.print(x0, y, &format!("{} ", mark(a)), style, r);
+    x = s.print(x, y, &a.name, ui.text.bold(), r);
+    x = s.print(x + 2, y, a.word(), style, r);
+    if a.origin != Origin::Found && a.from_earlier_session() && !a.archived {
         x = s.print(x + 2, y, EARLIER, ui.text.bold(), r);
     }
     let mut tail = match a.origin {
@@ -354,21 +356,21 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     // Row 2: what the status can be based on, or why there is none.
     let changed;
     let note = match (a.origin, a.kind()) {
+        _ if a.archived => {
+            "archived: the worktree was removed and the branch kept; v shows the history, d forgets this record"
+        }
         (Origin::Found, _) => {
             "no record: task and provider unknown; ret reviews it, a adopts it, A archives it"
         }
         (Origin::Composed, _) => {
             "composed result: no agent runs here; ret reviews it, t tests it, I integrates it like an agent's work"
         }
-        _ if a.worktree_note.is_some() && !a.archived => {
+        _ if a.worktree_note.is_some() => {
             changed = format!(
                 "worktree changed: {}",
                 a.worktree_note.as_deref().unwrap_or_default()
             );
             changed.as_str()
-        }
-        (Origin::Loaded, _) if a.archived => {
-            "archived: the worktree was removed; the record stays for its history and decisions"
         }
         (Origin::Loaded, _) if a.from_earlier_session() && a.base_status().is_decided() => {
             "no process, and none is started again: the work was decided on"
@@ -904,15 +906,12 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
     let sm = l.summary;
     let r = sm.right();
     let (n, add, rem) = a.review.totals();
-    let st = a.status();
-    let mut x = s.print(sm.x + 1, sm.y, &a.name, ui.text.bold(), r);
-    x = s.print(
-        x + 2,
-        sm.y,
-        st.label(),
-        ui.text.patch(status_style(&ed.theme, st)),
-        r,
-    );
+    let style = ui
+        .text
+        .patch(state_style(&ed.theme, a.status(), a.archived));
+    let mut x = s.print(sm.x + 1, sm.y, &format!("{} ", mark(a)), style, r);
+    x = s.print(x, sm.y, &a.name, ui.text.bold(), r);
+    x = s.print(x + 2, sm.y, a.word(), style, r);
     let made = a
         .review
         .files

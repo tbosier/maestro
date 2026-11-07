@@ -141,10 +141,10 @@ fn loaded_agents_say_they_are_not_running_and_found_worktrees_have_no_status() {
     let rows = screen(&ed);
     let text = rows.join("\n");
     let first = rows.iter().find(|r| r.contains("sh-1")).unwrap();
-    assert!(first.starts_with("▌ sh-1  stopped  "), "{first}");
+    assert!(first.starts_with("▌ - sh-1  stopped  "), "{first}");
     assert!(
         rows.iter()
-            .any(|r| r.contains("sh-1  stopped  not running (from an earlier session)")),
+            .any(|r| r.contains("- sh-1  stopped  not running (from an earlier session)")),
         "{text}"
     );
     assert!(text.contains("not running, earlier session"), "{text}");
@@ -156,13 +156,21 @@ fn loaded_agents_say_they_are_not_running_and_found_worktrees_have_no_status() {
     // The found worktree shows that it has no record instead of a status.
     ed.handle_key(KeyEvent::char('j'));
     let text = screen(&ed).join("\n");
-    assert!(text.contains("found-notes-2  found worktree"), "{text}");
+    assert!(text.contains("- found-notes-2  found worktree"), "{text}");
     assert!(
         text.contains("no record: task and provider unknown"),
         "{text}"
     );
     assert!(text.contains("a adopt"), "{text}");
     assert!(!text.contains("R relaunch"), "{text}");
+    // Its review offers no key that refuses a found worktree.
+    ed.handle_key(KeyEvent::plain(KeyCode::Enter));
+    assert!(ed.agents.panel.review.is_some(), "{:?}", ed.status);
+    let keys: Vec<&str> = panel::hints(&ed).into_iter().map(|(k, _)| k).collect();
+    for gone in ["c", "D", "m", "t", "I", "X"] {
+        assert!(!keys.contains(&gone), "{gone} in {keys:?}");
+    }
+    assert!(keys.contains(&"j/k") && keys.contains(&"esc"), "{keys:?}");
 }
 
 fn added(path: &str) -> maestro_editor::agents::DiffFile {
@@ -678,4 +686,126 @@ fn clicks_select_the_agent_drawn_there_and_the_key_box_holds_every_hint() {
         assert!(text.contains(&format!("{k} {d}")), "{k} {d}:\n{text}");
     }
     assert!(!text.contains("too small"), "{text}");
+}
+
+/// An agent from `record`, archived or found as asked.
+fn loaded(id: u64, status: &str, archived: bool, found: bool) -> Agent {
+    use maestro_editor::agents::{Origin, persist::from_record};
+    let mut a = from_record(&record(id, status), &[]);
+    a.archived = archived;
+    if found {
+        a.origin = Origin::Found;
+        a.name = format!("found-notes-{id}");
+    }
+    a
+}
+
+#[test]
+fn the_panel_and_the_sidebar_use_the_same_word_for_each_state() {
+    // Every status a record loads with (a status that needs a process
+    // loads as stopped), an archived agent whatever its status, and a
+    // found worktree: (saved status, archived, found, mark and word).
+    let cases = [
+        ("ready-for-review", false, false, "! ready for review"),
+        ("completed", false, false, "= finished, no changes"),
+        ("blocked", false, false, "! blocked"),
+        ("failed", false, false, "! failed"),
+        ("rejected", false, false, "= rejected"),
+        ("integrated", false, false, "= integrated"),
+        ("stopped", false, false, "- stopped"),
+        ("running", false, false, "- stopped"),
+        ("ready-for-review", true, false, "= archived"),
+        ("rejected", true, false, "= archived"),
+        ("stopped", false, true, "- found worktree"),
+        ("stopped", true, true, "= archived"),
+    ];
+    for (status, archived, found, want) in cases {
+        let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 120, 28));
+        let a = loaded(1, status, archived, found);
+        let name = a.name.clone();
+        ed.agents.agents.push(a);
+        let (mark, word) = want.split_once(' ').unwrap();
+        let shown = format!("{mark} {name}  {word}");
+        // The panel's list and the summary next to it.
+        ed.handle_key(KeyEvent::char(' '));
+        ed.handle_key(KeyEvent::char('a'));
+        let rows = screen(&ed);
+        let list = rows.iter().find(|r| r.contains(&name)).unwrap();
+        assert!(list.starts_with(&format!("▌ {shown}")), "{status}: {list}");
+        assert_eq!(
+            list.matches(&shown).count(),
+            2,
+            "{status}: list and summary: {list}"
+        );
+        // The sidebar's row for the same agent.
+        ed.handle_key(KeyEvent::plain(KeyCode::Esc));
+        assert!(!ed.agents.panel_open());
+        ed.handle_key(KeyEvent::char(' '));
+        ed.handle_key(KeyEvent::char('s'));
+        let (_, views, _) = crate::render::split_screen(120, 30, &ed);
+        ed.resize(views);
+        let rows = screen(&ed);
+        let side = rows.iter().find(|r| r.contains(&name)).unwrap();
+        assert!(
+            side.starts_with(&format!("  {shown}  ")),
+            "{status}: sidebar {side}"
+        );
+        // And the jump palette's detail.
+        let jump = maestro_editor::workspaces::jump::items(&ed);
+        let item = jump.iter().find(|i| i.label.contains(&name)).unwrap();
+        assert_eq!(item.detail, want, "{status}: palette");
+    }
+}
+
+#[test]
+fn an_archived_agent_shows_archived_and_only_keys_that_work() {
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 160, 28));
+    ed.agents
+        .agents
+        .push(loaded(1, "ready-for-review", true, false));
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    let mut s = Surface::new(160, 30, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let rows: Vec<String> = (0..30).map(|y| row(&s, y)).collect();
+    let text = rows.join("\n");
+    // The list and the summary both say archived, never the old status.
+    assert!(rows[2].starts_with("▌ = sh-1  archived"), "{}", rows[2]);
+    assert_eq!(
+        rows[2].matches("= sh-1  archived").count(),
+        2,
+        "{}",
+        rows[2]
+    );
+    assert!(!rows[2].contains("ready for review"), "{}", rows[2]);
+    // What it was before stays in the list's facts.
+    assert!(rows[3].contains("was ready for review"), "{}", rows[3]);
+    assert!(
+        text.contains("archived: the worktree was removed and the branch kept"),
+        "{text}"
+    );
+    assert!(text.contains("worktree archived; branch maestro/notes-1 kept"));
+    // An archived agent never runs again; the summary does not say so
+    // next to its state.
+    assert!(!rows[2].contains("not running"), "{}", rows[2]);
+    let hints = &rows[28];
+    assert!(hints.contains("d forget record"), "{hints}");
+    for gone in [
+        "ret review",
+        "t test",
+        "m message",
+        "I integrate",
+        "X reject",
+        "A archive",
+        "R relaunch",
+    ] {
+        assert!(!hints.contains(gone), "{gone} in {hints}");
+    }
+    // The archived state is not color alone: the mark and the word are
+    // drawn in the decided color.
+    let at = rows[2].find("= sh-1").unwrap();
+    let x = rows[2][..at].chars().count();
+    let cell = s.cell(x as u16, 2).unwrap();
+    assert_eq!(cell.symbol, "=");
+    assert_eq!(cell.style.fg, ed.theme.agent.completed.fg);
 }

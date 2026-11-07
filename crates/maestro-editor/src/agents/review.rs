@@ -474,17 +474,25 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<Reviewed, String>) {
     }
 }
 
+/// Why the review screen does not open for the agent. [`open`] refuses
+/// with it and the panel's hints use it.
+pub(crate) fn blocker(a: &super::Agent) -> Option<String> {
+    if a.worktree.is_none() {
+        return Some("the agent has no worktree yet".into());
+    }
+    if a.archived {
+        return Some("the agent's worktree was archived; there is nothing to review".into());
+    }
+    None
+}
+
 /// Opens the review screen for agent `id` and refreshes its diff.
 pub fn open(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    if a.worktree.is_none() {
-        ed.error("the agent has no worktree yet");
-        return;
-    }
-    if a.archived {
-        ed.error("the agent's worktree was archived; there is nothing to review");
+    if let Some(why) = blocker(a) {
+        ed.error(why);
         return;
     }
     ed.agents.panel.review = Some(ReviewView::new(id));

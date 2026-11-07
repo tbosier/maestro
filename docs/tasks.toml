@@ -289,3 +289,13 @@ status = "done"
 # New untracked files after t are recorded with their blob ids; the review
 # marks them T, K counts one as the agent's, and integrate leaves them
 # untracked by exact-name pathspec exclusion. See docs/agent-model.md.
+
+[[task]]
+id = "fix-status-words"
+title = "One word per agent state in the panel, sidebar, palette and notifications; archived agents say archived; hints only for keys that work; d forgets an archived agent's record"
+crates = ["maestro-editor", "maestro-tui"]
+branch = "fix/status-words"
+owner = "agent"
+status = "done"
+# Hints use the same refusal functions as the actions. The word table is in
+# docs/agent-model.md under State words. Saved status keys are unchanged.

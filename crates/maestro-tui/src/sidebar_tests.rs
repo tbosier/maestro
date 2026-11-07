@@ -108,7 +108,9 @@ fn sidebar_lists_agents_by_attention_then_projects_with_facts() {
         " needs you (1)",
         "  ! sh-3  ready for review  alpha (e",
         " idle (1)",
-        "  - sh-4  idle  alpha (earlier sessi",
+        // The row says what the agent panel says: stopped, in the idle
+        // group.
+        "  - sh-4  stopped  alpha (earlier se",
         " projects",
         " v alpha  2 worktrees, current",
         "   @ main  here",
