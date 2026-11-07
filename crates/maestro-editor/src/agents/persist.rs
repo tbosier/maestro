@@ -185,6 +185,15 @@ pub struct SavedTestOutput {
     pub command: String,
     #[serde(default)]
     pub agent_was_running: bool,
+    /// For a tracked file the run changed, the blob id of its contents
+    /// before the run. Absent for a created file and in older records;
+    /// older versions ignore it (and so count the file as the agent's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// For a tracked file the run changed, the blob id its index entry held
+    /// then. Absent where `before` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +461,16 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
                 o.blob
             ));
         }
+        if let Some(b) = o
+            .before
+            .iter()
+            .chain(o.index.iter())
+            .find(|b| !is_object_id(b))
+        {
+            return Err(format!(
+                "test run file's earlier blob {b:?} is not an object id"
+            ));
+        }
     }
     for p in &r.parts {
         if !p.branch.starts_with("maestro/") || !is_object_id(&p.commit) {
@@ -619,6 +638,8 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
                     blob: o.blob.clone(),
                     command: o.command.clone(),
                     agent_was_running: o.agent_was_running,
+                    before: o.before.clone(),
+                    index: o.index.clone(),
                 })
             })
             .collect(),
@@ -681,6 +702,8 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
             blob: o.blob.clone(),
             command: o.command.clone(),
             agent_was_running: o.agent_was_running,
+            before: o.before.clone(),
+            index: o.index.clone(),
         })
         .collect();
     a.parts = r
@@ -865,7 +888,7 @@ fn fingerprint(ed: &Editor) -> u64 {
         a.composition.as_ref().map(|c| &c.commit).hash(&mut h);
         a.parts.len().hash(&mut h);
         for o in &a.test_outputs {
-            (&o.path, &o.blob).hash(&mut h);
+            (&o.path, &o.blob, &o.before, &o.index).hash(&mut h);
         }
     }
     h.finish()
@@ -1706,11 +1729,22 @@ mod tests {
         );
         // A test run's file is a path inside the worktree with a blob id;
         // integrate leaves exactly these paths out of its commit.
-        for (path, blob, why) in [
-            ("../escape", "abc123", "not a path inside the worktree"),
-            ("/etc/passwd", "abc123", "not a path inside the worktree"),
-            ("", "abc123", "not a path inside the worktree"),
-            ("Cargo.lock", "--not-hex", "not an object id"),
+        for (path, blob, before, why) in [
+            (
+                "../escape",
+                "abc123",
+                None,
+                "not a path inside the worktree",
+            ),
+            (
+                "/etc/passwd",
+                "abc123",
+                None,
+                "not a path inside the worktree",
+            ),
+            ("", "abc123", None, "not a path inside the worktree"),
+            ("Cargo.lock", "--not-hex", None, "not an object id"),
+            ("Cargo.lock", "abc123", Some("HEAD"), "not an object id"),
         ] {
             let mut f = file.clone();
             f.agents[0].test_outputs = vec![SavedTestOutput {
@@ -1718,6 +1752,8 @@ mod tests {
                 blob: blob.into(),
                 command: "cargo test".into(),
                 agent_was_running: false,
+                before: before.map(str::to_string),
+                index: None,
             }];
             let bad = write(&dir, "outputs.json", &serde_json::to_string(&f).unwrap());
             assert!(
@@ -1897,5 +1933,45 @@ mod tests {
         assert_eq!(t.tail.last().unwrap(), "line 499");
         assert_eq!(t.dropped, 7 + 500 - MAX_TEST_TAIL);
         assert_eq!((t.finished, t.code, t.duration_ms), (true, Some(0), 1500));
+    }
+
+    /// A test run file's `before` is left out when absent, an older record
+    /// without it loads as a created file, and a version that does not know
+    /// the field reads a record that has it.
+    #[test]
+    fn test_output_before_is_optional_both_ways() {
+        let created = SavedTestOutput {
+            path: "Cargo.lock".into(),
+            blob: "abc123".into(),
+            command: "cargo test".into(),
+            agent_was_running: false,
+            before: None,
+            index: None,
+        };
+        let json = serde_json::to_string(&created).unwrap();
+        assert!(!json.contains("before"), "{json}");
+        let old = r#"{"path":"Cargo.lock","blob":"abc123","command":"cargo test"}"#;
+        assert_eq!(
+            serde_json::from_str::<SavedTestOutput>(old).unwrap(),
+            created
+        );
+        let changed = SavedTestOutput {
+            before: Some("def456".into()),
+            ..created
+        };
+        let json = serde_json::to_string(&changed).unwrap();
+        assert!(json.contains(r#""before":"def456""#), "{json}");
+        // The struct as versions before this field had it.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Older {
+            path: String,
+            blob: String,
+            command: String,
+            #[serde(default)]
+            agent_was_running: bool,
+        }
+        let older: Older = serde_json::from_str(&json).unwrap();
+        assert_eq!(older.blob, "abc123");
     }
 }
