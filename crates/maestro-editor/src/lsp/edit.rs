@@ -329,7 +329,9 @@ fn execute(ed: &mut Editor, plan: Vec<Planned>) -> Result<Applied, String> {
                 // the caller's status message.
                 let before = ed.status.take();
                 crate::recovery::notify_if_recoverable(ed, id);
-                if let Some((_, w)) = ed.status.take() {
+                if let Some((sev, w)) = ed.status.take() {
+                    // Logged once, as part of the edit's own message.
+                    ed.messages.unrecord(sev, &w);
                     applied.warnings.push(w);
                 }
                 ed.status = before;

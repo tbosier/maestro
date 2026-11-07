@@ -22,6 +22,7 @@ pub mod keymap;
 pub mod layout;
 pub mod lsp;
 pub mod lsp_commands;
+pub mod messages;
 pub mod motion;
 pub mod navigation;
 pub mod picker;

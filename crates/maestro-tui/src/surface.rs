@@ -7,6 +7,21 @@ use maestro_editor::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Columns one grapheme takes when [`Surface::put`] draws it. Control
+/// characters are drawn as `?`, one column.
+pub fn grapheme_width(grapheme: &str) -> usize {
+    if grapheme.chars().any(char::is_control) {
+        1
+    } else {
+        grapheme.width().max(1)
+    }
+}
+
+/// Columns `s` takes when [`Surface::print`] draws it with no limit.
+pub fn text_width(s: &str) -> usize {
+    s.graphemes(true).map(grapheme_width).sum()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     /// The grapheme drawn here. Empty for the right half of a wide grapheme.
@@ -88,7 +103,7 @@ impl Surface {
         } else {
             grapheme
         };
-        let w = grapheme.width().max(1) as u16;
+        let w = grapheme_width(grapheme) as u16;
         if x + w > max_x.min(self.width) || y >= self.height {
             return 0;
         }

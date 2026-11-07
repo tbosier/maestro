@@ -58,6 +58,17 @@ pub enum Severity {
     Error,
 }
 
+impl Severity {
+    /// The word shown with a message, so severity never rests on color.
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        }
+    }
+}
+
 /// How much interface is shown. Switching never changes editor state, only
 /// presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -179,6 +190,9 @@ pub struct Editor {
     pub theme: Theme,
     pub registers: Registers,
     pub status: Option<(Severity, String)>,
+    /// Every status message set through [`Editor::set_status`] and its
+    /// wrappers, for `:messages` (see [`crate::messages`]).
+    pub messages: crate::messages::MessageLog,
     pub prompt: Option<Prompt>,
     pub picker: Option<Picker>,
     pub keymaps: Keymaps,
@@ -251,6 +265,7 @@ impl Editor {
             theme,
             registers: Registers::default(),
             status: None,
+            messages: Default::default(),
             prompt: None,
             picker: None,
             keymaps,
@@ -383,8 +398,11 @@ impl Editor {
         self.config.editor.tab_width.max(1)
     }
 
+    /// Shows `msg` on the status line and keeps it in the message log.
     pub fn set_status(&mut self, severity: Severity, msg: impl Into<String>) {
-        self.status = Some((severity, msg.into()));
+        let msg = msg.into();
+        self.messages.push(severity, &msg);
+        self.status = Some((severity, msg));
     }
 
     /// Sets a status message without hiding a more important one already
@@ -393,11 +411,26 @@ impl Editor {
     /// automation socket, config errors).
     pub fn add_status(&mut self, severity: Severity, msg: impl Into<String>) {
         let msg = msg.into();
+        self.messages.push(severity, &msg);
         self.status = Some(match self.status.take() {
             Some((old_sev, old)) if old_sev >= severity => (old_sev, format!("{old}; {msg}")),
             Some((_, old)) => (severity, format!("{msg}; {old}")),
             None => (severity, msg),
         });
+    }
+
+    /// `path` as messages show it: relative inside the working directory,
+    /// `~/...` under the home directory, absolute otherwise.
+    pub fn show_path(&self, path: &Path) -> String {
+        crate::navigation::display_path(path, &self.cwd)
+    }
+
+    /// A buffer's name as messages show it: its path through
+    /// [`Editor::show_path`], or `[scratch]`.
+    pub fn doc_name(&self, doc: &Document) -> String {
+        doc.path()
+            .map(|p| self.show_path(p))
+            .unwrap_or_else(|| "[scratch]".into())
     }
 
     pub fn info(&mut self, msg: impl Into<String>) {
@@ -674,7 +707,7 @@ impl Editor {
         if b.doc.is_modified() && !force {
             return Err(format!(
                 "{} has unsaved changes (add ! to discard them)",
-                b.doc.display_name()
+                self.doc_name(&b.doc)
             ));
         }
         let path = b.doc.path().map(Path::to_path_buf);
@@ -684,11 +717,13 @@ impl Editor {
             .copied()
             .find(|k| *k != id)
             .unwrap_or_else(|| self.add_document(Document::default()));
+        let mut replaced = Vec::new();
         for v in self.views.values_mut().filter(|v| v.doc == id) {
             v.doc = replacement;
             v.selection = Selection::point(0);
             v.top_line = 0;
             v.left_col = 0;
+            replaced.push(v.id);
         }
         for v in self.views.values_mut() {
             if v.alternate == Some(id) {
@@ -705,10 +740,10 @@ impl Editor {
         }
         let sel = self.buffers[&replacement].last_selection.clone();
         let text = self.buffers[&replacement].doc.text().clone();
-        for v in self.views.values_mut().filter(|v| v.doc == replacement) {
-            if v.selection == Selection::point(0) {
-                v.selection = sel.clamp_normal(text.slice(..));
-            }
+        // Only views that showed the closed buffer move; a view already on
+        // the replacement keeps its cursor, even at the very start.
+        for v in self.views.values_mut().filter(|v| replaced.contains(&v.id)) {
+            v.selection = sel.clamp_normal(text.slice(..));
         }
         Ok(())
     }
@@ -1567,7 +1602,7 @@ impl Editor {
             if b.disk_change_reported || !b.doc.changed_on_disk() {
                 continue;
             }
-            let name = b.doc.display_name();
+            let name = self.doc_name(&b.doc);
             let path_exists = b.doc.path().is_some_and(Path::exists);
             if !b.doc.is_modified() && path_exists {
                 let sel = self
