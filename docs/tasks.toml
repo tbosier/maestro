@@ -266,3 +266,15 @@ crates = ["maestro-editor", "maestro-tui", "maestro-git", "maestro-config"]
 branch = "feat/file-tree"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "fix-task-base"
+title = "New tasks start from the main worktree's branch; the provider list says where and warns about uncommitted files"
+crates = ["maestro-editor", "maestro-tui"]
+branch = "fix/task-base"
+owner = "agent"
+status = "done"
+# n starts from the HEAD of the branch checked out in the main worktree (what
+# I integrates into), from any worktree. The provider list names the commit,
+# says when you are in another worktree, and warns with ! about uncommitted
+# files there. Detached or unborn main: the current worktree's HEAD, said so.
