@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use maestro_git::{RebaseCheck, RebaseError, RebaseOnto};
+use maestro_git::{LeftOut, RebaseCheck, RebaseError, RebaseOnto};
 
 use super::actions::{
     OffTarget, busy, commit_list, found_refusal, list_paths, open_agent_worktree, open_exact,
@@ -114,6 +114,32 @@ fn free_name(repo: &maestro_git::Repository, branch: &str) -> Result<String, Str
 /// `Err` says why it is not offered: the worktree is gone, detached or in
 /// the middle of an operation, the work would conflict, or there is no
 /// work to move.
+/// The files Maestro's test run created that are still as it left them:
+/// they stay untracked and are not moved. A tracked file whose test-run
+/// change is still the run's refuses the rebase: integrate commits such a
+/// file as it was before the run and leaves the run's version on disk, but
+/// a rebase needs every tracked file committed.
+fn test_run_files(
+    wt: &maestro_git::Repository,
+    outputs: &[TestOutput],
+) -> Result<Vec<PathBuf>, String> {
+    let left = super::test_outputs::still_left_out(wt, outputs)?;
+    let changed: Vec<PathBuf> = left
+        .iter()
+        .filter(|l| l.instead.is_some())
+        .map(|l| l.path.clone())
+        .collect();
+    if !changed.is_empty() {
+        return Err(format!(
+            "Maestro's test run changed tracked files in the agent's worktree ({}), and a \
+             rebase needs every tracked file committed; K in the review counts a file's change \
+             as the agent's",
+            list_paths(&changed)
+        ));
+    }
+    Ok(left.into_iter().map(|l| l.path).collect())
+}
+
 pub(crate) fn offer(
     git: &maestro_git::Git,
     w: &WorktreeInfo,
@@ -131,9 +157,10 @@ pub(crate) fn offer(
             op.way_out()
         ));
     }
-    let made = super::test_outputs::still_made_by_tests(&wt, outputs)?;
+    let made = test_run_files(&wt, outputs)?;
+    let left: Vec<LeftOut> = made.iter().cloned().map(LeftOut::untracked).collect();
     let snap = wt
-        .work_snapshot_leaving_out(&made)
+        .work_snapshot_leaving_out(&left)
         .map_err(|e| format!("could not read the agent's files: {e}"))?;
     let st = wt.status().map_err(|e| e.to_string())?;
     let uncommitted: Vec<PathBuf> = st
@@ -435,14 +462,15 @@ fn run_inner(
             f.target
         ));
     }
-    let made = super::test_outputs::still_made_by_tests(&wt, &f.outputs_checked)?;
+    let made = test_run_files(&wt, &f.outputs_checked).map_err(|e| format!("{e}{again}"))?;
     if made != f.left_behind {
         return Err(format!(
             "files Maestro's test run created changed after the dialog was checked{again}"
         ));
     }
+    let left: Vec<LeftOut> = made.iter().cloned().map(LeftOut::untracked).collect();
     let snap = wt
-        .work_snapshot_leaving_out(&made)
+        .work_snapshot_leaving_out(&left)
         .map_err(|e| format!("could not read the agent's files: {e}"))?;
     if snap.head != f.checked_head || snap.tree != f.checked_tree {
         return Err(format!(
@@ -460,7 +488,7 @@ fn run_inner(
     }
     if !f.uncommitted.is_empty() {
         let c = wt
-            .commit_all_leaving_out(&f.message, &made)
+            .commit_all_leaving_out(&f.message, &left)
             .map_err(|e| format!("committing the agent's work failed: {e}"))?;
         *committed = c.clone();
         let Some(c) = c else {

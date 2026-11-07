@@ -184,8 +184,9 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
             .as_ref()
             .map_err(Clone::clone)
             .and_then(|(r, base)| super::test_outputs::before_run(r, &recorded, base));
-        // Files earlier runs created are left out, as integrate leaves
-        // them out of what it compares with this tree.
+        // Files earlier runs created or changed are left out, as integrate
+        // leaves them out of what it compares with this tree. The tree is
+        // also what the run's changes to tracked files are found against.
         let made = start
             .as_ref()
             .map(|s| s.still_made.clone())
@@ -195,9 +196,10 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
                 .map(|s| s.tree)
                 .map_err(|e| e.to_string())
         });
-        let end = move || match (&repo, &start) {
-            (Ok((r, _)), Ok(s)) => super::test_outputs::after_run(r, s),
-            (Err(e), _) | (_, Err(e)) => Err(e.clone()),
+        let start_tree = tree.clone();
+        let end = move || match (&repo, &start, &start_tree) {
+            (Ok((r, _)), Ok(s), Ok(t)) => super::test_outputs::after_run(r, s, t),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e.clone()),
         };
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             job.send(move |ed| test_not_started(ed, id, started, "stopped before it started"));
@@ -1199,12 +1201,15 @@ pub struct IntegrateFacts {
     /// The main worktree's checked-out branch.
     pub target: String,
     /// Uncommitted or untracked files in the agent's worktree when checked,
-    /// without `left_behind`.
+    /// without the files `left_behind` created, and without the files it
+    /// changed that the commit would leave as they are.
     pub uncommitted: Vec<PathBuf>,
-    /// Files Maestro's verification run created that are still as it left
-    /// them: they stay untracked in the agent's worktree and are not
-    /// committed or integrated. Everything else in the dialog leaves them
-    /// out too.
+    /// Files Maestro's verification run created, and tracked files it
+    /// changed, that are still as it left them. A created file stays
+    /// untracked in the agent's worktree; a changed one is committed as it
+    /// was before the run and stays changed on disk. The run's files and
+    /// changes are not committed or integrated, and everything else in the
+    /// dialog leaves them out too.
     pub left_behind: Vec<super::TestOutput>,
     /// The agent's records of files its test runs made, as the dialog was
     /// checked with them. A run that ends after that can record more, and
@@ -1687,9 +1692,8 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
             let (wt, main) = check_before_commit_detailed(&git, &facts)?;
             // Files the verification run made and nobody changed since
             // stay behind; they are not the agent's work.
-            let made = super::test_outputs::still_made_by_tests(&wt, &outputs).map_err(|e| {
-                format!("could not tell which files Maestro's test run created: {e}")
-            })?;
+            let made = super::test_outputs::still_made_by_tests(&wt, &outputs)
+                .map_err(|e| format!("could not tell which files Maestro's test run wrote: {e}"))?;
             facts.left_behind = outputs
                 .iter()
                 .filter(|o| made.contains(&o.path))
@@ -1697,15 +1701,45 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 .collect();
             // One snapshot of the agent's files, from Git now rather than
             // the review's last refresh; everything below is about it.
+            let leave = super::test_outputs::left_out(&outputs, &made);
             let snap = wt
-                .work_snapshot_leaving_out(&made)
+                .work_snapshot_leaving_out(&leave)
                 .map_err(|e| format!("could not read the agent's files: {e}"))?;
             facts.checked_tree = snap.tree.clone();
             facts.checked_head = snap.head.clone();
+            // A file the run changed is only committed when its version
+            // from before the run differs from the branch's.
+            let changed: Vec<PathBuf> = leave
+                .iter()
+                .filter(|l| l.instead.is_some())
+                .map(|l| l.path.clone())
+                .collect();
+            let unchanged: Vec<PathBuf> = if changed.is_empty() {
+                Vec::new()
+            } else {
+                let committed: Vec<PathBuf> = wt
+                    .diff(
+                        &maestro_git::DiffSpec::Revisions {
+                            from: snap.head.clone(),
+                            to: snap.commit.clone(),
+                        },
+                        &changed,
+                    )
+                    .map_err(|e| format!("could not read the agent's files: {e}"))?
+                    .iter()
+                    .flat_map(super::file_paths)
+                    .cloned()
+                    .collect();
+                changed
+                    .into_iter()
+                    .filter(|p| !committed.contains(p))
+                    .collect()
+            };
             let st = wt.status().map_err(|e| e.to_string())?;
             facts.uncommitted = st
                 .uncommitted()
                 .map(|e| e.path.clone())
+                .filter(|p| !unchanged.contains(p))
                 .chain(
                     st.untracked()
                         .map(|e| e.path.clone())
@@ -1822,8 +1856,8 @@ fn conflicts_after(
     };
     for o in others {
         let theirs = open_agent_worktree(git, &o.worktree).and_then(|r| {
-            let made = super::test_outputs::still_made_by_tests(&r, &o.test_outputs)?;
-            r.work_snapshot_leaving_out(&made)
+            let leave = super::test_outputs::still_left_out(&r, &o.test_outputs)?;
+            r.work_snapshot_leaving_out(&leave)
                 .map_err(|e| e.to_string())
         });
         match theirs.map(|t| main.merge_check(&merged, &t.commit)) {
@@ -1917,21 +1951,32 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
         return finish_dialog(agent, how, facts, lines);
     }
     let subject = facts.message.lines().next().unwrap_or_default();
-    if !facts.left_behind.is_empty() {
-        let paths: Vec<PathBuf> = facts.left_behind.iter().map(|o| o.path.clone()).collect();
-        let mut commands: Vec<String> = facts
-            .left_behind
-            .iter()
-            .map(|o| format!("`{}`", o.command))
-            .collect();
-        commands.sort();
-        commands.dedup();
+    let (changed, created): (Vec<&super::TestOutput>, Vec<&super::TestOutput>) =
+        facts.left_behind.iter().partition(|o| o.before.is_some());
+    let commands = |outputs: &[&super::TestOutput]| {
+        let mut v: Vec<String> = outputs.iter().map(|o| format!("`{}`", o.command)).collect();
+        v.sort();
+        v.dedup();
+        v.join(", ")
+    };
+    let paths = |outputs: &[&super::TestOutput]| -> Vec<PathBuf> {
+        outputs.iter().map(|o| o.path.clone()).collect()
+    };
+    if !created.is_empty() {
         lines.push(format!(
             "LEFT BEHIND: {} file(s) {} ({}), not by the agent: {}. They stay untracked in the agent's worktree and are not committed or integrated; K in the review counts one as the agent's.",
-            paths.len(),
+            created.len(),
             super::review::TEST_MADE,
-            commands.join(", "),
-            list_paths(&paths)
+            commands(&created),
+            list_paths(&paths(&created))
+        ));
+    }
+    if !changed.is_empty() {
+        lines.push(format!(
+            "LEFT BEHIND: the changes Maestro's test run ({}) made to {} tracked file(s): {}. Step 1 commits each as it was before the run; the run's version stays in the agent's worktree, uncommitted, and is not integrated; K in the review counts one as the agent's.",
+            commands(&changed),
+            changed.len(),
+            list_paths(&paths(&changed))
         ));
     }
     if facts.uncommitted.is_empty() {
@@ -2065,7 +2110,7 @@ pub fn integrate(ed: &mut Editor, id: AgentId, how: Integration, facts: Integrat
     // which files are the run's; the dialog no longer says what happens.
     if facts.part.is_none() && a.test_outputs != facts.outputs_checked {
         ed.error(
-            "not integrated, nothing changed: the files Maestro's test run created changed \
+            "not integrated, nothing changed: the files Maestro's test run wrote changed \
              after the dialog was checked; press I again to see what it would bring now",
         );
         return;
@@ -2146,12 +2191,13 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
     // The files left behind must be exactly the dialog's: one changed since
     // is the agent's now, and the dialog did not show it as such.
     let leave: Vec<PathBuf> = f.left_behind.iter().map(|o| o.path.clone()).collect();
+    let left_out = super::test_outputs::left_out(&f.left_behind, &leave);
     match super::test_outputs::still_made_by_tests(&wt, &f.left_behind) {
         Ok(now) if now == leave => {}
         Ok(now) => {
             let changed: Vec<PathBuf> = leave.into_iter().filter(|p| !now.contains(p)).collect();
             out.outcome = Err(format!(
-                "files Maestro's test run created changed after the dialog was checked and count \
+                "files Maestro's test run wrote changed after the dialog was checked and count \
                  as the agent's now: {}; nothing changed. Press I again to see what it would \
                  bring now",
                 list_paths(&changed)
@@ -2160,12 +2206,12 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
         }
         Err(e) => {
             out.outcome = Err(format!(
-                "could not tell which files Maestro's test run created ({e}); nothing changed"
+                "could not tell which files Maestro's test run wrote ({e}); nothing changed"
             ));
             return out;
         }
     }
-    match wt.commit_all_leaving_out(&message, &leave) {
+    match wt.commit_all_leaving_out(&message, &left_out) {
         Ok(c) => out.committed = c,
         Err(maestro_git::GitError::Unmerged(p)) => {
             out.outcome = Err(format!(
@@ -2189,7 +2235,7 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
                 let changed: Vec<PathBuf> =
                     leave.into_iter().filter(|p| !now.contains(p)).collect();
                 out.outcome = Err(format!(
-                    "files Maestro's test run created changed while the agent's work was \
+                    "files Maestro's test run wrote changed while the agent's work was \
                      committed and count as the agent's now: {}; nothing was integrated. Press I \
                      again to see what it would bring now",
                     list_paths(&changed)
@@ -2198,7 +2244,7 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             }
             Err(e) => {
                 out.outcome = Err(format!(
-                    "could not tell which files Maestro's test run created ({e}); nothing was \
+                    "could not tell which files Maestro's test run wrote ({e}); nothing was \
                      integrated"
                 ));
                 return out;
@@ -2270,9 +2316,13 @@ pub(crate) fn land(
             return;
         }
     };
-    // Files Maestro's test run made may stay untracked in the agent's
-    // worktree; any other uncommitted file there still refuses.
-    let left: Vec<PathBuf> = f.left_behind.iter().map(|o| o.path.clone()).collect();
+    // Files Maestro's test run created may stay untracked in the agent's
+    // worktree, and tracked files it changed may stay changed there; any
+    // other uncommitted file there still refuses.
+    let (changed, created): (Vec<&super::TestOutput>, Vec<&super::TestOutput>) =
+        f.left_behind.iter().partition(|o| o.before.is_some());
+    let left: Vec<PathBuf> = created.iter().map(|o| o.path.clone()).collect();
+    let modified: Vec<PathBuf> = changed.iter().map(|o| o.path.clone()).collect();
     // Only that commit: `maestro-git` refuses if the branch no longer
     // points at it, and gives git the commit id, not the branch name.
     out.outcome = main
@@ -2283,6 +2333,7 @@ pub(crate) fn land(
                 target: &f.target,
                 base: &f.base,
                 leave_untracked: &left,
+                leave_modified: &modified,
             },
             how,
         )
@@ -2624,6 +2675,27 @@ pub fn confirm_forget(ed: &mut Editor, id: AgentId) {
     }));
 }
 
+/// Takes the agent at index `i` out of the panel, stopping whatever of it
+/// still runs, and returns it.
+pub(crate) fn remove_from_panel(ed: &mut Editor, i: usize) -> super::Agent {
+    let mut a = ed.agents.agents.remove(i);
+    if a.is_running() || a.tests_running() {
+        a.stop();
+    }
+    let p = &mut ed.agents.panel;
+    // The selection stays on the same agent when a row above it goes.
+    if i < p.selected {
+        p.selected -= 1;
+    }
+    p.selected = p.selected.min(ed.agents.agents.len().saturating_sub(1));
+    p.scroll = 0;
+    if p.terminal_focus == Some(a.id) {
+        p.terminal_focus = None;
+    }
+    super::conflicts::refresh(ed);
+    a
+}
+
 /// Removes an archived agent's record from the panel and, when records are
 /// saved, from the records file at the next save. Nothing on disk but the
 /// records file changes: the worktree is gone already and the branch stays.
@@ -2635,20 +2707,8 @@ pub fn forget(ed: &mut Editor, id: AgentId) {
         ed.error(why);
         return;
     }
-    let mut a = ed.agents.agents.remove(i);
-    if a.is_running() || a.tests_running() {
-        a.stop();
-    }
-    if let Some(w) = &a.worktree {
-        super::persist::forget(ed, w);
-    }
-    let p = &mut ed.agents.panel;
-    p.selected = p.selected.min(ed.agents.agents.len().saturating_sub(1));
-    p.scroll = 0;
-    if p.terminal_focus == Some(id) {
-        p.terminal_focus = None;
-    }
-    super::conflicts::refresh(ed);
+    let a = remove_from_panel(ed, i);
+    super::persist::forget(ed, &a);
     ed.info(match &a.worktree {
         Some(w) => format!("forgot {}'s record; branch {} kept", a.name, w.branch),
         None => format!("forgot {}'s record", a.name),

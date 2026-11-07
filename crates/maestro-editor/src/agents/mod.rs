@@ -301,10 +301,12 @@ pub struct TestRun {
     pub finished: Option<TestFinish>,
     /// The tree of the worktree's files (tracked and untracked, not
     /// ignored) as they were just before the command started, without
-    /// files earlier runs created ([`TestOutput`]), from
+    /// files earlier runs created and with tracked files they changed as
+    /// they were before those runs ([`TestOutput`]), from
     /// `maestro_git::Repository::work_snapshot_leaving_out`. Integrate
-    /// compares it with the files then; `None` until computed, or when it
-    /// could not be.
+    /// compares it with the files then, and the run's changes to tracked
+    /// files are found against it; `None` until computed, or when it could
+    /// not be.
     pub tree: Option<String>,
     /// The agent's process was running when the run started or finished,
     /// so it may have changed files the run did not see.
@@ -368,8 +370,9 @@ const MAX_STDERR_LINES: usize = 500;
 /// Transcript entries kept per ACP agent.
 const MAX_TRANSCRIPT: usize = 5_000;
 
-/// A file Maestro's own verification run (`t`) created in the agent's
-/// worktree, as the run left it. See [`test_outputs`].
+/// A file Maestro's own verification run (`t`) created, or a tracked file
+/// it changed, in the agent's worktree, as the run left it. See
+/// [`test_outputs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestOutput {
     /// Relative to the worktree root.
@@ -377,6 +380,17 @@ pub struct TestOutput {
     /// Its blob id when the run ended. Once the file's contents differ
     /// from this, it counts as the agent's again.
     pub blob: String,
+    /// For a tracked file the run changed: the blob id of its contents just
+    /// before the run (the agent's version, or the commit's when the agent
+    /// had not changed it), which is what counts as the agent's and is
+    /// committed. `None` for a file the run created.
+    pub before: Option<String>,
+    /// For a tracked file the run changed: the blob id its index entry held
+    /// when the run ended. Once the entry holds anything else (it was
+    /// staged or committed) but `before`, which Maestro's own commit puts
+    /// there, the file counts as the agent's again. `None` for a created
+    /// file.
+    pub index: Option<String>,
     /// The command that created it, as the run showed it.
     pub command: String,
     /// The agent's process was running during that run, so it may have
@@ -387,12 +401,15 @@ pub struct TestOutput {
 /// The last review diff of an agent's worktree.
 #[derive(Debug, Default)]
 pub struct ReviewData {
-    /// Every changed file, the agent's first and then those in
-    /// `test_made`, each group in Git's order.
+    /// Every changed file, the agent's first and then the test run's (the
+    /// last `test_made.len()` entries).
     pub files: Vec<DiffFile>,
-    /// Files of `files` that Maestro's verification run created and that
-    /// are still as it left them (untracked, same contents): shown apart,
-    /// left out of the counts, of overlaps, marks, compose and integrate.
+    /// The paths of the test run's entries at the end of `files`, in
+    /// order: files Maestro's verification run created, and its changes to
+    /// tracked files, that are still as it left them. Shown apart, left out
+    /// of the counts, of overlaps, marks, compose and integrate. A tracked
+    /// file the agent had changed before the run is also in the agent's
+    /// part of `files`, with its contents from before the run.
     pub test_made: Vec<PathBuf>,
     /// The worktree's `HEAD` commit when `files` was computed.
     pub head: Option<String>,
@@ -418,19 +435,41 @@ impl ReviewData {
         (n, a, r)
     }
 
-    /// `f` is a file Maestro's verification run created, as it left it.
-    pub fn is_test_made(&self, f: &DiffFile) -> bool {
-        f.change == FileChange::Added
-            && f.old_path.is_none()
-            && f.new_path
-                .as_ref()
-                .is_some_and(|p| self.test_made.contains(p))
+    /// How many entries of `files`, from the start, are the agent's.
+    pub fn agent_count(&self) -> usize {
+        self.files.len().saturating_sub(self.test_made.len())
     }
 
-    /// The files that count as the agent's work: every file but those
-    /// the verification run created.
+    /// Entry `i` of `files` is Maestro's verification run's (a file it
+    /// created, or its change to a tracked file), as it left it.
+    pub fn is_test_made(&self, i: usize) -> bool {
+        i < self.files.len() && i >= self.agent_count()
+    }
+
+    /// The files that count as the agent's work: every entry but the
+    /// verification run's.
     pub fn agent_files(&self) -> impl Iterator<Item = &DiffFile> {
-        self.files.iter().filter(|f| !self.is_test_made(f))
+        self.files[..self.agent_count()].iter()
+    }
+
+    /// `K` on `path`: its entry is no longer the test run's. A created
+    /// file's entry joins the agent's files at once; a changed file's entry
+    /// (the run's change only) is dropped, and the refresh `K` asks for
+    /// shows the whole file as the agent's.
+    pub fn release_test_made(&mut self, path: &std::path::Path) {
+        let Some(k) = self.test_made.iter().position(|p| p == path) else {
+            return;
+        };
+        let i = self.agent_count() + k;
+        self.test_made.remove(k);
+        if i >= self.files.len() {
+            return;
+        }
+        let f = self.files.remove(i);
+        if f.change == FileChange::Added && f.old_path.is_none() {
+            let at = self.agent_count();
+            self.files.insert(at, f);
+        }
     }
 }
 

@@ -1208,16 +1208,19 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
                 ("t", Some(a)) => actions::test_blocker(ed, a).is_none(),
                 ("I", Some(a)) => actions::integrate_blocker(a).is_none(),
                 ("X", Some(a)) => actions::reject_blocker(a).is_none(),
-                ("D", Some(a)) => actions::drop_blocker(a).is_none(),
-                ("c", Some(a)) => actions::found_refusal(a).is_none(),
-                // K applies to a file the test run created, between runs.
-                ("K", Some(a)) => {
-                    !a.tests_running()
-                        && a.review
-                            .files
-                            .get(v.file)
-                            .is_some_and(|f| a.review.is_test_made(f))
+                // Not on the test run's change to a tracked file.
+                ("D", Some(a)) => {
+                    actions::drop_blocker(a).is_none()
+                        && !(a.review.is_test_made(v.file)
+                            && a.review
+                                .files
+                                .get(v.file)
+                                .is_some_and(|f| f.change != maestro_git::FileChange::Added))
                 }
+                ("c", Some(a)) => actions::found_refusal(a).is_none(),
+                // K applies to a file the test run created or changed,
+                // between runs.
+                ("K", Some(a)) => !a.tests_running() && a.review.is_test_made(v.file),
                 _ => true,
             })
             .collect();
