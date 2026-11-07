@@ -880,10 +880,9 @@ impl PersistState {
         }
     }
 
-    /// A record of the agent in `worktree` was forgotten. For the
-    /// sidebar, which lists records by worktree: the creation time is not
-    /// compared.
-    pub fn is_forgotten(&self, worktree: &Path) -> bool {
+    /// The record of the agent in `worktree` created at `created`
+    /// (milliseconds since the Unix epoch) was forgotten.
+    pub fn is_forgotten(&self, worktree: &Path, created: u64) -> bool {
         if self.forgotten.is_empty() {
             return false;
         }
@@ -891,7 +890,7 @@ impl PersistState {
         self.forgotten
             .values()
             .flatten()
-            .any(|f| Path::new(&f.worktree) == path)
+            .any(|f| f.created == created && Path::new(&f.worktree) == path)
     }
 
     /// The keys of every record forgotten, in any repository.
@@ -900,16 +899,20 @@ impl PersistState {
     }
 }
 
-/// `ours` with the entries of `theirs` it lacks, one entry per record (the
-/// earliest forget), and at most [`MAX_FORGOTTEN`] (the latest). Sorted,
-/// so two sessions that know the same forgets write the same text.
+/// `ours` with the entries of `theirs` it lacks, one entry per record
+/// (the earliest forget, with the highest id any session gave it), and at
+/// most [`MAX_FORGOTTEN`] (the latest). Sorted, so two sessions that know
+/// the same forgets write the same text.
 fn union_forgotten(ours: &[Forgotten], theirs: &[Forgotten]) -> Vec<Forgotten> {
     let mut by_key: HashMap<RecordKey, Forgotten> = HashMap::new();
     for f in ours.iter().chain(theirs) {
         let key = (PathBuf::from(&f.worktree), f.created);
-        match by_key.get(&key) {
-            Some(had) if (had.at, had.id) <= (f.at, f.id) => {}
-            _ => {
+        match by_key.get_mut(&key) {
+            Some(had) => {
+                had.id = had.id.max(f.id);
+                had.at = had.at.min(f.at);
+            }
+            None => {
                 by_key.insert(key, f.clone());
             }
         }
@@ -1414,11 +1417,15 @@ fn take_outside_changes(ed: &mut Editor, state: &Path, errors: &mut Vec<String>)
             }
             ReadOutcome::Records(f) => {
                 take_forgotten(ed, &root, &f.forgotten);
+                // A copy still listed here but forgotten is not saved, so
+                // it must not stand in for another record at its path.
+                let forgotten = ed.agents.persist.forgotten_keys();
                 let known: HashSet<PathBuf> = ed
                     .agents
                     .agents
                     .iter()
                     .filter(|a| a.origin != Origin::Found)
+                    .filter(|a| !agent_key(a).is_some_and(|k| forgotten.contains(&k)))
                     .filter_map(|a| a.worktree.as_ref().map(|w| normalize_path(&w.path)))
                     .collect();
                 // A record forgotten here or by the writer stays forgotten
@@ -1439,8 +1446,11 @@ fn take_outside_changes(ed: &mut Editor, state: &Path, errors: &mut Vec<String>)
                 }
             }
         }
-        if let Some(RepoState::Ready { seen, .. }) = ed.agents.persist.repos.get_mut(&root) {
+        // The file is not what this session wrote, so the next save writes
+        // even when its text is the same as the last one.
+        if let Some(RepoState::Ready { seen, written }) = ed.agents.persist.repos.get_mut(&root) {
             *seen = now_seen;
+            *written = None;
         }
     }
 }
@@ -1796,13 +1806,16 @@ mod tests {
 
     #[test]
     fn forgotten_entries_merge_once_each_sorted_and_bounded() {
-        // The same record forgotten in two sessions is kept once, with the
-        // earlier forget; either order gives the same list.
+        // The same record forgotten in two sessions, under two ids, is kept
+        // once, with the earlier forget and the higher id, so neither id is
+        // handed out again; either order gives the same list.
         let mut late = gone(1, 50);
         late.id = 7;
         let ab = union_forgotten(&[gone(2, 20), late.clone()], &[gone(1, 10)]);
         let ba = union_forgotten(&[gone(1, 10)], &[late, gone(2, 20)]);
-        assert_eq!(ab, vec![gone(1, 10), gone(2, 20)]);
+        let mut both = gone(1, 10);
+        both.id = 7;
+        assert_eq!(ab, vec![both, gone(2, 20)]);
         assert_eq!(ab, ba);
         // Past the bound the oldest forgets go.
         let many: Vec<Forgotten> = (1..=MAX_FORGOTTEN as u64 + 5).map(|i| gone(i, i)).collect();

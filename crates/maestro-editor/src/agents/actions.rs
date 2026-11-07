@@ -2525,6 +2525,10 @@ pub(crate) fn remove_from_panel(ed: &mut Editor, i: usize) -> super::Agent {
         a.stop();
     }
     let p = &mut ed.agents.panel;
+    // The selection stays on the same agent when a row above it goes.
+    if i < p.selected {
+        p.selected -= 1;
+    }
     p.selected = p.selected.min(ed.agents.agents.len().saturating_sub(1));
     p.scroll = 0;
     if p.terminal_focus == Some(a.id) {
