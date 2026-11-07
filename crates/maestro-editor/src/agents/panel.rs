@@ -642,7 +642,7 @@ fn compete(ed: &mut Editor) {
     let contract = a.contract.clone();
     let notes = match &base {
         Some(b) => vec![format!(
-            "starts from {}, the commit {} started from, so both work on the same code",
+            "starts from {}, the commit {} started from, so the competing agents work on the same code",
             super::create::short(b),
             a.name
         )],
@@ -681,11 +681,13 @@ pub(crate) fn choose_provider(
         Some(_) => "provider (task with a contract)",
         None => "provider (no task contract)",
     };
+    // Every provider list counts, so a check started for an earlier list
+    // never lands on this one.
+    ed.agents.panel.start_check += 1;
+    let check = ed.agents.panel.start_check;
     if base.is_none() {
         // Where the agent will start, and what it will not get, takes Git:
         // checked on a background thread while the list is up.
-        ed.agents.panel.start_check += 1;
-        let check = ed.agents.panel.start_check;
         let git = ed.git.git().clone();
         let cwd = ed.cwd.clone();
         let spawned = ed.spawn_background("agent-start-point", move |tx| {

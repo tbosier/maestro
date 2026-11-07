@@ -269,7 +269,7 @@ pub fn start_notes(git: &Git, cwd: &Path) -> Vec<String> {
                 let files = if dirty.len() == 1 { "file" } else { "files" };
                 notes.push(format!(
                     "! {name} has {} uncommitted {files} ({}): the agent will not see them; \
-                     commit or stash them first if it should",
+                     commit them first if it should",
                     dirty.len(),
                     super::actions::list_paths(&dirty)
                 ));

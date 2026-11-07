@@ -1156,6 +1156,11 @@ fn a_task_started_in_another_worktree_starts_from_main() {
     let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]).trim().to_string();
     assert_ne!(first_head, main_head);
 
+    // Uncommitted work in main, which is warned about, and in the
+    // worktree the editor goes to, which is not where the agent starts.
+    std::fs::write(f.repo.join("src/lib.rs"), "pub fn wip() {}\n").unwrap();
+    std::fs::write(first.join("here.txt"), "here\n").unwrap();
+
     // Into the agent's worktree, as the sidebar's worktree switch does.
     run(&mut ed, &format!(":cd {}\n", first.display()));
     assert_eq!(ed.cwd, first);
@@ -1181,7 +1186,16 @@ fn a_task_started_in_another_worktree_starts_from_main() {
         )),
         "{notes:?}"
     );
-    assert!(!notes.iter().any(|l| l.starts_with('!')), "{notes:?}");
+    let warnings: Vec<&String> = notes.iter().filter(|l| l.starts_with('!')).collect();
+    assert_eq!(
+        warnings,
+        [
+            &"! main has 1 uncommitted file (src/lib.rs): the agent will not see them; \
+            commit them first if it should"
+                .to_string()
+        ],
+        "{notes:?}"
+    );
     run(&mut ed, "j\n");
     wait_files(&mut ed, 1, &["mul.rs"]);
     assert_eq!(agent(&ed, 1).worktree.as_ref().unwrap().base, main_head);
@@ -1193,21 +1207,32 @@ fn a_task_started_in_another_worktree_starts_from_main() {
         agent(&ed, 1).history
     );
 
-    // `N` on it competes from the same commit and says so.
+    // `N` on it competes from the same commit and says so, and a check
+    // left running by a list closed just before does not change that.
+    run(&mut ed, "n");
+    ed.paste_text("closed at once");
+    run(&mut ed, "\n<esc>");
     select(&mut ed, 1);
     run(&mut ed, "N");
-    let notes = choice_notes(&ed);
-    assert!(
-        notes.contains(&format!(
-            "starts from {}, the commit {} started from, so both work on the same code",
-            &main_head[..8],
-            agent(&ed, 1).name
-        )),
-        "{notes:?}"
+    let compete = format!(
+        "starts from {}, the commit {} started from, so the competing agents work on the \
+         same code",
+        &main_head[..8],
+        agent(&ed, 1).name
     );
-    run(&mut ed, "<esc>");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        ed.poll_background();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(choice_notes(&ed), [compete]);
+    run(&mut ed, "\n");
+    wait_files(&mut ed, 2, &["two.rs"]);
+    assert_eq!(agent(&ed, 2).worktree.as_ref().unwrap().base, main_head);
 
     // It integrates into main with nothing of the first agent's.
+    f.git(&f.repo, &["checkout", "-q", "--", "src/lib.rs"]);
+    select(&mut ed, 1);
     open_integrate(&mut ed);
     run(&mut ed, "y");
     poll_until(&mut ed, "the integration", |ed| {
@@ -1277,8 +1302,7 @@ fn the_provider_list_warns_about_uncommitted_files_in_main() {
     }
     assert!(!warning.contains("build.log"), "{warning}");
     assert!(
-        warning
-            .ends_with("): the agent will not see them; commit or stash them first if it should"),
+        warning.ends_with("): the agent will not see them; commit them first if it should"),
         "{warning}"
     );
     // A warning, not a refusal: the agent starts.
@@ -1286,19 +1310,30 @@ fn the_provider_list_warns_about_uncommitted_files_in_main() {
     wait_files(&mut ed, 0, &["x.txt"]);
     assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, main_head);
 
-    // A detached main worktree: the commit checked out, said plainly.
+    // A detached main worktree: the agent starts from the commit checked
+    // out where the editor is (here the first agent's worktree, a commit
+    // ahead of main), as before, and the list says so plainly.
     f.git(&f.repo, &["stash", "-q", "--include-untracked"]);
     f.git(&f.repo, &["checkout", "-q", "--detach"]);
+    let first = worktree(&ed, 0);
+    f.git(&first, &["add", "-A"]);
+    f.git(&first, &["commit", "-q", "-m", "x"]);
+    let first_head = f.git(&first, &["rev-parse", "HEAD"]).trim().to_string();
+    run(&mut ed, &format!(":cd {}\n", first.display()));
     let notes = start_notes(&mut ed, "detached");
     assert!(
         notes.iter().any(|l| l.starts_with(&format!(
             "! the main worktree has a detached HEAD, so the agent starts from the commit \
              checked out here, {}",
-            &main_head[..8]
+            &first_head[..8]
         ))),
         "{notes:?}"
     );
-    run(&mut ed, "<esc>");
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "the worktree", |ed| {
+        ed.agents.agents.len() == 2 && agent(ed, 1).worktree.is_some()
+    });
+    assert_eq!(agent(&ed, 1).worktree.as_ref().unwrap().base, first_head);
 }
 
 fn integrate_refuses_when_the_worktree_is_gone() {

@@ -1470,10 +1470,12 @@ fn draw_overlay(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
             ..
         } => {
             // Notes go above the items, with a blank line after them.
-            let mut note_lines: Vec<String> = notes
-                .iter()
-                .flat_map(|n| panel::wrap_words(n, inner.max(1)))
-                .collect();
+            let wrap_notes = |notes: &mut dyn Iterator<Item = &String>| -> Vec<String> {
+                notes
+                    .flat_map(|n| panel::wrap_words(n, inner.max(1)))
+                    .collect()
+            };
+            let mut note_lines = wrap_notes(&mut notes.iter());
             if !note_lines.is_empty() {
                 note_lines.push(String::new());
             }
@@ -1485,7 +1487,19 @@ fn draw_overlay(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
             draw_box(s, b, title, ui.popup, ui.popup_border, ui.popup_title);
             // At least one row stays for the items.
             let inside = (h - 2) as usize;
-            let shown = note_lines.len().min(inside.saturating_sub(1));
+            let room = inside.saturating_sub(1);
+            if note_lines.len() > room {
+                // Too short for every note: warnings first, and the last
+                // row says that some were left out.
+                let (warn, rest): (Vec<&String>, Vec<&String>) =
+                    notes.iter().partition(|n| n.starts_with('!'));
+                note_lines = wrap_notes(&mut warn.into_iter().chain(rest));
+                note_lines.truncate(room.saturating_sub(1));
+                if room > 0 {
+                    note_lines.push("! window too short for every note".into());
+                }
+            }
+            let shown = note_lines.len().min(room);
             for (i, line) in note_lines.iter().take(shown).enumerate() {
                 s.print(x + 2, y + 1 + i as u16, line, ui.popup, b.right() - 1);
             }
