@@ -1464,24 +1464,40 @@ fn draw_overlay(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
         }
         Overlay::Choice {
             title,
+            notes,
             items,
             selected,
             ..
         } => {
-            let h = (items.len() as u16 + 2)
+            // Notes go above the items, with a blank line after them.
+            let mut note_lines: Vec<String> = notes
+                .iter()
+                .flat_map(|n| panel::wrap_words(n, inner.max(1)))
+                .collect();
+            if !note_lines.is_empty() {
+                note_lines.push(String::new());
+            }
+            let h = (note_lines.len() as u16 + items.len() as u16 + 2)
                 .min(area.height.saturating_sub(2))
                 .max(3);
             let y = area.y + (area.height.saturating_sub(h)) / 3;
             let b = Rect::new(x, y, w, h);
             draw_box(s, b, title, ui.popup, ui.popup_border, ui.popup_title);
-            let rows = (h - 2) as usize;
+            // At least one row stays for the items.
+            let inside = (h - 2) as usize;
+            let shown = note_lines.len().min(inside.saturating_sub(1));
+            for (i, line) in note_lines.iter().take(shown).enumerate() {
+                s.print(x + 2, y + 1 + i as u16, line, ui.popup, b.right() - 1);
+            }
+            let top = y + 1 + shown as u16;
+            let rows = inside - shown;
             let first = if *selected >= rows {
                 selected + 1 - rows
             } else {
                 0
             };
             for (i, (label, detail)) in items.iter().enumerate().skip(first).take(rows) {
-                let ry = y + 1 + (i - first) as u16;
+                let ry = top + (i - first) as u16;
                 let style = if i == *selected {
                     ui.popup_selected
                 } else {

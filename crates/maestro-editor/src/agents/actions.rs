@@ -457,6 +457,7 @@ pub fn choose_permission(ed: &mut Editor, id: AgentId) {
     ed.agents.panel.overlay = Some(Overlay::Choice {
         purpose: ChoicePurpose::Permission(id),
         title: format!("permission: {}", req.tool_title),
+        notes: Vec::new(),
         items,
         selected: 0,
     });
@@ -2189,6 +2190,7 @@ pub fn ask_adopt(ed: &mut Editor, id: AgentId) {
             providers,
         },
         title: "adopt with provider (nothing starts now)".into(),
+        notes: Vec::new(),
         items,
         selected: 0,
     });
