@@ -171,7 +171,7 @@ pub fn notify_if_recoverable(editor: &mut Editor, id: DocumentId) {
         Severity::Warning,
         format!(
             "unsaved changes from another session exist for {}; :recover loads them, :recover-discard deletes them",
-            path.display()
+            editor.show_path(&path)
         ),
     );
 }
@@ -203,7 +203,8 @@ pub fn tick(editor: &mut Editor, now: Instant) {
             match write(&dir, &path, &session, buf.doc.text()) {
                 Ok(()) => buf.recovery_version = Some(version),
                 Err(e) => {
-                    failure = Some(format!("recovery write failed for {}: {e}", path.display()))
+                    let shown = crate::navigation::display_path(&path, &editor.cwd);
+                    failure = Some(format!("recovery write failed for {shown}: {e}"))
                 }
             }
         }

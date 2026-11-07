@@ -482,10 +482,12 @@ fn stage_in_background(
 ) -> Result<(PathBuf, String), String> {
     let repo = crate::git::find_repo(git, path)?;
     let root = repo.root().to_path_buf();
-    let rel = repo
-        .relative(path)
-        .ok_or_else(|| format!("{} is outside the repository", path.display()))?;
-    let on_disk = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let rel = repo.relative(path).ok_or_else(|| {
+        let shown = crate::navigation::home_path(path);
+        format!("{shown} is outside the repository")
+    })?;
+    let on_disk =
+        std::fs::read(path).map_err(|e| format!("{}: {e}", crate::navigation::home_path(path)))?;
     if on_disk != buffer {
         return Err(format!(
             "{} changed on disk since the buffer was loaded; reload it first",

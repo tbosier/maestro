@@ -85,7 +85,7 @@ pub fn prepare(
         Ok(None) => {
             return Err(format!(
                 "{} is not in a Git repository; agents work in worktrees of one",
-                cwd.display()
+                crate::navigation::home_path(cwd)
             ));
         }
         Err(e) => return Err(e.to_string()),
@@ -115,8 +115,12 @@ pub fn prepare(
         },
     };
     let dir = worktree_root(&main_root, worktree_dir);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        // Kept in the agent's history, so not relative to today's
+        // working directory.
+        let shown = crate::navigation::home_path(&dir);
+        format!("could not create {shown}: {e}")
+    })?;
     for n in 0..100 {
         let name = if n == 0 {
             format!("{slug}-{id}")
@@ -141,7 +145,7 @@ pub fn prepare(
     }
     Err(format!(
         "no free branch name for maestro/{slug}-{id} in {}",
-        dir.display()
+        crate::navigation::home_path(&dir)
     ))
 }
 
@@ -194,7 +198,7 @@ pub fn start_notes(git: &Git, cwd: &Path) -> Vec<String> {
         Ok(None) => {
             return vec![format!(
                 "! {} is not in a Git repository; agents work in worktrees of one",
-                cwd.display()
+                crate::navigation::home_path(cwd)
             )];
         }
         Err(e) => return vec![format!("! could not find the repository: {e}")],
@@ -223,7 +227,7 @@ pub fn start_notes(git: &Git, cwd: &Path) -> Vec<String> {
                 let label = repo
                     .head()
                     .map(|h| h.label())
-                    .unwrap_or_else(|_| here.display().to_string());
+                    .unwrap_or_else(|_| crate::navigation::display_path(&here, cwd));
                 notes.push(format!(
                     "you are in {label}; the new agent starts from {branch}, not from here"
                 ));
@@ -281,7 +285,7 @@ pub fn start_notes(git: &Git, cwd: &Path) -> Vec<String> {
         }
         Err(e) => notes.push(format!(
             "! could not check {} for uncommitted files: {e}",
-            source.display()
+            crate::navigation::display_path(&source, cwd)
         )),
     }
     notes
@@ -318,12 +322,14 @@ fn on_worktree(ed: &mut Editor, id: AgentId, result: Result<(WorktreeInfo, Strin
     }
     match result {
         Ok((info, from)) => {
+            // The history outlives the working directory: `~/...`, not
+            // a path relative to where the editor is now.
+            let shown = crate::navigation::home_path(&info.path);
             let Some(a) = ed.agents.get_mut(id) else {
                 return;
             };
             a.log(format!(
-                "worktree {} on branch {} from {from}",
-                info.path.display(),
+                "worktree {shown} on branch {} from {from}",
                 info.branch,
             ));
             let main_root = info.main_root.clone();
@@ -379,7 +385,7 @@ pub fn relaunch(ed: &mut Editor, id: AgentId) {
             None => Some("the agent has no worktree".into()),
             Some(w) if !w.path.is_dir() => Some(format!(
                 "not relaunched: the worktree {} is gone",
-                w.path.display()
+                ed.show_path(&w.path)
             )),
             // Checked again now: the worktree may have changed since the
             // records were loaded.

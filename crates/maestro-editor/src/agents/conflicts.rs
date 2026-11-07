@@ -294,7 +294,10 @@ pub(crate) fn check(
 ) -> Merge {
     let repo = match git.discover(root) {
         Ok(Some(r)) => r,
-        Ok(None) => return Merge::Failed(format!("{} is not a repository", root.display())),
+        Ok(None) => {
+            let shown = crate::navigation::home_path(root);
+            return Merge::Failed(format!("{shown} is not a repository"));
+        }
         Err(e) => return Merge::Failed(e.to_string()),
     };
     match repo.merge_check(ours, theirs) {

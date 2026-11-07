@@ -254,7 +254,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// [`read`], with a hash of exactly the bytes that were parsed, so a later
 /// save can tell whether someone else wrote the file since.
 fn read_seen(path: &Path, main_root: &Path) -> (ReadOutcome, Seen) {
-    let shown = path.display();
+    let shown = crate::navigation::home_path(path);
     let unusable = |m: String| (ReadOutcome::Unusable(m), Some(0));
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -283,7 +283,7 @@ fn read_seen(path: &Path, main_root: &Path) -> (ReadOutcome, Seen) {
 }
 
 fn parse(bytes: &[u8], path: &Path, main_root: &Path) -> ReadOutcome {
-    let shown = path.display();
+    let shown = crate::navigation::home_path(path);
     let value: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => return ReadOutcome::Unusable(format!("{shown} is not valid JSON: {e}")),
@@ -305,8 +305,8 @@ fn parse(bytes: &[u8], path: &Path, main_root: &Path) -> ReadOutcome {
     if Path::new(&file.repository) != want {
         return ReadOutcome::Unusable(format!(
             "{shown} belongs to {}, not {}",
-            file.repository,
-            want.display()
+            crate::navigation::home_path(Path::new(&file.repository)),
+            crate::navigation::home_path(&want)
         ));
     }
     for r in &file.agents {
@@ -1072,15 +1072,15 @@ fn verify(ed: &mut Editor, root: &Path, list: &[maestro_git::Worktree]) -> usize
         {
             None => Some(format!(
                 "Git no longer lists {} as a worktree",
-                w.path.display()
+                crate::navigation::home_path(&w.path)
             )),
             Some(x) if x.prunable.is_some() => Some(format!(
                 "the worktree directory {} is gone",
-                w.path.display()
+                crate::navigation::home_path(&w.path)
             )),
             Some(x) if x.branch.as_deref() != Some(w.branch.as_str()) => Some(format!(
                 "the worktree {} is now on {}, not {}",
-                w.path.display(),
+                crate::navigation::home_path(&w.path),
                 x.branch
                     .as_deref()
                     .map_or("a detached HEAD".to_string(), |b| format!("branch {b}")),
@@ -1347,7 +1347,7 @@ pub fn save(ed: &mut Editor, durable: bool) {
             }
             Err(e) => errors.push(format!(
                 "could not save agent records to {}: {e}",
-                path.display()
+                crate::navigation::home_path(&path)
             )),
         }
     }

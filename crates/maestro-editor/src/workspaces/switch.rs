@@ -41,11 +41,11 @@ pub fn switch(ed: &mut Editor, target: &Path) -> bool {
     let target = match std::fs::canonicalize(target) {
         Ok(p) if p.is_dir() => p,
         Ok(p) => {
-            ed.error(format!("{} is not a directory", p.display()));
+            ed.error(format!("{} is not a directory", ed.show_path(&p)));
             return false;
         }
         Err(e) => {
-            ed.error(format!("cannot switch to {}: {e}", target.display()));
+            ed.error(format!("cannot switch to {}: {e}", ed.show_path(target)));
             return false;
         }
     };
@@ -127,7 +127,9 @@ pub fn switch(ed: &mut Editor, target: &Path) -> bool {
 fn label(ed: &Editor, root: &Path) -> String {
     match super::names_for(ed, root) {
         Some((p, w)) => format!("{p}:{w}"),
-        None => root.display().to_string(),
+        // The working directory has usually just changed to `root`, so
+        // the form relative to it would be empty.
+        None => crate::navigation::home_path(root),
     }
 }
 

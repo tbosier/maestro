@@ -353,14 +353,16 @@ pub fn write(state_dir: &Path, cwd: &Path, session: &SessionFile) -> Result<(), 
     if session.buffers.is_empty() {
         return match fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(format!("could not remove {}: {e}", path.display()))
+                Err(format!("could not remove {}: {e}", super::home_path(&path)))
             }
             _ => Ok(()),
         };
     }
     let text = toml::to_string(session).map_err(|e| e.to_string())?;
-    write_private(&path, text.as_bytes(), true)
-        .map_err(|e| format!("could not save the session to {}: {e}", path.display()))
+    write_private(&path, text.as_bytes(), true).map_err(|e| {
+        let shown = super::home_path(&path);
+        format!("could not save the session to {shown}: {e}")
+    })
 }
 
 /// Reads the saved session for `cwd`, if there is one.
@@ -369,10 +371,10 @@ pub fn load(state_dir: &Path, cwd: &Path) -> Result<Option<SessionFile>, String>
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        Err(e) => return Err(format!("could not read {}: {e}", super::home_path(&path))),
     };
-    let session: SessionFile =
-        toml::from_str(&text).map_err(|e| format!("invalid session {}: {e}", path.display()))?;
+    let session: SessionFile = toml::from_str(&text)
+        .map_err(|e| format!("invalid session {}: {e}", super::home_path(&path)))?;
     let want = crate::editor::normalize_path(cwd);
     if session.version != VERSION || Path::new(&session.cwd) != want {
         return Ok(None);

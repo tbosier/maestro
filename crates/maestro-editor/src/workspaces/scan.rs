@@ -297,10 +297,14 @@ fn run(input: &Input) -> Found {
                 if matches!(source, Source::Configured | Source::Added) {
                     let why = match why {
                         Unusable::Missing | Unusable::NotDirectory => {
-                            format!("{} is not a directory", dir.display())
+                            // Kept on the project and shown after a later
+                            // `:cd`, so not relative to today's directory.
+                            let shown = crate::navigation::home_path(&dir);
+                            format!("{shown} is not a directory")
                         }
                         Unusable::NotRepository => {
-                            format!("{} is not in a Git repository", dir.display())
+                            let shown = crate::navigation::home_path(&dir);
+                            format!("{shown} is not in a Git repository")
                         }
                         Unusable::Git(e) => e,
                     };

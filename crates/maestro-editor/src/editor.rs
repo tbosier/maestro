@@ -539,12 +539,13 @@ impl Editor {
     pub fn open(&mut self, path: &Path) -> Result<DocumentId, String> {
         let path = self.resolve_path(path);
         if path.is_dir() {
-            return Err(format!("{} is a directory", path.display()));
+            return Err(format!("{} is a directory", self.show_path(&path)));
         }
         let id = match self.find_buffer_by_path(&path) {
             Some(id) => id,
             None => {
-                let doc = Document::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let doc =
+                    Document::open(&path).map_err(|e| format!("{}: {e}", self.show_path(&path)))?;
                 let read_only = doc.read_only();
                 let id = self.add_document(doc);
                 if let Some(r) = read_only {

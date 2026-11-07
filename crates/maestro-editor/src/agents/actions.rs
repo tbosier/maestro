@@ -968,6 +968,9 @@ pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
     // thread; removal waits until it is gone.
     let terminal = a.runtime.terminal().cloned();
     a.git_busy = Some("archiving");
+    // The refusal goes into the agent's history too, which outlives the
+    // working directory.
+    let shown = crate::navigation::home_path(&w.path);
     let spawned = ed.spawn_background("agent-archive", move |tx| {
         let removal = (|| {
             if let Some(t) = terminal {
@@ -1035,16 +1038,14 @@ pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
                 }
                 None => {
                     return refuse(format!(
-                        "{} is not a worktree of this repository; nothing was removed",
-                        w.path.display()
+                        "{shown} is not a worktree of this repository; nothing was removed"
                     ));
                 }
                 // The path now holds other work than the record says: a
                 // removal would delete what the dialog did not name.
                 Some(x) if x.branch.as_deref() != Some(w.branch.as_str()) => {
                     return refuse(format!(
-                        "the worktree {} is on {} now, not {}; nothing was removed",
-                        w.path.display(),
+                        "the worktree {shown} is on {} now, not {}; nothing was removed",
                         x.branch
                             .as_deref()
                             .map_or("a detached HEAD".to_string(), |b| format!("branch {b}")),
@@ -1082,13 +1083,16 @@ fn archived_inner(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) 
     let Some(w) = a.worktree.clone() else {
         return;
     };
+    // `~/...` in the history, which outlives the working directory;
+    // relative to it on the status line.
+    let logged = crate::navigation::home_path(&w.path);
+    let shown = crate::navigation::display_path(&w.path, &ed.cwd);
     match removal.result {
         Ok(()) if removal.already_gone => {
             a.archived = true;
             a.review = Default::default();
             a.log(format!(
-                "the worktree {} was already gone; marked archived, branch {} kept",
-                w.path.display(),
+                "the worktree {logged} was already gone; marked archived, branch {} kept",
                 w.branch
             ));
             if let Some(v) = &ed.agents.panel.review
@@ -1097,8 +1101,7 @@ fn archived_inner(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) 
                 ed.agents.panel.review = None;
             }
             ed.info(format!(
-                "{} was already gone; marked archived, nothing removed",
-                w.path.display()
+                "{shown} was already gone; marked archived, nothing removed"
             ));
         }
         Ok(()) => {
@@ -1112,8 +1115,7 @@ fn archived_inner(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) 
                 ed.agents.panel.review = None;
             }
             ed.info(format!(
-                "archived {}: worktree {how}, branch {} kept",
-                w.path.display(),
+                "archived {shown}: worktree {how}, branch {} kept",
                 w.branch
             ));
         }
@@ -1369,7 +1371,10 @@ pub(crate) fn open_exact(
     git: &maestro_git::Git,
     path: &Path,
 ) -> Result<maestro_git::Repository, String> {
-    let gone = || format!("{} is no longer a worktree", path.display());
+    let gone = || {
+        let shown = crate::navigation::home_path(path);
+        format!("{shown} is no longer a worktree")
+    };
     let repo = git
         .discover(path)
         .map_err(|e| e.to_string())?
@@ -1394,8 +1399,8 @@ fn same_repository(
     } else {
         Err(format!(
             "{} is not a worktree of the repository at {}",
-            wt.root().display(),
-            main.root().display()
+            crate::navigation::home_path(wt.root()),
+            crate::navigation::home_path(main.root())
         ))
     }
 }

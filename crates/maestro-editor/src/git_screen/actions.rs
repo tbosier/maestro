@@ -1041,7 +1041,7 @@ fn open_message(ed: &mut Editor, amend: bool, prepared: Prepared) {
         Err(e) => {
             return ed.error(format!(
                 "could not write a message file in {}: {e}",
-                repo.git_dir().display()
+                ed.show_path(repo.git_dir())
             ));
         }
     };
@@ -1157,11 +1157,13 @@ pub fn check_commit_message(ed: &mut Editor) {
                         super::open_at(ed, root);
                     }
                 }
-                Err(e) => ed.error(format!(
-                    "not {}: {e}; the message is kept in {}",
-                    if amend { "amended" } else { "committed" },
-                    path.display()
-                )),
+                Err(e) => {
+                    let kept = ed.show_path(&path);
+                    ed.error(format!(
+                        "not {}: {e}; the message is kept in {kept}",
+                        if amend { "amended" } else { "committed" },
+                    ))
+                }
             }
         });
     });

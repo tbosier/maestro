@@ -1212,28 +1212,39 @@ pub fn stop_all(ed: &mut Editor) {
 pub(crate) fn worktree_mismatch(w: &WorktreeInfo) -> Option<String> {
     fn read_small(p: &Path) -> Result<String, String> {
         match std::fs::symlink_metadata(p) {
-            Ok(m) if m.is_file() && m.len() < 64 * 1024 => {
-                std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))
-            }
-            Ok(_) => Err(format!("{} is not a small regular file", p.display())),
-            Err(e) => Err(format!("{}: {e}", p.display())),
+            Ok(m) if m.is_file() && m.len() < 64 * 1024 => std::fs::read_to_string(p)
+                .map_err(|e| format!("{}: {e}", crate::navigation::home_path(p))),
+            Ok(_) => Err(format!(
+                "{} is not a small regular file",
+                crate::navigation::home_path(p)
+            )),
+            Err(e) => Err(format!("{}: {e}", crate::navigation::home_path(p))),
         }
     }
     let check = || -> Result<(), String> {
-        let dot_git = read_small(&w.path.join(".git"))
-            .map_err(|e| format!("{} is not a linked worktree ({e})", w.path.display()))?;
+        let dot_git = read_small(&w.path.join(".git")).map_err(|e| {
+            format!(
+                "{} is not a linked worktree ({e})",
+                crate::navigation::home_path(&w.path)
+            )
+        })?;
         let gitdir = dot_git
             .trim()
             .strip_prefix("gitdir:")
             .map(str::trim)
-            .ok_or_else(|| format!("{} has an unexpected .git file", w.path.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "{} has an unexpected .git file",
+                    crate::navigation::home_path(&w.path)
+                )
+            })?;
         let gitdir = w.path.join(gitdir);
         let head = read_small(&gitdir.join("HEAD"))?;
         let branch = head.trim().strip_prefix("ref: refs/heads/");
         if branch != Some(w.branch.as_str()) {
             return Err(format!(
                 "the worktree {} is on {} now, not {}",
-                w.path.display(),
+                crate::navigation::home_path(&w.path),
                 branch.map_or("a detached HEAD".to_string(), |b| format!("branch {b}")),
                 w.branch
             ));
@@ -1247,8 +1258,8 @@ pub(crate) fn worktree_mismatch(w: &WorktreeInfo) -> Option<String> {
             if canon(&gitdir.join(common.trim())) != canon(&main_git) {
                 return Err(format!(
                     "{} is not a worktree of the repository at {}",
-                    w.path.display(),
-                    w.main_root.display()
+                    crate::navigation::home_path(&w.path),
+                    crate::navigation::home_path(&w.main_root)
                 ));
             }
         }

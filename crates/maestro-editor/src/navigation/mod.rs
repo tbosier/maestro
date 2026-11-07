@@ -74,26 +74,82 @@ fn recent_files(ed: &mut Editor) {
     recent::open_picker(ed);
 }
 
-/// Path shown in pickers: relative to `root` when inside it, otherwise with
-/// the home directory abbreviated to `~`. Control characters in file names
-/// are shown as `?` so they cannot reach the terminal.
+/// Path shown in pickers and messages: relative to `root` when inside it,
+/// otherwise as [`home_path`] shows it. `root` itself is shown by
+/// [`home_path`] too, since its relative form would be empty. A relative
+/// path whose first part is a directory named `~` gets a leading `./`, so
+/// it cannot be read as the home directory. Control characters in file
+/// names are shown as `?` so they cannot reach the terminal.
 pub fn display_path(path: &Path, root: &Path) -> String {
-    let shown = if let Ok(rel) = path.strip_prefix(root) {
-        rel.to_string_lossy().into_owned()
-    } else if let Some(home) = std::env::var_os("HOME")
-        && let Ok(rel) = path.strip_prefix(&home)
-    {
-        format!("~/{}", rel.to_string_lossy())
-    } else {
-        path.to_string_lossy().into_owned()
+    match path.strip_prefix(root) {
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            let shown = rel.to_string_lossy().into_owned();
+            if rel.components().next() == Some(std::path::Component::Normal("~".as_ref())) {
+                printable(format!("./{shown}"))
+            } else {
+                printable(shown)
+            }
+        }
+        _ => home_path(path),
+    }
+}
+
+/// `path` with the home directory abbreviated to `~` (`~/src/app`, or `~`
+/// for home itself), absolute otherwise. For a directory the working
+/// directory just changed to, where a relative form says nothing, and for
+/// text that outlives the working directory (agent history) or is built
+/// where it is not known.
+pub fn home_path(path: &Path) -> String {
+    abbreviate_home(path, home_dirs())
+}
+
+/// HOME as set, and with symlinks resolved when that differs: `:cd`
+/// canonicalizes its target, so a home reached through a symlink must
+/// match too. Read once; nothing in the editor changes HOME.
+fn home_dirs() -> &'static [PathBuf] {
+    static HOMES: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    HOMES.get_or_init(|| {
+        let Some(home) = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute())
+        else {
+            return Vec::new();
+        };
+        let mut homes = vec![home.clone()];
+        if let Ok(real) = std::fs::canonicalize(&home)
+            && real != home
+        {
+            homes.push(real);
+        }
+        homes
+    })
+}
+
+/// [`home_path`] with the home directories given. A home of `/` is not
+/// abbreviated: every path would start with `~`.
+fn abbreviate_home(path: &Path, homes: &[PathBuf]) -> String {
+    let rel = homes
+        .iter()
+        .filter(|h| h.parent().is_some())
+        .find_map(|h| path.strip_prefix(h).ok());
+    let shown = match rel {
+        Some(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+        Some(rel) => format!("~/{}", rel.to_string_lossy()),
+        None => path.to_string_lossy().into_owned(),
     };
-    if shown.chars().any(char::is_control) {
-        return shown
+    printable(shown)
+}
+
+/// `s` with control characters replaced by `?`.
+fn printable(s: String) -> String {
+    if s.chars().any(char::is_control) {
+        return s
             .chars()
             .map(|c| if c.is_control() { '?' } else { c })
             .collect();
     }
-    shown
+    s
 }
 
 /// Opens a picker that background work will fill, and returns its id.
@@ -132,5 +188,33 @@ mod tests {
             display_path(Path::new("/work/proj/a\x1b[2Jb\n.rs"), root),
             "a?[2Jb?.rs"
         );
+        // The root itself has no relative form.
+        assert_eq!(display_path(root, root), home_path(root));
+        // A directory named `~` is not the home directory.
+        assert_eq!(display_path(Path::new("/work/proj/~/x"), root), "./~/x");
+    }
+
+    #[test]
+    fn home_is_abbreviated_through_a_symlink_but_not_when_it_is_root() {
+        let homes = [PathBuf::from("/link/me"), PathBuf::from("/real/me")];
+        assert_eq!(abbreviate_home(Path::new("/link/me"), &homes), "~");
+        assert_eq!(
+            abbreviate_home(Path::new("/real/me/src/app"), &homes),
+            "~/src/app"
+        );
+        assert_eq!(
+            abbreviate_home(Path::new("/real/me/a\x07b"), &homes),
+            "~/a?b"
+        );
+        assert_eq!(
+            abbreviate_home(Path::new("/elsewhere/x"), &homes),
+            "/elsewhere/x"
+        );
+        assert_eq!(
+            abbreviate_home(Path::new("/elsewhere/x"), &[]),
+            "/elsewhere/x"
+        );
+        let root_home = [PathBuf::from("/")];
+        assert_eq!(abbreviate_home(Path::new("/etc/x"), &root_home), "/etc/x");
     }
 }
