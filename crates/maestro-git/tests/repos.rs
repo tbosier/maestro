@@ -390,6 +390,71 @@ fn worktree_add_list_remove() {
     );
 }
 
+#[test]
+fn worktrees_added_at_once_from_many_threads_all_succeed() {
+    // `N compete` makes several worktrees of one repository at the same
+    // moment. Git reads every entry under `.git/worktrees` while it adds
+    // one, and fails on an entry another `worktree add` has made but not
+    // filled in yet ("failed to read .../commondir"). Without the lock this
+    // test failed in 9 of 60 runs on Linux, so a pass here is weak
+    // evidence; a failure is the race.
+    let f = Fixture::new();
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 5;
+    for round in 0..ROUNDS {
+        let start = std::sync::Barrier::new(THREADS);
+        let errors: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let repo = f.repo();
+                    let path = f.tmp.join(format!("race-{round}-{i}"));
+                    let start = &start;
+                    s.spawn(move || {
+                        let branch = format!("race/{round}-{i}");
+                        // Every thread calls git at the same moment.
+                        start.wait();
+                        let added = repo.add_worktree(&path, &branch, "main");
+                        let listed = repo.worktrees();
+                        added
+                            .err()
+                            .into_iter()
+                            .chain(listed.err())
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert!(errors.is_empty(), "round {round}: {errors:#?}");
+    }
+    assert_eq!(f.repo().worktrees().unwrap().len(), 1 + ROUNDS * THREADS);
+}
+
+#[test]
+fn the_worktree_lock_is_per_repository() {
+    // A long `gh pr checkout` (or a slow hook) in one project must not
+    // hold up worktrees in another.
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let (ra, rb) = (a.repo(), b.repo());
+    let (tx, rx) = std::sync::mpsc::channel();
+    ra.with_worktree_lock(|| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                rb.add_worktree(&b.tmp.join("other"), "other", "main")
+                    .unwrap();
+                tx.send(()).unwrap();
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .expect("another repository's worktree was held up by this lock");
+        });
+    });
+}
+
 fn refusals(err: RemoveError) -> Vec<RemoveRefusal> {
     match err {
         RemoveError::Refused(r) => r,
