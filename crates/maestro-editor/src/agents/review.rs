@@ -320,7 +320,7 @@ pub fn request(ed: &mut Editor, id: AgentId) {
                     let head = repo.resolve("HEAD").ok();
                     repo.review_diff(&w.base)
                         .map(|files| {
-                            let made = test_made(&repo, &files, &outputs);
+                            let (files, made) = split(&repo, &w.base, files, &outputs);
                             Reviewed { files, head, made }
                         })
                         .map_err(|e| e.to_string())
@@ -349,32 +349,129 @@ pub fn request(ed: &mut Editor, id: AgentId) {
 
 /// A review diff computed on a background thread.
 struct Reviewed {
+    /// The agent's files, then the verification run's.
     files: Vec<DiffFile>,
     head: Option<String>,
-    /// Files of `files` the verification run created, as it left them.
+    /// The paths of the run's entries at the end of `files`, in order.
     made: Vec<PathBuf>,
 }
 
-/// Which added files of `files` are recorded test outputs still as their
-/// run left them. When Git cannot tell, none are: every file then counts
-/// as the agent's, as it did before Maestro recorded any.
-fn test_made(
+/// `files` (the whole review diff of the worktree against `base`) as the
+/// review shows it: the agent's files first, then the entries of the
+/// recorded test outputs still as their run left them, with their paths.
+/// A created file's entry moves to the end. A changed tracked file's entry
+/// is split in two: the agent's part, the file as it was before the run
+/// against the fork point (none when the agent had not changed it), and
+/// the run's part, the file now against that. When Git cannot tell, none
+/// are the run's: every file then counts as the agent's, as it did before
+/// Maestro recorded any.
+fn split(
     repo: &maestro_git::Repository,
+    base: &str,
+    mut files: Vec<DiffFile>,
+    outputs: &[super::TestOutput],
+) -> (Vec<DiffFile>, Vec<PathBuf>) {
+    let made = super::test_outputs::still_made_by_tests(repo, outputs).unwrap_or_default();
+    let created: Vec<&PathBuf> = outputs
+        .iter()
+        .filter(|o| o.before.is_none() && made.contains(&o.path))
+        .map(|o| &o.path)
+        .collect();
+    let changed: Vec<PathBuf> = outputs
+        .iter()
+        .filter(|o| o.before.is_some() && made.contains(&o.path))
+        .map(|o| o.path.clone())
+        .collect();
+    let mut runs = Vec::new();
+    if !changed.is_empty()
+        && let Ok(parts) = changed_parts(repo, base, &files, outputs, &changed)
+    {
+        files.retain(|f| {
+            !super::file_paths(f)
+                .iter()
+                .any(|p| parts.affected.contains(*p))
+        });
+        files.extend(parts.agents);
+        // Git's order: by path, byte by byte.
+        files.sort_by(|a, b| {
+            let key = |f: &DiffFile| f.path().map(|p| p.as_os_str().as_encoded_bytes().to_vec());
+            key(a).cmp(&key(b))
+        });
+        runs = parts.theirs;
+    }
+    let is_created = |f: &DiffFile| {
+        f.change == FileChange::Added
+            && f.old_path.is_none()
+            && f.new_path.as_ref().is_some_and(|p| created.contains(&p))
+    };
+    let (mut ordered, theirs): (Vec<DiffFile>, Vec<DiffFile>) =
+        files.into_iter().partition(|f| !is_created(f));
+    let made: Vec<PathBuf> = theirs
+        .iter()
+        .chain(runs.iter())
+        .filter_map(|f| f.new_path.clone())
+        .collect();
+    ordered.extend(theirs);
+    ordered.extend(runs);
+    (ordered, made)
+}
+
+/// The review's entries for the tracked files a test run changed.
+struct ChangedParts {
+    /// Every path the whole-diff entries of those files name.
+    affected: Vec<PathBuf>,
+    /// The agent's diff of those paths.
+    agents: Vec<DiffFile>,
+    /// The run's change to each file.
+    theirs: Vec<DiffFile>,
+}
+
+/// For the tracked files in `changed` that the run changed: every path of
+/// `files` their entries name (a rename names two), the agent's diff of
+/// those paths with the run's changes replaced by the contents from before
+/// the run, and the run's change to each file.
+fn changed_parts(
+    repo: &maestro_git::Repository,
+    base: &str,
     files: &[DiffFile],
     outputs: &[super::TestOutput],
-) -> Vec<PathBuf> {
-    let added: Vec<super::TestOutput> = outputs
-        .iter()
-        .filter(|o| {
-            files.iter().any(|f| {
-                f.change == FileChange::Added
-                    && f.old_path.is_none()
-                    && f.new_path.as_ref() == Some(&o.path)
-            })
+    changed: &[PathBuf],
+) -> Result<ChangedParts, maestro_git::GitError> {
+    let fork = repo
+        .merge_base(base, "HEAD")?
+        .ok_or_else(|| maestro_git::GitError::InvalidArgument("no fork point".into()))?;
+    let leave = super::test_outputs::left_out(outputs, changed);
+    let snap = repo.work_snapshot_leaving_out(&leave)?;
+    let mut affected: Vec<PathBuf> = changed.to_vec();
+    for f in files {
+        let paths = super::file_paths(f);
+        if paths.iter().any(|p| changed.contains(*p)) {
+            affected.extend(paths.into_iter().cloned());
+        }
+    }
+    affected.sort();
+    affected.dedup();
+    let agents = repo.diff(
+        &maestro_git::DiffSpec::Revisions {
+            from: fork,
+            to: snap.commit.clone(),
+        },
+        &affected,
+    )?;
+    let theirs: Vec<DiffFile> = repo
+        .diff_against(&snap.commit, changed)?
+        .into_iter()
+        .filter(|f| {
+            f.change == FileChange::Modified
+                && f.old_path == f.new_path
+                && f.new_path.as_ref().is_some_and(|p| changed.contains(p))
         })
-        .cloned()
         .collect();
-    super::test_outputs::still_made_by_tests(repo, &added).unwrap_or_default()
+    Ok(ChangedParts {
+        affected,
+        agents,
+        theirs,
+    })
 }
 
 fn applied(ed: &mut Editor, id: AgentId, result: Result<Reviewed, String>) {
@@ -382,19 +479,6 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<Reviewed, String>) {
         return;
     };
     a.review.running = false;
-    // The agent's files first, then those the verification run made.
-    let result = result.map(|mut r| {
-        let made = |f: &DiffFile| {
-            f.change == FileChange::Added
-                && f.old_path.is_none()
-                && f.new_path.as_ref().is_some_and(|p| r.made.contains(p))
-        };
-        let (mut files, theirs): (Vec<DiffFile>, Vec<DiffFile>) =
-            r.files.drain(..).partition(|f| !made(f));
-        files.extend(theirs);
-        r.files = files;
-        r
-    });
     // Overlaps and conflicts with other agents follow every change to
     // what the diff says (files, an error, the first result) and to the
     // commit it is on. A binary file's diff does not show its contents,
@@ -514,7 +598,7 @@ pub fn current_rows(ed: &Editor) -> Vec<Row> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if a.review.is_test_made(f) {
+    if a.review.is_test_made(v.file) {
         out.extend(test_made_notes(a, f));
     } else if let Some(c) = &a.contract {
         for (_, why) in super::out_of_scope(c, std::slice::from_ref(f)) {
@@ -522,6 +606,19 @@ pub fn current_rows(ed: &Editor) -> Vec<Row> {
                 "{OUT_OF_SCOPE}: {why}; integrating it needs O, D drops it"
             )));
         }
+    }
+    // The agent's part of a file the run also changed.
+    if !a.review.is_test_made(v.file)
+        && f.new_path.as_ref().is_some_and(|p| {
+            a.review.files[a.review.agent_count()..]
+                .iter()
+                .any(|t| t.new_path.as_ref() == Some(p) && t.change == FileChange::Modified)
+        })
+    {
+        out.push(Row::Note(format!(
+            "{TEST_CHANGED} too; that change is listed apart (T). This is the file as it was \
+             before the run, which integrate commits"
+        )));
     }
     out.extend(rows(f, v.side_by_side, &file_comments(&a.comments, f)));
     out
@@ -533,20 +630,41 @@ pub const OUT_OF_SCOPE: &str = "outside the task contract";
 /// The words the review puts on a file Maestro's verification run made.
 pub const TEST_MADE: &str = "created by Maestro's test run";
 
-/// The lines above the diff of a file the verification run made.
+/// The words the review puts on a verification run's change to a tracked
+/// file.
+pub const TEST_CHANGED: &str = "changed by Maestro's test run";
+
+/// [`TEST_MADE`] or [`TEST_CHANGED`], for one of the run's entries.
+pub fn test_words(f: &DiffFile) -> &'static str {
+    if f.change == FileChange::Added {
+        TEST_MADE
+    } else {
+        TEST_CHANGED
+    }
+}
+
+/// The lines above the diff of a file the verification run made, or of
+/// its change to a tracked file.
 fn test_made_notes(a: &super::Agent, f: &DiffFile) -> Vec<Row> {
     let output = f
         .new_path
         .as_ref()
         .and_then(|p| a.test_outputs.iter().find(|o| &o.path == p));
     let command = output.map_or(String::new(), |o| format!(" (`{}`)", o.command));
-    let mut out = vec![
-        Row::Note(format!("T {TEST_MADE}{command}, not by the agent")),
-        Row::Note(
+    let what = test_words(f);
+    let mut out = vec![Row::Note(format!("T {what}{command}, not by the agent"))];
+    if f.change == FileChange::Added {
+        out.push(Row::Note(
             "not counted, integrated or composed; K counts it as the agent's, D drops it (deletes it)"
                 .into(),
-        ),
-    ];
+        ));
+    } else {
+        out.push(Row::Note(
+            "this change is not counted, integrated or composed: integrate commits the file as it \
+             was before the run and leaves this change on disk; K counts it as the agent's"
+                .into(),
+        ));
+    }
     if output.is_some_and(|o| o.agent_was_running) {
         out.push(Row::Note(
             "the agent was running during that run; if it wrote this file, press K".into(),
@@ -691,10 +809,16 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             let file = ed
                 .agents
                 .get(id)
-                .and_then(|a| a.review.files.get(v.file))
-                .cloned();
+                .and_then(|a| {
+                    a.review
+                        .files
+                        .get(v.file)
+                        .map(|f| (f, a.review.is_test_made(v.file)))
+                })
+                .map(|(f, t)| (f.clone(), t));
             match file {
-                Some(f) => super::actions::ask_drop_file(ed, id, &f),
+                Some((f, true)) if f.change != FileChange::Added => ed.error(DROP_TEST_CHANGE),
+                Some((f, _)) => super::actions::ask_drop_file(ed, id, &f),
                 None => ed.error("no file to drop"),
             }
         }
@@ -727,6 +851,11 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
         ed.agents.panel.review = Some(v);
     }
 }
+
+/// Why `D` refuses on the test run's change to a tracked file.
+pub const DROP_TEST_CHANGE: &str = "D does not drop the test run's change to a tracked file: it \
+     would restore the starting commit's version and lose the agent's own change too. Integrate \
+     already leaves the run's change out; K counts it as the agent's";
 
 /// `Enter`: opens the worktree's file in a normal buffer at the line under
 /// the cursor and hides the panel.

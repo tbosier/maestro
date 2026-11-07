@@ -180,8 +180,37 @@ fn main() {
             an_archived_agent_says_so_and_its_record_can_be_forgotten,
         ),
         (
+            "a_forget_sticks_when_another_maestro_saves_after_it",
+            a_forget_sticks_when_another_maestro_saves_after_it,
+        ),
+        (
+            "a_forget_sticks_when_another_maestro_saved_before_it",
+            a_forget_sticks_when_another_maestro_saved_before_it,
+        ),
+        ("a_forget_survives_a_restart", a_forget_survives_a_restart),
+        (
             "files_the_test_run_creates_are_listed_apart_and_left_behind",
             files_the_test_run_creates_are_listed_apart_and_left_behind,
+        ),
+        (
+            "a_tracked_file_the_test_run_rewrites_is_marked_and_integrated_as_it_was",
+            a_tracked_file_the_test_run_rewrites_is_marked_and_integrated_as_it_was,
+        ),
+        (
+            "a_file_the_agent_edited_before_the_run_integrates_the_agents_version",
+            a_file_the_agent_edited_before_the_run_integrates_the_agents_version,
+        ),
+        (
+            "a_test_run_change_carries_over_until_edited_and_k_keeps_it",
+            a_test_run_change_carries_over_until_edited_and_k_keeps_it,
+        ),
+        (
+            "a_run_that_writes_back_the_index_version_keeps_the_agents_edit",
+            a_run_that_writes_back_the_index_version_keeps_the_agents_edit,
+        ),
+        (
+            "staging_a_test_run_change_makes_it_the_agents",
+            staging_a_test_run_change_makes_it_the_agents,
         ),
         (
             "a_test_run_file_the_agent_changes_is_the_agents_and_records_survive",
@@ -3903,13 +3932,252 @@ fn an_archived_agent_says_so_and_its_record_can_be_forgotten() {
     assert!(ed.agents.agents.is_empty(), "{:?}", ed.status);
     quit(&mut ed);
     drop(ed);
-    let saved = std::fs::read_to_string(f.records()).unwrap();
-    assert!(!saved.contains(wt.to_str().unwrap()), "{saved}");
+    let saved = raw_records(&f);
+    assert!(saved.agents.is_empty(), "{saved:?}");
+    assert_eq!(forgotten_paths(&saved), std::slice::from_ref(&wt));
 
     // After a restart it does not come back.
     let mut ed = f.session_editor(c);
     open_and_load(&mut ed, 0);
     assert!(ed.agents.agents.is_empty());
+}
+
+/// The records file as written, parsed without the filtering a read does.
+fn raw_records(f: &Fixture) -> maestro_editor::agents::persist::RecordsFile {
+    let text = std::fs::read_to_string(f.records()).unwrap();
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+fn forgotten_paths(file: &maestro_editor::agents::persist::RecordsFile) -> Vec<PathBuf> {
+    file.forgotten
+        .iter()
+        .map(|x| PathBuf::from(&x.worktree))
+        .collect()
+}
+
+fn saved_paths(file: &maestro_editor::agents::persist::RecordsFile) -> Vec<PathBuf> {
+    file.agents
+        .iter()
+        .map(|r| PathBuf::from(&r.worktree.path))
+        .collect()
+}
+
+/// A provider whose program exits at once and writes nothing, so the
+/// worktree archives without forcing.
+fn quiet_config() -> Config {
+    config(&[("quiet", sh_provider("true"))])
+}
+
+/// Starts a task in `ed` and waits for its program to exit.
+fn finished_agent(ed: &mut Editor, task: &str) -> usize {
+    let i = ed.agents.agents.len();
+    start_task(ed, task, 0);
+    poll_until(ed, "the program's exit", |ed| {
+        ed.agents.agents.len() > i && agent(ed, i).exited.is_some() && !agent(ed, i).review.running
+    });
+    i
+}
+
+/// Archives agent `i` of `ed` (its worktree is clean) and waits for it.
+fn archive_agent(ed: &mut Editor, i: usize) {
+    select(ed, i);
+    run(ed, "Ay");
+    poll_until(ed, "the archive", |ed| agent(ed, i).archived);
+}
+
+/// Two Maestros on one project. A forgets an archived record and saves;
+/// B, which loaded that record before, saves after it. B drops the record
+/// from its own panel instead of writing it back, keeps its selection on
+/// the agent it was on, and a later session does not load the record.
+fn a_forget_sticks_when_another_maestro_saves_after_it() {
+    let f = Fixture::new();
+    let mut a = f.session_editor(quiet_config());
+    open_and_load(&mut a, 0);
+    let i = finished_agent(&mut a, "write notes");
+    let wt = worktree(&a, i);
+    archive_agent(&mut a, i);
+    maestro_editor::agents::persist::save(&mut a, true);
+
+    let mut b = f.session_editor(quiet_config());
+    open_and_load(&mut b, 1);
+    assert!(agent(&b, 0).archived);
+    // B has agents of its own below it, and the middle one selected.
+    finished_agent(&mut b, "other notes");
+    finished_agent(&mut b, "more notes");
+    select(&mut b, 1);
+    let selected = agent(&b, 1).name.clone();
+
+    // A forgets it and saves, as its tick does within a second.
+    select(&mut a, 0);
+    run(&mut a, "dy");
+    assert!(a.agents.agents.is_empty(), "{:?}", a.status);
+    maestro_editor::agents::persist::save(&mut a, false);
+    let file = raw_records(&f);
+    assert!(file.agents.is_empty(), "{file:?}");
+    assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+
+    // B saves with its stale copy: the copy leaves B's panel, the
+    // selection stays on the same agent, and the file keeps the forget.
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(b.agents.agents.len(), 2, "{:?}", b.status);
+    assert!(!b.agents.agents.iter().any(|x| x.archived));
+    assert_eq!(b.agents.selected().unwrap().name, selected);
+    assert!(
+        status_text(&b).contains("was forgotten in another Maestro"),
+        "{}",
+        status_text(&b)
+    );
+    let file = raw_records(&f);
+    assert_eq!(file.agents.len(), 2, "{file:?}");
+    assert!(!saved_paths(&file).contains(&wt), "{file:?}");
+    assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+    quit(&mut b);
+    quit(&mut a);
+    drop((a, b));
+
+    let mut c = f.session_editor(quiet_config());
+    open_and_load(&mut c, 2);
+    assert!(c.agents.agents.iter().all(|x| !x.archived));
+}
+
+/// The other order: B writes its copy of the record (here not archived:
+/// B loaded it before A archived it) after A forgot it but before A saved.
+/// A's save leaves it out again; B keeps showing its copy until it quits
+/// but no longer saves it; a later session does not load it.
+fn a_forget_sticks_when_another_maestro_saved_before_it() {
+    let f = Fixture::new();
+    let mut a = f.session_editor(quiet_config());
+    open_and_load(&mut a, 0);
+    let i = finished_agent(&mut a, "write notes");
+    let wt = worktree(&a, i);
+    maestro_editor::agents::persist::save(&mut a, true);
+
+    let mut b = f.session_editor(quiet_config());
+    open_and_load(&mut b, 1);
+    assert!(!agent(&b, 0).archived);
+
+    archive_agent(&mut a, i);
+    run(&mut a, "dy");
+    assert!(a.agents.agents.is_empty(), "{:?}", a.status);
+
+    // B saves first: its copy is in the file again.
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(saved_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+    // A saves: the record is not added back to A, and the file loses it.
+    maestro_editor::agents::persist::save(&mut a, false);
+    assert!(a.agents.agents.is_empty(), "{:?}", a.status);
+    let file = raw_records(&f);
+    assert!(file.agents.is_empty(), "{file:?}");
+    assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+
+    // B saves again: its copy is not archived there, so it stays listed,
+    // says why, and is not written.
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(b.agents.agents.len(), 1);
+    assert!(
+        status_text(&b).contains("forgotten in another Maestro; it is no longer saved"),
+        "{}",
+        status_text(&b)
+    );
+    assert!(
+        agent(&b, 0)
+            .history
+            .iter()
+            .any(|h| h.text.contains("forgotten in another Maestro")),
+        "{:?}",
+        agent(&b, 0).history
+    );
+
+    // Someone makes a new worktree at the same path, and a third session
+    // adopts it: another record, with another creation time. B, which
+    // still lists its forgotten copy at that path, keeps the new record
+    // when it saves.
+    f.git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "maestro/again",
+            wt.to_str().unwrap(),
+        ],
+    );
+    let mut c = f.session_editor(quiet_config());
+    open_and_load(&mut c, 1);
+    assert_eq!(worktree(&c, 0), wt);
+    run(&mut c, "a");
+    poll_until(&mut c, "the provider list", |ed| {
+        matches!(ed.agents.panel.overlay, Some(Overlay::Choice { .. }))
+    });
+    run(&mut c, "\n");
+    quit(&mut c);
+    drop(c);
+    assert_eq!(saved_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(saved_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+    quit(&mut b);
+    quit(&mut a);
+    drop((a, b));
+    let file = raw_records(&f);
+    assert_eq!(saved_paths(&file), std::slice::from_ref(&wt));
+    assert_eq!(file.agents[0].worktree.branch, "maestro/again");
+
+    // A later session loads the adopted record, not the forgotten one, and
+    // the sidebar lists it.
+    let mut d = f.session_editor(quiet_config());
+    open_and_load(&mut d, 1);
+    assert_eq!(
+        agent(&d, 0).worktree.as_ref().unwrap().branch,
+        "maestro/again"
+    );
+}
+
+/// The forget is in the file, so it outlives the session that made it: a
+/// restarted session refuses the record when an older Maestro (which drops
+/// the forgotten list) writes it back, and a new agent never takes the
+/// forgotten one's id.
+fn a_forget_survives_a_restart() {
+    let f = Fixture::new();
+    let mut a = f.session_editor(quiet_config());
+    open_and_load(&mut a, 0);
+    let i = finished_agent(&mut a, "write notes");
+    let wt = worktree(&a, i);
+    let forgotten = agent(&a, i).name.clone();
+    archive_agent(&mut a, i);
+    maestro_editor::agents::persist::save(&mut a, true);
+    let before = std::fs::read_to_string(f.records()).unwrap();
+    run(&mut a, "dy");
+    quit(&mut a);
+    drop(a);
+    assert_eq!(forgotten_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+
+    // A restarted session: nothing loads, and the forget is remembered.
+    let mut d = f.session_editor(quiet_config());
+    open_and_load(&mut d, 0);
+    // An older Maestro writes the record back without the list, twice:
+    // the second time D's text is the same as what it last wrote, and it
+    // still writes, because the file is not that text any more.
+    for _ in 0..2 {
+        std::fs::write(f.records(), &before).unwrap();
+        maestro_editor::agents::persist::save(&mut d, true);
+        assert!(d.agents.agents.is_empty(), "{:?}", d.status);
+        let file = raw_records(&f);
+        assert!(file.agents.is_empty(), "{file:?}");
+        assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+    }
+    // A new agent takes an id above the forgotten one's.
+    let j = finished_agent(&mut d, "write more notes");
+    let name = agent(&d, j).name.clone();
+    assert_ne!(name, forgotten);
+    assert!(agent(&d, j).id.0 > 1, "{name}");
+    quit(&mut d);
+    drop(d);
+
+    let mut e = f.session_editor(quiet_config());
+    open_and_load(&mut e, 1);
+    assert_eq!(agent(&e, 0).name, name);
+    assert_eq!(forgotten_paths(&raw_records(&f)), [wt]);
 }
 
 // ----- files Maestro's own test run creates ----------------------------------
@@ -4016,7 +4284,7 @@ fn files_the_test_run_creates_are_listed_apart_and_left_behind() {
     assert!(!hinted_k(&ed));
     run(&mut ed, "K");
     assert!(
-        status_text(&ed).contains("was not created by Maestro's test run"),
+        status_text(&ed).contains("was not created or changed by Maestro's test run"),
         "{}",
         status_text(&ed)
     );
@@ -4053,7 +4321,7 @@ fn files_the_test_run_creates_are_listed_apart_and_left_behind() {
     run(&mut ed, "y");
     assert!(
         status_text(&ed).contains(
-            "not integrated, nothing changed: the files Maestro's test run created changed after \
+            "not integrated, nothing changed: the files Maestro's test run wrote changed after \
              the dialog was checked"
         ),
         "{}",
@@ -4124,7 +4392,7 @@ fn a_test_run_file_the_agent_changes_is_the_agents_and_records_survive() {
     wait_idle(&mut ed, 0);
     assert!(
         status_text(&ed).contains(
-            "files Maestro's test run created changed after the dialog was checked and count as \
+            "files Maestro's test run wrote changed after the dialog was checked and count as \
              the agent's now: made-by-tests.txt; nothing changed"
         ),
         "{}",
@@ -4156,5 +4424,354 @@ fn a_test_run_file_the_agent_changes_is_the_agents_and_records_survive() {
     assert_eq!(
         f.git(&f.repo, &["show", "HEAD:made-by-tests.txt"]),
         "x, then the agent's\n"
+    );
+}
+
+// ----- tracked files Maestro's own test run changes ----------------------------
+
+/// The blob id of `rel` in the worktree's `HEAD`.
+fn head_blob(f: &Fixture, dir: &Path, rel: &str) -> String {
+    f.git(dir, &["rev-parse", &format!("HEAD:{rel}")])
+        .trim()
+        .to_string()
+}
+
+/// `t` rewrites the tracked README.md (and creates a file): the review
+/// marks the rewrite `T` after the agent's files and does not count it,
+/// mark it or drop it; integrate names it as left behind, commits the
+/// agent's work without it, and leaves the rewrite on disk. The created
+/// file is handled as before.
+fn a_tracked_file_the_test_run_rewrites_is_marked_and_integrated_as_it_was() {
+    let f = Fixture::new();
+    let test = "printf 'rewritten by the tests\\n' > README.md; echo x > made-by-tests.txt";
+    let mut ed = f.editor(test_run_config(test));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    let original = head_blob(&f, &wt, "README.md");
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt", "README.md"]);
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+    let a = agent(&ed, 0);
+    assert_eq!(
+        review_paths(&ed, 0),
+        ["notes.txt", "made-by-tests.txt", "README.md"],
+        "the agent's files first, then the test run's"
+    );
+    assert_eq!(a.review.totals(), (1, 1, 0), "only notes.txt is counted");
+    let readme = a
+        .test_outputs
+        .iter()
+        .find(|o| o.path == Path::new("README.md"))
+        .expect("a record of README.md");
+    assert_eq!(readme.before.as_deref(), Some(original.as_str()));
+    assert!(
+        a.test_outputs
+            .iter()
+            .any(|o| o.path == Path::new("made-by-tests.txt") && o.before.is_none())
+    );
+    assert!(
+        a.history.iter().any(|h| h
+            .text
+            .contains("the test run changed 1 tracked file(s): README.md")),
+        "{:?}",
+        a.history
+    );
+
+    // The review labels the change; it cannot be marked or dropped.
+    run(&mut ed, "\n<tab><tab>");
+    let rows = review_rows(&ed);
+    match &rows[0] {
+        Row::Note(n) => assert!(
+            n.starts_with(&format!(
+                "T changed by Maestro's test run (`sh -c {test}`), not by the agent"
+            )),
+            "{n}"
+        ),
+        other => panic!("expected the test run note, got {other:?}"),
+    }
+    assert!(
+        matches!(&rows[1], Row::Note(n) if n.contains("integrate commits the file as it was before the run")),
+        "{rows:?}"
+    );
+    let hinted_now = hinted(&ed);
+    assert!(
+        hinted_now.contains(&"K") && !hinted_now.contains(&"D"),
+        "{hinted_now:?}"
+    );
+    run(&mut ed, "]");
+    run(&mut ed, " ");
+    assert!(agent(&ed, 0).marks.is_empty());
+    assert!(
+        status_text(&ed).contains("this change was made by Maestro's test run, not by the agent"),
+        "{}",
+        status_text(&ed)
+    );
+    run(&mut ed, "D");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(
+        status_text(&ed).contains("D does not drop the test run's change to a tracked file"),
+        "{}",
+        status_text(&ed)
+    );
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    for want in [
+        "LEFT BEHIND: 1 file(s) created by Maestro's test run".to_string(),
+        format!(
+            "LEFT BEHIND: the changes Maestro's test run (`sh -c {test}`) made to 1 tracked \
+             file(s): README.md. Step 1 commits each as it was before the run"
+        ),
+        "When checked (1 in all; the review lists every one): notes.txt.".to_string(),
+    ] {
+        assert!(text.contains(&want), "{want:?} not in {text}");
+    }
+    assert!(
+        !text.contains("changed after the last verification"),
+        "{text}"
+    );
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(head_files(&f), ["README.md", "notes.txt", "src/lib.rs"]);
+    assert_eq!(f.git(&f.repo, &["show", "HEAD:README.md"]), "# demo\n");
+    assert_eq!(read(&f.repo.join("README.md")), "# demo\n");
+    // The worktree keeps the run's rewrite and file, uncommitted.
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, " M README.md\n?? made-by-tests.txt\n");
+}
+
+/// The agent changed README.md and committed nothing; the run then
+/// rewrote it. The review shows the agent's part (counted) and the run's
+/// part (T); integrate commits the agent's version from before the run.
+fn a_file_the_agent_edited_before_the_run_integrates_the_agents_version() {
+    let f = Fixture::new();
+    let mut c = config(&[(
+        "writer",
+        sh_provider("printf 'the agent was here\\n' >> README.md"),
+    )]);
+    c.agents.test_command = vec![
+        "sh".into(),
+        "-c".into(),
+        "printf 'rewritten by the tests\\n' > README.md".into(),
+    ];
+    let mut ed = f.editor(c);
+    run(&mut ed, " a");
+    start_task(&mut ed, "edit the readme", 0);
+    wait_files(&mut ed, 0, &["README.md"]);
+    let wt = worktree(&ed, 0);
+    let agents = f.git(&wt, &["hash-object", "README.md"]).trim().to_string();
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    let a = agent(&ed, 0);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "README.md"]);
+    assert_eq!(a.test_outputs[0].before.as_deref(), Some(agents.as_str()));
+    // The agent's part: one line added to the original.
+    assert_eq!(a.review.totals(), (1, 1, 0));
+    let added: Vec<&str> = a.review.files[0]
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind == maestro_git::DiffLineKind::Added)
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(added, ["the agent was here"]);
+    // The run's part: from the agent's version to the rewrite.
+    let run_part: Vec<&str> = a.review.files[1]
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind == maestro_git::DiffLineKind::Added)
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(run_part, ["rewritten by the tests"]);
+    run(&mut ed, "\n");
+    let rows = review_rows(&ed);
+    assert!(
+        rows.iter().any(
+            |r| matches!(r, Row::Note(n) if n.starts_with("changed by Maestro's test run too"))
+        ),
+        "{rows:?}"
+    );
+    run(&mut ed, "<esc>");
+
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains("When checked (1 in all; the review lists every one): README.md."),
+        "{text}"
+    );
+    assert!(
+        text.contains("made to 1 tracked file(s): README.md"),
+        "{text}"
+    );
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "# demo\nthe agent was here\n"
+    );
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, " M README.md\n");
+}
+
+/// A run's change to a tracked file survives a restart and a second run
+/// that writes the same; an edit after the run makes the whole file the
+/// agent's; the next run records its change against that edit; `K` keeps
+/// the run's version, and integrate commits it.
+fn a_test_run_change_carries_over_until_edited_and_k_keeps_it() {
+    let f = Fixture::new();
+    let c = test_run_config("printf 'rewritten by the tests\\n' > README.md");
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    let outputs = agent(&ed, 0).test_outputs.clone();
+    assert!(outputs[0].before.is_some());
+    quit(&mut ed);
+    drop(ed);
+    let saved = read(&f.records());
+    assert!(saved.contains("\"before\""), "{saved}");
+
+    // Reloaded: the record is back, and a second run that writes the same
+    // keeps it as it was.
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+    run(&mut ed, "\n");
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    run(&mut ed, "<esc>");
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+
+    // Edited after the run: the whole file is the agent's, as it is now.
+    std::fs::write(wt.join("README.md"), "edited after the run\n").unwrap();
+    run(&mut ed, "\nr");
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "notes.txt"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (2, 2, 1));
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "n");
+
+    // The next run's change is recorded against that edit.
+    let edited = f.git(&wt, &["hash-object", "README.md"]).trim().to_string();
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    assert_eq!(
+        agent(&ed, 0).test_outputs[0].before.as_deref(),
+        Some(edited.as_str())
+    );
+    // K: the run's version is the agent's.
+    run(&mut ed, "\n<tab><tab>");
+    run(&mut ed, "K");
+    assert!(
+        status_text(&ed).contains(
+            "README.md counts as writer-1's work now (K); integrate commits it with the test \
+             run's change"
+        ),
+        "{}",
+        status_text(&ed)
+    );
+    assert!(agent(&ed, 0).test_outputs.is_empty());
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "notes.txt"]);
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "rewritten by the tests\n"
+    );
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, "");
+}
+
+/// The agent changed README.md; the run writes back the committed version,
+/// which is also what the index holds. That is still the run's change: the
+/// review shows the agent's edit and the run's revert apart, and integrate
+/// commits the agent's edit.
+fn a_run_that_writes_back_the_index_version_keeps_the_agents_edit() {
+    let f = Fixture::new();
+    let mut c = config(&[(
+        "writer",
+        sh_provider("printf 'the agent was here\\n' >> README.md"),
+    )]);
+    c.agents.test_command = vec![
+        "sh".into(),
+        "-c".into(),
+        "printf '# demo\\n' > README.md".into(),
+    ];
+    let mut ed = f.editor(c);
+    run(&mut ed, " a");
+    start_task(&mut ed, "edit the readme", 0);
+    wait_files(&mut ed, 0, &["README.md"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    assert_eq!(read(&wt.join("README.md")), "# demo\n");
+    assert_eq!(review_paths(&ed, 0), ["README.md", "README.md"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (1, 1, 0));
+    open_integrate(&mut ed);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "# demo\nthe agent was here\n"
+    );
+    assert_eq!(read(&wt.join("README.md")), "# demo\n");
+}
+
+/// Staging the run's version of a tracked file makes it the agent's, as
+/// staging a created file does: the review counts it and integrate
+/// commits it.
+fn staging_a_test_run_change_makes_it_the_agents() {
+    let f = Fixture::new();
+    let mut ed = f.editor(test_run_config(
+        "printf 'rewritten by the tests\\n' > README.md",
+    ));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    f.git(&wt, &["add", "README.md"]);
+    run(&mut ed, "\nr");
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "notes.txt"]);
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "rewritten by the tests\n"
     );
 }

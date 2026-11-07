@@ -30,6 +30,13 @@
 //! when the text changed. It runs from [`super::tick`] (about once a
 //! second) and when the editor quits. Before writing, it compares the file
 //! with what this session last read or wrote ([`take_outside_changes`]).
+//!
+//! A record forgotten with `d` stays in the file as a [`Forgotten`] entry
+//! (the latest [`MAX_FORGOTTEN`]). Every session unions the entries it
+//! reads with its own and writes them all, and never loads or writes a
+//! record one names, so a session holding a stale copy cannot bring it
+//! back. Maestro 0.11.0 and earlier ignore the entries and drop them when
+//! they save.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -57,6 +64,10 @@ pub const MAX_ERRORS: usize = 100;
 const MAX_ID: u64 = 1 << 40;
 /// A records file larger than this is refused rather than read.
 const MAX_FILE_BYTES: u64 = 64 << 20;
+/// Forgotten records remembered per file (the latest). Another session can
+/// only write a forgotten record back while its entry is kept, so this is
+/// how many later forgets an open session's stale copy survives.
+pub const MAX_FORGOTTEN: usize = 1000;
 
 /// `<state>/agents/<fnv1a of the canonical main worktree path>.json`.
 pub fn records_path(state_dir: &Path, main_root: &Path) -> PathBuf {
@@ -71,6 +82,45 @@ pub struct RecordsFile {
     /// The canonical path of the main worktree, to catch hash collisions.
     pub repository: String,
     pub agents: Vec<AgentRecord>,
+    /// Records forgotten with `d`. A record that matches one is never
+    /// loaded or written again, by any session of this version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forgotten: Vec<Forgotten>,
+}
+
+/// A record forgotten with `d`. It names the record by its worktree and
+/// creation time, which every session holds the same; ids are not used,
+/// because a session renumbers a record whose id it already uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forgotten {
+    /// The agent's id in the session that forgot it. New agents never take
+    /// an id at or below it.
+    pub id: u64,
+    /// The worktree's path, normalized.
+    pub worktree: String,
+    /// The record's `created`, milliseconds since the Unix epoch.
+    pub created: u64,
+    /// When it was forgotten, milliseconds since the Unix epoch.
+    pub at: u64,
+}
+
+/// What a [`Forgotten`] entry and a record are matched on: the normalized
+/// worktree path and the creation time.
+type RecordKey = (PathBuf, u64);
+
+fn forgotten_keys<'a>(list: impl IntoIterator<Item = &'a Forgotten>) -> HashSet<RecordKey> {
+    list.into_iter()
+        .map(|f| (PathBuf::from(&f.worktree), f.created))
+        .collect()
+}
+
+fn record_key(r: &AgentRecord) -> RecordKey {
+    (normalize_path(Path::new(&r.worktree.path)), r.created)
+}
+
+fn agent_key(a: &Agent) -> Option<RecordKey> {
+    let w = a.worktree.as_ref()?;
+    Some((normalize_path(&w.path), millis(a.created)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +185,15 @@ pub struct SavedTestOutput {
     pub command: String,
     #[serde(default)]
     pub agent_was_running: bool,
+    /// For a tracked file the run changed, the blob id of its contents
+    /// before the run. Absent for a created file and in older records;
+    /// older versions ignore it (and so count the file as the agent's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// For a tracked file the run changed, the blob id its index entry held
+    /// then. Absent where `before` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,7 +356,7 @@ fn parse(bytes: &[u8], path: &Path, main_root: &Path) -> ReadOutcome {
         }
         None => return ReadOutcome::Unusable(format!("{shown} has no version")),
     }
-    let file: RecordsFile = match serde_json::from_value(value) {
+    let mut file: RecordsFile = match serde_json::from_value(value) {
         Ok(f) => f,
         Err(e) => return ReadOutcome::Unusable(format!("{shown} is not a records file: {e}")),
     };
@@ -309,6 +368,19 @@ fn parse(bytes: &[u8], path: &Path, main_root: &Path) -> ReadOutcome {
             crate::navigation::home_path(&want)
         ));
     }
+    for f in &file.forgotten {
+        // Its id raises the counter new agents take theirs from.
+        if f.id == 0 || f.id > MAX_ID || !Path::new(&f.worktree).is_absolute() {
+            return ReadOutcome::Unusable(format!(
+                "{shown}: forgotten record {} at {:?} has an id out of range or a relative path",
+                f.id, f.worktree
+            ));
+        }
+    }
+    // A record written back by a Maestro that ignores the forgotten list
+    // (0.11.0 and earlier) stays forgotten for every reader of this file.
+    let keys = forgotten_keys(&file.forgotten);
+    file.agents.retain(|r| !keys.contains(&record_key(r)));
     for r in &file.agents {
         if let Err(e) = check_record(r, &want) {
             return ReadOutcome::Unusable(format!("{shown}: agent {}: {e}", r.id));
@@ -387,6 +459,16 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
             return Err(format!(
                 "test run file blob {:?} is not an object id",
                 o.blob
+            ));
+        }
+        if let Some(b) = o
+            .before
+            .iter()
+            .chain(o.index.iter())
+            .find(|b| !is_object_id(b))
+        {
+            return Err(format!(
+                "test run file's earlier blob {b:?} is not an object id"
             ));
         }
     }
@@ -556,6 +638,8 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
                     blob: o.blob.clone(),
                     command: o.command.clone(),
                     agent_was_running: o.agent_was_running,
+                    before: o.before.clone(),
+                    index: o.index.clone(),
                 })
             })
             .collect(),
@@ -618,6 +702,8 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
             blob: o.blob.clone(),
             command: o.command.clone(),
             agent_was_running: o.agent_was_running,
+            before: o.before.clone(),
+            index: o.index.clone(),
         })
         .collect();
     a.parts = r
@@ -747,10 +833,11 @@ pub struct PersistState {
     /// [`fingerprint`] at the last save, so an unchanged state is not
     /// even serialized.
     last_fingerprint: Option<u64>,
-    /// Worktrees (normalized paths) whose archived agent's record the user
-    /// forgot (`d`) in this session. Records for them in a file another
-    /// Maestro wrote are not added back, and the sidebar does not list them.
-    forgotten: HashSet<PathBuf>,
+    /// Records forgotten (`d`), per repository: in this session, or read
+    /// from the file another session wrote. Matching records are never
+    /// loaded or saved, the sidebar does not list them, and every save
+    /// writes the list, so no session of this version brings them back.
+    forgotten: HashMap<PathBuf, Vec<Forgotten>>,
     /// Repositories whose file must be written even when no agent of
     /// theirs is left, because a record was forgotten. An entry stays
     /// until a write synced to disk (on quit) holds the change.
@@ -770,6 +857,13 @@ fn fingerprint(ed: &Editor) -> u64 {
         .values()
         .filter(|r| matches!(r, RepoState::Ready { .. }))
         .count()
+        .hash(&mut h);
+    ed.agents
+        .persist
+        .forgotten
+        .values()
+        .map(Vec::len)
+        .sum::<usize>()
         .hash(&mut h);
     for a in &ed.agents.agents {
         (a.id.0, &a.name, &a.task, a.group, &a.provider.name).hash(&mut h);
@@ -794,7 +888,7 @@ fn fingerprint(ed: &Editor) -> u64 {
         a.composition.as_ref().map(|c| &c.commit).hash(&mut h);
         a.parts.len().hash(&mut h);
         for o in &a.test_outputs {
-            (&o.path, &o.blob).hash(&mut h);
+            (&o.path, &o.blob, &o.before, &o.index).hash(&mut h);
         }
     }
     h.finish()
@@ -809,20 +903,141 @@ impl PersistState {
         }
     }
 
-    /// The record of the agent in `worktree` was forgotten in this session.
-    pub fn is_forgotten(&self, worktree: &Path) -> bool {
-        !self.forgotten.is_empty() && self.forgotten.contains(&normalize_path(worktree))
+    /// The record of the agent in `worktree` created at `created`
+    /// (milliseconds since the Unix epoch) was forgotten.
+    pub fn is_forgotten(&self, worktree: &Path, created: u64) -> bool {
+        if self.forgotten.is_empty() {
+            return false;
+        }
+        let path = normalize_path(worktree);
+        self.forgotten
+            .values()
+            .flatten()
+            .any(|f| f.created == created && Path::new(&f.worktree) == path)
+    }
+
+    /// The keys of every record forgotten, in any repository.
+    fn forgotten_keys(&self) -> HashSet<RecordKey> {
+        forgotten_keys(self.forgotten.values().flatten())
     }
 }
 
-/// Notes that the record of the agent in `w` was forgotten: the next save
-/// writes its repository's file without it, even when no agent of that
-/// repository is left, and records for that worktree that another Maestro
-/// saved are not added back in this session.
-pub(crate) fn forget(ed: &mut Editor, w: &WorktreeInfo) {
+/// `ours` with the entries of `theirs` it lacks, one entry per record
+/// (the earliest forget, with the highest id any session gave it), and at
+/// most [`MAX_FORGOTTEN`] (the latest). Sorted, so two sessions that know
+/// the same forgets write the same text.
+fn union_forgotten(ours: &[Forgotten], theirs: &[Forgotten]) -> Vec<Forgotten> {
+    let mut by_key: HashMap<RecordKey, Forgotten> = HashMap::new();
+    for f in ours.iter().chain(theirs) {
+        let key = (PathBuf::from(&f.worktree), f.created);
+        match by_key.get_mut(&key) {
+            Some(had) => {
+                had.id = had.id.max(f.id);
+                had.at = had.at.min(f.at);
+            }
+            None => {
+                by_key.insert(key, f.clone());
+            }
+        }
+    }
+    let mut all: Vec<Forgotten> = by_key.into_values().collect();
+    all.sort_by(|a, b| {
+        (a.at, &a.worktree, a.created, a.id).cmp(&(b.at, &b.worktree, b.created, b.id))
+    });
+    let extra = all.len().saturating_sub(MAX_FORGOTTEN);
+    all.drain(..extra);
+    all
+}
+
+/// Adds the forgotten entries read from `root`'s file to this session's.
+/// New agents take ids above theirs. An agent of this session that one
+/// names leaves the panel when it is archived and idle, as if forgotten
+/// here; otherwise it stays until the editor quits but is no longer saved.
+fn take_forgotten(ed: &mut Editor, root: &Path, theirs: &[Forgotten]) {
+    if theirs.is_empty() {
+        return;
+    }
+    let had = ed.agents.persist.forgotten_keys();
+    let ours = ed
+        .agents
+        .persist
+        .forgotten
+        .get(root)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let all = union_forgotten(ours, theirs);
+    let state = &mut ed.agents;
+    state.next_id = state
+        .next_id
+        .max(theirs.iter().map(|f| f.id).max().unwrap_or(0));
+    let new: HashSet<RecordKey> = forgotten_keys(&all)
+        .into_iter()
+        .filter(|k| !had.contains(k))
+        .collect();
+    state.persist.forgotten.insert(root.to_path_buf(), all);
+    if new.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while i < ed.agents.agents.len() {
+        let a = &ed.agents.agents[i];
+        if a.origin == Origin::Found || !agent_key(a).is_some_and(|k| new.contains(&k)) {
+            i += 1;
+            continue;
+        }
+        if super::actions::forget_blocker(a).is_none() {
+            let a = super::actions::remove_from_panel(ed, i);
+            ed.add_status(
+                Severity::Info,
+                format!("{}'s record was forgotten in another Maestro", a.name),
+            );
+            continue;
+        }
+        let a = &mut ed.agents.agents[i];
+        a.log(
+            "its record was forgotten in another Maestro: it stays in this panel until the \
+             editor quits, and is no longer saved",
+        );
+        let name = a.name.clone();
+        ed.add_status(
+            Severity::Warning,
+            format!(
+                "{name}'s record was forgotten in another Maestro; it is no longer saved and \
+                 leaves the panel when the editor quits"
+            ),
+        );
+        i += 1;
+    }
+}
+
+/// Notes that the record of `a` was forgotten: the next save writes its
+/// repository's file without it, even when no agent of that repository is
+/// left, and with an entry that keeps every session of this version from
+/// loading or saving that record again.
+pub(crate) fn forget(ed: &mut Editor, a: &Agent) {
+    let Some(w) = &a.worktree else {
+        return;
+    };
+    let root = normalize_path(&w.main_root);
     let p = &mut ed.agents.persist;
-    p.forgotten.insert(normalize_path(&w.path));
-    p.rewrite.insert(normalize_path(&w.main_root));
+    // A path that is not UTF-8 was never saved, so the file has nothing
+    // to forget.
+    if let Some(path) = normalize_path(&w.path).to_str() {
+        let entry = Forgotten {
+            id: a.id.0,
+            worktree: path.to_string(),
+            created: millis(a.created),
+            at: millis(SystemTime::now()),
+        };
+        let ours = p
+            .forgotten
+            .get(&root)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let all = union_forgotten(ours, &[entry]);
+        p.forgotten.insert(root.clone(), all);
+    }
+    p.rewrite.insert(root);
     p.last_fingerprint = None;
 }
 
@@ -995,6 +1210,7 @@ fn take_file(ed: &mut Editor, root: &Path, file: ReadOutcome, seen: Seen) -> usi
             0
         }
         ReadOutcome::Records(f) => {
+            take_forgotten(ed, root, &f.forgotten);
             let n = merge(ed, &f.agents);
             ed.agents.persist.repos.insert(
                 root.to_path_buf(),
@@ -1013,10 +1229,10 @@ fn take_file(ed: &mut Editor, root: &Path, file: ReadOutcome, seen: Seen) -> usi
 /// this session already has gets a new id, and its history says so.
 fn merge(ed: &mut Editor, records: &[AgentRecord]) -> usize {
     let providers = super::providers(ed);
-    let forgotten = &ed.agents.persist;
+    let forgotten = ed.agents.persist.forgotten_keys();
     let mut records: Vec<&AgentRecord> = records
         .iter()
-        .filter(|r| !forgotten.is_forgotten(Path::new(&r.worktree.path)))
+        .filter(|r| !forgotten.contains(&record_key(r)))
         .collect();
     records.sort_by_key(|r| r.id);
     let taken: HashSet<u64> = ed.agents.agents.iter().map(|a| a.id.0).collect();
@@ -1223,22 +1439,27 @@ fn take_outside_changes(ed: &mut Editor, state: &Path, errors: &mut Vec<String>)
                 continue;
             }
             ReadOutcome::Records(f) => {
+                take_forgotten(ed, &root, &f.forgotten);
+                // A copy still listed here but forgotten is not saved, so
+                // it must not stand in for another record at its path.
+                let forgotten = ed.agents.persist.forgotten_keys();
                 let known: HashSet<PathBuf> = ed
                     .agents
                     .agents
                     .iter()
                     .filter(|a| a.origin != Origin::Found)
+                    .filter(|a| !agent_key(a).is_some_and(|k| forgotten.contains(&k)))
                     .filter_map(|a| a.worktree.as_ref().map(|w| normalize_path(&w.path)))
                     .collect();
-                // A record the user forgot here stays forgotten.
+                // A record forgotten here or by the writer stays forgotten
+                // (`merge` leaves it out).
                 let new: Vec<AgentRecord> = f
                     .agents
                     .into_iter()
                     .filter(|r| !known.contains(&normalize_path(Path::new(&r.worktree.path))))
-                    .filter(|r| !ed.agents.persist.is_forgotten(Path::new(&r.worktree.path)))
                     .collect();
-                if !new.is_empty() {
-                    let n = merge(ed, &new);
+                let n = merge(ed, &new);
+                if n > 0 {
                     ed.add_status(
                         Severity::Info,
                         format!(
@@ -1248,8 +1469,11 @@ fn take_outside_changes(ed: &mut Editor, state: &Path, errors: &mut Vec<String>)
                 }
             }
         }
-        if let Some(RepoState::Ready { seen, .. }) = ed.agents.persist.repos.get_mut(&root) {
+        // The file is not what this session wrote, so the next save writes
+        // even when its text is the same as the last one.
+        if let Some(RepoState::Ready { seen, written }) = ed.agents.persist.repos.get_mut(&root) {
             *seen = now_seen;
+            *written = None;
         }
     }
 }
@@ -1260,7 +1484,8 @@ pub fn save(ed: &mut Editor, durable: bool) {
     let Some(state) = enabled(ed) else {
         return;
     };
-    if ed.agents.agents.is_empty() && ed.agents.persist.rewrite.is_empty() {
+    let p = &ed.agents.persist;
+    if ed.agents.agents.is_empty() && p.rewrite.is_empty() && p.forgotten.is_empty() {
         return;
     }
     let print = fingerprint(ed);
@@ -1271,10 +1496,15 @@ pub fn save(ed: &mut Editor, durable: bool) {
     take_outside_changes(ed, &state, &mut errors);
     let mut groups: BTreeMap<PathBuf, Vec<AgentRecord>> = BTreeMap::new();
     let mut unsaved = Vec::new();
+    let forgotten = ed.agents.persist.forgotten_keys();
     for a in &ed.agents.agents {
         let Some(w) = &a.worktree else {
             continue;
         };
+        // Forgotten in another Maestro while it is still listed here.
+        if agent_key(a).is_some_and(|k| forgotten.contains(&k)) {
+            continue;
+        }
         match to_record(a) {
             Some(r) => {
                 if r.comments.len() < a.comments.len() {
@@ -1300,8 +1530,12 @@ pub fn save(ed: &mut Editor, durable: bool) {
             unsaved.join(", ")
         ));
     }
-    // A repository whose last agent was forgotten is written with none.
-    for root in &ed.agents.persist.rewrite {
+    // A repository whose last agent was forgotten is written with none,
+    // and one with forgotten records keeps the list in its file even when
+    // no agent of this session is in it: a Maestro that ignores the list
+    // may have dropped it.
+    let p = &ed.agents.persist;
+    for root in p.rewrite.iter().chain(p.forgotten.keys()) {
         groups.entry(root.clone()).or_default();
     }
     for (root, mut records) in groups {
@@ -1319,6 +1553,13 @@ pub fn save(ed: &mut Editor, durable: bool) {
             version: VERSION,
             repository: repository.to_string(),
             agents: records,
+            forgotten: ed
+                .agents
+                .persist
+                .forgotten
+                .get(&root)
+                .cloned()
+                .unwrap_or_default(),
         };
         let text = match serde_json::to_string_pretty(&file) {
             Ok(t) => t,
@@ -1423,6 +1664,7 @@ mod tests {
             version: VERSION,
             repository: "/r".into(),
             agents: vec![record(1), record(2)],
+            forgotten: vec![],
         };
         let p = write(&dir, "ok.json", &serde_json::to_string(&file).unwrap());
         assert_eq!(
@@ -1487,11 +1729,22 @@ mod tests {
         );
         // A test run's file is a path inside the worktree with a blob id;
         // integrate leaves exactly these paths out of its commit.
-        for (path, blob, why) in [
-            ("../escape", "abc123", "not a path inside the worktree"),
-            ("/etc/passwd", "abc123", "not a path inside the worktree"),
-            ("", "abc123", "not a path inside the worktree"),
-            ("Cargo.lock", "--not-hex", "not an object id"),
+        for (path, blob, before, why) in [
+            (
+                "../escape",
+                "abc123",
+                None,
+                "not a path inside the worktree",
+            ),
+            (
+                "/etc/passwd",
+                "abc123",
+                None,
+                "not a path inside the worktree",
+            ),
+            ("", "abc123", None, "not a path inside the worktree"),
+            ("Cargo.lock", "--not-hex", None, "not an object id"),
+            ("Cargo.lock", "abc123", Some("HEAD"), "not an object id"),
         ] {
             let mut f = file.clone();
             f.agents[0].test_outputs = vec![SavedTestOutput {
@@ -1499,6 +1752,8 @@ mod tests {
                 blob: blob.into(),
                 command: "cargo test".into(),
                 agent_was_running: false,
+                before: before.map(str::to_string),
+                index: None,
             }];
             let bad = write(&dir, "outputs.json", &serde_json::to_string(&f).unwrap());
             assert!(
@@ -1519,6 +1774,91 @@ mod tests {
             matches!(read(&dir.join("dir.json"), Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("not a regular file"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn gone(id: u64, at: u64) -> Forgotten {
+        Forgotten {
+            id,
+            worktree: format!("/r-worktrees/do-it-{id}"),
+            created: 1_000,
+            at,
+        }
+    }
+
+    #[test]
+    fn a_forgotten_record_is_not_read_and_bad_entries_are_refused() {
+        let dir = std::env::temp_dir().join(format!("maestro-forgotten-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Record 2 is named by an entry; record 1 has the path of another
+        // entry but a different creation time: another agent, kept.
+        let mut other = gone(1, 5);
+        other.created = 999;
+        let file = RecordsFile {
+            version: VERSION,
+            repository: "/r".into(),
+            agents: vec![record(1), record(2)],
+            forgotten: vec![other.clone(), gone(2, 6)],
+        };
+        let p = write(&dir, "f.json", &serde_json::to_string(&file).unwrap());
+        let ReadOutcome::Records(read_back) = read(&p, Path::new("/r")) else {
+            panic!("{:?}", read(&p, Path::new("/r")));
+        };
+        assert_eq!(read_back.agents, vec![record(1)]);
+        assert_eq!(read_back.forgotten, vec![other, gone(2, 6)]);
+        // A file without the list (written by 0.11.0) reads as before.
+        let old = r#"{"version": 1, "repository": "/r", "agents": []}"#;
+        let p = write(&dir, "old.json", old);
+        assert!(
+            matches!(read(&p, Path::new("/r")), ReadOutcome::Records(f) if f.forgotten.is_empty())
+        );
+        // An id that would overflow the counter, or a relative path.
+        for bad in [
+            Forgotten {
+                id: u64::MAX,
+                ..gone(1, 1)
+            },
+            Forgotten {
+                id: 0,
+                ..gone(1, 1)
+            },
+            Forgotten {
+                worktree: "relative".into(),
+                ..gone(1, 1)
+            },
+        ] {
+            let f = RecordsFile {
+                forgotten: vec![bad],
+                ..file.clone()
+            };
+            let p = write(&dir, "bad.json", &serde_json::to_string(&f).unwrap());
+            assert!(
+                matches!(read(&p, Path::new("/r")), ReadOutcome::Unusable(ref m) if m.contains("forgotten record")),
+                "{:?}",
+                read(&p, Path::new("/r"))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgotten_entries_merge_once_each_sorted_and_bounded() {
+        // The same record forgotten in two sessions, under two ids, is kept
+        // once, with the earlier forget and the higher id, so neither id is
+        // handed out again; either order gives the same list.
+        let mut late = gone(1, 50);
+        late.id = 7;
+        let ab = union_forgotten(&[gone(2, 20), late.clone()], &[gone(1, 10)]);
+        let ba = union_forgotten(&[gone(1, 10)], &[late, gone(2, 20)]);
+        let mut both = gone(1, 10);
+        both.id = 7;
+        assert_eq!(ab, vec![both, gone(2, 20)]);
+        assert_eq!(ab, ba);
+        // Past the bound the oldest forgets go.
+        let many: Vec<Forgotten> = (1..=MAX_FORGOTTEN as u64 + 5).map(|i| gone(i, i)).collect();
+        let kept = union_forgotten(&many, &[]);
+        assert_eq!(kept.len(), MAX_FORGOTTEN);
+        assert_eq!(kept[0], gone(6, 6));
+        assert_eq!(kept.last(), many.last());
     }
 
     #[test]
@@ -1593,5 +1933,45 @@ mod tests {
         assert_eq!(t.tail.last().unwrap(), "line 499");
         assert_eq!(t.dropped, 7 + 500 - MAX_TEST_TAIL);
         assert_eq!((t.finished, t.code, t.duration_ms), (true, Some(0), 1500));
+    }
+
+    /// A test run file's `before` is left out when absent, an older record
+    /// without it loads as a created file, and a version that does not know
+    /// the field reads a record that has it.
+    #[test]
+    fn test_output_before_is_optional_both_ways() {
+        let created = SavedTestOutput {
+            path: "Cargo.lock".into(),
+            blob: "abc123".into(),
+            command: "cargo test".into(),
+            agent_was_running: false,
+            before: None,
+            index: None,
+        };
+        let json = serde_json::to_string(&created).unwrap();
+        assert!(!json.contains("before"), "{json}");
+        let old = r#"{"path":"Cargo.lock","blob":"abc123","command":"cargo test"}"#;
+        assert_eq!(
+            serde_json::from_str::<SavedTestOutput>(old).unwrap(),
+            created
+        );
+        let changed = SavedTestOutput {
+            before: Some("def456".into()),
+            ..created
+        };
+        let json = serde_json::to_string(&changed).unwrap();
+        assert!(json.contains(r#""before":"def456""#), "{json}");
+        // The struct as versions before this field had it.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Older {
+            path: String,
+            blob: String,
+            command: String,
+            #[serde(default)]
+            agent_was_running: bool,
+        }
+        let older: Older = serde_json::from_str(&json).unwrap();
+        assert_eq!(older.blob, "abc123");
     }
 }

@@ -259,16 +259,20 @@ fn row_changed_lines(row: &Row) -> Vec<(usize, usize)> {
     }
 }
 
-/// Why hunk `index` of `f` cannot be marked now, if it cannot.
-fn refusal(a: &Agent, f: &DiffFile, index: usize) -> Option<String> {
+/// Why hunk `index` of `f` (entry `file` of the review) cannot be marked
+/// now, if it cannot.
+fn refusal(a: &Agent, file: usize, f: &DiffFile, index: usize) -> Option<String> {
     if let Some(why) = unmarkable(f) {
         return Some(why.to_string());
     }
-    if a.review.is_test_made(f) {
+    if a.review.is_test_made(file) {
+        let what = if f.change == FileChange::Added {
+            format!("this file was {}", super::review::TEST_MADE)
+        } else {
+            "this change was made by Maestro's test run".to_string()
+        };
         return Some(format!(
-            "this file was {}, not by the agent, and is never integrated; K counts it as the \
-             agent's",
-            super::review::TEST_MADE
+            "{what}, not by the agent, and is never integrated; K counts it as the agent's"
         ));
     }
     match hunk_state(a, f, index) {
@@ -308,7 +312,7 @@ pub fn toggle_hunk(ed: &mut Editor, id: AgentId, file: usize, rows: &[Row], curs
         }
         return;
     }
-    if let Some(why) = refusal(a, &f, hunk) {
+    if let Some(why) = refusal(a, file, &f, hunk) {
         ed.error(why);
         return;
     }
@@ -361,7 +365,7 @@ pub fn toggle_range(
     let Some(h) = f.hunks.get(hunk) else {
         return;
     };
-    if let Some(why) = refusal(a, &f, hunk) {
+    if let Some(why) = refusal(a, file, &f, hunk) {
         ed.error(why);
         return;
     }
