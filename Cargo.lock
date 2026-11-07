@@ -704,6 +704,7 @@ name = "maestro-editor"
 version = "0.11.0"
 dependencies = [
  "ignore",
+ "jiff",
  "maestro-agent",
  "maestro-config",
  "maestro-core",

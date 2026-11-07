@@ -49,6 +49,15 @@ tree-sitter-c = "0.24"
 portable-pty = "0.9"
 vt100 = "0.18"
 agent-client-protocol-schema = { version = "1.14", default-features = false }
+# Local time for :messages: reads TZ, /etc/localtime and the zoneinfo files
+# itself, with no libc calls. Windows gets a bundled zone database, since it
+# has no zoneinfo files.
+jiff = { version = "0.2.38", default-features = false, features = [
+  "std",
+  "tz-system",
+  "tzdb-zoneinfo",
+  "tzdb-bundle-platform",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
