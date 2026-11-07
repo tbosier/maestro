@@ -140,6 +140,10 @@ pub struct SavedTestOutput {
     /// older versions ignore it (and so count the file as the agent's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
+    /// For a tracked file the run changed, the blob id its index entry held
+    /// then. Absent where `before` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,8 +398,11 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
                 o.blob
             ));
         }
-        if let Some(b) = &o.before
-            && !is_object_id(b)
+        if let Some(b) = o
+            .before
+            .iter()
+            .chain(o.index.iter())
+            .find(|b| !is_object_id(b))
         {
             return Err(format!(
                 "test run file's earlier blob {b:?} is not an object id"
@@ -569,6 +576,7 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
                     command: o.command.clone(),
                     agent_was_running: o.agent_was_running,
                     before: o.before.clone(),
+                    index: o.index.clone(),
                 })
             })
             .collect(),
@@ -632,6 +640,7 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
             command: o.command.clone(),
             agent_was_running: o.agent_was_running,
             before: o.before.clone(),
+            index: o.index.clone(),
         })
         .collect();
     a.parts = r
@@ -808,7 +817,7 @@ fn fingerprint(ed: &Editor) -> u64 {
         a.composition.as_ref().map(|c| &c.commit).hash(&mut h);
         a.parts.len().hash(&mut h);
         for o in &a.test_outputs {
-            (&o.path, &o.blob, &o.before).hash(&mut h);
+            (&o.path, &o.blob, &o.before, &o.index).hash(&mut h);
         }
     }
     h.finish()
@@ -1525,6 +1534,7 @@ mod tests {
                 command: "cargo test".into(),
                 agent_was_running: false,
                 before: before.map(str::to_string),
+                index: None,
             }];
             let bad = write(&dir, "outputs.json", &serde_json::to_string(&f).unwrap());
             assert!(
@@ -1632,6 +1642,7 @@ mod tests {
             command: "cargo test".into(),
             agent_was_running: false,
             before: None,
+            index: None,
         };
         let json = serde_json::to_string(&created).unwrap();
         assert!(!json.contains("before"), "{json}");

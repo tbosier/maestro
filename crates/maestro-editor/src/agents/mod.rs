@@ -384,6 +384,12 @@ pub struct TestOutput {
     /// had not changed it), which is what counts as the agent's and is
     /// committed. `None` for a file the run created.
     pub before: Option<String>,
+    /// For a tracked file the run changed: the blob id its index entry held
+    /// when the run ended. Once the entry holds anything else (it was
+    /// staged or committed) but `before`, which Maestro's own commit puts
+    /// there, the file counts as the agent's again. `None` for a created
+    /// file.
+    pub index: Option<String>,
     /// The command that created it, as the run showed it.
     pub command: String,
     /// The agent's process was running during that run, so it may have

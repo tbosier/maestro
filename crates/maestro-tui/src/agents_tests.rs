@@ -291,6 +291,7 @@ fn test_run_files_are_marked_and_not_counted() {
         path: "Cargo.lock".into(),
         blob: "0123abcd".into(),
         before: None,
+        index: None,
         command: "cargo test".into(),
         agent_was_running: false,
     }];

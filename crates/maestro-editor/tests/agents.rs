@@ -192,6 +192,14 @@ fn main() {
             a_test_run_change_carries_over_until_edited_and_k_keeps_it,
         ),
         (
+            "a_run_that_writes_back_the_index_version_keeps_the_agents_edit",
+            a_run_that_writes_back_the_index_version_keeps_the_agents_edit,
+        ),
+        (
+            "staging_a_test_run_change_makes_it_the_agents",
+            staging_a_test_run_change_makes_it_the_agents,
+        ),
+        (
             "a_test_run_file_the_agent_changes_is_the_agents_and_records_survive",
             a_test_run_file_the_agent_changes_is_the_agents_and_records_survive,
         ),
@@ -4372,4 +4380,73 @@ fn a_test_run_change_carries_over_until_edited_and_k_keeps_it() {
     );
     let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
     assert_eq!(left, "");
+}
+
+/// The agent changed README.md; the run writes back the committed version,
+/// which is also what the index holds. That is still the run's change: the
+/// review shows the agent's edit and the run's revert apart, and integrate
+/// commits the agent's edit.
+fn a_run_that_writes_back_the_index_version_keeps_the_agents_edit() {
+    let f = Fixture::new();
+    let mut c = config(&[(
+        "writer",
+        sh_provider("printf 'the agent was here\\n' >> README.md"),
+    )]);
+    c.agents.test_command = vec![
+        "sh".into(),
+        "-c".into(),
+        "printf '# demo\\n' > README.md".into(),
+    ];
+    let mut ed = f.editor(c);
+    run(&mut ed, " a");
+    start_task(&mut ed, "edit the readme", 0);
+    wait_files(&mut ed, 0, &["README.md"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    assert_eq!(read(&wt.join("README.md")), "# demo\n");
+    assert_eq!(review_paths(&ed, 0), ["README.md", "README.md"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (1, 1, 0));
+    open_integrate(&mut ed);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "# demo\nthe agent was here\n"
+    );
+    assert_eq!(read(&wt.join("README.md")), "# demo\n");
+}
+
+/// Staging the run's version of a tracked file makes it the agent's, as
+/// staging a created file does: the review counts it and integrate
+/// commits it.
+fn staging_a_test_run_change_makes_it_the_agents() {
+    let f = Fixture::new();
+    let mut ed = f.editor(test_run_config(
+        "printf 'rewritten by the tests\\n' > README.md",
+    ));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    f.git(&wt, &["add", "README.md"]);
+    run(&mut ed, "\nr");
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "notes.txt"]);
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "rewritten by the tests\n"
+    );
 }

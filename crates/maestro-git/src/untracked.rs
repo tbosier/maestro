@@ -38,8 +38,8 @@ pub struct LeftOut {
     pub path: PathBuf,
     /// `None`: an untracked file, which stays untracked. `Some(blob)`: a
     /// tracked file, committed with these contents (a blob id that must be
-    /// in the object store) instead of the file on disk, which is left as
-    /// it is.
+    /// in the object store) and the mode of the file on disk, instead of
+    /// the file on disk, which is left as it is.
     pub instead: Option<String>,
 }
 

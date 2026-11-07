@@ -19,16 +19,17 @@
 //! worktree's files ([`maestro_git::Repository::work_snapshot_leaving_out`],
 //! the tree the run's record keeps), which writes their contents to the
 //! object store. When the run ends it snapshots them again. A regular file
-//! whose contents differ between the two, that is tracked (in the index)
-//! and whose index entry does not hold the new contents, was changed by
-//! the run, and is recorded with the blob ids of both: the contents from
-//! before the run are the agent's (its own edit, or the commit's version)
-//! and are what integrate commits.
+//! whose contents differ between the two and that is tracked (in the
+//! index) was changed by the run, and is recorded with the blob ids of
+//! both and of its index entry: the contents from before the run are the
+//! agent's (its own edit, or the commit's version) and are what integrate
+//! commits.
 //!
 //! A record stays the run's only while the file is exactly as the run left
 //! it: a created file still untracked with the same contents; a changed
-//! file still tracked, with the run's contents on disk and not in the
-//! index. Once the agent (or anyone) changes, stages or commits it, the
+//! file still tracked, with the run's contents on disk and its index
+//! entry as the run left it (or holding the version from before the run,
+//! which integrate puts there). Once the agent (or anyone) changes, stages or commits it, the
 //! whole file as it is then counts as the agent's, the run's change
 //! included, and so it does when the user presses `K` on it in the
 //! review. Maestro cannot tell a later edit's lines from the run's, and an
@@ -42,7 +43,8 @@
 //! What it cannot tell: a file the agent writes while the run is going is
 //! taken for the run's (the review says when the agent was running). A run
 //! that changes an untracked file the agent wrote, deletes a file, or
-//! changes only a file's mode changes the agent's work.
+//! changes only a file's mode changes the agent's work; a mode the run
+//! gives a file it also changed is committed.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -59,8 +61,8 @@ pub const MAX_TEST_OUTPUTS: usize = 1_000;
 /// Which of `outputs` are still as their run left them: a created file
 /// untracked, not ignored, a regular file with the recorded contents; a
 /// changed file tracked, not in conflict, a regular file with the recorded
-/// contents that its index entry does not hold, and with its contents from
-/// before the run still in the object store.
+/// contents, its index entry untouched ([`index_untouched`]), and its
+/// contents from before the run still in the object store.
 pub fn still_made_by_tests(
     repo: &Repository,
     outputs: &[TestOutput],
@@ -89,12 +91,26 @@ pub fn still_made_by_tests(
             Some(before) => {
                 present.contains(before)
                     && tracked.iter().any(|t| {
-                        t.path == o.path && t.file.as_ref() == Some(&o.blob) && t.index != o.blob
+                        t.path == o.path
+                            && t.file.as_ref() == Some(&o.blob)
+                            && index_untouched(o, before, &t.index)
                     })
             }
         })
         .map(|o| o.path.clone())
         .collect())
+}
+
+/// A changed file's index entry, `now`, is as the run left it, or holds
+/// the version from before the run (Maestro's commit of the agent's work
+/// puts it there). Anything else means someone staged or committed the
+/// file since. A record without the run's index blob (none are written so)
+/// only asks that the entry not hold the run's contents.
+fn index_untouched(o: &TestOutput, before: &str, now: &str) -> bool {
+    match &o.index {
+        Some(i) => now == i || now == before,
+        None => now != o.blob,
+    }
 }
 
 /// What committing the agent's work leaves out for the records of
@@ -150,13 +166,21 @@ pub fn before_run(
     })
 }
 
+/// A file the run created or changed, as [`TestOutput`] records it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RunFile {
+    pub path: PathBuf,
+    pub blob: String,
+    pub before: Option<String>,
+    pub index: Option<String>,
+}
+
 /// What the run left: the files it created and the tracked files it
 /// changed, with their contents, and how many more than are recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEnd {
-    /// `(path, blob, before)`, in path order; `before` as in
-    /// [`TestOutput::before`].
-    pub files: Vec<(PathBuf, String, Option<String>)>,
+    /// In path order.
+    pub files: Vec<RunFile>,
     pub not_recorded: usize,
 }
 
@@ -192,15 +216,21 @@ pub fn after_run(repo: &Repository, start: &RunStart, tree: &str) -> Result<RunE
         .collect();
     candidates.extend(new);
     let candidates: Vec<PathBuf> = candidates.into_iter().collect();
-    let mut files: Vec<(PathBuf, String, Option<String>)> = repo
+    let mut files: Vec<RunFile> = repo
         .untracked_blobs(&candidates)
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|(p, b)| (p, b, None))
+        .map(|(path, blob)| RunFile {
+            path,
+            blob,
+            before: None,
+            index: None,
+        })
         .collect();
 
     // Tracked files the run changed: the files now against the snapshot
-    // taken before it.
+    // taken before it. A run that writes back the index's version still
+    // changed the agent's file.
     let after = repo
         .work_snapshot_leaving_out(&[])
         .map_err(|e| e.to_string())?;
@@ -209,16 +239,17 @@ pub fn after_run(repo: &Repository, start: &RunStart, tree: &str) -> Result<RunE
         .map_err(|e| e.to_string())?;
     let paths: Vec<PathBuf> = changed.iter().map(|c| c.path.clone()).collect();
     let tracked = repo.tracked_blobs(&paths).map_err(|e| e.to_string())?;
-    files.extend(
-        changed
-            .into_iter()
-            .filter(|c| {
-                tracked
-                    .iter()
-                    .any(|t| t.path == c.path && t.file.as_ref() == Some(&c.to) && t.index != c.to)
-            })
-            .map(|c| (c.path, c.to, Some(c.from))),
-    );
+    files.extend(changed.into_iter().filter_map(|c| {
+        let t = tracked
+            .iter()
+            .find(|t| t.path == c.path && t.file.as_ref() == Some(&c.to))?;
+        Some(RunFile {
+            index: Some(t.index.clone()),
+            path: c.path,
+            blob: c.to,
+            before: Some(c.from),
+        })
+    }));
     files.sort();
     not_recorded += files.len().saturating_sub(MAX_TEST_OUTPUTS);
     files.truncate(MAX_TEST_OUTPUTS);
@@ -256,19 +287,19 @@ pub fn record(
     let next: Vec<TestOutput> = end
         .files
         .into_iter()
-        .map(|(path, blob, before)| {
+        .map(|f| {
             // A file an earlier run made and this one left alone keeps
             // the command that made it.
-            let earlier = a
-                .test_outputs
-                .iter()
-                .find(|o| o.path == path && o.blob == blob && o.before == before);
+            let earlier = a.test_outputs.iter().find(|o| {
+                o.path == f.path && o.blob == f.blob && o.before == f.before && o.index == f.index
+            });
             match earlier {
                 Some(o) => o.clone(),
                 None => TestOutput {
-                    path,
-                    blob,
-                    before,
+                    path: f.path,
+                    blob: f.blob,
+                    before: f.before,
+                    index: f.index,
                     command: command.to_string(),
                     agent_was_running,
                 },

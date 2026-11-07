@@ -499,10 +499,12 @@ impl Repository {
         self.commit_all_leaving_out(message, &[])
     }
 
-    /// `git add --all`, or with `leave_out`, every path but those (each
-    /// matched by its exact name, relative to the root), and then the index
-    /// entries of those given contents to commit instead set to them, with
-    /// the mode their entry has (a regular file's when they have none).
+    /// `git add --all`, or with `leave_out`, every path but the untracked
+    /// files named there (each matched by its exact name, relative to the
+    /// root), and then the index entries of those given contents to commit
+    /// instead set to them. They keep the mode `git add` just gave them
+    /// from the file on disk, so a mode the agent gave the file is kept;
+    /// one that is no longer a regular file refuses.
     fn add_all(&self, leave_out: &[LeftOut]) -> Result<()> {
         if leave_out.is_empty() {
             self.run(&["add", "--all", "--", "."], Access::Write)?;
@@ -534,7 +536,11 @@ impl Repository {
                 p.display()
             )));
         }
-        let paths: Vec<PathBuf> = leave_out.iter().map(|l| l.path.clone()).collect();
+        let paths: Vec<PathBuf> = leave_out
+            .iter()
+            .filter(|l| l.instead.is_none())
+            .map(|l| l.path.clone())
+            .collect();
         let mut args: Vec<OsString> = vec!["add".into(), "--all".into(), "--".into()];
         args.extend(crate::untracked::all_but(&paths)?);
         self.with_magic_pathspecs().run(&args, Access::Write)?;
@@ -545,10 +551,12 @@ impl Repository {
         let modes = self.tracked_modes(&wanted)?;
         let mut input = Vec::new();
         for (p, blob) in &instead {
-            let mode = modes
-                .iter()
-                .find(|(q, _)| q == *p)
-                .map_or("100644", |(_, m)| m.as_str());
+            let Some((_, mode)) = modes.iter().find(|(q, _)| q == *p) else {
+                return Err(GitError::InvalidArgument(format!(
+                    "{} is no longer a regular tracked file",
+                    p.display()
+                )));
+            };
             input.extend_from_slice(format!("{mode} {blob}\t").as_bytes());
             input.extend_from_slice(p.as_os_str().as_encoded_bytes());
             input.push(0);
@@ -603,7 +611,9 @@ impl Repository {
             return Err(GitError::Unmerged(conflicted));
         }
         let merging = self.pseudo_ref("MERGE_HEAD")?;
-        if status.is_clean() && merging.is_none() {
+        // A clean worktree can still commit other contents for a file.
+        let instead = leave_out.iter().any(|l| l.instead.is_some());
+        if status.is_clean() && merging.is_none() && !instead {
             return Ok(None);
         }
         self.check_identity()?;

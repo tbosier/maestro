@@ -871,20 +871,26 @@ fn commit_all_leaving_out_keeps_named_untracked_files_out() {
 }
 
 /// A tracked file left out with other contents is committed with those
-/// contents, keeps its mode, and stays as it is on disk; the snapshot with
-/// the same list has the commit's tree. A blob id that is not one is
-/// refused before anything is staged.
+/// contents and the mode of the file on disk (an executable bit the agent
+/// set without staging it), and stays as it is on disk; the snapshot with
+/// the same list has the commit's tree. A blob id that is not one, or is
+/// missing, is refused before anything is staged.
 #[test]
 fn commit_all_leaving_out_commits_other_contents_for_a_tracked_file() {
     let f = Fixture::new();
     let repo = f.repo();
     f.write("run.sh", "echo 1\n");
-    f.git(&["add", "run.sh"]);
-    f.git(&["update-index", "--chmod=+x", "run.sh"]);
-    f.git(&["commit", "-q", "-m", "script"]);
-    // The agent's version, then a test run's rewrite of both files.
+    f.commit_all("script");
+    // The agent's version (made executable, not staged), then a test
+    // run's rewrite of both files.
     f.write("a.txt", "the agent's\n");
     f.write("run.sh", "echo 2\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = f.repo.join("run.sh");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let agents = f.git(&["hash-object", "-w", "a.txt"]).trim().to_string();
     let script = f.git(&["hash-object", "-w", "run.sh"]).trim().to_string();
     f.write("a.txt", "rewritten by the tests\n");
@@ -916,13 +922,33 @@ fn commit_all_leaving_out_commits_other_contents_for_a_tracked_file() {
         f.git(&["show", &format!("{id}:new.txt")]),
         "the agent's new file\n"
     );
-    let mode = f.git(&["ls-tree", &id, "run.sh"]);
-    assert!(mode.starts_with("100755 "), "{mode}");
+    #[cfg(unix)]
+    {
+        let mode = f.git(&["ls-tree", &id, "run.sh"]);
+        assert!(mode.starts_with("100755 "), "{mode}");
+    }
     // The files on disk are untouched and differ from the commit.
     assert_eq!(read_in(&f.repo, "a.txt"), "rewritten by the tests\n");
     assert_eq!(f.git(&["status", "--porcelain"]), " M a.txt\n M run.sh\n");
     // Nothing else to commit.
     assert_eq!(repo.commit_all_leaving_out("again", &leave).unwrap(), None);
+
+    // A clean worktree (a test run wrote back the committed version) still
+    // commits the other contents.
+    f.git(&["checkout", "--", "a.txt", "run.sh"]);
+    assert!(repo.status().unwrap().is_clean());
+    f.write("a.txt", "the agent's, again\n");
+    let again = f.git(&["hash-object", "-w", "a.txt"]).trim().to_string();
+    f.git(&["checkout", "--", "a.txt"]);
+    assert!(repo.status().unwrap().is_clean());
+    let id = repo
+        .commit_all_leaving_out("from a clean worktree", &[LeftOut::instead("a.txt", again)])
+        .unwrap()
+        .expect("a commit");
+    assert_eq!(
+        f.git(&["show", &format!("{id}:a.txt")]),
+        "the agent's, again\n"
+    );
 }
 
 /// `tracked_blobs` gives the index entry's and the file's blob ids of
@@ -1096,7 +1122,8 @@ fn integrate_reviewed_lets_named_modified_files_stay_behind() {
     f.git_ok(&wt, &["checkout", "--", "one.txt"]);
     let out = try_it().unwrap();
     assert_eq!(out.new_head, rev(&f, &f.repo, "HEAD"));
-    assert_eq!(f.git(&["show", "HEAD:a.txt"]), read_in(&f.repo, "a.txt"));
+    assert_eq!(f.git(&["show", "HEAD:a.txt"]), "one\ntwo\nthree\n");
+    assert_eq!(read_in(&f.repo, "a.txt"), "one\ntwo\nthree\n");
     assert_eq!(read_in(&wt, "a.txt"), "rewritten by the tests\n");
 }
 
