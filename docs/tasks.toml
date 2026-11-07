@@ -266,3 +266,14 @@ crates = ["maestro-editor", "maestro-tui", "maestro-git", "maestro-config"]
 branch = "feat/file-tree"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "fix-test-outputs"
+title = "Files Maestro's own test run creates are listed apart and left out of counts, compose and integrate"
+crates = ["maestro-editor", "maestro-tui", "maestro-git"]
+branch = "fix/test-outputs"
+owner = "agent"
+status = "done"
+# New untracked files after t are recorded with their blob ids; the review
+# marks them T, K counts one as the agent's, and integrate leaves them
+# untracked by exact-name pathspec exclusion. See docs/agent-model.md.

@@ -163,6 +163,14 @@ fn main() {
             "compose_view_j_and_k_stay_in_the_agents_column",
             compose_view_j_and_k_stay_in_the_agents_column,
         ),
+        (
+            "files_the_test_run_creates_are_listed_apart_and_left_behind",
+            files_the_test_run_creates_are_listed_apart_and_left_behind,
+        ),
+        (
+            "a_test_run_file_the_agent_changes_is_the_agents_and_records_survive",
+            a_test_run_file_the_agent_changes_is_the_agents_and_records_survive,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -3452,4 +3460,223 @@ fn compose_view_j_and_k_stay_in_the_agents_column() {
     run(&mut ed, "h");
     run(&mut ed, "j");
     assert_eq!(at(&ed), (0, 1), "j goes down alpha's column");
+}
+
+// ----- files Maestro's own test run creates ----------------------------------
+
+/// A writer agent whose verification command creates files the agent never
+/// wrote, as `cargo test` creates `Cargo.lock`.
+fn test_run_config(test: &str) -> Config {
+    let mut c = config(&[("writer", sh_provider("printf 'notes\\n' > notes.txt"))]);
+    c.agents.test_command = vec!["sh".into(), "-c".into(), test.into()];
+    c
+}
+
+/// Waits until the review lists `made` as the test run's files.
+fn wait_test_made(ed: &mut Editor, i: usize, made: &[&str]) {
+    let want: Vec<PathBuf> = made.iter().map(PathBuf::from).collect();
+    poll_until(ed, "the review of the test run's files", |ed| {
+        let r = &agent(ed, i).review;
+        !r.running && r.computed.is_some() && r.test_made == want
+    });
+}
+
+fn head_files(f: &Fixture) -> Vec<String> {
+    f.git(&f.repo, &["ls-tree", "-r", "--name-only", "HEAD"])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `t` creates two files: the review lists them after the agent's file,
+/// labeled and not counted; they cannot be marked; `K` makes one the
+/// agent's; integrate names the other as left behind, commits everything
+/// else, and leaves it untracked in the worktree.
+fn files_the_test_run_creates_are_listed_apart_and_left_behind() {
+    let f = Fixture::new();
+    let test = "echo x > made-by-tests.txt; mkdir -p out; echo y > 'out/[x].log'";
+    let mut ed = f.editor(test_run_config(test));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt", "out/[x].log"]);
+    let a = agent(&ed, 0);
+    assert_eq!(
+        review_paths(&ed, 0),
+        ["notes.txt", "made-by-tests.txt", "out/[x].log"],
+        "the agent's files first, then the test run's"
+    );
+    assert_eq!(a.review.totals(), (1, 1, 0), "only notes.txt is counted");
+    assert_eq!(a.test_outputs.len(), 2);
+    assert_eq!(a.test_outputs[0].command, format!("sh -c {test}"));
+    assert!(
+        a.history.iter().any(|h| h
+            .text
+            .contains("the test run created 2 file(s) the agent did not write")),
+        "{:?}",
+        a.history
+    );
+    assert_eq!(status(&ed, 0), Status::ReadyForReview);
+
+    // The review labels the file and refuses to mark it.
+    run(&mut ed, "\n<tab>");
+    let rows = review_rows(&ed);
+    match &rows[0] {
+        Row::Note(n) => assert!(
+            n.starts_with(&format!(
+                "T created by Maestro's test run (`sh -c {test}`), not by the agent"
+            )),
+            "{n}"
+        ),
+        other => panic!("expected the test run note, got {other:?}"),
+    }
+    assert!(
+        matches!(&rows[1], Row::Note(n) if n.contains("K counts it as the agent's, D drops it")),
+        "{rows:?}"
+    );
+    run(&mut ed, "]");
+    run(&mut ed, " ");
+    assert!(agent(&ed, 0).marks.is_empty());
+    assert!(
+        status_text(&ed).contains("created by Maestro's test run, not by the agent"),
+        "{}",
+        status_text(&ed)
+    );
+    // K: made-by-tests.txt is the agent's from now on.
+    run(&mut ed, "K");
+    assert!(
+        status_text(&ed).contains("made-by-tests.txt counts as writer-1's work now (K)"),
+        "{}",
+        status_text(&ed)
+    );
+    wait_test_made(&mut ed, 0, &["out/[x].log"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (2, 2, 0));
+    // K on a file that is the agent's says so and changes nothing.
+    run(&mut ed, "<tab><tab>K");
+    assert!(
+        status_text(&ed).contains("was not created by Maestro's test run"),
+        "{}",
+        status_text(&ed)
+    );
+
+    // Integrate names the file left behind and leaves it out.
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains(&format!(
+            "LEFT BEHIND: 1 file(s) created by Maestro's test run (`sh -c {test}`), not by the \
+             agent: out/[x].log. They stay untracked"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "When checked (2 in all; the review lists every one): made-by-tests.txt, notes.txt."
+        ),
+        "{text}"
+    );
+    // The verification did not run on made-by-tests.txt, which counts as
+    // the agent's now; the file left behind is not a change since it ran.
+    assert!(
+        text.contains("ran: made-by-tests.txt.\n"),
+        "only the kept file changed since the run: {text}"
+    );
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        head_files(&f),
+        ["README.md", "made-by-tests.txt", "notes.txt", "src/lib.rs"]
+    );
+    assert_eq!(
+        read(&wt.join("out/[x].log")),
+        "y\n",
+        "the file is not deleted"
+    );
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, "?? out/[x].log\n");
+}
+
+/// A file the agent wrote before the run stays the agent's even when the
+/// run changes it. The record survives a restart; a second run that
+/// leaves the test file as it was keeps it the run's; once the agent
+/// changes it, it is the agent's and integrate commits it.
+fn a_test_run_file_the_agent_changes_is_the_agents_and_records_survive() {
+    let f = Fixture::new();
+    let c = test_run_config("echo x > made-by-tests.txt; echo again >> notes.txt");
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt"]);
+    assert_eq!(review_paths(&ed, 0), ["notes.txt", "made-by-tests.txt"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (1, 2, 0));
+    let outputs = agent(&ed, 0).test_outputs.clone();
+    quit(&mut ed);
+    drop(ed);
+    let saved = read(&f.records());
+    assert!(saved.contains("\"test_outputs\""), "{saved}");
+
+    // Reloaded: the record is back and the review still labels the file.
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+    run(&mut ed, "\n");
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt"]);
+    // A second run writes the same file again and appends to notes.txt:
+    // the file is still the run's.
+    run(&mut ed, "<esc>");
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt"]);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+
+    // The agent changes the file while the integrate dialog that leaves
+    // it behind is open: integrating refuses, changing nothing.
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(text.contains("LEFT BEHIND: 1 file(s)"), "{text}");
+    std::fs::write(wt.join("made-by-tests.txt"), "x, then the agent's\n").unwrap();
+    run(&mut ed, "y");
+    wait_idle(&mut ed, 0);
+    assert!(
+        status_text(&ed).contains(
+            "files Maestro's test run created changed after the dialog was checked and count as \
+             the agent's now: made-by-tests.txt; nothing changed"
+        ),
+        "{}",
+        status_text(&ed)
+    );
+    assert_ne!(status(&ed, 0), Status::Integrated);
+    assert_eq!(
+        f.git(&wt, &["rev-list", "--count", "HEAD"]).trim(),
+        "1",
+        "nothing was committed on the agent's branch"
+    );
+
+    // It is the agent's now: the review counts it.
+    run(&mut ed, "\nr");
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(agent(&ed, 0).review.totals(), (2, 4, 0));
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        head_files(&f),
+        ["README.md", "made-by-tests.txt", "notes.txt", "src/lib.rs"]
+    );
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:made-by-tests.txt"]),
+        "x, then the agent's\n"
+    );
 }

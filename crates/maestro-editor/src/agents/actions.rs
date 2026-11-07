@@ -121,6 +121,7 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
     };
     let shown = cmd.join(" ");
     let worktree = a.worktree.clone();
+    let recorded = a.test_outputs.clone();
     let git = ed.git.git().clone();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let Some(a) = ed.agents.get_mut(id) else {
@@ -141,14 +142,32 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
     ed.agents.panel.view = DetailView::Tests;
     ed.agents.panel.scroll = 0;
     ed.info(format!("running {shown}{source}"));
-    // On a background thread: first a snapshot of the files the run
+    // On a background thread: first the untracked files the run starts
+    // with (to tell which ones it creates) and a snapshot of the files it
     // starts on (what integrate later compares against), then the run.
     let spawned = ed.spawn_background("agent-tests", move |job| {
-        let tree = match &worktree {
-            Some(w) => open_agent_worktree(&git, w)
-                .and_then(|repo| repo.work_snapshot().map_err(|e| e.to_string()))
-                .map(|s| s.tree),
+        let repo = match &worktree {
+            Some(w) => open_agent_worktree(&git, w).map(|r| (r, w.base.clone())),
             None => Err("no worktree".into()),
+        };
+        let start = repo
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|(r, base)| super::test_outputs::before_run(r, &recorded, base));
+        // Files earlier runs created are left out, as integrate leaves
+        // them out of what it compares with this tree.
+        let made = start
+            .as_ref()
+            .map(|s| s.still_made.clone())
+            .unwrap_or_default();
+        let tree = repo.as_ref().map_err(Clone::clone).and_then(|(r, _)| {
+            r.work_snapshot_leaving_out(&made)
+                .map(|s| s.tree)
+                .map_err(|e| e.to_string())
+        });
+        let end = move || match (&repo, &start) {
+            (Ok((r, _)), Ok(s)) => super::test_outputs::after_run(r, s),
+            (Err(e), _) | (_, Err(e)) => Err(e.clone()),
         };
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             job.send(move |ed| test_not_started(ed, id, started, "stopped before it started"));
@@ -173,10 +192,20 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
                 }
             }
             finished => {
+                // Read right after the command and the processes it left
+                // ended, before anything else runs in the worktree.
+                let made = end();
                 let buffer = buffer.clone();
+                let command = shown.clone();
                 tx.send(move |ed| {
                     drain_output(ed, id, &buffer);
                     on_test_event(ed, id, finished);
+                    let running = ed
+                        .agents
+                        .get(id)
+                        .and_then(|a| a.tests.last())
+                        .is_some_and(|t| t.agent_was_running);
+                    super::test_outputs::record(ed, id, &command, running, made);
                 });
             }
         });
@@ -1105,8 +1134,14 @@ pub struct IntegrateFacts {
     pub base: String,
     /// The main worktree's checked-out branch.
     pub target: String,
-    /// Uncommitted or untracked files in the agent's worktree when checked.
+    /// Uncommitted or untracked files in the agent's worktree when checked,
+    /// without `left_behind`.
     pub uncommitted: Vec<PathBuf>,
+    /// Files Maestro's verification run created that are still as it left
+    /// them: they stay untracked in the agent's worktree and are not
+    /// committed or integrated. Everything else in the dialog leaves them
+    /// out too.
+    pub left_behind: Vec<super::TestOutput>,
     pub message: String,
     pub agent_running: bool,
     /// The agent's task contract.
@@ -1192,6 +1227,8 @@ struct Other {
     name: String,
     worktree: super::WorktreeInfo,
     paths: std::collections::BTreeSet<PathBuf>,
+    /// Files its verification run made, left out of its snapshot.
+    test_made: Vec<PathBuf>,
 }
 
 /// What the integrate check needs to know about the last verification.
@@ -1424,6 +1461,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
     let name = a.name.clone();
     let agent_running = a.is_running();
     let contract = a.contract.clone();
+    let outputs = a.test_outputs.clone();
     let has_command = a.contract.as_ref().is_some_and(|c| c.verify.is_some())
         || test_command(ed, &w.path).is_some();
     let last_test = a.latest_test().map(|t| LastTest {
@@ -1446,6 +1484,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 name: o.name.clone(),
                 worktree: ow,
                 paths: super::conflicts::changed_paths(o),
+                test_made: o.review.test_made.clone(),
             })
         })
         .collect();
@@ -1463,6 +1502,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 base: w.base.clone(),
                 target,
                 uncommitted: Vec::new(),
+                left_behind: Vec::new(),
                 message,
                 agent_running,
                 contract,
@@ -1477,18 +1517,32 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 part: None,
             };
             let (wt, main) = check_before_commit(&git, &facts)?;
+            // Files the verification run made and nobody changed since
+            // stay behind; they are not the agent's work.
+            let made = super::test_outputs::still_made_by_tests(&wt, &outputs).map_err(|e| {
+                format!("could not tell which files Maestro's test run created: {e}")
+            })?;
+            facts.left_behind = outputs
+                .iter()
+                .filter(|o| made.contains(&o.path))
+                .cloned()
+                .collect();
             // One snapshot of the agent's files, from Git now rather than
             // the review's last refresh; everything below is about it.
             let snap = wt
-                .work_snapshot()
+                .work_snapshot_leaving_out(&made)
                 .map_err(|e| format!("could not read the agent's files: {e}"))?;
             facts.checked_tree = snap.tree.clone();
             facts.checked_head = snap.head.clone();
             let st = wt.status().map_err(|e| e.to_string())?;
             facts.uncommitted = st
                 .uncommitted()
-                .chain(st.untracked())
                 .map(|e| e.path.clone())
+                .chain(
+                    st.untracked()
+                        .map(|e| e.path.clone())
+                        .filter(|p| !made.contains(p)),
+                )
                 .collect();
             let files = diff_since_fork(&wt, &w.base, &snap.commit)?;
             if let Some(c) = &facts.contract {
@@ -1584,8 +1638,10 @@ fn conflicts_after(
         Err(e) => return unchecked(e.to_string()),
     };
     for o in others {
-        let theirs = open_agent_worktree(git, &o.worktree)
-            .and_then(|r| r.work_snapshot().map_err(|e| e.to_string()));
+        let theirs = open_agent_worktree(git, &o.worktree).and_then(|r| {
+            r.work_snapshot_leaving_out(&o.test_made)
+                .map_err(|e| e.to_string())
+        });
         match theirs.map(|t| main.merge_check(&merged, &t.commit)) {
             Ok(Ok(maestro_git::MergeCheck::Clean { .. })) => facts.clean_after.push(o.name.clone()),
             Ok(Ok(maestro_git::MergeCheck::Conflicts { files, .. })) => facts
@@ -1677,6 +1733,23 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
         return finish_dialog(agent, how, facts, lines);
     }
     let subject = facts.message.lines().next().unwrap_or_default();
+    if !facts.left_behind.is_empty() {
+        let paths: Vec<PathBuf> = facts.left_behind.iter().map(|o| o.path.clone()).collect();
+        let mut commands: Vec<String> = facts
+            .left_behind
+            .iter()
+            .map(|o| format!("`{}`", o.command))
+            .collect();
+        commands.sort();
+        commands.dedup();
+        lines.push(format!(
+            "LEFT BEHIND: {} file(s) {} ({}), not by the agent: {}. They stay untracked in the agent's worktree and are not committed or integrated; K in the review counts one as the agent's.",
+            paths.len(),
+            super::review::TEST_MADE,
+            commands.join(", "),
+            list_paths(&paths)
+        ));
+    }
     if facts.uncommitted.is_empty() {
         lines.push(format!(
             "1. The agent's worktree had nothing uncommitted when checked; anything new by then is committed to {} as \"{subject}\".",
@@ -1693,8 +1766,13 @@ pub fn integrate_dialog(agent: AgentId, how: Integration, facts: IntegrateFacts)
         if facts.uncommitted.len() > SHOWN {
             names.push(format!("and {} more", facts.uncommitted.len() - SHOWN));
         }
+        let but = if facts.left_behind.is_empty() {
+            ""
+        } else {
+            " (but those left behind)"
+        };
         lines.push(format!(
-            "1. Commit all uncommitted and untracked files in {} to branch {} as \"{subject}\". When checked ({} in all; the review lists every one): {}. D in the review drops a file you do not want.",
+            "1. Commit all uncommitted and untracked files{but} in {} to branch {} as \"{subject}\". When checked ({} in all; the review lists every one): {}. D in the review drops a file you do not want.",
             facts.worktree.display(),
             facts.branch,
             facts.uncommitted.len(),
@@ -1872,7 +1950,29 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
             names.join(", ")
         ));
     }
-    match wt.commit_all(&message) {
+    // The files left behind must be exactly the dialog's: one changed since
+    // is the agent's now, and the dialog did not show it as such.
+    let leave: Vec<PathBuf> = f.left_behind.iter().map(|o| o.path.clone()).collect();
+    match super::test_outputs::still_made_by_tests(&wt, &f.left_behind) {
+        Ok(now) if now == leave => {}
+        Ok(now) => {
+            let changed: Vec<PathBuf> = leave.into_iter().filter(|p| !now.contains(p)).collect();
+            out.outcome = Err(format!(
+                "files Maestro's test run created changed after the dialog was checked and count \
+                 as the agent's now: {}; nothing changed. Press I again to see what it would \
+                 bring now",
+                list_paths(&changed)
+            ));
+            return out;
+        }
+        Err(e) => {
+            out.outcome = Err(format!(
+                "could not tell which files Maestro's test run created ({e}); nothing changed"
+            ));
+            return out;
+        }
+    }
+    match wt.commit_all_leaving_out(&message, &leave) {
         Ok(c) => out.committed = c,
         Err(maestro_git::GitError::Unmerged(p)) => {
             out.outcome = Err(format!(
@@ -1951,6 +2051,9 @@ pub(crate) fn land(
             return;
         }
     };
+    // Files Maestro's test run made may stay untracked in the agent's
+    // worktree; any other uncommitted file there still refuses.
+    let left: Vec<PathBuf> = f.left_behind.iter().map(|o| o.path.clone()).collect();
     // Only that commit: `maestro-git` refuses if the branch no longer
     // points at it, and gives git the commit id, not the branch name.
     out.outcome = main
@@ -1960,6 +2063,7 @@ pub(crate) fn land(
                 commit: reviewed,
                 target: &f.target,
                 base: &f.base,
+                leave_untracked: &left,
             },
             how,
         )

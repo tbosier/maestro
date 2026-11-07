@@ -829,6 +829,133 @@ fn commit_all_commits_everything_or_nothing() {
     assert!(!tree.contains("untracked.txt"), "{tree}");
 }
 
+/// Files left out by exact name stay untracked and out of the commit,
+/// even with glob characters in their names; everything else goes in,
+/// and the snapshot with the same list has the commit's tree.
+#[test]
+fn commit_all_leaving_out_keeps_named_untracked_files_out() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    f.write("a.txt", "changed\n");
+    f.write("Cargo.lock", "made by the tests\n");
+    f.write("out/[1].txt", "also made by the tests\n");
+    f.write("out/1.txt", "the agent's\n");
+    f.write("keep.txt", "the agent's too\n");
+    let leave: Vec<PathBuf> = vec!["Cargo.lock".into(), "out/[1].txt".into()];
+    let snap = repo.work_snapshot_leaving_out(&leave).unwrap();
+    let full = repo.work_snapshot().unwrap();
+    assert_ne!(snap.tree, full.tree);
+
+    let id = repo
+        .commit_all_leaving_out("agent work", &leave)
+        .unwrap()
+        .expect("a commit");
+    let tree = f.git(&["ls-tree", "-r", "--name-only", &id]);
+    let names: Vec<&str> = tree.lines().collect();
+    assert_eq!(names, ["a.txt", "keep.txt", "out/1.txt"], "{tree}");
+    assert_eq!(repo.commit_shape(&id).unwrap().tree, snap.tree);
+    let untracked = repo.untracked_files().unwrap();
+    assert_eq!(untracked, leave);
+    // Only left-out files remain: nothing to commit.
+    assert_eq!(repo.commit_all_leaving_out("again", &leave).unwrap(), None);
+    // A path that escapes the worktree is refused before anything runs.
+    assert!(
+        repo.commit_all_leaving_out("bad", &["../x".into()])
+            .is_err()
+    );
+}
+
+/// `untracked_blobs` reports untracked regular files only, with the id
+/// `git add` would store; `paths_in` says which paths a commit holds.
+#[test]
+fn untracked_blobs_names_only_untracked_regular_files() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    f.write(".gitignore", "*.log\n");
+    f.commit_all("ignore logs");
+    f.write("new.txt", "x\n");
+    f.write("skip.log", "ignored\n");
+    f.write("a.txt", "tracked, changed\n");
+    std::fs::create_dir_all(f.repo.join("dir")).unwrap();
+    f.write("dir/inner.txt", "y\n");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("new.txt", f.repo.join("link")).unwrap();
+    let ask: Vec<PathBuf> = [
+        "new.txt",
+        "skip.log",
+        "a.txt",
+        "dir",
+        "link",
+        "missing",
+        "dir/inner.txt",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    let got = repo.untracked_blobs(&ask).unwrap();
+    let names: Vec<&Path> = got.iter().map(|(p, _)| p.as_path()).collect();
+    assert_eq!(names, [Path::new("new.txt"), Path::new("dir/inner.txt")]);
+    let want = f.git(&["hash-object", "new.txt"]);
+    assert_eq!(got[0].1, want.trim());
+    assert!(repo.untracked_blobs(&["/etc/passwd".into()]).is_err());
+
+    let held = repo
+        .paths_in(
+            "HEAD",
+            &["a.txt".into(), "new.txt".into(), ".gitignore".into()],
+        )
+        .unwrap();
+    assert_eq!(held, [PathBuf::from("a.txt"), PathBuf::from(".gitignore")]);
+}
+
+/// `leave_untracked` lets exactly those untracked files stay in the
+/// source worktree; any other untracked file still refuses.
+#[test]
+fn integrate_reviewed_lets_named_untracked_files_stay_behind() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let base = rev(&f, &f.repo, "HEAD");
+    let wt = agent_branch(&f, "agent/left", "one.txt", "1\n");
+    let reviewed = rev(&f, &wt, "HEAD");
+    write_in(&wt, "Cargo.lock", "made by the tests\n");
+    write_in(&wt, "stray.txt", "not named\n");
+    let leave = [PathBuf::from("Cargo.lock")];
+    let err = repo
+        .integrate_reviewed(
+            "agent/left",
+            Reviewed {
+                commit: &reviewed,
+                target: "main",
+                base: &base,
+                leave_untracked: &leave,
+            },
+            Integration::Merge,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, IntegrateError::SourceDirty(p) if p == &[PathBuf::from("stray.txt")]),
+        "{err:?}"
+    );
+    std::fs::remove_file(wt.join("stray.txt")).unwrap();
+    let out = repo
+        .integrate_reviewed(
+            "agent/left",
+            Reviewed {
+                commit: &reviewed,
+                target: "main",
+                base: &base,
+                leave_untracked: &leave,
+            },
+            Integration::Merge,
+        )
+        .unwrap();
+    assert_eq!(out.new_head, rev(&f, &f.repo, "HEAD"));
+    let tree = f.git(&["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(tree.lines().any(|l| l == "one.txt"), "{tree}");
+    assert!(!tree.lines().any(|l| l == "Cargo.lock"), "{tree}");
+    assert!(wt.join("Cargo.lock").exists());
+}
+
 #[test]
 fn commit_all_respects_hooks_and_identity() {
     let f = Fixture::new();
@@ -1091,6 +1218,7 @@ fn on_main<'a>(commit: &'a str, base: &'a str) -> Reviewed<'a> {
         commit,
         target: "main",
         base,
+        leave_untracked: &[],
     }
 }
 

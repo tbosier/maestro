@@ -836,17 +836,27 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
             );
         }
         let (add, rem) = f.counts();
-        let counts = format!(" +{add} -{rem}");
+        // A file Maestro's test run made is marked `T` and says so where
+        // the counts go: it is not counted, so it shows none.
+        let test_made = a.review.is_test_made(f);
+        let counts = if test_made {
+            " test run".to_string()
+        } else {
+            format!(" +{add} -{rem}")
+        };
         let cw = counts.chars().count() as u16;
         let name_r = list.right().saturating_sub(cw);
         // A file outside the task contract is marked with `!` before its
         // change letter; the summary says what the mark means.
-        let outside = a.contract.as_ref().is_some_and(|c| {
-            maestro_editor::agents::file_paths(f)
-                .iter()
-                .any(|p| c.violation(p).is_some())
-        });
-        let x = if outside {
+        let outside = !test_made
+            && a.contract.as_ref().is_some_and(|c| {
+                maestro_editor::agents::file_paths(f)
+                    .iter()
+                    .any(|p| c.violation(p).is_some())
+            });
+        let x = if test_made {
+            s.print(list.x + 1, y, "T", bg.patch(ui.text_muted).bold(), name_r)
+        } else if outside {
             s.print(
                 list.x + 1,
                 y,
@@ -863,6 +873,10 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         s.print(x + 1, y, &path, bg, name_r);
+        if test_made {
+            s.print(name_r, y, &counts, bg.patch(ui.text_muted), list.right());
+            continue;
+        }
         let x = s.print(
             name_r,
             y,
@@ -899,10 +913,21 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
         ui.text.patch(status_style(&ed.theme, st)),
         r,
     );
+    let made = a
+        .review
+        .files
+        .iter()
+        .filter(|f| a.review.is_test_made(f))
+        .count();
+    let extra = if made > 0 {
+        format!("  and {made} created by the test run (T, not counted)")
+    } else {
+        String::new()
+    };
     s.print(
         x + 2,
         sm.y,
-        &format!("{n} files +{add} -{rem}"),
+        &format!("{n} files +{add} -{rem}{extra}"),
         ui.text_muted,
         r,
     );
@@ -913,7 +938,11 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
                 f.path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
-                review::change_label(f),
+                if a.review.is_test_made(f) {
+                    format!("T {}, {}", review::change_label(f), review::TEST_MADE)
+                } else {
+                    review::change_label(f)
+                },
                 if v.side_by_side {
                     "side-by-side"
                 } else {
