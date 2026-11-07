@@ -530,6 +530,12 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<Reviewed, String>) {
             .retain(|(agent, m)| *agent != id || keys.contains(&m.key));
         dropped += before - c.marks.len();
     }
+    // Its files and hunks may now come in another order: the compose
+    // view's cursor stays on its hunk.
+    if let Some(mut c) = ed.agents.panel.compose.take() {
+        super::compose::follow(ed, &mut c);
+        ed.agents.panel.compose = Some(c);
+    }
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };

@@ -172,6 +172,10 @@ fn main() {
             compose_view_j_and_k_stay_in_the_agents_column,
         ),
         (
+            "compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes",
+            compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes,
+        ),
+        (
             "an_archived_agent_says_so_and_its_record_can_be_forgotten",
             an_archived_agent_says_so_and_its_record_can_be_forgotten,
         ),
@@ -3580,8 +3584,18 @@ fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
     .unwrap();
     let beta = id(&ed, 1);
     maestro_editor::agents::review::request(&mut ed, beta);
+    // A refresh C asked for may still be running and read the file while
+    // it was being written: it drops the mark too. Wait for the review of
+    // the new text, with no refresh queued behind it.
     poll_until(&mut ed, "the refresh that drops beta's mark", |ed| {
+        let b = agent(ed, 1);
         ed.agents.panel.compose.as_ref().unwrap().marks.len() == 1
+            && !b.review.running
+            && !b.review.again
+            && b.review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "beta three"))
     });
     assert!(status_text(&ed).contains("unmarked"), "{:?}", ed.status);
     run(&mut ed, "j \n");
@@ -3711,6 +3725,123 @@ fn compose_view_j_and_k_stay_in_the_agents_column() {
     run(&mut ed, "h");
     run(&mut ed, "j");
     assert_eq!(at(&ed), (0, 1), "j goes down alpha's column");
+}
+
+/// A refreshed diff reorders the compose view's hunks. The cursor stays
+/// on its hunk (same agent, same hunk), or on that agent's nearest hunk
+/// when its hunk is gone, and on its file when another file joins the
+/// list before it. Each refresh is waited for, so nothing here depends on
+/// timing.
+fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
+    use maestro_editor::agents::compose;
+    let f = calc_fixture();
+    let sed = |s: &str| {
+        sh_provider(&format!(
+            "sed '{s}' calc.txt > calc.tmp && mv calc.tmp calc.txt"
+        ))
+    };
+    let c = config(&[
+        ("alpha", sed("s/^line 2$/alpha 2/; s/^line 28$/alpha 28/")),
+        ("beta", sed("s/^line 3$/beta 3/; s/^line 15$/beta 15/")),
+    ]);
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 0);
+    start_contract_task(&mut ed, "improve the calculator\n@allow calc.txt", 0);
+    wait_files(&mut ed, 0, &["calc.txt"]);
+    run(&mut ed, "N");
+    run(&mut ed, "\n");
+    wait_files(&mut ed, 1, &["calc.txt"]);
+    select(&mut ed, 0);
+    run(&mut ed, "C");
+    // Agent, old start and length of the hunk under the cursor.
+    let at = |ed: &Editor| {
+        let v = ed.agents.panel.compose.as_ref().expect("the compose view");
+        let it = &compose::items(ed, v)[v.cursor];
+        let a = ed.agents.get(it.agent).expect("the item's agent");
+        let h = &a.review.files[it.file].hunks[it.hunk];
+        (a.name.clone(), h.old_start, h.old_len)
+    };
+    let shape = |ed: &Editor| {
+        let v = ed.agents.panel.compose.as_ref().expect("the compose view");
+        compose::items(ed, v)
+            .iter()
+            .map(|i| (i.col, i.hunk))
+            .collect::<Vec<_>>()
+    };
+    // A refresh the test asked for, and any one queued behind it, applied.
+    let settled =
+        |ed: &Editor, i: usize| !agent(ed, i).review.running && !agent(ed, i).review.again;
+    poll_until(&mut ed, "the refreshes C asked for", |ed| {
+        settled(ed, 0) && settled(ed, 1)
+    });
+    // Written whole, as an agent's `sed > tmp && mv` does: a refresh never
+    // reads it half written.
+    let write = |path: PathBuf, text: String| {
+        let tmp = path.with_extension("maestro-test-tmp");
+        std::fs::write(&tmp, text).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+    };
+    run(&mut ed, "l");
+    assert_eq!(at(&ed), ("beta-2".into(), 1, 6));
+    assert_eq!(shape(&ed), [(0, 0), (1, 0), (1, 1), (0, 1)]);
+
+    // alpha also changes line 10. Its new hunk joins the first band, and
+    // the second item is now alpha's: the cursor stays on beta's hunk.
+    let alpha_wt = worktree(&ed, 0);
+    let text = read(&alpha_wt.join("calc.txt")).replace("\nline 10\n", "\nalpha 10\n");
+    write(alpha_wt.join("calc.txt"), text);
+    let alpha = id(&ed, 0);
+    maestro_editor::agents::review::request(&mut ed, alpha);
+    poll_until(&mut ed, "alpha's refresh with line 10", |ed| {
+        settled(ed, 0)
+            && agent(ed, 0).review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "alpha 10"))
+    });
+    assert_eq!(shape(&ed), [(0, 0), (0, 1), (1, 0), (1, 1), (0, 2)]);
+    assert_eq!(
+        at(&ed),
+        ("beta-2".into(), 1, 6),
+        "the cursor follows beta's hunk"
+    );
+    // space marks the hunk the cursor is on.
+    run(&mut ed, " ");
+    let v = ed.agents.panel.compose.clone().unwrap();
+    let marked: Vec<(AgentId, usize, usize)> = v
+        .marks
+        .iter()
+        .map(|(a, m)| (*a, m.key.old_start, m.key.old_len))
+        .collect();
+    assert_eq!(marked, [(id(&ed, 1), 1, 6)]);
+
+    // beta empties the file: its hunk is gone, and the cursor goes to
+    // beta's nearest hunk, the deletion, not to the item now in its place.
+    let beta_wt = worktree(&ed, 1);
+    write(beta_wt.join("calc.txt"), String::new());
+    let beta = id(&ed, 1);
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "beta's refresh of the empty file", |ed| {
+        settled(ed, 1) && agent(ed, 1).review.files[0].hunks[0].new_len == 0
+    });
+    assert_eq!(shape(&ed), [(0, 0), (0, 1), (0, 2), (1, 0)]);
+    assert_eq!(at(&ed), ("beta-2".into(), 1, 30), "beta's nearest hunk");
+    assert!(ed.agents.panel.compose.as_ref().unwrap().marks.is_empty());
+
+    // beta adds a.txt, which sorts before calc.txt: the view stays on
+    // calc.txt and on beta's hunk.
+    write(beta_wt.join("a.txt"), "new\n".into());
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "beta's refresh with a.txt", |ed| {
+        settled(ed, 1) && agent(ed, 1).review.files.len() == 2
+    });
+    let v = ed.agents.panel.compose.clone().unwrap();
+    assert_eq!(
+        compose::files(&ed, &v),
+        [PathBuf::from("a.txt"), PathBuf::from("calc.txt")]
+    );
+    assert_eq!(v.file, 1, "the view stays on calc.txt");
+    assert_eq!(at(&ed), ("beta-2".into(), 1, 30));
 }
 
 /// An archived agent says "archived" wherever it is listed, offers only
