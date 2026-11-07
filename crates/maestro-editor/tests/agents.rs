@@ -3584,6 +3584,24 @@ fn files_the_test_run_creates_are_listed_apart_and_left_behind() {
         text.contains("ran: made-by-tests.txt.\n"),
         "only the kept file changed since the run: {text}"
     );
+    // A test run that ends while the dialog is up records another file:
+    // the dialog no longer says what happens, so `y` refuses.
+    let checked = agent(&ed, 0).test_outputs.clone();
+    let mut late = checked[0].clone();
+    late.path = "late.txt".into();
+    ed.agents.agents[0].test_outputs.push(late);
+    run(&mut ed, "y");
+    assert!(
+        status_text(&ed).contains(
+            "not integrated, nothing changed: the files Maestro's test run created changed after \
+             the dialog was checked"
+        ),
+        "{}",
+        status_text(&ed)
+    );
+    assert_ne!(status(&ed, 0), Status::Integrated);
+    ed.agents.agents[0].test_outputs = checked;
+    open_integrate(&mut ed);
     run(&mut ed, "y");
     poll_until(&mut ed, "the integration", |ed| {
         status(ed, 0) == Status::Integrated

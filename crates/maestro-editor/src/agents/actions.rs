@@ -1142,6 +1142,10 @@ pub struct IntegrateFacts {
     /// committed or integrated. Everything else in the dialog leaves them
     /// out too.
     pub left_behind: Vec<super::TestOutput>,
+    /// The agent's records of files its test runs made, as the dialog was
+    /// checked with them. A run that ends after that can record more, and
+    /// integrating then refuses rather than commit them as the agent's.
+    pub outputs_checked: Vec<super::TestOutput>,
     pub message: String,
     pub agent_running: bool,
     /// The agent's task contract.
@@ -1227,8 +1231,9 @@ struct Other {
     name: String,
     worktree: super::WorktreeInfo,
     paths: std::collections::BTreeSet<PathBuf>,
-    /// Files its verification run made, left out of its snapshot.
-    test_made: Vec<PathBuf>,
+    /// Files its verification runs made; those still as the runs left
+    /// them are left out of its snapshot.
+    test_outputs: Vec<super::TestOutput>,
 }
 
 /// What the integrate check needs to know about the last verification.
@@ -1484,7 +1489,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 name: o.name.clone(),
                 worktree: ow,
                 paths: super::conflicts::changed_paths(o),
-                test_made: o.review.test_made.clone(),
+                test_outputs: o.test_outputs.clone(),
             })
         })
         .collect();
@@ -1503,6 +1508,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 target,
                 uncommitted: Vec::new(),
                 left_behind: Vec::new(),
+                outputs_checked: outputs.clone(),
                 message,
                 agent_running,
                 contract,
@@ -1639,7 +1645,8 @@ fn conflicts_after(
     };
     for o in others {
         let theirs = open_agent_worktree(git, &o.worktree).and_then(|r| {
-            r.work_snapshot_leaving_out(&o.test_made)
+            let made = super::test_outputs::still_made_by_tests(&r, &o.test_outputs)?;
+            r.work_snapshot_leaving_out(&made)
                 .map_err(|e| e.to_string())
         });
         match theirs.map(|t| main.merge_check(&merged, &t.commit)) {
@@ -1877,6 +1884,15 @@ pub fn integrate(ed: &mut Editor, id: AgentId, how: Integration, facts: Integrat
         ed.error(format!("not integrated, nothing changed: {why}"));
         return;
     }
+    // A test run that ended (or a K) after the dialog was checked changed
+    // which files are the run's; the dialog no longer says what happens.
+    if facts.part.is_none() && a.test_outputs != facts.outputs_checked {
+        ed.error(
+            "not integrated, nothing changed: the files Maestro's test run created changed \
+             after the dialog was checked; press I again to see what it would bring now",
+        );
+        return;
+    }
     if let Some(a) = ed.agents.get_mut(id) {
         a.git_busy = Some("integrating");
     }
@@ -1984,6 +2000,32 @@ fn run_integration(git: &maestro_git::Git, f: &IntegrateFacts, how: Integration)
         Err(e) => {
             out.outcome = Err(format!("committing the agent's work failed: {e}"));
             return out;
+        }
+    }
+    // Checked again after the commit: a file left behind that changed
+    // meanwhile (a commit hook, the agent) is the agent's now, and was
+    // left out. The commit stays on the agent's branch.
+    if !leave.is_empty() {
+        match super::test_outputs::still_made_by_tests(&wt, &f.left_behind) {
+            Ok(now) if now == leave => {}
+            Ok(now) => {
+                let changed: Vec<PathBuf> =
+                    leave.into_iter().filter(|p| !now.contains(p)).collect();
+                out.outcome = Err(format!(
+                    "files Maestro's test run created changed while the agent's work was \
+                     committed and count as the agent's now: {}; nothing was integrated. Press I \
+                     again to see what it would bring now",
+                    list_paths(&changed)
+                ));
+                return out;
+            }
+            Err(e) => {
+                out.outcome = Err(format!(
+                    "could not tell which files Maestro's test run created ({e}); nothing was \
+                     integrated"
+                ));
+                return out;
+            }
         }
     }
     // The dialog's lists and warnings were about one snapshot: the

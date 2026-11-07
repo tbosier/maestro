@@ -147,8 +147,8 @@ pub fn record(
         Ok(e) => e,
         Err(e) => {
             a.log(format!(
-                "could not tell which files the test run created ({e}); the review counts \
-                 every file as the agent's"
+                "could not tell which files the test run created ({e}); files it created count \
+                 as the agent's, and earlier records are kept"
             ));
             return;
         }
@@ -208,6 +208,11 @@ pub fn keep_as_agents(ed: &mut Editor, id: AgentId, path: &std::path::Path) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
+    // A run going now would record the file again when it ends.
+    if a.tests_running() {
+        ed.error("wait for the test run to finish; it would record the file again when it ends");
+        return;
+    }
     let Some(i) = a.test_outputs.iter().position(|o| o.path == path) else {
         ed.error(format!(
             "{} was not created by Maestro's test run; it already counts as the agent's",
