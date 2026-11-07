@@ -2517,6 +2517,23 @@ pub fn confirm_forget(ed: &mut Editor, id: AgentId) {
     }));
 }
 
+/// Takes the agent at index `i` out of the panel, stopping whatever of it
+/// still runs, and returns it.
+pub(crate) fn remove_from_panel(ed: &mut Editor, i: usize) -> super::Agent {
+    let mut a = ed.agents.agents.remove(i);
+    if a.is_running() || a.tests_running() {
+        a.stop();
+    }
+    let p = &mut ed.agents.panel;
+    p.selected = p.selected.min(ed.agents.agents.len().saturating_sub(1));
+    p.scroll = 0;
+    if p.terminal_focus == Some(a.id) {
+        p.terminal_focus = None;
+    }
+    super::conflicts::refresh(ed);
+    a
+}
+
 /// Removes an archived agent's record from the panel and, when records are
 /// saved, from the records file at the next save. Nothing on disk but the
 /// records file changes: the worktree is gone already and the branch stays.
@@ -2528,20 +2545,8 @@ pub fn forget(ed: &mut Editor, id: AgentId) {
         ed.error(why);
         return;
     }
-    let mut a = ed.agents.agents.remove(i);
-    if a.is_running() || a.tests_running() {
-        a.stop();
-    }
-    if let Some(w) = &a.worktree {
-        super::persist::forget(ed, w);
-    }
-    let p = &mut ed.agents.panel;
-    p.selected = p.selected.min(ed.agents.agents.len().saturating_sub(1));
-    p.scroll = 0;
-    if p.terminal_focus == Some(id) {
-        p.terminal_focus = None;
-    }
-    super::conflicts::refresh(ed);
+    let a = remove_from_panel(ed, i);
+    super::persist::forget(ed, &a);
     ed.info(match &a.worktree {
         Some(w) => format!("forgot {}'s record; branch {} kept", a.name, w.branch),
         None => format!("forgot {}'s record", a.name),
