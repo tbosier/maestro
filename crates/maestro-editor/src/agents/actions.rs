@@ -656,23 +656,25 @@ pub fn confirm_reject(ed: &mut Editor, id: AgentId) {
     }));
 }
 
+/// Why `D` in the review refuses for the agent, judged from the record.
+/// [`ask_drop_file`] refuses with it and the review's hints use it.
+pub(crate) fn drop_blocker(a: &super::Agent) -> Option<String> {
+    found_refusal(a).or_else(|| busy(a))
+}
+
 /// Asks before discarding the agent's change to one file (`D` in the
 /// review).
 pub fn ask_drop_file(ed: &mut Editor, id: AgentId, file: &maestro_git::DiffFile) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    if let Some(why) = found_refusal(a) {
+    if let Some(why) = drop_blocker(a) {
         ed.error(why);
         return;
     }
     let Some(w) = a.worktree.clone() else {
         return;
     };
-    if let Some(why) = busy(a) {
-        ed.error(why);
-        return;
-    }
     let base = &w.base[..w.base.len().min(8)];
     let shown = |p: &Option<PathBuf>| p.as_deref().map(|p| p.display().to_string());
     let (old, new) = (file.old_path.clone(), file.new_path.clone());

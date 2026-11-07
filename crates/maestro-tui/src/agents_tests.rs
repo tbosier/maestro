@@ -162,6 +162,14 @@ fn loaded_agents_say_they_are_not_running_and_found_worktrees_have_no_status() {
     );
     assert!(text.contains("a adopt"), "{text}");
     assert!(!text.contains("R relaunch"), "{text}");
+    // Its review offers no key that refuses a found worktree.
+    ed.handle_key(KeyEvent::plain(KeyCode::Enter));
+    assert!(ed.agents.panel.review.is_some(), "{:?}", ed.status);
+    let keys: Vec<&str> = panel::hints(&ed).into_iter().map(|(k, _)| k).collect();
+    for gone in ["c", "D", "m", "t", "I", "X"] {
+        assert!(!keys.contains(&gone), "{gone} in {keys:?}");
+    }
+    assert!(keys.contains(&"j/k") && keys.contains(&"esc"), "{keys:?}");
 }
 
 fn added(path: &str) -> maestro_editor::agents::DiffFile {

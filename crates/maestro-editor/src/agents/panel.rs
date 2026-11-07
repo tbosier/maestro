@@ -1135,8 +1135,9 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
         return super::compose::hints();
     }
     if let Some(v) = &p.review {
-        // The review's own keys always work; the agent's actions are left
-        // out when they would refuse, judged as the actions judge.
+        // Moving, viewing and refreshing always work; the actions are left
+        // out when they would refuse, judged as the actions judge (a found
+        // worktree takes no comments).
         let a = ed.agents.get(v.agent);
         return super::review::hints()
             .into_iter()
@@ -1145,6 +1146,8 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
                 ("t", Some(a)) => actions::test_blocker(ed, a).is_none(),
                 ("I", Some(a)) => actions::integrate_blocker(a).is_none(),
                 ("X", Some(a)) => actions::reject_blocker(a).is_none(),
+                ("D", Some(a)) => actions::drop_blocker(a).is_none(),
+                ("c", Some(a)) => actions::found_refusal(a).is_none(),
                 _ => true,
             })
             .collect();
@@ -1156,8 +1159,10 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     };
     // Every key below is offered only when its action would not refuse,
     // judged by the same function the action calls first. A few checks
-    // read Git or the worktree when the key is pressed (the worktree's
-    // branch, unsaved buffers, the main worktree); those can still refuse.
+    // run only when the key is pressed, because they read Git, the
+    // worktree or PATH (the worktree's branch, unsaved buffers, the main
+    // worktree, which providers are available for N and R); those can
+    // still refuse.
     let ok = |why: Option<String>| why.is_none();
     // First, so it is the last hint a narrow panel cuts: the way into the
     // agent.

@@ -689,7 +689,8 @@ pub struct PersistState {
     /// Maestro wrote are not added back, and the sidebar does not list them.
     forgotten: HashSet<PathBuf>,
     /// Repositories whose file must be written even when no agent of
-    /// theirs is left, because a record was forgotten.
+    /// theirs is left, because a record was forgotten. An entry stays
+    /// until a write synced to disk (on quit) holds the change.
     rewrite: HashSet<PathBuf>,
 }
 
@@ -1264,7 +1265,9 @@ pub fn save(ed: &mut Editor, durable: bool) {
             && *last == text
             && (*synced || !durable)
         {
-            ed.agents.persist.rewrite.remove(&root);
+            if *synced {
+                ed.agents.persist.rewrite.remove(&root);
+            }
             continue;
         }
         let path = records_path(&state, &root);
@@ -1272,7 +1275,9 @@ pub fn save(ed: &mut Editor, durable: bool) {
             Ok(()) => {
                 *seen = Some(hash_bytes(text.as_bytes()));
                 *written = Some((text, durable));
-                ed.agents.persist.rewrite.remove(&root);
+                if durable {
+                    ed.agents.persist.rewrite.remove(&root);
+                }
             }
             Err(e) => errors.push(format!(
                 "could not save agent records to {}: {e}",
