@@ -113,6 +113,11 @@ pub struct Reviewed<'a> {
     /// The commit the reviewed work started from. It must be on the target
     /// branch, so the range integrated holds only commits after it.
     pub base: &'a str,
+    /// Untracked files (relative to the source worktree's root) that may
+    /// stay behind in the worktree that has the branch checked out: the
+    /// review left them out on purpose. Any other uncommitted or untracked
+    /// file there still refuses the integration.
+    pub leave_untracked: &'a [PathBuf],
 }
 
 /// [`Reviewed`] with the source resolved to a full id.
@@ -120,6 +125,7 @@ struct Pinned<'a> {
     commit: String,
     target: &'a str,
     base: &'a str,
+    leave_untracked: &'a [PathBuf],
 }
 
 /// A worktree's files as an unreferenced commit, from
@@ -355,6 +361,14 @@ impl Repository {
     /// on it. Used for merge dry runs between worktrees that hold
     /// uncommitted work ([`Repository::merge_check`]).
     pub fn work_snapshot(&self) -> Result<WorkSnapshot> {
+        self.work_snapshot_leaving_out(&[])
+    }
+
+    /// [`Repository::work_snapshot`] without the untracked files named in
+    /// `leave_out` (relative to the root, matched by exact name): what
+    /// [`Repository::commit_all_leaving_out`] with the same list would
+    /// commit. A path in `leave_out` that is already in the index stays.
+    pub fn work_snapshot_leaving_out(&self, leave_out: &[PathBuf]) -> Result<WorkSnapshot> {
         let head = self.resolve("HEAD")?;
         let index = TempFile::index_copy("snapshot-index", &self.git_dir().join("index"))?;
         // As in `review_diff`: a whole index, never new shared index files.
@@ -364,7 +378,7 @@ impl Repository {
                 .env("GIT_INDEX_FILE", &index.0)
                 .config("core.splitIndex=false"),
         );
-        shadow.run(&["add", "--all", "--", "."], Access::Write)?;
+        shadow.add_all(leave_out)?;
         let out = shadow.run(&["write-tree"], Access::Write)?;
         let tree = String::from_utf8_lossy(&out).trim().to_string();
         check_rev(&tree)?;
@@ -475,6 +489,32 @@ impl Repository {
     /// after staging and the commit is refused, but the conflict entries in
     /// the index are gone.
     pub fn commit_all(&self, message: &str) -> Result<Option<String>> {
+        self.commit_all_leaving_out(message, &[])
+    }
+
+    /// `git add --all`, or with `leave_out`, every path but those (each
+    /// matched by its exact name, relative to the root).
+    fn add_all(&self, leave_out: &[PathBuf]) -> Result<()> {
+        if leave_out.is_empty() {
+            self.run(&["add", "--all", "--", "."], Access::Write)?;
+        } else {
+            let mut args: Vec<OsString> = vec!["add".into(), "--all".into(), "--".into()];
+            args.extend(crate::untracked::all_but(leave_out)?);
+            self.with_magic_pathspecs().run(&args, Access::Write)?;
+        }
+        Ok(())
+    }
+
+    /// [`Repository::commit_all`], leaving the untracked files named in
+    /// `leave_out` (relative to the root, matched by exact name) untracked
+    /// and out of the commit. A path in `leave_out` that is already staged
+    /// is committed: this only keeps `git add` from picking it up. Returns
+    /// `None` when nothing else was there to commit.
+    pub fn commit_all_leaving_out(
+        &self,
+        message: &str,
+        leave_out: &[PathBuf],
+    ) -> Result<Option<String>> {
         let status = self.status()?;
         let conflicted: Vec<PathBuf> = status.conflicted().map(|e| e.path.clone()).collect();
         if !conflicted.is_empty() {
@@ -485,7 +525,7 @@ impl Repository {
             return Ok(None);
         }
         self.check_identity()?;
-        self.run(&["add", "--all"], Access::Write)?;
+        self.add_all(leave_out)?;
         if self.pseudo_ref("MERGE_HEAD")? != merging {
             return Err(GitError::InvalidArgument(
                 "a merge started in this worktree while committing; nothing was committed".into(),
@@ -742,6 +782,7 @@ impl Repository {
             commit: self.resolve(reviewed.commit)?,
             target: reviewed.target,
             base: reviewed.base,
+            leave_untracked: reviewed.leave_untracked,
         };
         self.integrate_inner(branch, Some(&pinned), how)
     }
@@ -798,7 +839,7 @@ impl Repository {
         if !dirty.is_empty() {
             return Err(IntegrateError::Dirty(dirty));
         }
-        self.check_source_worktree(branch)?;
+        self.check_source_worktree(branch, pinned.map_or(&[], |p| p.leave_untracked))?;
 
         let range = format!("{old_head}..{source}");
         let mut commits = self.rev_list(&["--reverse", &range])?;
@@ -914,8 +955,13 @@ impl Repository {
     }
 
     /// Refuses when the worktree that has `branch` checked out (if any,
-    /// other than this one) has uncommitted or untracked files.
-    fn check_source_worktree(&self, branch: &str) -> Result<(), IntegrateError> {
+    /// other than this one) has uncommitted or untracked files, other than
+    /// the untracked files named in `leave_untracked`.
+    fn check_source_worktree(
+        &self,
+        branch: &str,
+        leave_untracked: &[PathBuf],
+    ) -> Result<(), IntegrateError> {
         let here = std::fs::canonicalize(self.root()).unwrap_or_else(|_| self.root().into());
         for wt in self.worktrees()? {
             if wt.branch.as_deref() != Some(branch) || wt.prunable.is_some() || wt.bare {
@@ -931,8 +977,13 @@ impl Repository {
             let status = repo.status()?;
             let files: Vec<PathBuf> = status
                 .uncommitted()
-                .chain(status.untracked())
                 .map(|e| e.path.clone())
+                .chain(
+                    status
+                        .untracked()
+                        .map(|e| e.path.clone())
+                        .filter(|p| !leave_untracked.contains(p)),
+                )
                 .collect();
             if !files.is_empty() {
                 return Err(IntegrateError::SourceDirty(files));

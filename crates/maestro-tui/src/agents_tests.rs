@@ -114,6 +114,7 @@ fn record(id: u64, status: &str) -> maestro_editor::agents::persist::AgentRecord
         origin: None,
         composition: None,
         parts: vec![],
+        test_outputs: vec![],
     }
 }
 
@@ -247,6 +248,70 @@ fn contracts_and_conflicts_are_shown_in_words() {
     );
     assert!(
         text.contains("outside the task contract: stray.txt matches no allowed pattern"),
+        "{text}"
+    );
+}
+
+/// A file Maestro's test run made is marked `T` and says "test run" where
+/// the counts go; the summary counts only the agent's files and names it.
+#[test]
+fn test_run_files_are_marked_and_not_counted() {
+    use maestro_editor::agents::persist::from_record;
+    use maestro_editor::agents::review::ReviewView;
+    use maestro_editor::agents::{DiffLine, Hunk, TestOutput};
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 1, 160, 28));
+    let mut a = from_record(&record(1, "ready-for-review"), &[]);
+    let mut lock = added("Cargo.lock");
+    lock.hunks = vec![Hunk {
+        old_start: 0,
+        old_len: 0,
+        new_start: 1,
+        new_len: 1,
+        section: String::new(),
+        lines: vec![DiffLine {
+            kind: DiffLineKind::Added,
+            old_line: None,
+            new_line: Some(1),
+            text: "version = 4".into(),
+            no_newline: false,
+        }],
+    }];
+    a.review.files = vec![added("notes.txt"), lock];
+    a.review.test_made = vec!["Cargo.lock".into()];
+    a.review.computed = Some(std::time::Instant::now());
+    a.test_outputs = vec![TestOutput {
+        path: "Cargo.lock".into(),
+        blob: "0123abcd".into(),
+        command: "cargo test".into(),
+        agent_was_running: false,
+    }];
+    let id = a.id;
+    ed.agents.agents.push(a);
+    ed.handle_key(KeyEvent::char(' '));
+    ed.handle_key(KeyEvent::char('a'));
+    ed.agents.panel.review = Some(ReviewView {
+        file: 1,
+        ..ReviewView::new(id)
+    });
+    let mut s = Surface::new(160, 30, ed.theme.ui.text);
+    crate::render::render(&ed, &mut s);
+    let rows: Vec<String> = (0..30).map(|y| row(&s, y)).collect();
+    let text = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("TA Cargo.lock") && r.contains("test run│")),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 files +0 -0  and 1 created by the test run (T, not counted)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Cargo.lock  T added, created by Maestro's test run"),
+        "{text}"
+    );
+    assert!(
+        text.contains("T created by Maestro's test run (`cargo test`), not by the agent"),
         "{text}"
     );
 }
