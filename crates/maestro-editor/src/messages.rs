@@ -27,8 +27,9 @@ pub struct Message {
 #[derive(Debug, Default)]
 pub struct MessageLog {
     entries: VecDeque<Message>,
-    /// The buffer the last `:messages` opened; the next one replaces it.
-    doc: Option<DocumentId>,
+    /// Buffers `:messages` opened that are still open. The next `:messages`
+    /// closes the ones nothing shows and nobody edited.
+    docs: Vec<DocumentId>,
 }
 
 impl MessageLog {
@@ -63,6 +64,21 @@ impl MessageLog {
         });
     }
 
+    /// Takes back the newest record of `text`, for a message that was set
+    /// only to be captured and shown as part of a later one.
+    pub(crate) fn unrecord(&mut self, severity: Severity, text: &str) {
+        if let Some(last) = self.entries.back_mut()
+            && last.severity == severity
+            && last.text == text
+        {
+            if last.count > 1 {
+                last.count -= 1;
+            } else {
+                self.entries.pop_back();
+            }
+        }
+    }
+
     /// The kept messages, oldest first.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Message> + ExactSizeIterator {
         self.entries.iter()
@@ -90,9 +106,30 @@ fn utc_clock(secs: i64) -> String {
     format!("{:02}:{:02}:{:02}", day / 3600, day % 3600 / 60, day % 60)
 }
 
-/// Splits `line` into pieces at most `width` columns wide, breaking after
-/// a space where one is in reach and inside a word otherwise. Columns are
-/// counted as the editor draws text (wide characters take two).
+/// `line` with each tab replaced by spaces up to the next multiple of
+/// `tab_width`, so the log holds no tabs whose width depends on where they
+/// are drawn.
+fn expand_tabs(line: &str, tab_width: usize) -> String {
+    let tab_width = tab_width.max(1);
+    let mut out = String::new();
+    let mut col = 0;
+    for g in maestro_core::text::graphemes(maestro_core::RopeSlice::from(line)) {
+        if g == "\t" {
+            let n = tab_width - col % tab_width;
+            out.push_str(&" ".repeat(n));
+            col += n;
+        } else {
+            col += maestro_core::text::grapheme_width(&g, col, tab_width);
+            out.push_str(&g);
+        }
+    }
+    out
+}
+
+/// Splits `line` (with no tabs; see [`expand_tabs`]) into pieces at most
+/// `width` columns wide, breaking after a space where one is in reach and
+/// inside a word otherwise. Columns are counted as the editor draws text:
+/// wide characters take two, control characters two (`^X`).
 fn wrap(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
@@ -101,7 +138,7 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     // Byte offset in `cur` just after its last space, and the width there.
     let mut last_space: Option<(usize, usize)> = None;
     for g in maestro_core::text::graphemes(maestro_core::RopeSlice::from(line)) {
-        let w = maestro_core::text::grapheme_width(&g, cur_w, 4);
+        let w = maestro_core::text::grapheme_width(&g, cur_w, 1);
         if cur_w + w > width && !cur.is_empty() {
             if g == " " {
                 // The line ends exactly here; the space goes with the break.
@@ -135,21 +172,37 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Narrowest text column worth keeping beside the time and severity; below
+/// it each message starts on the line after them.
+const MIN_TEXT_W: usize = 20;
+
 /// The log as text, oldest first, and the char offset of the newest
-/// message's first line (where the cursor goes). Message text is wrapped
-/// to `width` columns (pass `usize::MAX` for none), continuation lines
-/// indented under it.
-pub fn render(log: &MessageLog, width: usize) -> (String, usize) {
-    let mut text =
-        format!("Status messages, oldest first. Times are UTC. The last {LOG_LEN} are kept.\n\n");
+/// message's first line (where the cursor goes). Lines are wrapped to
+/// `width` columns (pass `usize::MAX` for none) and tabs expanded to
+/// `tab_width`. Where there is room the text sits right of the time and
+/// severity, continuation lines indented under it; in a narrow view each
+/// message starts on the line after them, indented two columns.
+pub fn render(log: &MessageLog, width: usize, tab_width: usize) -> (String, usize) {
+    let width = width.max(1);
+    let mut text = String::new();
+    let header =
+        format!("Status messages, oldest first. Times are UTC. The last {LOG_LEN} are kept.");
+    for piece in wrap(&header, width) {
+        text.push_str(&piece);
+        text.push('\n');
+    }
+    text.push('\n');
     if log.is_empty() {
         text.push_str("No messages yet.\n");
         return (text, 0);
     }
     // Width of the widest severity word, so the text column lines up.
     let word_w = "warning".len();
-    let indent = " ".repeat("00:00:00".len() + 2 + word_w + 2);
-    let text_w = width.saturating_sub(indent.len()).max(20);
+    let beside = "00:00:00".len() + 2 + word_w + 2;
+    let narrow = width < beside + MIN_TEXT_W;
+    let indent = if narrow { 2 } else { beside };
+    let text_w = width.saturating_sub(indent).max(1);
+    let pad = " ".repeat(indent);
     let mut newest = 0;
     for m in log.iter() {
         newest = text.len();
@@ -157,16 +210,19 @@ pub fn render(log: &MessageLog, width: usize) -> (String, usize) {
         if m.count > 1 {
             body.push_str(&format!(" (shown {} times in a row)", m.count));
         }
-        let pieces = body.lines().flat_map(|l| wrap(l, text_w));
+        let head = format!("{}  {:<word_w$}", utc_clock(m.at), m.severity.label());
+        if narrow {
+            text.push_str(head.trim_end());
+            text.push('\n');
+        }
+        let pieces = body
+            .lines()
+            .flat_map(|l| wrap(&expand_tabs(l, tab_width), text_w));
         for (i, piece) in pieces.enumerate() {
-            let line = if i == 0 {
-                format!(
-                    "{}  {:<word_w$}  {piece}",
-                    utc_clock(m.at),
-                    m.severity.label()
-                )
+            let line = if i == 0 && !narrow {
+                format!("{head}  {piece}")
             } else {
-                format!("{indent}{piece}")
+                format!("{pad}{piece}")
             };
             text.push_str(line.trim_end());
             text.push('\n');
@@ -177,31 +233,34 @@ pub fn render(log: &MessageLog, width: usize) -> (String, usize) {
 }
 
 /// `:messages`: opens the log in a scratch buffer with the cursor on the
-/// newest message. The buffer an earlier `:messages` opened is dropped when
-/// nothing else shows it and it was not edited.
+/// newest message. Buffers earlier `:messages` opened are closed when no
+/// view shows them and nobody edited them.
 pub fn show(ed: &mut Editor) {
     // Room for text in the focused view, less a gutter wide enough for
-    // five-digit line numbers, so wrapped lines need no sideways scrolling.
+    // five-digit line numbers (the widest a log of 200 wrapped messages
+    // plausibly needs), so wrapped lines need no sideways scrolling.
     let width = (ed.view().area.width as usize).saturating_sub(8);
-    let (text, newest) = render(&ed.messages, width);
-    let old = ed.messages.doc.take();
+    let (text, newest) = render(&ed.messages, width, ed.tab_width());
     let id = ed.add_document(Document::from_text(&text));
     if let Some(b) = ed.buffers.get_mut(&id) {
         b.last_selection = Selection::point(newest);
     }
     ed.switch_to(id);
-    ed.messages.doc = Some(id);
-    if let Some(old) = old
-        && old != id
-        && ed
-            .buffers
-            .get(&old)
-            .is_some_and(|b| !b.doc.is_modified() && b.doc.path().is_none())
-        && !ed.views.values().any(|v| v.doc == old)
-    {
-        // Unmodified, so closing cannot fail or lose anything.
-        let _ = ed.close_buffer(old, false);
+    let old = std::mem::take(&mut ed.messages.docs);
+    for doc in old {
+        let Some(b) = ed.buffers.get(&doc) else {
+            continue;
+        };
+        let untouched = !b.doc.is_modified() && b.doc.path().is_none();
+        if untouched && !ed.views.values().any(|v| v.doc == doc) {
+            // Unmodified, so closing cannot fail or lose anything.
+            let _ = ed.close_buffer(doc, false);
+        } else if b.doc.path().is_none() {
+            // Still shown or edited: tried again next time.
+            ed.messages.docs.push(doc);
+        }
     }
+    ed.messages.docs.push(id);
 }
 
 #[cfg(test)]
@@ -236,7 +295,7 @@ mod tests {
         log.push_at(Severity::Warning, "one\ntwo", 3661);
         log.push_at(Severity::Info, "x", 3662);
         log.push_at(Severity::Info, "x", 3663);
-        let (text, newest) = render(&log, usize::MAX);
+        let (text, newest) = render(&log, usize::MAX, 4);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[2], "01:01:01  warning  one");
         assert_eq!(lines[3], "                   two");
@@ -254,10 +313,35 @@ mod tests {
         let long = format!("{} tail", "word ".repeat(10).trim_end());
         log.push_at(Severity::Error, &long, 0);
         // 19 columns of time and severity, 20 of text.
-        let (text, _) = render(&log, 39);
-        let lines: Vec<&str> = text.lines().skip(2).collect();
+        let (text, _) = render(&log, 39, 4);
+        // The header wraps too; messages start after the blank line.
+        let body = text.split("\n\n").nth(1).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines[0], "00:00:00  error    word word word word");
         assert_eq!(lines[1], "                   word word word word");
         assert_eq!(lines[2], "                   word word tail");
+    }
+
+    #[test]
+    fn unrecord_takes_back_only_the_matching_newest_message() {
+        let mut log = MessageLog::default();
+        log.push_at(Severity::Info, "keep", 1);
+        log.push_at(Severity::Warning, "w", 2);
+        log.push_at(Severity::Warning, "w", 3);
+        log.unrecord(Severity::Warning, "w");
+        assert_eq!(log.iter().next_back().unwrap().count, 1);
+        log.unrecord(Severity::Warning, "w");
+        log.unrecord(Severity::Warning, "keep");
+        let left: Vec<_> = log.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(left, ["keep"]);
+    }
+
+    #[test]
+    fn a_narrow_width_puts_the_text_under_the_time() {
+        let mut log = MessageLog::default();
+        log.push_at(Severity::Error, "one two three", 0);
+        let (text, newest) = render(&log, 24, 4);
+        assert!(text.lines().all(|l| l.chars().count() <= 24), "{text}");
+        assert!(text[newest..].starts_with("00:00:00  error\n  one two three\n"));
     }
 }

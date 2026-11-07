@@ -534,10 +534,16 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
         });
         if !same {
             if target.exists() && !force {
-                return Err(format!("{} exists (add ! to overwrite)", target.display()));
+                return Err(format!(
+                    "{} exists (add ! to overwrite)",
+                    editor.show_path(&target)
+                ));
             }
             if editor.find_buffer_by_path(&target).is_some() {
-                return Err(format!("{} is open in another buffer", target.display()));
+                return Err(format!(
+                    "{} is open in another buffer",
+                    editor.show_path(&target)
+                ));
             }
             editor.buffer_mut().doc.set_path(target);
             editor.refresh_syntax(editor.view().doc);
@@ -569,7 +575,25 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
             Ok(())
         }
         Err(SaveError::NoPath) => Err("no file name; use :w <path>".into()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            let name = buf
+                .doc
+                .path()
+                .map(|p| crate::navigation::display_path(p, &cwd))
+                .unwrap_or_else(|| buf.doc.display_name());
+            Err(save_error(&name, &e))
+        }
+    }
+}
+
+/// A save failure in words, naming the file as `name` (see
+/// [`Editor::show_path`]) instead of the absolute path the error carries.
+fn save_error(name: &str, e: &SaveError) -> String {
+    match e {
+        SaveError::ExternallyModified(_) => {
+            format!("{name} changed on disk since it was opened; use :w! to overwrite or :reload")
+        }
+        e => e.to_string(),
     }
 }
 
@@ -614,7 +638,12 @@ fn write_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
                     .path()
                     .map(|p| crate::navigation::display_path(p, &ed.cwd))
                     .unwrap_or_else(|| buf.doc.display_name());
-                errors.push(format!("{name}: {e}"));
+                let why = match e {
+                    // Already names the file.
+                    SaveError::ExternallyModified(_) => save_error(&name, &e),
+                    e => format!("{name}: {e}"),
+                };
+                errors.push(why);
             }
         }
     }

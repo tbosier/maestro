@@ -203,7 +203,8 @@ fn a_long_message_is_whole_in_messages_and_wrapped_to_the_view() {
     let name = "q".repeat(150);
     run(&mut ed, &format!(":{name}\n:messages\n"));
     let text = ed.doc().text().to_string();
-    let lines: Vec<&str> = text.lines().skip(2).collect();
+    let body = text.split("\n\n").nth(1).unwrap();
+    let lines: Vec<&str> = body.lines().collect();
     assert!(lines.len() > 1, "{text}");
     // No line is wider than the 80-column view less its gutter.
     assert!(lines.iter().all(|l| l.chars().count() <= 72), "{text}");
@@ -212,4 +213,100 @@ fn a_long_message_is_whole_in_messages_and_wrapped_to_the_view() {
     // Joined back, the wrapped lines hold the whole message.
     let joined: String = lines.iter().map(|l| l[19..].trim_start()).collect();
     assert_eq!(joined, format!("unknown command:{name}"));
+}
+
+fn message_buffers(ed: &Editor) -> usize {
+    ed.buffers
+        .values()
+        .filter(|b| b.doc.path().is_none())
+        .filter(|b| b.doc.text().to_string().starts_with("Status messages"))
+        .count()
+}
+
+#[test]
+fn refreshing_messages_leaves_another_split_cursor_alone() {
+    // The file is the only buffer, so closing a log falls back to it.
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 0, 80, 24));
+    let id = ed.add_document(Document::from_text("one\ntwo\nthree\n"));
+    ed.switch_to(id);
+    assert_eq!(ed.buffers.len(), 1);
+    run(&mut ed, "jj<C-w>v");
+    run(&mut ed, ":first\n:messages\n");
+    // The other split goes back to the top of the file.
+    run(&mut ed, "<C-w>wgg<C-w>w");
+    let other = *ed.views.keys().find(|v| **v != ed.focus).unwrap();
+    assert_eq!(ed.views[&other].doc, id);
+    assert_eq!(ed.views[&other].selection.primary().head, 0);
+    run(&mut ed, ":second\n:messages\n");
+    assert_eq!(message_buffers(&ed), 1);
+    assert_eq!(ed.views[&other].selection.primary().head, 0);
+}
+
+#[test]
+fn messages_closes_every_earlier_buffer_no_view_shows() {
+    let mut ed = editor();
+    run(&mut ed, ":a\n:messages\n");
+    // A second split keeps the first log on screen while another opens.
+    run(&mut ed, "<C-w>v:b\n:messages\n");
+    assert_eq!(message_buffers(&ed), 2);
+    run(&mut ed, "<C-w>q:c\n:messages\n");
+    assert_eq!(message_buffers(&ed), 1);
+}
+
+#[test]
+fn a_narrow_view_gets_messages_wrapped_to_its_width() {
+    let mut ed = Editor::new(Config::default(), Rect::new(0, 0, 40, 24));
+    let name = "w".repeat(60);
+    run(&mut ed, &format!(":{name}\n:messages\n"));
+    let text = ed.doc().text().to_string();
+    let width = 40 - ed.gutter_width(ed.view()) as usize;
+    assert!(
+        text.lines().all(|l| l.chars().count() <= width),
+        "wider than {width}:\n{text}"
+    );
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squeezed.contains(&format!("unknowncommand:{name}")),
+        "{text}"
+    );
+}
+
+#[test]
+fn tabs_in_a_message_become_spaces_in_the_log() {
+    let mut ed = editor();
+    ed.error("a\tb");
+    run(&mut ed, ":messages\n");
+    let text = ed.doc().text().to_string();
+    assert!(!text.contains('\t'), "{text}");
+    assert!(text.contains("error    a   b"), "{text}");
+}
+
+#[test]
+fn save_refusals_name_the_file_relative_to_the_working_directory() {
+    let dir = temp_dir("save");
+    std::fs::write(dir.join("taken.txt"), "x\n").unwrap();
+    let mut ed = editor();
+    run(&mut ed, &format!(":cd {}\n", dir.display()));
+    run(&mut ed, ":w taken.txt\n");
+    let (_, msg) = ed.status.clone().unwrap();
+    assert_eq!(msg, "taken.txt exists (add ! to overwrite)");
+
+    let path = dir.join("f.txt");
+    std::fs::write(&path, "v1\n").unwrap();
+    ed.open(&path).unwrap();
+    run(&mut ed, "imine <esc>");
+    std::fs::write(&path, "changed elsewhere\n").unwrap();
+    run(&mut ed, ":w\n");
+    let (_, msg) = ed.status.clone().unwrap();
+    assert_eq!(
+        msg,
+        "f.txt changed on disk since it was opened; use :w! to overwrite or :reload"
+    );
+    run(&mut ed, ":wa\n");
+    let (_, msg) = ed.status.clone().unwrap();
+    assert_eq!(
+        msg,
+        "f.txt changed on disk since it was opened; use :w! to overwrite or :reload"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

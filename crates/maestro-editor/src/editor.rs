@@ -717,11 +717,13 @@ impl Editor {
             .copied()
             .find(|k| *k != id)
             .unwrap_or_else(|| self.add_document(Document::default()));
+        let mut replaced = Vec::new();
         for v in self.views.values_mut().filter(|v| v.doc == id) {
             v.doc = replacement;
             v.selection = Selection::point(0);
             v.top_line = 0;
             v.left_col = 0;
+            replaced.push(v.id);
         }
         for v in self.views.values_mut() {
             if v.alternate == Some(id) {
@@ -738,10 +740,10 @@ impl Editor {
         }
         let sel = self.buffers[&replacement].last_selection.clone();
         let text = self.buffers[&replacement].doc.text().clone();
-        for v in self.views.values_mut().filter(|v| v.doc == replacement) {
-            if v.selection == Selection::point(0) {
-                v.selection = sel.clamp_normal(text.slice(..));
-            }
+        // Only views that showed the closed buffer move; a view already on
+        // the replacement keeps its cursor, even at the very start.
+        for v in self.views.values_mut().filter(|v| replaced.contains(&v.id)) {
+            v.selection = sel.clamp_normal(text.slice(..));
         }
         Ok(())
     }

@@ -1073,7 +1073,8 @@ fn draw_cmdline(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
         };
         let mut lines = msg.lines();
         let line = lines.next().unwrap_or_default();
-        let more = lines.next().is_some();
+        // Blank trailing lines hold nothing the marker would point to.
+        let more = lines.any(|l| !l.trim().is_empty());
         let shown = fit_message(
             &format!("{prefix}{line}"),
             text_right.saturating_sub(area.x) as usize,
@@ -1432,6 +1433,9 @@ mod tests {
         ed.info("first line\nsecond line");
         let line = cmdline_at_80(&mut ed);
         assert_eq!(line.trim_end(), "first line… (:messages)");
+        ed.info("only line\n\n");
+        let line = cmdline_at_80(&mut ed);
+        assert_eq!(line.trim_end(), "only line");
     }
 
     #[test]
