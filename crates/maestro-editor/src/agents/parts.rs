@@ -122,6 +122,8 @@ pub fn prepare(ed: &mut Editor, id: AgentId) {
                 base: w.base.clone(),
                 target,
                 uncommitted: Vec::new(),
+                left_behind: Vec::new(),
+                outputs_checked: Vec::new(),
                 message: String::new(),
                 agent_running,
                 contract,

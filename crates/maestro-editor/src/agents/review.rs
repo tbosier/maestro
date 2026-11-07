@@ -304,6 +304,7 @@ pub fn request(ed: &mut Editor, id: AgentId) {
     }
     a.review.running = true;
     a.review.again = false;
+    let outputs = a.test_outputs.clone();
     let spawned = ed.spawn_background("agent-review", move |tx| {
         // Discovery climbs to a parent repository when the worktree
         // directory is gone; only the worktree itself counts.
@@ -318,7 +319,10 @@ pub fn request(ed: &mut Editor, id: AgentId) {
                     // differently with other agents' work.
                     let head = repo.resolve("HEAD").ok();
                     repo.review_diff(&w.base)
-                        .map(|files| (files, head))
+                        .map(|files| {
+                            let made = test_made(&repo, &files, &outputs);
+                            Reviewed { files, head, made }
+                        })
                         .map_err(|e| e.to_string())
                 }
                 Ok(other) => Err(format!(
@@ -340,37 +344,83 @@ pub fn request(ed: &mut Editor, id: AgentId) {
     }
 }
 
-fn applied(ed: &mut Editor, id: AgentId, result: Result<(Vec<DiffFile>, Option<String>), String>) {
+/// A review diff computed on a background thread.
+struct Reviewed {
+    files: Vec<DiffFile>,
+    head: Option<String>,
+    /// Files of `files` the verification run created, as it left them.
+    made: Vec<PathBuf>,
+}
+
+/// Which added files of `files` are recorded test outputs still as their
+/// run left them. When Git cannot tell, none are: every file then counts
+/// as the agent's, as it did before Maestro recorded any.
+fn test_made(
+    repo: &maestro_git::Repository,
+    files: &[DiffFile],
+    outputs: &[super::TestOutput],
+) -> Vec<PathBuf> {
+    let added: Vec<super::TestOutput> = outputs
+        .iter()
+        .filter(|o| {
+            files.iter().any(|f| {
+                f.change == FileChange::Added
+                    && f.old_path.is_none()
+                    && f.new_path.as_ref() == Some(&o.path)
+            })
+        })
+        .cloned()
+        .collect();
+    super::test_outputs::still_made_by_tests(repo, &added).unwrap_or_default()
+}
+
+fn applied(ed: &mut Editor, id: AgentId, result: Result<Reviewed, String>) {
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
     a.review.running = false;
+    // The agent's files first, then those the verification run made.
+    let result = result.map(|mut r| {
+        let made = |f: &DiffFile| {
+            f.change == FileChange::Added
+                && f.old_path.is_none()
+                && f.new_path.as_ref().is_some_and(|p| r.made.contains(p))
+        };
+        let (mut files, theirs): (Vec<DiffFile>, Vec<DiffFile>) =
+            r.files.drain(..).partition(|f| !made(f));
+        files.extend(theirs);
+        r.files = files;
+        r
+    });
     // Overlaps and conflicts with other agents follow every change to
     // what the diff says (files, an error, the first result) and to the
     // commit it is on. A binary file's diff does not show its contents,
     // so a diff with one always counts as changed.
     let changed = match &result {
-        Ok((files, head)) => {
+        Ok(r) => {
             a.review.computed.is_none()
                 || a.review.error.is_some()
-                || *files != a.review.files
-                || *head != a.review.head
-                || files.iter().any(|f| f.binary)
+                || r.files != a.review.files
+                || r.head != a.review.head
+                || r.made != a.review.test_made
+                || r.files.iter().any(|f| f.binary)
         }
         Err(e) => a.review.error.as_ref() != Some(e),
     };
     match result {
-        Ok((files, head)) => {
-            a.review.files = files;
-            a.review.head = head;
+        Ok(r) => {
+            a.review.files = r.files;
+            a.review.head = r.head;
+            a.review.test_made = r.made;
             a.review.error = None;
             a.review.computed = Some(Instant::now());
             // A finished agent with nothing to review says so, judged
             // only on the newest diff: with a refresh queued this result
-            // may predate the agent's last edits.
+            // may predate the agent's last edits. Files the verification
+            // run made are not the agent's.
             match (
                 a.base_status(),
-                a.review.files.is_empty() && !a.review.again,
+                a.review.agent_files().next().is_none() && !a.review.again,
             ) {
                 (Status::ReadyForReview, true) => {
                     a.set_status(Status::Completed);
@@ -387,8 +437,7 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<(Vec<DiffFile>, Option<S
     // The compose view's marks of this agent follow its diff the same way.
     let keys: std::collections::BTreeSet<super::marks::HunkKey> = a
         .review
-        .files
-        .iter()
+        .agent_files()
         .flat_map(|f| f.hunks.iter().map(move |h| super::marks::HunkKey::of(f, h)))
         .collect();
     if let Some(c) = &mut ed.agents.panel.compose {
@@ -462,7 +511,9 @@ pub fn current_rows(ed: &Editor) -> Vec<Row> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if let Some(c) = &a.contract {
+    if a.review.is_test_made(f) {
+        out.extend(test_made_notes(a, f));
+    } else if let Some(c) = &a.contract {
         for (_, why) in super::out_of_scope(c, std::slice::from_ref(f)) {
             out.push(Row::Note(format!(
                 "{OUT_OF_SCOPE}: {why}; integrating it needs O, D drops it"
@@ -475,6 +526,31 @@ pub fn current_rows(ed: &Editor) -> Vec<Row> {
 
 /// The words the review puts on a file the task contract does not allow.
 pub const OUT_OF_SCOPE: &str = "outside the task contract";
+
+/// The words the review puts on a file Maestro's verification run made.
+pub const TEST_MADE: &str = "created by Maestro's test run";
+
+/// The lines above the diff of a file the verification run made.
+fn test_made_notes(a: &super::Agent, f: &DiffFile) -> Vec<Row> {
+    let output = f
+        .new_path
+        .as_ref()
+        .and_then(|p| a.test_outputs.iter().find(|o| &o.path == p));
+    let command = output.map_or(String::new(), |o| format!(" (`{}`)", o.command));
+    let mut out = vec![
+        Row::Note(format!("T {TEST_MADE}{command}, not by the agent")),
+        Row::Note(
+            "not counted, integrated or composed; K counts it as the agent's, D drops it (deletes it)"
+                .into(),
+        ),
+    ];
+    if output.is_some_and(|o| o.agent_was_running) {
+        out.push(Row::Note(
+            "the agent was running during that run; if it wrote this file, press K".into(),
+        ));
+    }
+    out
+}
 
 pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     let Some(mut v) = ed.agents.panel.review.clone() else {
@@ -619,6 +695,17 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
                 None => ed.error("no file to drop"),
             }
         }
+        KeyCode::Char('K') if !ctrl => {
+            let file = ed
+                .agents
+                .get(id)
+                .and_then(|a| a.review.files.get(v.file))
+                .and_then(|f| f.new_path.clone());
+            match file {
+                Some(p) => super::test_outputs::keep_as_agents(ed, id, &p),
+                None => ed.error("no file here was created by Maestro's test run"),
+            }
+        }
         KeyCode::Char('t') if !ctrl => super::actions::run_tests(ed, id),
         KeyCode::Char('m' | 'f') if !ctrl => super::actions::ask_message(ed, id),
         KeyCode::Char('?') => super::panel::show_keys(ed),
@@ -704,6 +791,7 @@ pub fn hints() -> Vec<(&'static str, &'static str)> {
         ("s", "side by side"),
         ("c", "comment"),
         ("D", "drop file"),
+        ("K", "count as the agent's"),
         ("ret", "open file"),
         ("m", "message agent"),
         ("t", "test"),

@@ -209,7 +209,7 @@ pub fn files(ed: &Editor, v: &ComposeView) -> Vec<PathBuf> {
         .agents
         .iter()
         .filter_map(|i| ed.agents.get(*i))
-        .flat_map(|a| a.review.files.iter().filter_map(|f| f.path().cloned()))
+        .flat_map(|a| a.review.agent_files().filter_map(|f| f.path().cloned()))
         .collect();
     out.sort();
     out.dedup();
@@ -238,7 +238,7 @@ pub fn items(ed: &Editor, v: &ComposeView) -> Vec<Item> {
         // Every entry of the path: a file whose type changed is a deletion
         // and an addition of one path.
         for (fi, f) in a.review.files.iter().enumerate() {
-            if f.path() != Some(&path) || unmarkable(f).is_some() {
+            if f.path() != Some(&path) || unmarkable(f).is_some() || a.review.is_test_made(f) {
                 continue;
             }
             for (hi, h) in f.hunks.iter().enumerate() {

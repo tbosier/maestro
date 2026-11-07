@@ -121,6 +121,20 @@ pub struct AgentRecord {
     /// Parts of the work integrated on their own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<SavedPart>,
+    /// Files Maestro's verification runs created in the worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_outputs: Vec<SavedTestOutput>,
+}
+
+/// A [`super::TestOutput`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTestOutput {
+    /// Relative to the worktree root.
+    pub path: String,
+    pub blob: String,
+    pub command: String,
+    #[serde(default)]
+    pub agent_was_running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +209,7 @@ pub struct SavedTestRun {
     pub tail: Vec<String>,
     /// Output lines not kept.
     pub dropped: usize,
-    /// The tree of the worktree's files when the run finished.
+    /// The tree of the worktree's files when the run started.
     #[serde(default)]
     pub tree: Option<String>,
     /// The agent's process ran during the run.
@@ -348,6 +362,33 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
         && !is_object_id(&c.commit)
     {
         return Err(format!("composed commit {:?} is not a commit id", c.commit));
+    }
+    // Integrate leaves these paths out of its commit: each must name a file
+    // inside the worktree, and the list stays bounded.
+    if r.test_outputs.len() > super::test_outputs::MAX_TEST_OUTPUTS {
+        return Err(format!(
+            "{} files created by test runs; at most {} are kept",
+            r.test_outputs.len(),
+            super::test_outputs::MAX_TEST_OUTPUTS
+        ));
+    }
+    for o in &r.test_outputs {
+        let p = Path::new(&o.path);
+        let plain = p
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if o.path.is_empty() || !plain {
+            return Err(format!(
+                "test run file {:?} is not a path inside the worktree",
+                o.path
+            ));
+        }
+        if !is_object_id(&o.blob) {
+            return Err(format!(
+                "test run file blob {:?} is not an object id",
+                o.blob
+            ));
+        }
     }
     for p in &r.parts {
         if !p.branch.starts_with("maestro/") || !is_object_id(&p.commit) {
@@ -506,6 +547,18 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
                 .collect(),
         }),
         parts,
+        test_outputs: a
+            .test_outputs
+            .iter()
+            .filter_map(|o| {
+                Some(SavedTestOutput {
+                    path: o.path.to_str()?.to_string(),
+                    blob: o.blob.clone(),
+                    command: o.command.clone(),
+                    agent_was_running: o.agent_was_running,
+                })
+            })
+            .collect(),
     })
 }
 
@@ -557,6 +610,16 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
             })
             .collect(),
     });
+    a.test_outputs = r
+        .test_outputs
+        .iter()
+        .map(|o| super::TestOutput {
+            path: PathBuf::from(&o.path),
+            blob: o.blob.clone(),
+            command: o.command.clone(),
+            agent_was_running: o.agent_was_running,
+        })
+        .collect();
     a.parts = r
         .parts
         .iter()
@@ -730,6 +793,9 @@ fn fingerprint(ed: &Editor) -> u64 {
         a.contract.as_ref().map(|c| c.brief()).hash(&mut h);
         a.composition.as_ref().map(|c| &c.commit).hash(&mut h);
         a.parts.len().hash(&mut h);
+        for o in &a.test_outputs {
+            (&o.path, &o.blob).hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -1329,6 +1395,7 @@ mod tests {
             origin: None,
             composition: None,
             parts: vec![],
+            test_outputs: vec![],
         }
     }
 
@@ -1418,6 +1485,28 @@ mod tests {
         assert!(
             matches!(read(&bad, Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("task contract"))
         );
+        // A test run's file is a path inside the worktree with a blob id;
+        // integrate leaves exactly these paths out of its commit.
+        for (path, blob, why) in [
+            ("../escape", "abc123", "not a path inside the worktree"),
+            ("/etc/passwd", "abc123", "not a path inside the worktree"),
+            ("", "abc123", "not a path inside the worktree"),
+            ("Cargo.lock", "--not-hex", "not an object id"),
+        ] {
+            let mut f = file.clone();
+            f.agents[0].test_outputs = vec![SavedTestOutput {
+                path: path.into(),
+                blob: blob.into(),
+                command: "cargo test".into(),
+                agent_was_running: false,
+            }];
+            let bad = write(&dir, "outputs.json", &serde_json::to_string(&f).unwrap());
+            assert!(
+                matches!(read(&bad, Path::new("/r")), ReadOutcome::Unusable(ref m) if m.contains(why)),
+                "{path:?} {blob:?}: {:?}",
+                read(&bad, Path::new("/r"))
+            );
+        }
         let mut f = file;
         f.agents[0].kind = "robot".into();
         let kind = write(&dir, "kind.json", &serde_json::to_string(&f).unwrap());

@@ -268,6 +268,29 @@ owner = "agent"
 status = "done"
 
 [[task]]
+id = "fix-task-base"
+title = "New tasks start from the main worktree's branch; the provider list says where and warns about uncommitted files"
+crates = ["maestro-editor", "maestro-tui"]
+branch = "fix/task-base"
+owner = "agent"
+status = "done"
+# n starts from the HEAD of the branch checked out in the main worktree (what
+# I integrates into), from any worktree. The provider list names the commit,
+# says when you are in another worktree, and warns with ! about uncommitted
+# files there. Detached or unborn main: the current worktree's HEAD, said so.
+
+[[task]]
+id = "fix-test-outputs"
+title = "Files Maestro's own test run creates are listed apart and left out of counts, compose and integrate"
+crates = ["maestro-editor", "maestro-tui", "maestro-git"]
+branch = "fix/test-outputs"
+owner = "agent"
+status = "done"
+# New untracked files after t are recorded with their blob ids; the review
+# marks them T, K counts one as the agent's, and integrate leaves them
+# untracked by exact-name pathspec exclusion. See docs/agent-model.md.
+
+[[task]]
 id = "fix-status-words"
 title = "One word per agent state in the panel, sidebar, palette and notifications; archived agents say archived; hints only for keys that work; d forgets an archived agent's record"
 crates = ["maestro-editor", "maestro-tui"]

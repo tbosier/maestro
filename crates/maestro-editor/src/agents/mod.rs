@@ -26,6 +26,7 @@ pub mod panel;
 pub mod parts;
 pub mod persist;
 pub mod review;
+pub mod test_outputs;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -298,9 +299,11 @@ pub struct TestRun {
     pub dropped: usize,
     pub finished: Option<TestFinish>,
     /// The tree of the worktree's files (tracked and untracked, not
-    /// ignored) as they were just after the run finished, from
-    /// `maestro_git::Repository::work_snapshot`. Integrate compares it
-    /// with the files then; `None` until computed, or when it could not be.
+    /// ignored) as they were just before the command started, without
+    /// files earlier runs created ([`TestOutput`]), from
+    /// `maestro_git::Repository::work_snapshot_leaving_out`. Integrate
+    /// compares it with the files then; `None` until computed, or when it
+    /// could not be.
     pub tree: Option<String>,
     /// The agent's process was running when the run started or finished,
     /// so it may have changed files the run did not see.
@@ -364,10 +367,32 @@ const MAX_STDERR_LINES: usize = 500;
 /// Transcript entries kept per ACP agent.
 const MAX_TRANSCRIPT: usize = 5_000;
 
+/// A file Maestro's own verification run (`t`) created in the agent's
+/// worktree, as the run left it. See [`test_outputs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestOutput {
+    /// Relative to the worktree root.
+    pub path: PathBuf,
+    /// Its blob id when the run ended. Once the file's contents differ
+    /// from this, it counts as the agent's again.
+    pub blob: String,
+    /// The command that created it, as the run showed it.
+    pub command: String,
+    /// The agent's process was running during that run, so it may have
+    /// written the file itself.
+    pub agent_was_running: bool,
+}
+
 /// The last review diff of an agent's worktree.
 #[derive(Debug, Default)]
 pub struct ReviewData {
+    /// Every changed file, the agent's first and then those in
+    /// `test_made`, each group in Git's order.
     pub files: Vec<DiffFile>,
+    /// Files of `files` that Maestro's verification run created and that
+    /// are still as it left them (untracked, same contents): shown apart,
+    /// left out of the counts, of overlaps, marks, compose and integrate.
+    pub test_made: Vec<PathBuf>,
     /// The worktree's `HEAD` commit when `files` was computed.
     pub head: Option<String>,
     /// When `files` was computed. `None` before the first diff.
@@ -379,15 +404,32 @@ pub struct ReviewData {
 }
 
 impl ReviewData {
-    /// Files changed, lines added, lines removed.
+    /// The agent's files changed, lines added, lines removed. Files the
+    /// verification run created ([`ReviewData::test_made`]) do not count.
     pub fn totals(&self) -> (usize, usize, usize) {
-        let (mut a, mut r) = (0, 0);
-        for f in &self.files {
+        let (mut n, mut a, mut r) = (0, 0, 0);
+        for f in self.agent_files() {
             let (fa, fr) = f.counts();
+            n += 1;
             a += fa;
             r += fr;
         }
-        (self.files.len(), a, r)
+        (n, a, r)
+    }
+
+    /// `f` is a file Maestro's verification run created, as it left it.
+    pub fn is_test_made(&self, f: &DiffFile) -> bool {
+        f.change == FileChange::Added
+            && f.old_path.is_none()
+            && f.new_path
+                .as_ref()
+                .is_some_and(|p| self.test_made.contains(p))
+    }
+
+    /// The files that count as the agent's work: every file but those
+    /// the verification run created.
+    pub fn agent_files(&self) -> impl Iterator<Item = &DiffFile> {
+        self.files.iter().filter(|f| !self.is_test_made(f))
     }
 }
 
@@ -402,7 +444,10 @@ pub fn file_paths(f: &DiffFile) -> Vec<&PathBuf> {
 /// Files of `files` that `contract` does not allow, with the reason, in
 /// diff order. A rename or deletion counts when either of its paths is
 /// outside the contract.
-pub fn out_of_scope(contract: &contract::Contract, files: &[DiffFile]) -> Vec<(PathBuf, String)> {
+pub fn out_of_scope<'a>(
+    contract: &contract::Contract,
+    files: impl IntoIterator<Item = &'a DiffFile>,
+) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     for f in files {
         for p in file_paths(f) {
@@ -482,6 +527,9 @@ pub struct Agent {
     pub parts: Vec<marks::Part>,
     /// For a composed result: where its hunks came from.
     pub composition: Option<compose::Composition>,
+    /// Files Maestro's verification runs created in the worktree, from
+    /// the last run that could tell. See [`test_outputs`].
+    pub test_outputs: Vec<TestOutput>,
 }
 
 impl Agent {
@@ -524,6 +572,7 @@ impl Agent {
             marks: Vec::new(),
             parts: Vec::new(),
             composition: None,
+            test_outputs: Vec::new(),
         }
     }
 
@@ -635,7 +684,7 @@ impl Agent {
     /// Files in the last review diff that the contract does not allow.
     pub fn out_of_scope(&self) -> Vec<(PathBuf, String)> {
         match &self.contract {
-            Some(c) => out_of_scope(c, &self.review.files),
+            Some(c) => out_of_scope(c, self.review.agent_files()),
             None => Vec::new(),
         }
     }
