@@ -266,10 +266,14 @@ pub fn start_notes(git: &Git, cwd: &Path) -> Vec<String> {
                 .map(|e| e.path.clone())
                 .collect();
             if !dirty.is_empty() {
-                let files = if dirty.len() == 1 { "file" } else { "files" };
+                let (files, them) = if dirty.len() == 1 {
+                    ("file", "it")
+                } else {
+                    ("files", "them")
+                };
                 notes.push(format!(
-                    "! {name} has {} uncommitted {files} ({}): the agent will not see them; \
-                     commit them first if it should",
+                    "! {name} has {} uncommitted {files} ({}): the agent will not see {them}; \
+                     commit {them} first if it should",
                     dirty.len(),
                     super::actions::list_paths(&dirty)
                 ));

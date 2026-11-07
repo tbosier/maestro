@@ -1190,8 +1190,8 @@ fn a_task_started_in_another_worktree_starts_from_main() {
     assert_eq!(
         warnings,
         [
-            &"! main has 1 uncommitted file (src/lib.rs): the agent will not see them; \
-            commit them first if it should"
+            &"! main has 1 uncommitted file (src/lib.rs): the agent will not see it; \
+            commit it first if it should"
                 .to_string()
         ],
         "{notes:?}"
