@@ -56,6 +56,26 @@ fn main() {
             integrate_refuses_a_base_that_is_not_on_the_target,
         ),
         (
+            "rebasing_an_agent_off_main_lets_i_integrate_only_its_work",
+            rebasing_an_agent_off_main_lets_i_integrate_only_its_work,
+        ),
+        (
+            "a_rebase_that_would_conflict_is_not_offered",
+            a_rebase_that_would_conflict_is_not_offered,
+        ),
+        (
+            "a_running_agent_is_not_rebased",
+            a_running_agent_is_not_rebased,
+        ),
+        (
+            "a_tracked_file_the_test_run_changed_blocks_the_rebase_until_k",
+            a_tracked_file_the_test_run_changed_blocks_the_rebase_until_k,
+        ),
+        (
+            "a_rebase_git_refuses_after_y_is_put_back",
+            a_rebase_git_refuses_after_y_is_put_back,
+        ),
+        (
             "a_task_started_in_another_worktree_starts_from_main",
             a_task_started_in_another_worktree_starts_from_main,
         ),
@@ -174,6 +194,14 @@ fn main() {
         (
             "compose_view_j_and_k_stay_in_the_agents_column",
             compose_view_j_and_k_stay_in_the_agents_column,
+        ),
+        (
+            "compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes",
+            compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes,
+        ),
+        (
+            "compose_view_cursor_stays_on_its_hunk_when_an_agent_is_archived",
+            compose_view_cursor_stays_on_its_hunk_when_an_agent_is_archived,
         ),
         (
             "an_archived_agent_says_so_and_its_record_can_be_forgotten",
@@ -1163,44 +1191,294 @@ fn rejecting_during_creation_never_launches_and_quit_waits_for_git() {
     assert!(ed.should_quit);
 }
 
-fn integrate_refuses_a_base_that_is_not_on_the_target() {
-    let f = Fixture::new();
-    // main gets a second commit, the agent starts from it, and then main
-    // is reset to the first: the agent's base is no longer on main.
+/// main gets the commit "second", an agent starts from it and runs
+/// `script`, and once the program exits (unless `wait_exit` is false)
+/// main is reset to "initial" and gets "main moves on": the agent's base
+/// is no longer on main. Returns the editor, the old base and main's
+/// `HEAD`.
+fn off_main_agent(f: &Fixture, script: &str, wait_exit: bool) -> (Editor, String, String) {
     std::fs::write(f.repo.join("second.txt"), "second\n").unwrap();
     f.git(&f.repo, &["add", "-A"]);
     f.git(&f.repo, &["commit", "-q", "-m", "second"]);
-    let mut ed = f.editor(config(&[(
-        "alpha",
-        provider(
-            AgentProviderKind::Terminal,
-            "sh",
-            &["-c", "printf a > a.txt", "sh", "{task}"],
-        ),
-    )]));
+    let base = f.git(&f.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let mut ed = f.editor(config(&[("alpha", sh_provider(script))]));
     run(&mut ed, " a");
     start_task(&mut ed, "add a", 0);
-    poll_until(&mut ed, "the agent's exit", |ed| {
-        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
-    });
+    if wait_exit {
+        poll_until(&mut ed, "the agent's exit", |ed| {
+            ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+        });
+    } else {
+        poll_until(&mut ed, "the agent's worktree", |ed| {
+            ed.agents
+                .agents
+                .first()
+                .is_some_and(|a| a.worktree.is_some() && a.is_running())
+        });
+    }
     f.git(&f.repo, &["reset", "-q", "--hard", "HEAD~1"]);
-    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
-    // The review shows only the agent's file.
-    poll_until(&mut ed, "the review", |ed| review_paths(ed, 0) == ["a.txt"]);
-    run(&mut ed, "I");
-    poll_until(&mut ed, "the refusal", |ed| {
+    std::fs::write(f.repo.join("main.txt"), "main\n").unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "main moves on"]);
+    let main = f.git(&f.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    (ed, base, main)
+}
+
+/// `I` and the refusal it ends with.
+fn refused(ed: &mut Editor) -> String {
+    run(ed, "I");
+    poll_until(ed, "the refusal", |ed| {
         ed.status
             .as_ref()
             .is_some_and(|(_, m)| m.contains("not integrated"))
     });
-    let msg = ed.status.clone().unwrap().1;
+    status_text(ed)
+}
+
+fn branch_exists(f: &Fixture, branch: &str) -> bool {
+    f.cmd(
+        &f.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .status
+    .success()
+}
+
+fn integrate_refuses_a_base_that_is_not_on_the_target() {
+    let f = Fixture::new();
+    let (mut ed, base, main_head) = off_main_agent(&f, "printf a > a.txt", true);
+    // The review shows only the agent's file.
+    poll_until(&mut ed, "the review", |ed| review_paths(ed, 0) == ["a.txt"]);
+    let msg = refused(&mut ed);
+    // The refusal names the commit main lacks: short id and subject.
     assert!(msg.contains("which is not on main"), "{msg}");
-    assert!(ed.agents.panel.overlay.is_none());
-    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
-    assert_eq!(
-        f.git(&worktree(&ed, 0), &["status", "--porcelain"]),
-        "?? a.txt\n"
+    assert!(msg.contains("1 commit(s) that main does not have"), "{msg}");
+    assert!(msg.contains(&format!("{} second", &base[..7])), "{msg}");
+    let wt = worktree(&ed, 0);
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    let tip = f.git(&wt, &["rev-parse", "HEAD"]);
+    assert!(
+        agent(&ed, 0)
+            .history
+            .iter()
+            .any(|h| h.text.contains("integrate refused") && h.text.contains("second")),
+        "{:?}",
+        agent(&ed, 0).history
     );
+    // The rebase is offered, and says what it does.
+    let (text, keys) = dialog(&ed);
+    assert!(
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Rebase { .. })),
+        "{text}"
+    );
+    assert_eq!(keys[0].0, "y");
+    assert!(text.contains(&format!("{} second", &base[..7])), "{text}");
+    assert!(
+        text.contains("Commits the uncommitted work in a.txt"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("git rebase --onto main {} {branch}", &base[..8])),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("kept as the branch {branch}-before-rebase")),
+        "{text}"
+    );
+    // n leaves everything as it was.
+    run(&mut ed, "n");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]).trim(), main_head);
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "?? a.txt\n");
+    assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, base);
+    assert!(!branch_exists(&f, &format!("{branch}-before-rebase")));
+}
+
+/// `y` moves the agent's commit and its uncommitted file onto main, and
+/// `I` then integrates only those.
+fn rebasing_an_agent_off_main_lets_i_integrate_only_its_work() {
+    let f = Fixture::new();
+    let (mut ed, base, main_head) = off_main_agent(&f, "printf a > a.txt", true);
+    // The agent committed a.txt and left b.txt uncommitted.
+    let wt = worktree(&ed, 0);
+    f.git(&wt, &["add", "a.txt"]);
+    f.git(&wt, &["commit", "-q", "-m", "agent adds a"]);
+    std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+    let old_tip = f.git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    refused(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(text.contains("agent adds a"), "{text}");
+    assert!(text.contains("in b.txt"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the rebase", |ed| {
+        agent(ed, 0).git_busy.is_none() && status_text(ed).contains("rebased")
+    });
+    let msg = status_text(&ed);
+    assert!(msg.contains("2 commit(s) moved"), "{msg}");
+    assert!(msg.contains(&format!("{branch}-before-rebase")), "{msg}");
+    // The agent now starts from main, its branch is two commits on top,
+    // and the old tip is kept under a name.
+    assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, main_head);
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD~2"]).trim(), main_head);
+    assert_eq!(
+        f.git(
+            &f.repo,
+            &["rev-parse", &format!("{branch}-before-rebase~1")]
+        )
+        .trim(),
+        old_tip
+    );
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "");
+    assert!(!wt.join("second.txt").exists());
+    poll_until(&mut ed, "the review against the new base", |ed| {
+        let mut p = review_paths(ed, 0);
+        p.sort();
+        !ed.agents.agents[0].review.running && p == ["a.txt", "b.txt"]
+    });
+    // I now integrates, and main gets the agent's two files and nothing
+    // from the old base.
+    open_integrate(&mut ed);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    let log = f.git(&f.repo, &["log", "--format=%s", "main"]);
+    assert!(!log.contains("second"), "{log}");
+    assert!(log.contains("agent adds a"), "{log}");
+    assert!(f.repo.join("a.txt").exists() && f.repo.join("b.txt").exists());
+    assert!(!f.repo.join("second.txt").exists());
+    assert!(
+        agent(&ed, 0)
+            .history
+            .iter()
+            .any(|h| h.text.starts_with("rebased")),
+        "{:?}",
+        agent(&ed, 0).history
+    );
+    let _ = base;
+}
+
+/// main changes the agent's file: the dry run finds the conflict, the
+/// rebase is not offered and the branch stays where it was.
+fn a_rebase_that_would_conflict_is_not_offered() {
+    let f = Fixture::new();
+    let (mut ed, _base, _) = off_main_agent(&f, "printf 'agent\\n' > README.md", true);
+    let wt = worktree(&ed, 0);
+    f.git(&wt, &["commit", "-q", "-am", "agent edits the readme"]);
+    let tip = f.git(&wt, &["rev-parse", "HEAD"]);
+    std::fs::write(f.repo.join("README.md"), "main\n").unwrap();
+    f.git(&f.repo, &["commit", "-q", "-am", "main edits the readme"]);
+    let msg = refused(&mut ed);
+    assert!(msg.contains("is not offered"), "{msg}");
+    assert!(msg.contains("would conflict in README.md"), "{msg}");
+    assert!(ed.agents.panel.overlay.is_none(), "{msg}");
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "");
+}
+
+/// `y`, then git refuses (here a `pre-rebase` hook): the rebase is put
+/// back, Maestro's commit of the uncommitted work is undone, and the
+/// old-tip branch is gone.
+fn a_rebase_git_refuses_after_y_is_put_back() {
+    let f = Fixture::new();
+    let (mut ed, base, _) = off_main_agent(&f, "printf a > a.txt", true);
+    let wt = worktree(&ed, 0);
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    let tip = f.git(&wt, &["rev-parse", "HEAD"]);
+    refused(&mut ed);
+    dialog(&ed);
+    let hook = f.repo.join(".git/hooks/pre-rebase");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the failed rebase", |ed| {
+        agent(ed, 0).git_busy.is_none() && status_text(ed).contains("not rebased")
+    });
+    let msg = status_text(&ed);
+    assert!(msg.contains("the rebase was aborted"), "{msg}");
+    assert!(msg.contains("is back where it was"), "{msg}");
+    assert!(!msg.contains("was committed on its branch"), "{msg}");
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "A  a.txt\n");
+    assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, base);
+    assert!(!branch_exists(&f, &format!("{branch}-before-rebase")));
+}
+
+/// The test run rewrote a tracked file: integrate would commit it as it
+/// was before the run and leave the run's version on disk, but a rebase
+/// needs every tracked file committed, so it is not offered until `K`
+/// makes the change the agent's.
+fn a_tracked_file_the_test_run_changed_blocks_the_rebase_until_k() {
+    let f = Fixture::new();
+    std::fs::write(f.repo.join("second.txt"), "second\n").unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "second"]);
+    let mut ed = f.editor(test_run_config(
+        "printf 'rewritten by the tests\\n' > README.md",
+    ));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    f.git(&f.repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    std::fs::write(f.repo.join("main.txt"), "main\n").unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "main moves on"]);
+    let tip = f.git(&wt, &["rev-parse", "HEAD"]);
+
+    let msg = refused(&mut ed);
+    assert!(msg.contains("is not offered"), "{msg}");
+    assert!(
+        msg.contains(
+            "Maestro's test run changed tracked files in the agent's worktree (README.md)"
+        ),
+        "{msg}"
+    );
+    assert!(ed.agents.panel.overlay.is_none(), "{msg}");
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
+
+    // K on the run's change: now it is the agent's and the rebase moves it.
+    run(&mut ed, "\n<tab>K<esc>");
+    assert!(agent(&ed, 0).test_outputs.is_empty(), "{:?}", ed.status);
+    refused(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(text.contains("README.md"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the rebase", |ed| {
+        agent(ed, 0).git_busy.is_none() && status_text(ed).contains("rebased")
+    });
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "");
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+    assert!(!wt.join("second.txt").exists());
+}
+
+/// A running agent could commit while its branch is rewritten: the
+/// rebase is not offered.
+fn a_running_agent_is_not_rebased() {
+    let f = Fixture::new();
+    let (mut ed, _base, _) = off_main_agent(&f, "printf a > a.txt; sleep 30", false);
+    let wt = worktree(&ed, 0);
+    poll_until(&mut ed, "the agent's file", |_| wt.join("a.txt").exists());
+    let msg = refused(&mut ed);
+    assert!(msg.contains("1 commit(s) that main does not have"), "{msg}");
+    assert!(msg.contains("is not offered"), "{msg}");
+    assert!(msg.contains("is still running"), "{msg}");
+    assert!(ed.agents.panel.overlay.is_none(), "{msg}");
+    quit(&mut ed);
 }
 
 /// The reviewer's case: the editor switched into an agent's worktree,
@@ -3657,8 +3935,18 @@ fn composing_hunks_of_two_agents_tests_and_integrates_the_result() {
     .unwrap();
     let beta = id(&ed, 1);
     maestro_editor::agents::review::request(&mut ed, beta);
+    // A refresh C asked for may still be running and read the file while
+    // it was being written: it drops the mark too. Wait for the review of
+    // the new text, with no refresh queued behind it.
     poll_until(&mut ed, "the refresh that drops beta's mark", |ed| {
+        let b = agent(ed, 1);
         ed.agents.panel.compose.as_ref().unwrap().marks.len() == 1
+            && !b.review.running
+            && !b.review.again
+            && b.review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "beta three"))
     });
     assert!(status_text(&ed).contains("unmarked"), "{:?}", ed.status);
     run(&mut ed, "j \n");
@@ -3788,6 +4076,193 @@ fn compose_view_j_and_k_stay_in_the_agents_column() {
     run(&mut ed, "h");
     run(&mut ed, "j");
     assert_eq!(at(&ed), (0, 1), "j goes down alpha's column");
+}
+
+/// alpha (lines 2 and 28) and beta (lines 3 and 15) on one task, both
+/// finished, and the compose view open on alpha's first hunk once the
+/// refreshes `C` asked for are in.
+fn compose_two_agents() -> (Fixture, Editor) {
+    let f = calc_fixture();
+    let sed = |s: &str| {
+        sh_provider(&format!(
+            "sed '{s}' calc.txt > calc.tmp && mv calc.tmp calc.txt"
+        ))
+    };
+    let c = config(&[
+        ("alpha", sed("s/^line 2$/alpha 2/; s/^line 28$/alpha 28/")),
+        ("beta", sed("s/^line 3$/beta 3/; s/^line 15$/beta 15/")),
+    ]);
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 0);
+    start_contract_task(&mut ed, "improve the calculator\n@allow calc.txt", 0);
+    wait_files(&mut ed, 0, &["calc.txt"]);
+    run(&mut ed, "N");
+    run(&mut ed, "\n");
+    wait_files(&mut ed, 1, &["calc.txt"]);
+    select(&mut ed, 0);
+    run(&mut ed, "C");
+    poll_until(&mut ed, "the refreshes C asked for", |ed| {
+        review_settled(ed, 0) && review_settled(ed, 1)
+    });
+    (f, ed)
+}
+
+/// A refresh the test asked for, and any one queued behind it, applied.
+fn review_settled(ed: &Editor, i: usize) -> bool {
+    !agent(ed, i).review.running && !agent(ed, i).review.again
+}
+
+/// Agent, old start and length of the compose view's hunk under the
+/// cursor.
+fn compose_at(ed: &Editor) -> (String, usize, usize) {
+    use maestro_editor::agents::compose;
+    let v = ed.agents.panel.compose.as_ref().expect("the compose view");
+    let it = &compose::items(ed, v)[v.cursor];
+    let a = ed.agents.get(it.agent).expect("the item's agent");
+    let h = &a.review.files[it.file].hunks[it.hunk];
+    (a.name.clone(), h.old_start, h.old_len)
+}
+
+/// A refreshed diff reorders the compose view's hunks. The cursor stays
+/// on its hunk (same agent, same hunk), or on that agent's nearest hunk
+/// when its hunk is gone, and on its file when another file joins the
+/// list before it. Each refresh is waited for, so nothing here depends on
+/// timing.
+fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
+    use maestro_editor::agents::compose;
+    let (_f, mut ed) = compose_two_agents();
+    let at = compose_at;
+    let settled = review_settled;
+    let shape = |ed: &Editor| {
+        let v = ed.agents.panel.compose.as_ref().expect("the compose view");
+        compose::items(ed, v)
+            .iter()
+            .map(|i| (i.col, i.hunk))
+            .collect::<Vec<_>>()
+    };
+    // Written whole, as an agent's `sed > tmp && mv` does: a refresh never
+    // reads it half written.
+    let write = |path: PathBuf, text: String| {
+        let tmp = path.with_extension("maestro-test-tmp");
+        std::fs::write(&tmp, text).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+    };
+    run(&mut ed, "l");
+    assert_eq!(at(&ed), ("beta-2".into(), 1, 6));
+    assert_eq!(shape(&ed), [(0, 0), (1, 0), (1, 1), (0, 1)]);
+
+    // alpha also changes line 10. Its new hunk joins the first band, and
+    // the second item is now alpha's: the cursor stays on beta's hunk.
+    let alpha_wt = worktree(&ed, 0);
+    let text = read(&alpha_wt.join("calc.txt")).replace("\nline 10\n", "\nalpha 10\n");
+    write(alpha_wt.join("calc.txt"), text);
+    let alpha = id(&ed, 0);
+    maestro_editor::agents::review::request(&mut ed, alpha);
+    poll_until(&mut ed, "alpha's refresh with line 10", |ed| {
+        settled(ed, 0)
+            && agent(ed, 0).review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "alpha 10"))
+    });
+    assert_eq!(shape(&ed), [(0, 0), (0, 1), (1, 0), (1, 1), (0, 2)]);
+    assert_eq!(
+        at(&ed),
+        ("beta-2".into(), 1, 6),
+        "the cursor follows beta's hunk"
+    );
+    // space marks the hunk the cursor is on.
+    run(&mut ed, " ");
+    let v = ed.agents.panel.compose.clone().unwrap();
+    let marked: Vec<(AgentId, usize, usize)> = v
+        .marks
+        .iter()
+        .map(|(a, m)| (*a, m.key.old_start, m.key.old_len))
+        .collect();
+    assert_eq!(marked, [(id(&ed, 1), 1, 6)]);
+
+    // beta changes its line-15 hunk under the cursor: the cursor goes to
+    // beta's hunk nearest to where it was, the new line-15 hunk, not to
+    // beta's first.
+    run(&mut ed, "j");
+    assert_eq!(at(&ed), ("beta-2".into(), 12, 7));
+    let beta_wt = worktree(&ed, 1);
+    let text = read(&beta_wt.join("calc.txt")).replace("beta 15", "beta fifteen");
+    write(beta_wt.join("calc.txt"), text);
+    let beta = id(&ed, 1);
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "beta's refresh with beta fifteen", |ed| {
+        settled(ed, 1)
+            && agent(ed, 1).review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "beta fifteen"))
+    });
+    assert_eq!(at(&ed), ("beta-2".into(), 12, 7), "beta's nearest hunk");
+    assert_eq!(ed.agents.panel.compose.as_ref().unwrap().marks.len(), 1);
+
+    // beta empties the file: its hunks are gone, and the cursor goes to
+    // beta's nearest hunk, the deletion, not to the item now in its place.
+    write(beta_wt.join("calc.txt"), String::new());
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "beta's refresh of the empty file", |ed| {
+        settled(ed, 1) && agent(ed, 1).review.files[0].hunks[0].new_len == 0
+    });
+    assert_eq!(shape(&ed), [(0, 0), (0, 1), (0, 2), (1, 0)]);
+    assert_eq!(at(&ed), ("beta-2".into(), 1, 30), "beta's nearest hunk");
+    assert!(ed.agents.panel.compose.as_ref().unwrap().marks.is_empty());
+
+    // beta adds a.txt, which sorts before calc.txt: the view stays on
+    // calc.txt and on beta's hunk.
+    write(beta_wt.join("a.txt"), "new\n".into());
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "beta's refresh with a.txt", |ed| {
+        settled(ed, 1) && agent(ed, 1).review.files.len() == 2
+    });
+    let v = ed.agents.panel.compose.clone().unwrap();
+    assert_eq!(
+        compose::files(&ed, &v),
+        [PathBuf::from("a.txt"), PathBuf::from("calc.txt")]
+    );
+    assert_eq!(v.file, 1, "the view stays on calc.txt");
+    assert_eq!(at(&ed), ("beta-2".into(), 1, 30));
+}
+
+/// Archiving empties the agent's review, and its hunks leave the compose
+/// view: the cursor stays on beta's hunk. The view is opened while the
+/// force question is up and its refreshes are waited for, so the archive's
+/// result is the only one left to apply; the order does not depend on
+/// timing.
+fn compose_view_cursor_stays_on_its_hunk_when_an_agent_is_archived() {
+    use maestro_editor::agents::compose;
+    let (_f, mut ed) = compose_two_agents();
+    run(&mut ed, "<esc>");
+    // alpha's worktree has uncommitted changes: archiving asks to force.
+    select(&mut ed, 0);
+    run(&mut ed, "A");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the force confirmation", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::ForceArchive(_)))
+    });
+    // C under the question: the keys go to the question.
+    let beta = id(&ed, 1);
+    compose::open(&mut ed, beta);
+    poll_until(&mut ed, "the refreshes the view asked for", |ed| {
+        review_settled(ed, 0) && review_settled(ed, 1)
+    });
+    run(&mut ed, "F");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(!agent(&ed, 0).archived);
+    run(&mut ed, "l");
+    assert_eq!(compose_at(&ed), ("beta-2".into(), 1, 6));
+    poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
+    assert!(review_settled(&ed, 0) && review_settled(&ed, 1));
+    assert_eq!(
+        compose_at(&ed),
+        ("beta-2".into(), 1, 6),
+        "the cursor stays on beta's first hunk"
+    );
 }
 
 /// An archived agent says "archived" wherever it is listed, offers only

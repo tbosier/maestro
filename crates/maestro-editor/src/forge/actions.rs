@@ -791,7 +791,9 @@ fn worktree_job(
                 ));
             }
             let cmd = maestro_forge::checkout_command(pr, &branch, &path, &main);
-            gh.run(&cmd).map_err(|e| e.to_string())?;
+            // gh adds a worktree; agents may be adding theirs at once.
+            repo.with_worktree_lock(|| gh.run(&cmd))
+                .map_err(|e| e.to_string())?;
             false
         }
     };

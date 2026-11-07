@@ -533,6 +533,9 @@ fn applied(ed: &mut Editor, id: AgentId, result: Result<Reviewed, String>) {
             .retain(|(agent, m)| *agent != id || keys.contains(&m.key));
         dropped += before - c.marks.len();
     }
+    // Its files and hunks may now come in another order: the compose
+    // view's cursor stays on its hunk.
+    super::compose::refollow(ed);
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };

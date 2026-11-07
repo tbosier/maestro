@@ -374,6 +374,7 @@ pub fn keep_as_agents(ed: &mut Editor, id: AgentId, path: &std::path::Path) {
     );
     a.log(msg.clone());
     ed.info(msg);
+    super::compose::refollow(ed);
     super::review::request(ed, id);
     super::conflicts::refresh(ed);
 }

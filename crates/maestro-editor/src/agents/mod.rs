@@ -25,6 +25,7 @@ pub mod marks;
 pub mod panel;
 pub mod parts;
 pub mod persist;
+pub mod rebase;
 pub mod review;
 pub mod test_outputs;
 
