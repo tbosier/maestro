@@ -52,6 +52,7 @@ pub use stage::ApplyTo;
 pub use stash::Stash;
 pub use state::Operation;
 pub use status::{BranchInfo, ChangeKind, ConflictKind, EntryState, Status, StatusEntry};
+pub use untracked::{ChangedBlob, LeftOut, TrackedBlob};
 pub use worktree::{RemoveError, RemoveRefusal, Worktree};
 
 /// Errors from running `git`.

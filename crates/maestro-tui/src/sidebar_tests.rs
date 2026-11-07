@@ -55,6 +55,7 @@ fn editor(width: u16, height: u16) -> Editor {
         archived: false,
         tests_failed: false,
         worktree: PathBuf::from(wt),
+        created: 0,
     };
     ed.workspaces.projects = vec![
         Project {

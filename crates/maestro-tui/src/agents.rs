@@ -840,7 +840,7 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
         let (add, rem) = f.counts();
         // A file Maestro's test run made is marked `T` and says so where
         // the counts go: it is not counted, so it shows none.
-        let test_made = a.review.is_test_made(f);
+        let test_made = a.review.is_test_made(i);
         let counts = if test_made {
             " test run".to_string()
         } else {
@@ -912,14 +912,9 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
     let mut x = s.print(sm.x + 1, sm.y, &format!("{} ", mark(a)), style, r);
     x = s.print(x, sm.y, &a.name, ui.text.bold(), r);
     x = s.print(x + 2, sm.y, a.word(), style, r);
-    let made = a
-        .review
-        .files
-        .iter()
-        .filter(|f| a.review.is_test_made(f))
-        .count();
+    let made = a.review.test_made.len();
     let extra = if made > 0 {
-        format!("  and {made} created by the test run (T, not counted)")
+        format!("  and {made} by the test run (T, not counted)")
     } else {
         String::new()
     };
@@ -937,8 +932,8 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
                 f.path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
-                if a.review.is_test_made(f) {
-                    format!("T {}, {}", review::change_label(f), review::TEST_MADE)
+                if a.review.is_test_made(v.file) {
+                    format!("T {}, {}", review::change_label(f), review::test_words(f))
                 } else {
                     review::change_label(f)
                 },

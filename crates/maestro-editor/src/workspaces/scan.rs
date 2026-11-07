@@ -114,6 +114,9 @@ pub struct RecordAgent {
     /// it had not finished (as the agent panel shows it: killed).
     pub tests_failed: bool,
     pub worktree: PathBuf,
+    /// The record's creation time, milliseconds since the Unix epoch:
+    /// with the worktree, what a forgotten record is matched on.
+    pub created: u64,
 }
 
 /// Whether a scan runs and when the last one started.
@@ -516,6 +519,7 @@ fn read_records(state: &Path, main: &Path) -> (Vec<RecordAgent>, Option<String>)
                             .last()
                             .is_some_and(|t| !(t.finished && t.code == Some(0))),
                         worktree: normalize_path(Path::new(&r.worktree.path)),
+                        created: r.created,
                     }
                 })
                 .collect();
