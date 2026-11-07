@@ -32,7 +32,7 @@ pub(crate) fn list_paths(paths: &[PathBuf]) -> String {
 }
 
 /// Modified buffers whose files are under `root`.
-fn unsaved_under(ed: &Editor, root: &Path) -> Vec<String> {
+pub(crate) fn unsaved_under(ed: &Editor, root: &Path) -> Vec<String> {
     let root = normalize_path(root);
     ed.buffers
         .values()
@@ -1427,6 +1427,77 @@ pub(crate) fn open_agent_worktree(
     Ok(wt)
 }
 
+/// The agent's starting commit is not on the target branch: integrating
+/// would also bring in the commits `missing` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffTarget {
+    pub base: String,
+    pub target: String,
+    /// Commits the base has and the target lacks, newest first: the first
+    /// few and how many in all.
+    pub missing: maestro_git::Commits,
+}
+
+/// How many commits a refusal or a dialog names before "and N more".
+pub(crate) const COMMITS_SHOWN: usize = 3;
+
+/// `abc1234 subject; def5678 subject; and 2 more`.
+pub(crate) fn commit_list(c: &maestro_git::Commits) -> String {
+    let mut v: Vec<String> = c
+        .shown
+        .iter()
+        .take(COMMITS_SHOWN)
+        .map(|l| format!("{} {}", l.short, l.subject))
+        .collect();
+    let named = v.len();
+    if c.total > named {
+        v.push(format!("and {} more", c.total - named));
+    }
+    v.join("; ")
+}
+
+impl OffTarget {
+    /// The refusal, naming the commits.
+    pub fn words(&self) -> String {
+        format!(
+            "the agent started from {}, which is not on {}; integrating would also bring in \
+             {} commit(s) that {} does not have and the review does not show: {}",
+            super::create::short(&self.base),
+            self.target,
+            self.missing.total,
+            self.target,
+            commit_list(&self.missing)
+        )
+    }
+}
+
+/// Why [`check_before_commit_detailed`] refused.
+pub(crate) enum Refusal {
+    Other(String),
+    OffTarget(OffTarget),
+}
+
+impl From<String> for Refusal {
+    fn from(s: String) -> Self {
+        Refusal::Other(s)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(s: &str) -> Self {
+        Refusal::Other(s.into())
+    }
+}
+
+impl Refusal {
+    pub(crate) fn words(&self) -> String {
+        match self {
+            Refusal::Other(s) => s.clone(),
+            Refusal::OffTarget(o) => o.words(),
+        }
+    }
+}
+
 /// Everything integration needs to hold before anything is committed:
 /// both worktrees exist and are on the expected branches, the main
 /// worktree is clean, and the agent's base commit is on the target branch
@@ -1436,6 +1507,15 @@ pub(crate) fn check_before_commit(
     git: &maestro_git::Git,
     f: &IntegrateFacts,
 ) -> Result<(maestro_git::Repository, maestro_git::Repository), String> {
+    check_before_commit_detailed(git, f).map_err(|r| r.words())
+}
+
+/// [`check_before_commit`], telling a base that is not on the target apart
+/// from the other refusals, so `I` can offer to rebase.
+pub(crate) fn check_before_commit_detailed(
+    git: &maestro_git::Git,
+    f: &IntegrateFacts,
+) -> Result<(maestro_git::Repository, maestro_git::Repository), Refusal> {
     let wt = open_exact(git, &f.worktree)?;
     match wt.head().map_err(|e| e.to_string())? {
         Head::Branch(b) if b == f.branch => {}
@@ -1444,7 +1524,8 @@ pub(crate) fn check_before_commit(
                 "the agent's worktree is on {}, not {}",
                 other.label(),
                 f.branch
-            ));
+            )
+            .into());
         }
     }
     let main = open_exact(git, &f.main_root)?;
@@ -1452,14 +1533,17 @@ pub(crate) fn check_before_commit(
     match main.head().map_err(|e| e.to_string())? {
         Head::Branch(b) if b == f.target => {}
         Head::Detached(_) => {
-            return Err("the main worktree is not on a branch (detached HEAD)".into());
+            return Err(Refusal::Other(
+                "the main worktree is not on a branch (detached HEAD)".into(),
+            ));
         }
         other => {
             return Err(format!(
                 "the main worktree is now on {}, not {}",
                 other.label(),
                 f.target
-            ));
+            )
+            .into());
         }
     }
     let dirty: Vec<PathBuf> = main
@@ -1472,18 +1556,21 @@ pub(crate) fn check_before_commit(
         return Err(format!(
             "the main worktree has uncommitted changes in {}; commit or stash them first",
             list_paths(&dirty)
-        ));
+        )
+        .into());
     }
     if !main
         .can_fast_forward(&f.base, "HEAD")
         .map_err(|e| e.to_string())?
     {
-        return Err(format!(
-            "the agent started from {}, which is not on {}; integrating would also bring in \
-             the commits between them, which the review does not show",
-            super::create::short(&f.base),
-            f.target
-        ));
+        let missing = main
+            .commits_between("HEAD", &f.base, COMMITS_SHOWN)
+            .map_err(|e| e.to_string())?;
+        return Err(Refusal::OffTarget(OffTarget {
+            base: f.base.clone(),
+            target: f.target.clone(),
+            missing,
+        }));
     }
     Ok((wt, main))
 }
@@ -1568,8 +1655,13 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
             })
         })
         .collect();
+    // For the rebase offer, when the base turns out not to be on the
+    // target.
+    let rebase_message = message.clone();
+    let rebase_outputs = outputs.clone();
+    let rebase_worktree = w.clone();
     let spawned = ed.spawn_background("agent-integrate-check", move |tx| {
-        let facts = (|| -> Result<IntegrateFacts, String> {
+        let facts = (|| -> Result<IntegrateFacts, Refusal> {
             let main = open_exact(&git, &w.main_root)?;
             let Head::Branch(target) = main.head().map_err(|e| e.to_string())? else {
                 return Err("the main worktree is not on a branch (detached HEAD)".into());
@@ -1597,7 +1689,7 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
                 checked_head: String::new(),
                 part: None,
             };
-            let (wt, main) = check_before_commit(&git, &facts)?;
+            let (wt, main) = check_before_commit_detailed(&git, &facts)?;
             // Files the verification run made and nobody changed since
             // stay behind; they are not the agent's work.
             let made = super::test_outputs::still_made_by_tests(&wt, &outputs)
@@ -1684,15 +1776,30 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
             conflicts_after(&git, &main, Ok(snap), &overlapping, &mut facts);
             Ok(facts)
         })();
-        tx.send(move |ed| match facts {
-            Ok(f) => {
+        // The base is not on the target: what a rebase onto it would do.
+        let offer = match &facts {
+            Err(Refusal::OffTarget(off)) => Some(super::rebase::offer(
+                &git,
+                &rebase_worktree,
+                off,
+                &rebase_outputs,
+                &rebase_message,
+            )),
+            _ => None,
+        };
+        tx.send(move |ed| match (facts, offer) {
+            (Ok(f), _) => {
                 ed.agents.panel.overlay = Some(Overlay::Confirm(integrate_dialog(
                     id,
                     Integration::Merge,
                     f,
                 )));
             }
-            Err(e) => {
+            (Err(Refusal::OffTarget(off)), Some(offer)) => {
+                super::rebase::offered(ed, id, &off, offer)
+            }
+            (Err(e), _) => {
+                let e = e.words();
                 if let Some(a) = ed.agents.get_mut(id) {
                     a.log(format!("integrate refused: {e}"));
                 }
