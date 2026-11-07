@@ -1951,7 +1951,7 @@ fn rebase_onto_moves_only_the_branchs_commits_and_keeps_the_old_tip() {
     // An untracked file stays where it is.
     write_in(&wt, "stray.txt", "stray\n");
     match repo.rebase_check(&main, &base, &old_tip, None).unwrap() {
-        maestro_git::RebaseCheck::Clean { kept } => {
+        maestro_git::RebaseCheck::Clean { kept, .. } => {
             assert_eq!(kept, std::slice::from_ref(&old_tip))
         }
         other => panic!("{other:?}"),
@@ -2078,6 +2078,88 @@ fn rebase_onto_refuses_a_dirty_worktree_or_a_moved_branch() {
         "{r:?}"
     );
     assert_eq!(rev(&f, &wt, "HEAD"), tip);
+    assert!(
+        !f.git_in(
+            &f.repo,
+            &["rev-parse", "--verify", "--quiet", "agent/r-before-rebase"]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn rebase_onto_refuses_an_ignored_file_that_onto_tracks() {
+    let f = Fixture::new();
+    let (wt, base, _) = base_off_main(&f);
+    // main starts tracking local.txt; the agent's worktree has its own,
+    // ignored there, which a checkout would overwrite without asking.
+    f.write("local.txt", "main's\n");
+    f.commit_all("main tracks local.txt");
+    let main = rev(&f, &f.repo, "HEAD");
+    let info = PathBuf::from(
+        f.git_ok(&wt, &["rev-parse", "--git-path", "info/exclude"])
+            .trim(),
+    );
+    let info = if info.is_absolute() {
+        info
+    } else {
+        wt.join(info)
+    };
+    std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+    std::fs::write(&info, "local.txt\n").unwrap();
+    write_in(&wt, "local.txt", "only copy\n");
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let tip = rev(&f, &wt, "HEAD");
+    let r = repo.rebase_onto(maestro_git::RebaseOnto {
+        branch: "agent/r",
+        upstream: &base,
+        onto: &main,
+        tip: &tip,
+        keep_old_tip_as: "agent/r-before-rebase",
+        undo_to: None,
+    });
+    assert!(
+        matches!(r, Err(maestro_git::RebaseError::Refused(ref m)) if m.contains("local.txt")),
+        "{r:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("local.txt")).unwrap(),
+        "only copy\n"
+    );
+    assert_eq!(rev(&f, &wt, "HEAD"), tip);
+}
+
+#[test]
+fn a_rebase_a_hook_refuses_is_put_back() {
+    let f = Fixture::new();
+    let (wt, base, main) = base_off_main(&f);
+    let before_commit = rev(&f, &wt, "HEAD");
+    write_in(&wt, "two.txt", "2\n");
+    f.git_ok(&wt, &["add", "-A"]);
+    f.git_ok(&wt, &["commit", "-q", "-m", "work"]);
+    let tip = rev(&f, &wt, "HEAD");
+    let hooks = f.repo.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-rebase");
+    std::fs::write(&hook, "#!/bin/sh\necho no rebases here >&2\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let r = repo.rebase_onto(maestro_git::RebaseOnto {
+        branch: "agent/r",
+        upstream: &base,
+        onto: &main,
+        tip: &tip,
+        keep_old_tip_as: "agent/r-before-rebase",
+        undo_to: Some(&before_commit),
+    });
+    assert!(matches!(r, Err(maestro_git::RebaseError::Git(_))), "{r:?}");
+    assert_eq!(rev(&f, &wt, "HEAD"), before_commit);
+    assert_eq!(f.git_ok(&wt, &["status", "--porcelain"]), "A  two.txt\n");
     assert!(
         !f.git_in(
             &f.repo,

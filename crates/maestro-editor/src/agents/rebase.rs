@@ -49,6 +49,8 @@ pub struct RebaseFacts {
     pub keep_as: String,
     /// Why the conflict dry run could not run, if it could not.
     pub unchecked: Option<String>,
+    /// The tree the dry run says the rebased branch will hold.
+    pub expected_tree: Option<String>,
 }
 
 /// Why the rebase is refused for the agent, judged from the record. The
@@ -143,6 +145,22 @@ pub(crate) fn offer(
                 .filter(|p| !made.contains(p)),
         )
         .collect();
+    // Work to commit is what the files on disk hold beyond the branch's
+    // commit. Staged changes the files no longer have would be lost by
+    // committing the files as they are, so they are refused, not dropped.
+    let head_tree = wt.commit_shape(&snap.head).map_err(|e| e.to_string())?.tree;
+    let uncommitted = if snap.tree == head_tree {
+        if !uncommitted.is_empty() {
+            return Err(format!(
+                "the index has staged changes that the files on disk no longer have, in {}; \
+                 committing the files as they are would lose them",
+                list_paths(&uncommitted)
+            ));
+        }
+        Vec::new()
+    } else {
+        uncommitted
+    };
     let moving = wt
         .commits_between(&w.base, &snap.head, super::actions::COMMITS_SHOWN)
         .map_err(|e| e.to_string())?;
@@ -150,8 +168,12 @@ pub(crate) fn offer(
         return Err("the agent has no work of its own to move".into());
     }
     let extra = (!uncommitted.is_empty()).then_some(snap.commit.as_str());
+    let mut expected_tree = None;
     let unchecked = match wt.rebase_check(&onto, &w.base, &snap.head, extra) {
-        Ok(RebaseCheck::Clean { .. }) => None,
+        Ok(RebaseCheck::Clean { tree, .. }) => {
+            expected_tree = Some(tree);
+            None
+        }
         Ok(RebaseCheck::Conflicts(files)) => {
             return Err(format!(
                 "moving the agent's work onto {} would conflict in {}",
@@ -181,6 +203,7 @@ pub(crate) fn offer(
         checked_head: snap.head,
         checked_tree: snap.tree,
         unchecked,
+        expected_tree,
     })
 }
 
@@ -300,6 +323,8 @@ struct Rebased {
     /// kept.
     committed: Option<String>,
     outcome: Result<maestro_git::RebaseOutcome, String>,
+    /// Something wrong with a rebase that git completed.
+    warning: Option<String>,
 }
 
 /// `y`: rebases on a background thread.
@@ -356,10 +381,31 @@ fn run(git: &maestro_git::Git, f: &RebaseFacts) -> Rebased {
     let mut out = Rebased {
         committed: None,
         outcome: Err(String::new()),
+        warning: None,
     };
-    match run_inner(git, f, &mut out.committed) {
-        Ok(o) => out.outcome = Ok(o),
-        Err(e) => out.outcome = Err(e),
+    out.outcome = run_inner(git, f, &mut out.committed);
+    if let (Ok(o), Some(want)) = (&out.outcome, &f.expected_tree) {
+        let open = |r: &str| -> Result<String, String> {
+            let wt = open_agent_worktree(git, &f.worktree)?;
+            wt.commit_shape(r)
+                .map(|s| s.tree)
+                .map_err(|e| e.to_string())
+        };
+        match open(&o.new_tip) {
+            Ok(t) if t == *want => {}
+            Ok(_) => {
+                out.warning = Some(format!(
+                    "the rebased branch does not hold what the dry run computed; compare it with \
+                     {} before integrating",
+                    f.keep_as
+                ))
+            }
+            Err(e) => {
+                out.warning = Some(format!(
+                    "could not compare the rebased branch with the dry run ({e})"
+                ))
+            }
+        }
     }
     out
 }
@@ -403,13 +449,26 @@ fn run_inner(
             "the agent's branch or files changed after the dialog was checked{again}"
         ));
     }
+    // A merge or rebase started since the dialog would be finished by
+    // the commit below.
+    if let Some(op) = wt.operation().map_err(|e| e.to_string())? {
+        return Err(format!(
+            "a {} is in progress in the agent's worktree ({}){again}",
+            op.label(),
+            op.way_out()
+        ));
+    }
     if !f.uncommitted.is_empty() {
         let c = wt
             .commit_all_leaving_out(&f.message, &made)
             .map_err(|e| format!("committing the agent's work failed: {e}"))?;
         *committed = c.clone();
         let Some(c) = c else {
-            return Err(format!("there was nothing to commit after all{again}"));
+            return Err(
+                "the files matched the branch's commit when Maestro went to commit them; \
+                 nothing was rebased. Press I again to see what it would do now"
+                    .into(),
+            );
         };
         // The commit must hold exactly the files the dialog was checked on.
         let shape = wt.commit_shape(&c).map_err(|e| e.to_string())?;
@@ -443,7 +502,9 @@ fn run_inner(
     match r {
         Ok(o) => Ok(o),
         Err(e) => {
-            if !matches!(e, RebaseError::Refused(_) | RebaseError::AbortFailed { .. }) && undone {
+            // Only these two mean the branch was put back, and with it
+            // Maestro's commit undone.
+            if matches!(e, RebaseError::Conflicts(_) | RebaseError::Git(_)) {
                 *committed = None;
             }
             Err(match e {
@@ -455,9 +516,8 @@ fn run_inner(
                 RebaseError::Git(g) => {
                     format!("git failed ({g}); the rebase was aborted{put_back}")
                 }
-                RebaseError::AbortFailed { cause, detail } => format!(
-                    "{cause}, and putting the branch back failed: {detail}. Look at the agent's \
-                     worktree with git status before doing anything else"
+                RebaseError::Unknown { cause, detail } => format!(
+                    "{cause}; {detail}. Look at the agent's worktree before doing anything else"
                 ),
             })
         }
@@ -496,8 +556,17 @@ fn rebased(ed: &mut Editor, id: AgentId, f: RebaseFacts, r: Rebased) {
                 short(&f.onto),
                 f.keep_as
             );
-            a.log(msg.clone());
-            ed.info(msg);
+            match r.warning {
+                Some(w) => {
+                    let msg = format!("{msg}. WARNING: {w}");
+                    a.log(msg.clone());
+                    ed.error(msg);
+                }
+                None => {
+                    a.log(msg.clone());
+                    ed.info(msg);
+                }
+            }
         }
         Err(e) => {
             let mut msg = format!("not rebased: {e}");

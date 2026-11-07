@@ -25,9 +25,10 @@ pub struct Commits {
 /// What [`Repository::rebase_check`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseCheck {
-    /// Every commit applies; these are the ones that still change
-    /// something on the new base, oldest first.
-    Clean { kept: Vec<String> },
+    /// Every commit applies; `kept` are the ones that still change
+    /// something on the new base, oldest first, and `tree` is the tree the
+    /// last of them leaves: what the rebased branch should hold.
+    Clean { kept: Vec<String>, tree: String },
     /// Applying the commits stops on a conflict in these files.
     Conflicts(Vec<PathBuf>),
     /// The range holds merge commits, which a rebase would flatten.
@@ -69,20 +70,31 @@ pub struct RebaseOutcome {
 /// Why [`Repository::rebase_onto`] did not rebase.
 #[derive(Debug, thiserror::Error)]
 pub enum RebaseError {
-    /// Refused before anything changed.
+    /// Refused, or failed, before the old-tip branch was made: nothing
+    /// this call does changed anything.
     #[error("{0}")]
     Refused(String),
     /// Git stopped on a conflict in these files. The rebase was aborted,
-    /// the branch is back where it was, and the old-tip branch is deleted.
+    /// the branch is back where it was (and at `undo_to`, when given), and
+    /// the old-tip branch is deleted.
     #[error("the rebase stopped on a conflict in {} file(s)", .0.len())]
     Conflicts(Vec<PathBuf>),
     /// Git failed another way; put back as for `Conflicts`.
     #[error(transparent)]
-    Git(#[from] GitError),
-    /// Git failed and putting things back failed too. The text says what
-    /// was found.
-    #[error("{cause}; then putting the branch back failed: {detail}")]
-    AbortFailed { cause: String, detail: String },
+    Git(GitError),
+    /// Something failed after the old-tip branch was made and the
+    /// branch could not be shown to be put back: the rebase may have run,
+    /// or putting it back failed. The text says what was found; the
+    /// old-tip branch is kept.
+    #[error("{cause}; {detail}")]
+    Unknown { cause: String, detail: String },
+}
+
+impl From<GitError> for RebaseError {
+    /// A git error before anything changed.
+    fn from(e: GitError) -> Self {
+        RebaseError::Refused(e.to_string())
+    }
 }
 
 impl Repository {
@@ -152,8 +164,8 @@ impl Repository {
             check_rev(e)?;
             commits.push(e.to_string());
         }
-        match self.cherry_pick_check(onto, &commits) {
-            Ok(kept) => Ok(RebaseCheck::Clean { kept }),
+        match self.cherry_pick_trees(onto, &commits) {
+            Ok((kept, tree)) => Ok(RebaseCheck::Clean { kept, tree }),
             Err(IntegrateError::Conflicts(files)) => Ok(RebaseCheck::Conflicts(files)),
             Err(IntegrateError::Git(e)) => Err(e),
             Err(e) => Err(GitError::InvalidArgument(e.to_string())),
@@ -162,27 +174,34 @@ impl Repository {
 
     /// Rebases the branch checked out in this worktree: the commits of
     /// `upstream..tip` are replayed onto `onto`, as
-    /// `git rebase --onto <onto> <upstream>` does, and the branch then
-    /// points at the last of them. First a branch named
+    /// `git rebase --onto <onto> <upstream> <branch>` does, and the branch
+    /// then points at the last of them. First a branch named
     /// `keep_old_tip_as` is created at `tip`, so the old history stays
     /// reachable under a name.
     ///
     /// Refuses, changing nothing, when this worktree is not on `branch`,
     /// `branch` does not point at `tip`, an operation (merge, rebase,
     /// cherry-pick) is in progress here, tracked files have uncommitted
-    /// changes or conflicts, the range has merge commits, or the old-tip
-    /// branch already exists. Untracked files may stay; git refuses to
-    /// overwrite them.
+    /// changes or conflicts, the range has merge commits, the old-tip
+    /// branch already exists, or a file `onto` tracks and `tip` does not
+    /// is already on disk (untracked or ignored), since git would refuse
+    /// or overwrite it. The branch, `HEAD` and the operation state are
+    /// checked again just before git runs; a change in the moment after
+    /// that is not caught.
     ///
     /// The user's configuration that would change what a rebase does is
-    /// overridden: no autostash, no moving other branches
-    /// (`--no-update-refs`), no merges kept, no autosquash, and the merge
-    /// backend. Hooks run. Commits whose change `onto` already has are
-    /// dropped, as `git rebase` does.
+    /// overridden: the `ort` strategy, no autostash, no moving other
+    /// branches (`--no-update-refs`), no merges kept, no autosquash, the
+    /// merge backend, and the default todo line format. Hooks run.
+    /// Commits whose change `onto` already has are dropped, as
+    /// `git rebase` does.
     ///
-    /// When git fails (a conflict, a hook), the rebase is aborted, the
+    /// When git fails (a conflict, a hook), a rebase it left open is
+    /// aborted if it is this one (its state names `onto` and `tip`), the
     /// branch is checked to be back at `tip` with no tracked file changed,
-    /// `undo_to` is applied, and the old-tip branch is deleted.
+    /// the branch is moved from `tip` to `undo_to` with a compare-and-swap
+    /// on the branch itself (so no other branch moves), and the old-tip
+    /// branch is deleted.
     pub fn rebase_onto(&self, r: RebaseOnto<'_>) -> Result<RebaseOutcome, RebaseError> {
         check_branch_name(self, r.branch)?;
         check_branch_name(self, r.keep_old_tip_as)?;
@@ -192,34 +211,9 @@ impl Repository {
         if let Some(u) = r.undo_to {
             check_rev(u)?;
         }
-        match self.head()? {
-            Head::Branch(b) if b == r.branch => {}
-            other => {
-                return Err(RebaseError::Refused(format!(
-                    "the worktree is on {}, not {}",
-                    other.label(),
-                    r.branch
-                )));
-            }
-        }
-        if let Some(op) = self.operation()? {
-            return Err(RebaseError::Refused(format!(
-                "a {} is in progress in the worktree; finish it first ({})",
-                op.label(),
-                op.way_out()
-            )));
-        }
         let branch_ref = format!("refs/heads/{}", r.branch);
-        let at = self.resolve(&branch_ref)?;
-        if at != self.resolve(r.tip)? {
-            return Err(RebaseError::Refused(format!(
-                "{} is at {}, not at {}",
-                r.branch,
-                short(&at),
-                short(r.tip)
-            )));
-        }
-        let tip = at;
+        let tip = self.resolve(r.tip)?;
+        self.ready_to_rebase(&r, &branch_ref, &tip)?;
         let dirty: Vec<PathBuf> = self
             .status()?
             .uncommitted()
@@ -242,13 +236,59 @@ impl Repository {
             )));
         }
         let onto = self.resolve(r.onto)?;
+        // Files the checkout of `onto` would create. One already on disk
+        // is untracked or ignored here: git refuses the first and silently
+        // overwrites the second, and an abort would then delete it.
+        let out = self.run(
+            &[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--diff-filter=A",
+                "-z",
+                &tip,
+                &onto,
+                "--",
+            ],
+            Access::ReadOnly,
+        )?;
+        let in_the_way: Vec<String> = crate::split_nul(&out)
+            .into_iter()
+            .map(crate::bytes_to_path)
+            .filter(|p| std::fs::symlink_metadata(self.root().join(p)).is_ok())
+            .map(|p| p.display().to_string())
+            .collect();
+        if !in_the_way.is_empty() {
+            return Err(RebaseError::Refused(format!(
+                "these files are in the worktree but not in its branch, and {} has them: {}; \
+                 move them out of the way first",
+                short(&onto),
+                in_the_way.join(", ")
+            )));
+        }
         if let Err(e) = self.create_branch_at(r.keep_old_tip_as, &tip) {
             return Err(RebaseError::Refused(e.to_string()));
+        }
+        let unknown = |cause: String, detail: &str| RebaseError::Unknown {
+            cause,
+            detail: format!(
+                "{detail}; the old tip is kept as branch {}; look at the worktree with git status",
+                r.keep_old_tip_as
+            ),
+        };
+        // The checks took a moment; the branch, HEAD and state must still
+        // be what they found. This narrows the window, it cannot close it.
+        if let Err(e) = self.ready_to_rebase(&r, &branch_ref, &tip) {
+            return Err(match self.drop_keep(&r, &tip) {
+                Ok(()) => e,
+                Err(d) => unknown(e.to_string(), &d),
+            });
         }
 
         let args = [
             "rebase",
             "--merge",
+            "--strategy=ort",
             "--no-autostash",
             "--no-update-refs",
             "--no-rebase-merges",
@@ -258,19 +298,29 @@ impl Repository {
             "--onto",
             &onto,
             r.upstream,
+            r.branch,
         ];
-        let (out, shown) = self.writer().run_status(&args, Access::Write)?;
+        let writer = self.with_git(
+            self.writer()
+                .git()
+                .clone()
+                .config("rebase.instructionFormat=%s"),
+        );
+        let (out, shown) = match writer.run_status(&args, Access::Write) {
+            Ok(o) => o,
+            Err(e) => return Err(unknown(e.to_string(), "git may not have run")),
+        };
         if !out.status.success() {
             let cause = command_error(shown, &out);
             let conflicts: Vec<PathBuf> = self
                 .status()
                 .map(|s| s.conflicted().map(|e| e.path.clone()).collect())
                 .unwrap_or_default();
-            return Err(match self.put_back(&r, &tip) {
+            return Err(match self.put_back(&r, &onto, &tip) {
                 Ok(()) if !conflicts.is_empty() => RebaseError::Conflicts(conflicts),
                 Ok(()) => RebaseError::Git(cause),
-                Err(detail) => RebaseError::AbortFailed {
-                    cause: if conflicts.is_empty() {
+                Err(detail) => {
+                    let cause = if conflicts.is_empty() {
                         cause.to_string()
                     } else {
                         format!(
@@ -281,51 +331,114 @@ impl Repository {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         )
-                    },
-                    detail,
-                },
+                    };
+                    unknown(cause, &format!("putting the branch back failed: {detail}"))
+                }
             });
         }
 
         // Git said yes. Check that it did what was asked.
-        let mut wrong = Vec::new();
-        if let Some(op) = self.operation()? {
-            wrong.push(format!("a {} was left open", op.label()));
+        let checked = (|| -> Result<(String, Vec<String>)> {
+            let mut wrong = Vec::new();
+            if let Some(op) = self.operation()? {
+                wrong.push(format!("a {} was left open", op.label()));
+            }
+            if self.head()? != Head::Branch(r.branch.to_string()) {
+                wrong.push(format!("{} is no longer checked out", r.branch));
+            }
+            let new_tip = self.resolve(&branch_ref)?;
+            if !self.can_fast_forward(&onto, &new_tip)? {
+                wrong.push(format!(
+                    "{} is at {}, which is not on top of {}",
+                    r.branch,
+                    short(&new_tip),
+                    short(&onto)
+                ));
+            }
+            let commits = self.rev_list(&["--reverse", &format!("{onto}..{new_tip}")])?;
+            Ok((new_tip, commits)).and_then(|v| {
+                if wrong.is_empty() {
+                    Ok(v)
+                } else {
+                    Err(GitError::InvalidArgument(wrong.join("; ")))
+                }
+            })
+        })();
+        match checked {
+            Ok((new_tip, commits)) => Ok(RebaseOutcome { new_tip, commits }),
+            Err(e) => Err(unknown("git reported success".into(), &format!("but {e}"))),
         }
-        if self.head()? != Head::Branch(r.branch.to_string()) {
-            wrong.push(format!("{} is no longer checked out", r.branch));
-        }
-        let new_tip = self.resolve(&branch_ref)?;
-        if !self.can_fast_forward(&onto, &new_tip)? {
-            wrong.push(format!(
-                "{} is at {}, which is not on top of {}",
-                r.branch,
-                short(&new_tip),
-                short(&onto)
-            ));
-        }
-        if !wrong.is_empty() {
-            return Err(RebaseError::AbortFailed {
-                cause: "git reported success".into(),
-                detail: format!(
-                    "{}; the old tip is kept as branch {}",
-                    wrong.join("; "),
-                    r.keep_old_tip_as
-                ),
-            });
-        }
-        let commits = self.rev_list(&["--reverse", &format!("{onto}..{new_tip}")])?;
-        Ok(RebaseOutcome { new_tip, commits })
     }
 
-    /// After a failed rebase: aborts it if git left one open, checks the
-    /// branch is checked out at `tip` with no tracked file changed, applies
-    /// `undo_to`, and deletes the old-tip branch. Returns what could not be
-    /// put back.
-    fn put_back(&self, r: &RebaseOnto<'_>, tip: &str) -> std::result::Result<(), String> {
+    /// On `branch` at `tip` with no operation in progress.
+    fn ready_to_rebase(
+        &self,
+        r: &RebaseOnto<'_>,
+        branch_ref: &str,
+        tip: &str,
+    ) -> Result<(), RebaseError> {
+        match self.head()? {
+            Head::Branch(b) if b == r.branch => {}
+            other => {
+                return Err(RebaseError::Refused(format!(
+                    "the worktree is on {}, not {}",
+                    other.label(),
+                    r.branch
+                )));
+            }
+        }
+        if let Some(op) = self.operation()? {
+            return Err(RebaseError::Refused(format!(
+                "a {} is in progress in the worktree; finish it first ({})",
+                op.label(),
+                op.way_out()
+            )));
+        }
+        let at = self.resolve(branch_ref)?;
+        if at != tip || self.resolve("HEAD")? != tip {
+            return Err(RebaseError::Refused(format!(
+                "{} is at {}, not at {}",
+                r.branch,
+                short(&at),
+                short(tip)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Deletes the old-tip branch, if it still points at `tip`.
+    fn drop_keep(&self, r: &RebaseOnto<'_>, tip: &str) -> std::result::Result<(), String> {
+        let keep = format!("refs/heads/{}", r.keep_old_tip_as);
+        self.run(&["update-ref", "-d", &keep, tip], Access::Write)
+            .map(|_| ())
+            .map_err(|e| format!("deleting branch {} failed: {e}", r.keep_old_tip_as))
+    }
+
+    /// The rebase state git left in this worktree is this call's: the
+    /// merge backend's, rebasing `tip` onto `onto`.
+    fn our_rebase(&self, onto: &str, tip: &str) -> bool {
+        let dir = self.git_dir().join("rebase-merge");
+        let read = |f: &str| {
+            std::fs::read_to_string(dir.join(f))
+                .ok()
+                .map(|s| s.trim().to_string())
+        };
+        read("onto").as_deref() == Some(onto) && read("orig-head").as_deref() == Some(tip)
+    }
+
+    /// After a failed rebase: aborts it if git left this one open (another
+    /// one is left alone and reported), checks the branch is checked out
+    /// at `tip` with no tracked file changed, moves it to `undo_to`, and
+    /// deletes the old-tip branch. Returns what could not be put back.
+    fn put_back(
+        &self,
+        r: &RebaseOnto<'_>,
+        onto: &str,
+        tip: &str,
+    ) -> std::result::Result<(), String> {
         let mut problems: Vec<String> = Vec::new();
         match self.operation() {
-            Ok(Some(crate::Operation::Rebase)) => {
+            Ok(Some(crate::Operation::Rebase)) if self.our_rebase(onto, tip) => {
                 if let Err(e) = self.run(&["rebase", "--abort"], Access::Write) {
                     problems.push(e.to_string());
                 }
@@ -363,27 +476,33 @@ impl Repository {
             Err(e) => problems.push(e.to_string()),
         }
         if !problems.is_empty() {
-            problems.push(format!(
-                "the old tip is kept as branch {}",
-                r.keep_old_tip_as
-            ));
             return Err(problems.join("; "));
         }
-        if let Some(to) = r.undo_to
-            && let Err(e) = self.run(&["reset", "--soft", "--quiet", to], Access::Write)
-        {
-            return Err(format!(
-                "moving {} back to {} failed: {e}; it is at {}",
-                r.branch,
-                short(to),
-                short(tip)
-            ));
+        // The branch itself, from `tip` only: if the worktree switched to
+        // another branch meanwhile, nothing moves. The index is left as it
+        // is, as `reset --soft` would leave it.
+        if let Some(to) = r.undo_to {
+            let branch_ref = format!("refs/heads/{}", r.branch);
+            if let Err(e) = self.run(
+                &[
+                    "update-ref",
+                    "-m",
+                    "maestro: rebase put back",
+                    &branch_ref,
+                    to,
+                    tip,
+                ],
+                Access::Write,
+            ) {
+                return Err(format!(
+                    "moving {} back to {} failed: {e}; it is at {}",
+                    r.branch,
+                    short(to),
+                    short(tip)
+                ));
+            }
         }
-        let keep = format!("refs/heads/{}", r.keep_old_tip_as);
-        if let Err(e) = self.run(&["update-ref", "-d", &keep, tip], Access::Write) {
-            return Err(format!("deleting branch {} failed: {e}", r.keep_old_tip_as));
-        }
-        Ok(())
+        self.drop_keep(r, tip)
     }
 }
 

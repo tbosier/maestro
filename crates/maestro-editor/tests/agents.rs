@@ -68,6 +68,10 @@ fn main() {
             a_running_agent_is_not_rebased,
         ),
         (
+            "a_rebase_git_refuses_after_y_is_put_back",
+            a_rebase_git_refuses_after_y_is_put_back,
+        ),
+        (
             "a_task_started_in_another_worktree_starts_from_main",
             a_task_started_in_another_worktree_starts_from_main,
         ),
@@ -1333,6 +1337,38 @@ fn a_rebase_that_would_conflict_is_not_offered() {
     assert!(ed.agents.panel.overlay.is_none(), "{msg}");
     assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
     assert_eq!(f.git(&wt, &["status", "--porcelain"]), "");
+}
+
+/// `y`, then git refuses (here a `pre-rebase` hook): the rebase is put
+/// back, Maestro's commit of the uncommitted work is undone, and the
+/// old-tip branch is gone.
+fn a_rebase_git_refuses_after_y_is_put_back() {
+    let f = Fixture::new();
+    let (mut ed, base, _) = off_main_agent(&f, "printf a > a.txt", true);
+    let wt = worktree(&ed, 0);
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    let tip = f.git(&wt, &["rev-parse", "HEAD"]);
+    refused(&mut ed);
+    dialog(&ed);
+    let hook = f.repo.join(".git/hooks/pre-rebase");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the failed rebase", |ed| {
+        agent(ed, 0).git_busy.is_none() && status_text(ed).contains("not rebased")
+    });
+    let msg = status_text(&ed);
+    assert!(msg.contains("the rebase was aborted"), "{msg}");
+    assert!(msg.contains("is back where it was"), "{msg}");
+    assert!(!msg.contains("was committed on its branch"), "{msg}");
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "A  a.txt\n");
+    assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, base);
+    assert!(!branch_exists(&f, &format!("{branch}-before-rebase")));
 }
 
 /// A running agent could commit while its branch is rewritten: the

@@ -996,11 +996,21 @@ impl Repository {
     /// `cherry-pick` would, and returns the ones that change something.
     /// Writes objects (merged trees and blobs) to the object store, never
     /// refs, the index or files.
-    pub(crate) fn cherry_pick_check(
+    fn cherry_pick_check(
         &self,
         onto: &str,
         commits: &[String],
     ) -> Result<Vec<String>, IntegrateError> {
+        self.cherry_pick_trees(onto, commits).map(|(kept, _)| kept)
+    }
+
+    /// [`Repository::cherry_pick_check`], also returning the tree the last
+    /// commit leaves.
+    pub(crate) fn cherry_pick_trees(
+        &self,
+        onto: &str,
+        commits: &[String],
+    ) -> Result<(Vec<String>, String), IntegrateError> {
         let have = self.git().version()?;
         if have < MERGE_TREE_TREES {
             return Err(GitError::Unsupported {
@@ -1059,7 +1069,7 @@ impl Repository {
                 current = tree;
             }
         }
-        Ok(kept)
+        Ok((kept, current))
     }
 
     /// After a failed merge or cherry-pick (of `source`, or of `commits`
