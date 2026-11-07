@@ -42,7 +42,7 @@ fn unsaved_under(ed: &Editor, root: &Path) -> Vec<String> {
                 .path()
                 .is_some_and(|p| normalize_path(p).starts_with(&root))
         })
-        .map(|b| b.doc.display_name())
+        .map(|b| ed.doc_name(&b.doc))
         .collect()
 }
 

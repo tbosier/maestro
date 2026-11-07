@@ -355,6 +355,12 @@ static TYPED: &[TypedCommand] = &[
         fun: lsp_log,
     },
     TypedCommand {
+        name: "messages",
+        aliases: &[],
+        doc: "Show earlier status messages, including ones cut off or replaced",
+        fun: messages,
+    },
+    TypedCommand {
         name: "rename",
         aliases: &[],
         doc: "Rename the symbol under the cursor (prompts when no name is given)",
@@ -399,6 +405,11 @@ fn lsp_restart(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
 
 fn lsp_log(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     crate::lsp::show_log(ed);
+    Ok(())
+}
+
+fn messages(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::messages::show(ed);
     Ok(())
 }
 
@@ -532,6 +543,7 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
             editor.refresh_syntax(editor.view().doc);
         }
     }
+    let cwd = editor.cwd.clone();
     let (view, buf) = editor.current();
     let sel = view.selection.clone();
     let old_path: Option<PathBuf> = buf.doc.path().map(Path::to_path_buf);
@@ -539,7 +551,11 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
         Ok(()) => {
             buf.disk_change_reported = false;
             buf.recovery_version = None;
-            let name = buf.doc.display_name();
+            let name = buf
+                .doc
+                .path()
+                .map(|p| crate::navigation::display_path(p, &cwd))
+                .unwrap_or_else(|| buf.doc.display_name());
             let lines = crate::motion::last_line(buf.doc.text().slice(..)) + 1;
             let bytes = buf.doc.text().len_bytes();
             if let (Some(dir), Some(p)) = (editor.recovery_dir.clone(), old_path) {
@@ -592,7 +608,14 @@ fn write_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
                 }
                 crate::lsp::document_saved(ed, *id);
             }
-            Err(e) => errors.push(format!("{}: {e}", buf.doc.display_name())),
+            Err(e) => {
+                let name = buf
+                    .doc
+                    .path()
+                    .map(|p| crate::navigation::display_path(p, &ed.cwd))
+                    .unwrap_or_else(|| buf.doc.display_name());
+                errors.push(format!("{name}: {e}"));
+            }
         }
     }
     let unnamed = ed
@@ -620,7 +643,12 @@ fn quit(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
 }
 
 fn quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
-    let modified = ed.modified_buffers();
+    let modified: Vec<String> = ed
+        .buffers
+        .values()
+        .filter(|b| b.doc.is_modified())
+        .map(|b| ed.doc_name(&b.doc))
+        .collect();
     if !modified.is_empty() && !force {
         return Err(format!(
             "unsaved changes in {} (:wa saves, :qa! discards)",

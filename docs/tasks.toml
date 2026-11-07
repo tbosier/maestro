@@ -266,3 +266,15 @@ crates = ["maestro-editor", "maestro-tui", "maestro-git", "maestro-config"]
 branch = "feat/file-tree"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "fix-messages"
+title = "Message log and :messages, a cut marker on long status messages, relative paths in the worst offenders"
+crates = ["maestro-editor", "maestro-tui"]
+branch = "fix/messages"
+owner = "agent"
+status = "done"
+# Every message through set_status, info, error and add_status is kept (last
+# 200, repeats counted). The status line ends a cut message with
+# "… (:messages)". Reload, :w, :wa, :q, :bd and the integrate unsaved-edits
+# refusal name files relative to the working directory.

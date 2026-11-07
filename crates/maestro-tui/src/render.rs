@@ -1042,31 +1042,8 @@ fn draw_cmdline(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
             area.y,
         ));
     }
-    if let Some((sev, msg)) = &ed.status {
-        let (prefix, style) = match sev {
-            Severity::Info => ("", ui.message_info),
-            Severity::Warning => ("warning: ", ui.message_warning),
-            Severity::Error => ("error: ", ui.message_error),
-        };
-        let line = msg.lines().next().unwrap_or_default();
-        s.print(
-            area.x,
-            area.y,
-            &format!("{prefix}{line}"),
-            style,
-            area.right(),
-        );
-    } else if ed.mode != Mode::Insert
-        && ed.picker.is_none()
-        && let Some(d) = lsp::cursor_diagnostic(ed)
-    {
-        // When nothing else is said, the cursor line's diagnostic is.
-        let style = ui.text.patch(diagnostic_fg(&ed.theme, d.severity));
-        let line = d.message.lines().next().unwrap_or_default();
-        let text = format!("{}: {line}", d.severity.label());
-        s.print(area.x, area.y, &text, style, area.right());
-    }
-    // Pending state on the right: count, register, keys.
+    // Pending state on the right: count, register, keys. Worked out first
+    // so a message knows how much room it has.
     let mut pending = String::new();
     if let Some(r) = ed.selected_register {
         pending.push_str(&format!("\"{r} "));
@@ -1081,19 +1058,79 @@ fn draw_cmdline(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
     if let Some(label) = ed.pending_char_label() {
         pending.push_str(&format!("{label}: _"));
     }
-    if !pending.is_empty() {
-        let w = pending.chars().count() as u16 + 1;
-        if area.width > w {
-            s.print(
-                area.right() - w,
-                area.y,
-                &pending,
-                ui.text_muted,
-                area.right(),
-            );
-        }
+    let pending_w = pending.chars().count() as u16 + 1;
+    let show_pending = !pending.is_empty() && area.width > pending_w;
+    let text_right = if show_pending {
+        area.right() - pending_w
+    } else {
+        area.right()
+    };
+    if let Some((sev, msg)) = &ed.status {
+        let (prefix, style) = match sev {
+            Severity::Info => ("", ui.message_info),
+            Severity::Warning => ("warning: ", ui.message_warning),
+            Severity::Error => ("error: ", ui.message_error),
+        };
+        let mut lines = msg.lines();
+        let line = lines.next().unwrap_or_default();
+        let more = lines.next().is_some();
+        let shown = fit_message(
+            &format!("{prefix}{line}"),
+            text_right.saturating_sub(area.x) as usize,
+            more,
+        );
+        s.print(area.x, area.y, &shown, style, text_right);
+    } else if ed.mode != Mode::Insert
+        && ed.picker.is_none()
+        && let Some(d) = lsp::cursor_diagnostic(ed)
+    {
+        // When nothing else is said, the cursor line's diagnostic is.
+        let style = ui.text.patch(diagnostic_fg(&ed.theme, d.severity));
+        let line = d.message.lines().next().unwrap_or_default();
+        let text = format!("{}: {line}", d.severity.label());
+        s.print(area.x, area.y, &text, style, area.right());
+    }
+    if show_pending {
+        s.print(
+            area.right() - pending_w,
+            area.y,
+            &pending,
+            ui.text_muted,
+            area.right(),
+        );
     }
     None
+}
+
+/// Ends a status message the command line cannot show whole, and says
+/// where the rest is.
+pub(crate) const CUT_MARKER: &str = "… (:messages)";
+
+/// `text` fitted to `width` columns, measured the way [`Surface::print`]
+/// draws it. When it does not fit, or `more` says lines were left out, the
+/// end gives way to [`CUT_MARKER`]. Below the marker's own width the
+/// marker is cut too: there is no room to say anything.
+pub(crate) fn fit_message(text: &str, width: usize, more: bool) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if !more && crate::surface::text_width(text) <= width {
+        return text.to_string();
+    }
+    let room = width.saturating_sub(crate::surface::text_width(CUT_MARKER));
+    let mut out = String::new();
+    let mut used = 0;
+    for g in text.graphemes(true) {
+        let w = crate::surface::grapheme_width(g);
+        if used + w > room {
+            break;
+        }
+        used += w;
+        out.push_str(g);
+    }
+    // A cut at a space would leave "word … (:messages)" with two spaces.
+    let trimmed = out.trim_end().len();
+    out.truncate(trimmed);
+    out.push_str(CUT_MARKER);
+    out
 }
 
 /// Shows the continuations of a pending multi-key binding.
@@ -1343,6 +1380,80 @@ mod tests {
 
     fn row(s: &Surface, y: u16) -> String {
         s.row(y).iter().map(|c| c.symbol.as_str()).collect()
+    }
+
+    /// Types `script` into the editor; a newline is Enter.
+    fn type_keys(ed: &mut Editor, script: &str) {
+        for c in script.chars() {
+            let key = if c == '\n' {
+                maestro_editor::KeyEvent::plain(maestro_editor::KeyCode::Enter)
+            } else {
+                maestro_editor::KeyEvent::char(c)
+            };
+            ed.handle_key(key);
+        }
+    }
+
+    /// The command line of an 80-column frame after `ed` set a message.
+    fn cmdline_at_80(ed: &mut Editor) -> String {
+        ed.resize(Rect::new(0, 0, 80, 24));
+        let mut s = Surface::new(80, 24, ed.theme.ui.text);
+        render(ed, &mut s);
+        row(&s, 23)
+    }
+
+    #[test]
+    fn a_long_message_ends_with_the_cut_marker_at_80_columns() {
+        let mut ed = editor("text\n");
+        let name = "x".repeat(90);
+        type_keys(&mut ed, &format!(":{name}\n"));
+        let line = cmdline_at_80(&mut ed);
+        assert_eq!(line.chars().count(), 80);
+        assert!(line.starts_with("error: unknown command: xxx"), "{line:?}");
+        assert!(line.ends_with("x… (:messages)"), "{line:?}");
+    }
+
+    #[test]
+    fn a_message_that_fits_has_no_cut_marker() {
+        let mut ed = editor("text\n");
+        type_keys(&mut ed, ":no-such-command\n");
+        let line = cmdline_at_80(&mut ed);
+        assert_eq!(line.trim_end(), "error: unknown command: no-such-command");
+        // Exactly the width fits whole.
+        let name = "y".repeat(80 - "error: unknown command: ".len());
+        type_keys(&mut ed, &format!(":{name}\n"));
+        let line = cmdline_at_80(&mut ed);
+        assert_eq!(line, format!("error: unknown command: {name}"));
+    }
+
+    #[test]
+    fn a_message_with_more_lines_says_it_was_cut() {
+        let mut ed = editor("text\n");
+        ed.info("first line\nsecond line");
+        let line = cmdline_at_80(&mut ed);
+        assert_eq!(line.trim_end(), "first line… (:messages)");
+    }
+
+    #[test]
+    fn pending_keys_leave_the_message_room_for_its_marker() {
+        let mut ed = editor("text\n");
+        ed.info("z".repeat(100));
+        // Pending state drawn on the right of the same line (set directly:
+        // the measuring is what is under test, not how keys clear it).
+        ed.count = Some(12);
+        let line = cmdline_at_80(&mut ed);
+        assert!(line.ends_with("z… (:messages)12 "), "{line:?}");
+    }
+
+    #[test]
+    fn fitting_measures_wide_and_control_characters_like_the_surface() {
+        // 漢 takes two columns, a tab draws as one `?`.
+        assert_eq!(fit_message("a漢\tb", 5, false), "a漢\tb");
+        let cut = fit_message(&"漢".repeat(20), 20, false);
+        assert_eq!(cut, format!("{}{CUT_MARKER}", "漢".repeat(3)));
+        assert!(crate::surface::text_width(&cut) <= 20);
+        // No room for any text: the marker alone, cut by the surface.
+        assert_eq!(fit_message("abcdef", 4, true), CUT_MARKER);
     }
 
     #[test]
