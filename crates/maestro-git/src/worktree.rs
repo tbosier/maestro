@@ -2,9 +2,25 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::repo::check_rev;
 use crate::{Access, GitError, GitVersion, Repository, Result, bytes_to_path, command_error};
+
+/// Held while this process runs `git worktree` (add, list, remove, prune).
+/// `git worktree add` makes the new entry under `.git/worktrees` before it
+/// fills it in, and a `git worktree` command that reads the entries in that
+/// moment fails ("failed to read .git/worktrees/<name>/commondir"). Two
+/// agents started at once (`N compete`) did that. One lock for every
+/// repository: these commands are short and rare. Git run by another
+/// process, or other git commands that read the entries, are not covered.
+static WORKTREE_ADMIN: Mutex<()> = Mutex::new(());
+
+fn worktree_admin() -> MutexGuard<'static, ()> {
+    // Nothing is guarded but the order of git runs, so a panic while it
+    // was held leaves nothing to repair.
+    WORKTREE_ADMIN.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -147,7 +163,10 @@ impl Repository {
         if z {
             args.push("-z");
         }
-        let out = self.run(&args, Access::ReadOnly)?;
+        let out = {
+            let _admin = worktree_admin();
+            self.run(&args, Access::ReadOnly)?
+        };
         Ok(parse_worktrees(&out, if z { 0 } else { b'\n' }))
     }
 
@@ -171,7 +190,10 @@ impl Repository {
             path.clone().into_os_string(),
             base.into(),
         ];
-        self.run(&args, Access::Write)?;
+        {
+            let _admin = worktree_admin();
+            self.run(&args, Access::Write)?;
+        }
         let want = canon(&path);
         self.worktrees()?
             .into_iter()
@@ -316,6 +338,7 @@ impl Repository {
         // The exact path git listed, so git removes the worktree that was
         // checked and not another one matching a relative name.
         args.push(wt.path.into_os_string());
+        let _admin = worktree_admin();
         self.run(&args, Access::Write)?;
         Ok(())
     }
@@ -325,7 +348,10 @@ impl Repository {
     /// not check for commits that only a pruned worktree's HEAD referred to;
     /// call [`Repository::removal_check`] on it first to find them.
     pub fn prune_worktrees(&self) -> Result<Vec<String>> {
-        let (out, shown) = self.run_status(&["worktree", "prune", "--verbose"], Access::Write)?;
+        let (out, shown) = {
+            let _admin = worktree_admin();
+            self.run_status(&["worktree", "prune", "--verbose"], Access::Write)?
+        };
         if !out.status.success() {
             return Err(command_error(shown, &out));
         }

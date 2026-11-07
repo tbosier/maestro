@@ -390,6 +390,41 @@ fn worktree_add_list_remove() {
     );
 }
 
+#[test]
+fn worktrees_added_at_once_from_many_threads_all_succeed() {
+    // `N compete` makes several worktrees of one repository at the same
+    // moment. Git reads every entry under `.git/worktrees` while it adds
+    // one, and fails on an entry another `worktree add` has made but not
+    // filled in yet ("failed to read .../commondir").
+    let f = Fixture::new();
+    for round in 0..5 {
+        let errors: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let repo = f.repo();
+                    let path = f.tmp.join(format!("race-{round}-{i}"));
+                    s.spawn(move || {
+                        let branch = format!("race/{round}-{i}");
+                        let added = repo.add_worktree(&path, &branch, "main");
+                        let listed = repo.worktrees();
+                        added
+                            .err()
+                            .into_iter()
+                            .chain(listed.err())
+                            .map(|e| e.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap().collect::<Vec<_>>())
+                .collect()
+        });
+        assert!(errors.is_empty(), "round {round}: {errors:#?}");
+    }
+    assert_eq!(f.repo().worktrees().unwrap().len(), 1 + 5 * 8);
+}
+
 fn refusals(err: RemoveError) -> Vec<RemoveRefusal> {
     match err {
         RemoveError::Refused(r) => r,
