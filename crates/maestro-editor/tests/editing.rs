@@ -654,3 +654,119 @@ fn external_reload_keeps_the_cursor_on_its_text() {
     assert_eq!(ed.primary().head, 12, "cursor did not move to the top");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A fresh, canonical directory per test.
+fn save_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("maestro-saveas-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::canonicalize(&dir).unwrap()
+}
+
+fn status_error(ed: &Editor) -> String {
+    match &ed.status {
+        Some((maestro_editor::Severity::Error, msg)) => msg.clone(),
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_failed_write_to_a_new_path_keeps_the_buffer_as_it_was() {
+    use maestro_syntax::Language;
+    let dir = save_dir("missing-dir");
+    let path = dir.join("a.rs");
+    std::fs::write(&path, "fn a() {}\n").unwrap();
+    let mut ed = editor("");
+    ed.cwd = dir.clone();
+    ed.open(&path).unwrap();
+    run(&mut ed, "iX<esc>");
+    assert!(ed.doc().is_modified());
+    assert_eq!(ed.buffer().syntax.language(), Some(Language::Rust));
+
+    // The directory does not exist, so the write fails.
+    run(&mut ed, ":w no/such/dir/b.py<ret>");
+    let err = status_error(&ed);
+    assert!(err.contains("no/such/dir/b.py"), "names the target: {err}");
+    assert_eq!(ed.doc().path(), Some(path.as_path()), "name unchanged");
+    assert!(ed.doc().is_modified(), "still modified");
+    assert_eq!(ed.buffer().syntax.language(), Some(Language::Rust));
+    assert!(!dir.join("no").exists());
+
+    // A plain :w still goes to the original file.
+    run(&mut ed, ":w<ret>");
+    assert!(!ed.doc().is_modified(), "status: {:?}", ed.status);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Xfn a() {}\n");
+
+    // A successful :w <path> renames the buffer and redetects the language.
+    run(&mut ed, "iY<esc>:w b.py<ret>");
+    let renamed = dir.join("b.py");
+    assert_eq!(ed.doc().path(), Some(renamed.as_path()));
+    assert!(!ed.doc().is_modified(), "status: {:?}", ed.status);
+    assert_eq!(ed.buffer().syntax.language(), Some(Language::Python));
+    assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "XYfn a() {}\n");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Xfn a() {}\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_failed_write_of_an_unnamed_buffer_leaves_it_unnamed() {
+    let dir = save_dir("unnamed");
+    let mut ed = editor("");
+    ed.cwd = dir.clone();
+    run(&mut ed, "ihello<esc>:w missing/x.py<ret>");
+    status_error(&ed);
+    assert_eq!(ed.doc().path(), None);
+    assert!(ed.doc().is_modified());
+    assert_eq!(ed.buffer().syntax.language(), None);
+    run(&mut ed, ":w<ret>");
+    assert!(status_error(&ed).contains("no file name"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_failed_write_quit_to_a_new_path_neither_renames_nor_quits() {
+    let dir = save_dir("wq");
+    let path = dir.join("a.txt");
+    std::fs::write(&path, "a\n").unwrap();
+    let mut ed = editor("");
+    ed.cwd = dir.clone();
+    ed.open(&path).unwrap();
+    run(&mut ed, "iZ<esc>:wq gone/b.txt<ret>");
+    status_error(&ed);
+    assert!(!ed.should_quit);
+    assert_eq!(ed.doc().path(), Some(path.as_path()));
+    assert!(ed.doc().is_modified());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_refused_by_permissions_keeps_the_old_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = save_dir("perm");
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores directory permissions; nothing to test then.
+    let probe = locked.join("probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let path = dir.join("a.txt");
+    std::fs::write(&path, "a\n").unwrap();
+    let mut ed = editor("");
+    ed.cwd = dir.clone();
+    ed.open(&path).unwrap();
+    run(&mut ed, "iP<esc>:w locked/b.txt<ret>");
+    let err = status_error(&ed);
+    assert!(err.contains("locked/b.txt"), "names the target: {err}");
+    assert_eq!(ed.doc().path(), Some(path.as_path()));
+    assert!(ed.doc().is_modified());
+    run(&mut ed, ":w<ret>");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Pa\n");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

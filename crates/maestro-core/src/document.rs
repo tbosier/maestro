@@ -377,11 +377,38 @@ impl Document {
             // We never read this file but something created it meanwhile.
             return Err(SaveError::ExternallyModified(path));
         }
-        self.commit(current_selection);
+        // Write first: a failed write leaves an open undo group (an insert in
+        // progress) open, so the history looks as if no save was tried.
         let disk = crate::io::save(&path, &self.text, self.encoding)?;
+        self.commit(current_selection);
         self.disk = Some(disk);
         self.saved_revision = Some(self.history.current());
         Ok(())
+    }
+
+    /// Saves under a new name. The document takes the name only if the write
+    /// succeeds; on failure its path, saved state and disk state are left
+    /// exactly as they were, so a later plain save still goes to the old file.
+    /// An existing file at `path` is overwritten only with `force`.
+    pub fn save_as(
+        &mut self,
+        path: PathBuf,
+        current_selection: &Selection,
+        force: bool,
+    ) -> Result<(), SaveError> {
+        if !force && path.exists() {
+            return Err(SaveError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists", path.display()),
+            )));
+        }
+        let before = (self.path.clone(), self.saved_revision, self.disk);
+        self.set_path(path);
+        let result = self.save(current_selection, force);
+        if result.is_err() {
+            (self.path, self.saved_revision, self.disk) = before;
+        }
+        result
     }
 
     /// Replaces the contents with the file on disk as one undoable change.
@@ -522,6 +549,67 @@ mod tests {
             doc.apply(&Transaction::new(cs), &Selection::point(0)),
             Err(EditError::ReadOnly(_))
         ));
+    }
+
+    #[test]
+    fn a_failed_save_as_keeps_name_saved_state_and_disk_state() {
+        let dir = std::env::temp_dir().join(format!("maestro-doc-saveas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orig.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        let bad = dir.join("missing").join("new.txt");
+        assert!(matches!(
+            doc.save_as(bad, &Selection::point(0), false),
+            Err(SaveError::Io(_))
+        ));
+        assert_eq!(doc.path(), Some(path.as_path()));
+        assert!(!doc.is_modified(), "an unmodified buffer stays unmodified");
+        // The disk state survived: an outside write to the original is
+        // still caught on the next plain save.
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert!(doc.changed_on_disk());
+        assert!(matches!(
+            doc.save(&Selection::point(0), false),
+            Err(SaveError::ExternallyModified(_))
+        ));
+        // An existing file is not replaced without force.
+        let other = dir.join("other.txt");
+        std::fs::write(&other, "keep\n").unwrap();
+        assert!(matches!(
+            doc.save_as(other.clone(), &Selection::point(0), false),
+            Err(SaveError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep\n");
+        assert_eq!(doc.path(), Some(path.as_path()));
+        // A successful save as takes the new name.
+        let good = dir.join("new.txt");
+        doc.save_as(good.clone(), &Selection::point(0), false)
+            .unwrap();
+        assert_eq!(doc.path(), Some(good.as_path()));
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "one\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_keeps_an_open_undo_group_open() {
+        let dir = std::env::temp_dir().join(format!("maestro-doc-pending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut doc = Document::from_text("");
+        insert(&mut doc, 0, "a");
+        assert!(doc.has_pending());
+        let revision = doc.history().current();
+        let bad = dir.join("missing").join("x.txt");
+        assert!(doc.save_as(bad, &Selection::point(1), false).is_err());
+        assert!(doc.has_pending(), "the insert in progress stays one group");
+        assert_eq!(doc.history().current(), revision);
+        assert!(doc.is_modified());
+        // A successful save closes the group as before.
+        let good = dir.join("x.txt");
+        doc.save_as(good, &Selection::point(1), false).unwrap();
+        assert!(!doc.has_pending());
+        assert!(!doc.is_modified());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
