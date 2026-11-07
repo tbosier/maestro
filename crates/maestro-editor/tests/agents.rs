@@ -163,6 +163,10 @@ fn main() {
             "compose_view_j_and_k_stay_in_the_agents_column",
             compose_view_j_and_k_stay_in_the_agents_column,
         ),
+        (
+            "an_archived_agent_says_so_and_its_record_can_be_forgotten",
+            an_archived_agent_says_so_and_its_record_can_be_forgotten,
+        ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     let selected: Vec<_> = tests
@@ -318,6 +322,27 @@ fn status_text(ed: &Editor) -> String {
 
 fn hint_keys(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     maestro_editor::agents::panel::hints(ed)
+}
+
+/// The keys the hint line offers, without what they do.
+fn hinted(ed: &Editor) -> Vec<&'static str> {
+    hint_keys(ed).into_iter().map(|(k, _)| k).collect()
+}
+
+/// Agent `i`'s mark and state word, checked to be the same in the agent
+/// panel's terms and the sidebar's row for it (and the jump palette, which
+/// uses the sidebar's text).
+fn same_word(ed: &Editor, i: usize) -> String {
+    use maestro_editor::workspaces::{agent_entries, attention_for};
+    let a = agent(ed, i);
+    let panel = format!("{} {}", attention_for(a).symbol(), a.word());
+    let entries = agent_entries(ed);
+    let row = entries
+        .iter()
+        .find(|e| e.id == Some(a.id))
+        .unwrap_or_else(|| panic!("no sidebar row for {}", a.name));
+    assert_eq!(row.state_text(), panel, "{}: sidebar vs panel", a.name);
+    panel
 }
 
 /// Moves the panel's selection to agent `i` with `j`/`k`.
@@ -495,6 +520,7 @@ fn acp_agent_permission_feedback_and_review() {
     poll_until(&mut ed, "the permission request", |ed| {
         status(ed, 0) == Status::AwaitingApproval
     });
+    assert_eq!(same_word(&ed, 0), "! awaiting approval");
     let a = agent(&ed, 0);
     assert_eq!(a.permissions.len(), 1);
     assert_eq!(a.kind(), maestro_editor::agents::ProviderKind::Acp);
@@ -3452,4 +3478,155 @@ fn compose_view_j_and_k_stay_in_the_agents_column() {
     run(&mut ed, "h");
     run(&mut ed, "j");
     assert_eq!(at(&ed), (0, 1), "j goes down alpha's column");
+}
+
+/// An archived agent says "archived" wherever it is listed, offers only
+/// the keys that still work on it, and `d` forgets its record after a
+/// question: it leaves the panel and the saved records, and the branch
+/// stays. Along the way the panel and the sidebar use the same word for
+/// each state, and an agent whose program exited offers no message.
+fn an_archived_agent_says_so_and_its_record_can_be_forgotten() {
+    let f = Fixture::new();
+    let mut c = config(&[(
+        "quick",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &[
+                "-c",
+                "sleep 1; printf 'quick\\n' > notes.txt",
+                "sh",
+                "{task}",
+            ],
+        ),
+    )]);
+    c.agents.test_command = vec!["true".into()];
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write notes", 0);
+    poll_until(&mut ed, "the running program", |ed| {
+        ed.agents
+            .agents
+            .first()
+            .is_some_and(|a| a.status() == Status::Running)
+    });
+    // Running: typing in and a message both reach it.
+    assert_eq!(same_word(&ed, 0), "~ running");
+    let keys = hinted(&ed);
+    assert!(keys.contains(&"i") && keys.contains(&"m"), "{keys:?}");
+    // Forgetting refuses for an agent that is not archived.
+    run(&mut ed, "d");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(
+        status_text(&ed).contains("is not archived"),
+        "{}",
+        status_text(&ed)
+    );
+
+    poll_until(&mut ed, "the exit and its diff", |ed| {
+        let a = agent(ed, 0);
+        a.exited.is_some() && a.review.computed.is_some() && !a.review.files.is_empty()
+    });
+    // The program exited in this session: no message and no typing is
+    // offered, and m says why.
+    assert_eq!(same_word(&ed, 0), "! ready for review");
+    let keys = hinted(&ed);
+    assert!(!keys.contains(&"m") && !keys.contains(&"i"), "{keys:?}");
+    for key in ["ret", "t", "I", "X", "A", "R"] {
+        assert!(keys.contains(&key), "{key} missing from {keys:?}");
+    }
+    run(&mut ed, "m");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(
+        status_text(&ed).contains("program has exited"),
+        "{}",
+        status_text(&ed)
+    );
+    run(&mut ed, "i");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(ed.agents.panel.terminal_focus.is_none());
+
+    // Archive it: the change is uncommitted, so forcing asks again.
+    let wt = worktree(&ed, 0);
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    run(&mut ed, "Ay");
+    poll_until(&mut ed, "the force confirmation", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::ForceArchive(_)))
+    });
+    run(&mut ed, "F");
+    poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
+    assert!(!wt.exists());
+    assert_eq!(same_word(&ed, 0), "= archived");
+    // Only what works on an archived agent is offered, and every action
+    // left out refuses.
+    let keys = hinted(&ed);
+    for key in ["v", "N", "d", "n", "esc"] {
+        assert!(keys.contains(&key), "{key} missing from {keys:?}");
+    }
+    let refused = ["ret", "t", "m", "i", "I", "X", "A", "R", "a", "C", "p"];
+    for key in refused {
+        assert!(!keys.contains(&key), "{key} offered: {keys:?}");
+    }
+    for key in ["\n", "t", "m", "i", "I", "X", "A", "R", "a", "C", "p"] {
+        run(&mut ed, key);
+        assert!(
+            ed.agents.panel.overlay.is_none() && ed.agents.panel.review.is_none(),
+            "{key:?} opened {:?}",
+            ed.agents.panel.overlay
+        );
+        assert!(
+            matches!(ed.status, Some((maestro_editor::Severity::Error, _))),
+            "{key:?} did not refuse: {:?}",
+            ed.status
+        );
+    }
+    assert!(agent(&ed, 0).archived && agent(&ed, 0).base_status() == Status::ReadyForReview);
+    // The archived record is on disk, as another Maestro would have read it.
+    maestro_editor::agents::persist::save(&mut ed, true);
+    let before = std::fs::read_to_string(f.records()).unwrap();
+    assert!(before.contains(wt.to_str().unwrap()), "{before}");
+
+    // d asks first and says what it does and does not do; n keeps it.
+    run(&mut ed, "d");
+    let Some(Overlay::Confirm(dialog)) = &ed.agents.panel.overlay else {
+        panic!("no dialog: {:?}", ed.status);
+    };
+    assert!(matches!(dialog.action, ConfirmAction::Forget(_)));
+    let text = dialog.lines.join(" ");
+    for want in [
+        "saved agent records",
+        "nothing on disk is deleted",
+        &format!("The branch {branch} stays"),
+    ] {
+        assert!(text.contains(want), "{want:?} not in {text}");
+    }
+    run(&mut ed, "n");
+    assert_eq!(ed.agents.agents.len(), 1);
+    // y forgets it: the panel, the sidebar and the saved records lose it;
+    // the branch stays.
+    run(&mut ed, "dy");
+    assert!(ed.agents.agents.is_empty(), "{:?}", ed.status);
+    assert!(
+        status_text(&ed).contains(&format!("branch {branch} kept")),
+        "{}",
+        status_text(&ed)
+    );
+    assert!(maestro_editor::workspaces::agent_entries(&ed).is_empty());
+    let branches = f.git(&f.repo, &["branch", "--list", &branch]);
+    assert!(branches.contains(&branch), "{branches}");
+    // Another Maestro that still had the record saves it again: it is
+    // not added back here, and the next save leaves it out.
+    std::fs::write(f.records(), format!("{before}\n")).unwrap();
+    maestro_editor::agents::persist::save(&mut ed, true);
+    assert!(ed.agents.agents.is_empty(), "{:?}", ed.status);
+    quit(&mut ed);
+    drop(ed);
+    let saved = std::fs::read_to_string(f.records()).unwrap();
+    assert!(!saved.contains(wt.to_str().unwrap()), "{saved}");
+
+    // After a restart it does not come back.
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 0);
+    assert!(ed.agents.agents.is_empty());
 }

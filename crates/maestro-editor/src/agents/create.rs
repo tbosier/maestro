@@ -217,32 +217,10 @@ pub fn relaunch(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    let refusal = if a.origin == super::Origin::Found {
-        Some("this worktree has no record; a adopts it, then R can start an agent in it".into())
-    } else if a.origin == super::Origin::Composed {
-        Some(format!(
-            "{} is a composed result; no agent runs in it to start again",
-            a.name
-        ))
-    } else if a.is_running() {
-        Some(format!("{} is already running", a.name))
-    } else if a.archived {
-        Some("the agent's worktree was archived".into())
-    } else if a.base_status().is_decided() {
-        Some(format!(
-            "{} is {}; it is not relaunched",
-            a.name,
-            a.base_status().label()
-        ))
-    } else if let Some(what) = a.git_busy {
-        Some(format!(
-            "{} is busy ({what}); wait for it to finish",
-            a.name
-        ))
-    } else if a.tests_running() {
-        Some("tests are running for this agent; wait for them to finish".into())
-    } else if let Some(note) = &a.worktree_note {
-        Some(format!("not relaunched: {note}"))
+    // What the record says first (the hint line uses the same check),
+    // then the worktree on disk.
+    let refusal = if let Some(why) = a.relaunch_refusal() {
+        Some(why)
     } else {
         match &a.worktree {
             None => Some("the agent has no worktree".into()),

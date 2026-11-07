@@ -5,6 +5,7 @@
 
 use maestro_git::Integration;
 
+use super::actions;
 use super::contract::Contract;
 use super::create::NewAgent;
 use super::review::ReviewView;
@@ -97,6 +98,9 @@ pub enum ConfirmAction {
     Archive(AgentId),
     /// `F` force-removes the worktree, deleting what `lines` lists.
     ForceArchive(AgentId),
+    /// `y` forgets an archived agent's record: it leaves the panel and the
+    /// saved records. Nothing on disk but the records file changes.
+    Forget(AgentId),
     /// `y` discards the agent's change to one file in its worktree.
     DropFile {
         agent: AgentId,
@@ -456,6 +460,11 @@ fn list_key(ed: &mut Editor, key: KeyEvent) {
         (KeyCode::Char('C'), false) => {
             if let Some(id) = selected_id(ed) {
                 super::compose::open(ed, id);
+            }
+        }
+        (KeyCode::Char('d'), false) => {
+            if let Some(id) = selected_id(ed) {
+                super::actions::confirm_forget(ed, id);
             }
         }
         _ => {}
@@ -1037,6 +1046,7 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
         }
         (ConfirmAction::Archive(id), Some('y'), _) => super::actions::archive(ed, *id, false),
         (ConfirmAction::ForceArchive(id), Some('F'), _) => super::actions::archive(ed, *id, true),
+        (ConfirmAction::Forget(id), Some('y'), _) => super::actions::forget(ed, *id),
         (ConfirmAction::DropFile { agent, old, new }, Some('y'), _) => {
             super::actions::drop_file(ed, *agent, old.clone(), new.clone())
         }
@@ -1124,27 +1134,37 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     if p.compose.is_some() {
         return super::compose::hints();
     }
-    if p.review.is_some() {
-        return super::review::hints();
+    if let Some(v) = &p.review {
+        // The review's own keys always work; the agent's actions are left
+        // out when they would refuse, judged as the actions judge.
+        let a = ed.agents.get(v.agent);
+        return super::review::hints()
+            .into_iter()
+            .filter(|(k, _)| match (*k, a) {
+                ("m", Some(a)) => actions::message_blocker(a).is_none(),
+                ("t", Some(a)) => actions::test_blocker(ed, a).is_none(),
+                ("I", Some(a)) => actions::integrate_blocker(a).is_none(),
+                ("X", Some(a)) => actions::reject_blocker(a).is_none(),
+                _ => true,
+            })
+            .collect();
     }
     let mut out = vec![("n", "new task"), ("j/k", "select")];
     let Some(a) = ed.agents.selected() else {
         out.push(("esc", "close"));
         return out;
     };
-    if a.origin == super::Origin::Found {
-        out.extend([
-            ("ret", "review"),
-            ("a", "adopt"),
-            ("A", "archive"),
-            ("v", "view"),
-            ("esc", "close"),
-        ]);
-        return out;
-    }
+    // Every key below is offered only when its action would not refuse,
+    // judged by the same function the action calls first. A few checks
+    // read Git or the worktree when the key is pressed (the worktree's
+    // branch, unsaved buffers, the main worktree); those can still refuse.
+    let ok = |why: Option<String>| why.is_none();
     // First, so it is the last hint a narrow panel cuts: the way into the
     // agent.
-    if a.kind() == ProviderKind::Terminal && a.is_running() {
+    if a.runtime
+        .terminal()
+        .is_some_and(|t| t.exit_status().is_none())
+    {
         out.insert(0, ("i", "type into agent"));
     }
     if !a.permissions.is_empty() {
@@ -1156,30 +1176,37 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     if relaunchable && a.from_earlier_session() {
         out.push(("R", "relaunch"));
     }
-    out.extend([("ret", "review"), ("t", "test")]);
-    // A message cannot reach an agent with no process; R comes first
-    // instead. A composed result has no agent at all.
-    if !a.from_earlier_session() && a.origin != super::Origin::Composed {
+    if ok(super::review::blocker(a)) {
+        out.push(("ret", "review"));
+    }
+    if ok(actions::test_blocker(ed, a)) {
+        out.push(("t", "test"));
+    }
+    if ok(actions::message_blocker(a)) {
         out.push(("m", "message"));
     }
-    out.push(("N", "compete"));
-    let group = a.group;
-    if ed
-        .agents
-        .agents
-        .iter()
-        .filter(|x| x.group == group && !matches!(x.origin, super::Origin::Composed))
-        .count()
-        >= 2
-    {
+    if ok(actions::adopt_blocker(a)) {
+        out.push(("a", "adopt"));
+    }
+    if ok(actions::found_refusal(a)) {
+        out.push(("N", "compete"));
+    }
+    if ok(super::compose::blocker(ed, a.id)) {
         out.push(("C", "compose"));
     }
-    out.extend([
-        ("v", "view"),
-        ("I", "integrate"),
-        ("X", "reject"),
-        ("A", "archive"),
-    ]);
+    out.push(("v", "view"));
+    if ok(actions::integrate_blocker(a)) {
+        out.push(("I", "integrate"));
+    }
+    if ok(actions::reject_blocker(a)) {
+        out.push(("X", "reject"));
+    }
+    if ok(actions::archive_blocker(a)) {
+        out.push(("A", "archive"));
+    }
+    if ok(actions::forget_blocker(a)) {
+        out.push(("d", "forget record"));
+    }
     if relaunchable && !a.from_earlier_session() {
         out.push(("R", "relaunch"));
     }

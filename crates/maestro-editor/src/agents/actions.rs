@@ -70,36 +70,66 @@ pub fn test_command(ed: &Editor, root: &Path) -> Option<Vec<String>> {
         .then(|| vec!["cargo".to_string(), "test".to_string()])
 }
 
+/// Why `t` refuses for the agent, judged from the record and the config
+/// (and whether the worktree has a `Cargo.toml`). [`run_tests`] refuses
+/// with it, after checking the worktree's branch on disk; the panel's
+/// hints use it, so they never offer a test run that this refuses.
+pub(crate) fn test_blocker(ed: &Editor, a: &super::Agent) -> Option<String> {
+    if let Some(why) = test_record_blocker(a) {
+        return Some(why);
+    }
+    let w = a.worktree.as_ref()?;
+    let from_contract = a.contract.as_ref().is_some_and(|c| c.verify.is_some());
+    if !from_contract && test_command(ed, &w.path).is_none() {
+        return Some(NO_TEST_COMMAND.into());
+    }
+    None
+}
+
+/// The part of [`test_blocker`] that only reads the record.
+fn test_record_blocker(a: &super::Agent) -> Option<String> {
+    if a.worktree.is_none() {
+        return Some("the agent has no worktree yet".into());
+    }
+    if a.archived {
+        return Some("the agent's worktree was archived".into());
+    }
+    if let Some(why) = found_refusal(a) {
+        return Some(why);
+    }
+    if let Some(note) = &a.worktree_note {
+        return Some(format!("tests not run: {note}"));
+    }
+    if a.tests_running() {
+        return Some("tests are already running for this agent".into());
+    }
+    None
+}
+
+const NO_TEST_COMMAND: &str =
+    "no test command: the worktree has no Cargo.toml; set [agents] test-command";
+
 /// `t`: runs the verification command in the agent's worktree.
 pub fn run_tests(ed: &mut Editor, id: AgentId) {
     let tx = ed.idle_job_sender();
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    let Some(root) = a.worktree.as_ref().map(|w| w.path.clone()) else {
-        ed.error("the agent has no worktree yet");
-        return;
-    };
-    if a.archived {
-        ed.error("the agent's worktree was archived");
-        return;
-    }
-    if let Some(why) = found_refusal(a) {
+    if let Some(why) = test_record_blocker(a) {
         ed.error(why);
         return;
     }
-    if let Some(note) = &a.worktree_note {
-        ed.error(format!("tests not run: {note}"));
+    let Some(root) = a.worktree.as_ref().map(|w| w.path.clone()) else {
         return;
-    }
+    };
     // Checked again now: the worktree may have changed since it was made
     // or loaded, and the tests run code from it.
     if let Some(why) = a.worktree.as_ref().and_then(super::worktree_mismatch) {
         ed.error(format!("tests not run: {why}"));
         return;
     }
-    if a.tests_running() {
-        ed.error("tests are already running for this agent");
+    if let Some(why) = test_blocker(ed, a) {
+        ed.error(why);
         return;
     }
     // The task contract's command comes first, for this task only.
@@ -111,7 +141,7 @@ pub fn run_tests(ed: &mut Editor, id: AgentId) {
     };
     let agent_running = a.is_running();
     let Some(cmd) = from_contract.or_else(|| test_command(ed, &root)) else {
-        ed.error("no test command: the worktree has no Cargo.toml; set [agents] test-command");
+        ed.error(NO_TEST_COMMAND);
         return;
     };
     let spec = maestro_tasks::TaskSpec {
@@ -305,10 +335,18 @@ fn on_test_event(ed: &mut Editor, id: AgentId, event: TaskEvent) {
 
 // ----- message -----------------------------------------------------------
 
-/// Why a message cannot reach the agent now, if it cannot.
-fn message_blocker(a: &super::Agent) -> Option<String> {
+/// Why a message cannot reach the agent now, if it cannot. `m` and `i`
+/// refuse with it, and the panel's hints use it, so they never offer a
+/// message that would be refused.
+pub(crate) fn message_blocker(a: &super::Agent) -> Option<String> {
     if let Some(why) = found_refusal(a) {
         return Some(why);
+    }
+    if a.archived {
+        return Some(format!(
+            "{} is archived: its worktree was removed and no agent runs there to take a message",
+            a.name
+        ));
     }
     match &a.runtime {
         Runtime::None if a.origin == Origin::Composed => Some(format!(
@@ -545,26 +583,37 @@ pub(crate) fn busy(a: &super::Agent) -> Option<String> {
         .map(|what| format!("{} is busy ({what}); wait for it to finish", a.name))
 }
 
+/// Why `X` refuses for the agent. [`confirm_reject`] refuses with it and
+/// the panel's hints use it.
+pub(crate) fn reject_blocker(a: &super::Agent) -> Option<String> {
+    if let Some(why) = found_refusal(a) {
+        return Some(why);
+    }
+    if a.archived {
+        return Some(format!(
+            "{} is archived: its worktree was removed, so there is nothing left to reject",
+            a.name
+        ));
+    }
+    if a.base_status() == Status::Rejected {
+        return Some("the agent is already rejected; A archives its worktree".into());
+    }
+    if a.base_status() == Status::Integrated {
+        return Some(
+            "the agent's work is already integrated; rejecting it now changes nothing".into(),
+        );
+    }
+    // Rejecting while the worktree is still being made is allowed: the
+    // agent is then never launched.
+    busy(a).filter(|_| a.git_busy != Some(super::CREATING))
+}
+
 /// `X`: asks before rejecting.
 pub fn confirm_reject(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    if let Some(why) = found_refusal(a) {
-        ed.error(why);
-        return;
-    }
-    if a.base_status() == Status::Rejected {
-        ed.error("the agent is already rejected; A archives its worktree");
-        return;
-    }
-    if a.base_status() == Status::Integrated {
-        ed.error("the agent's work is already integrated; rejecting it now changes nothing");
-        return;
-    }
-    // Rejecting while the worktree is still being made is allowed: the
-    // agent is then never launched.
-    if let Some(why) = busy(a).filter(|_| a.git_busy != Some(super::CREATING)) {
+    if let Some(why) = reject_blocker(a) {
         ed.error(why);
         return;
     }
@@ -779,32 +828,44 @@ pub fn reject(ed: &mut Editor, id: AgentId, then_archive: bool) {
     }
 }
 
+/// Why `A` refuses for the agent. [`confirm_archive`] refuses with it and
+/// the panel's hints use it.
+pub(crate) fn archive_blocker(a: &super::Agent) -> Option<String> {
+    let Some(w) = &a.worktree else {
+        return Some("the agent has no worktree".into());
+    };
+    if a.archived {
+        return Some(format!(
+            "the worktree is already archived; d forgets {}'s record",
+            a.name
+        ));
+    }
+    if let Some(why) = busy(a) {
+        return Some(why);
+    }
+    // A directory that is gone has nothing left to delete: archiving only
+    // marks the record (or lets Git drop its stale entry).
+    if let Some(note) = a.worktree_note.as_ref().filter(|_| w.path.exists()) {
+        return Some(format!(
+            "not archived: {note}. Maestro does not remove a worktree that changed since it was \
+             recorded; look at it with `git worktree list`"
+        ));
+    }
+    None
+}
+
 /// `A`: asks before removing the worktree.
 pub fn confirm_archive(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    let Some(w) = &a.worktree else {
-        ed.error("the agent has no worktree");
-        return;
-    };
-    if a.archived {
-        ed.error("the worktree is already archived");
-        return;
-    }
-    if let Some(why) = busy(a) {
+    if let Some(why) = archive_blocker(a) {
         ed.error(why);
         return;
     }
-    // A directory that is gone has nothing left to delete: archiving only
-    // marks the record (or lets Git drop its stale entry).
-    if let Some(note) = a.worktree_note.as_ref().filter(|_| w.path.exists()) {
-        ed.error(format!(
-            "not archived: {note}. Maestro does not remove a worktree that changed since it was \
-             recorded; look at it with `git worktree list`"
-        ));
+    let Some(w) = &a.worktree else {
         return;
-    }
+    };
     let mut lines = vec![];
     if a.origin == Origin::Found {
         lines.push(format!(
@@ -1377,6 +1438,25 @@ pub(crate) fn check_before_commit(
     Ok((wt, main))
 }
 
+/// Why `I` refuses for the agent, judged from the record. [`prepare_integrate`]
+/// refuses with it before its other checks (unsaved buffers, then Git),
+/// and the panel's hints use it.
+pub(crate) fn integrate_blocker(a: &super::Agent) -> Option<String> {
+    if a.worktree.is_none() {
+        return Some("the agent has no worktree yet".into());
+    }
+    if a.archived {
+        return Some("the agent's worktree was archived; there is nothing to integrate".into());
+    }
+    if a.base_status() == Status::Rejected {
+        return Some("the agent was rejected; its work is not integrated".into());
+    }
+    if let Some(why) = found_refusal(a) {
+        return Some(why);
+    }
+    busy(a)
+}
+
 /// `I`: checks what integration would do on a background thread, then
 /// asks. A dirty or detached main worktree is refused here, before
 /// anything is committed.
@@ -1385,26 +1465,13 @@ pub fn prepare_integrate(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
+    if let Some(why) = integrate_blocker(a) {
+        ed.error(why);
+        return;
+    }
     let Some(w) = a.worktree.clone() else {
-        ed.error("the agent has no worktree yet");
         return;
     };
-    if a.archived {
-        ed.error("the agent's worktree was archived; there is nothing to integrate");
-        return;
-    }
-    if a.base_status() == Status::Rejected {
-        ed.error("the agent was rejected; its work is not integrated");
-        return;
-    }
-    if let Some(why) = found_refusal(a) {
-        ed.error(why);
-        return;
-    }
-    if let Some(why) = busy(a) {
-        ed.error(why);
-        return;
-    }
     if let Some(msg) = unsaved_block(ed, &w) {
         ed.error(msg);
         return;
@@ -2156,21 +2223,25 @@ fn integrated(ed: &mut Editor, id: AgentId, how: Integration, r: Integrated) {
 
 // ----- found worktrees ---------------------------------------------------------
 
+/// Why `a` refuses for the agent. [`ask_adopt`] refuses with it and the
+/// panel's hints use it.
+pub(crate) fn adopt_blocker(a: &super::Agent) -> Option<String> {
+    if a.origin != Origin::Found {
+        return Some("a adopts a found worktree; this agent already has a record".into());
+    }
+    if a.archived {
+        return Some("the worktree was archived".into());
+    }
+    busy(a)
+}
+
 /// `a` on a found worktree: asks which provider the adopted agent uses, for
 /// relaunching it later.
 pub fn ask_adopt(ed: &mut Editor, id: AgentId) {
     let Some(a) = ed.agents.get(id) else {
         return;
     };
-    if a.origin != Origin::Found {
-        ed.error("a adopts a found worktree; this agent already has a record");
-        return;
-    }
-    if a.archived {
-        ed.error("the worktree was archived");
-        return;
-    }
-    if let Some(why) = busy(a) {
+    if let Some(why) = adopt_blocker(a) {
         ed.error(why);
         return;
     }
@@ -2230,4 +2301,99 @@ pub fn adopt(ed: &mut Editor, id: AgentId, provider: ProviderSpec) {
     ed.info(format!(
         "adopted {branch} as {name}: {saved}; R relaunches it"
     ));
+}
+
+// ----- forgetting an archived agent's record ---------------------------------
+
+/// Why `d` refuses to forget the agent's record. Only an archived agent's
+/// record can be forgotten: its worktree was removed already, so nothing on
+/// disk is lost. [`confirm_forget`] and [`forget`] refuse with it, and the
+/// panel's hints use it.
+pub(crate) fn forget_blocker(a: &super::Agent) -> Option<String> {
+    if !a.archived {
+        return Some(format!(
+            "{} is not archived; d forgets only the record of an archived agent, whose worktree \
+             is gone (A archives it first)",
+            a.name
+        ));
+    }
+    busy(a)
+}
+
+/// `d`: asks before forgetting an archived agent's record.
+pub fn confirm_forget(ed: &mut Editor, id: AgentId) {
+    let Some(a) = ed.agents.get(id) else {
+        return;
+    };
+    if let Some(why) = forget_blocker(a) {
+        ed.error(why);
+        return;
+    }
+    let mut lines = vec![format!(
+        "Removes {}'s record from the agent panel: its task, history, test results and comments.",
+        a.name
+    )];
+    let blocked = a
+        .worktree
+        .as_ref()
+        .and_then(|w| ed.agents.persist.blocked(&w.main_root));
+    lines.push(match blocked {
+        _ if super::persist::enabled(ed).is_none() => {
+            "Agent records are not saved in this session (sessions are off), so this only removes it from the panel.".to_string()
+        }
+        Some(why) => format!(
+            "Agent records of this repository are not saved in this session ({why}), so this only removes it from the panel; the records file is left as it is."
+        ),
+        None => "It is also removed from the saved agent records, so it does not come back after a restart.".to_string(),
+    });
+    if let Some(w) = &a.worktree {
+        lines.push(format!(
+            "Its worktree {} was removed when it was archived; nothing on disk is deleted now.",
+            w.path.display()
+        ));
+        lines.push(format!(
+            "The branch {} stays, with its commits; delete it with git if you no longer want it.",
+            w.branch
+        ));
+    }
+    ed.agents.panel.overlay = Some(Overlay::Confirm(Confirm {
+        title: format!("forget {}", a.name),
+        lines,
+        keys: vec![
+            ("y".into(), "forget the record".into()),
+            ("n".into(), "cancel".into()),
+        ],
+        action: ConfirmAction::Forget(id),
+    }));
+}
+
+/// Removes an archived agent's record from the panel and, when records are
+/// saved, from the records file at the next save. Nothing on disk but the
+/// records file changes: the worktree is gone already and the branch stays.
+pub fn forget(ed: &mut Editor, id: AgentId) {
+    let Some(i) = ed.agents.agents.iter().position(|a| a.id == id) else {
+        return;
+    };
+    if let Some(why) = forget_blocker(&ed.agents.agents[i]) {
+        ed.error(why);
+        return;
+    }
+    let mut a = ed.agents.agents.remove(i);
+    if a.is_running() || a.tests_running() {
+        a.stop();
+    }
+    if let Some(w) = &a.worktree {
+        super::persist::forget(ed, w);
+    }
+    let p = &mut ed.agents.panel;
+    p.selected = p.selected.min(ed.agents.agents.len().saturating_sub(1));
+    p.scroll = 0;
+    if p.terminal_focus == Some(id) {
+        p.terminal_focus = None;
+    }
+    super::conflicts::refresh(ed);
+    ed.info(match &a.worktree {
+        Some(w) => format!("forgot {}'s record; branch {} kept", a.name, w.branch),
+        None => format!("forgot {}'s record", a.name),
+    });
 }

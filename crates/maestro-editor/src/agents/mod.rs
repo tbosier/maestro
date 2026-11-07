@@ -102,6 +102,9 @@ pub enum Status {
 }
 
 impl Status {
+    /// The word for this status. Every view uses it through
+    /// [`state_word`]: the panel, the sidebar, the jump palette and
+    /// notifications (see "State words" in `docs/agent-model.md`).
     pub fn label(self) -> &'static str {
         match self {
             Status::Starting => "starting",
@@ -187,6 +190,25 @@ impl Status {
         matches!(self, Status::Rejected | Status::Integrated)
     }
 }
+
+/// The word shown for an agent's state, the same in the agent panel, the
+/// sidebar, the jump palette and notifications: `archived` once the
+/// worktree was removed (whatever the status was), `found worktree` for a
+/// worktree with no record, else [`Status::label`].
+pub fn state_word(status: Status, archived: bool, origin: Origin) -> &'static str {
+    if archived {
+        ARCHIVED
+    } else if origin == Origin::Found {
+        FOUND
+    } else {
+        status.label()
+    }
+}
+
+/// The state word of an archived agent.
+pub const ARCHIVED: &str = "archived";
+/// The state word of a found worktree.
+pub const FOUND: &str = "found worktree";
 
 /// Where an agent's record came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -514,26 +536,74 @@ impl Agent {
 
     /// `R` would start the agent again: it has a record, no process, a
     /// worktree that is still its own, and no decision yet. (The provider
-    /// is checked when `R` is pressed.)
+    /// and the worktree on disk are checked when `R` is pressed.)
     pub fn can_relaunch(&self) -> bool {
-        !matches!(self.origin, Origin::Found | Origin::Composed)
-            && !self.is_running()
-            && !self.archived
-            && !self.base_status().is_decided()
-            && self.worktree.is_some()
-            && self.worktree_note.is_none()
-            && self.git_busy.is_none()
-            && !self.tests_running()
+        self.relaunch_refusal().is_none()
+    }
+
+    /// Why `R` refuses for this agent, judged from the record alone. `R`
+    /// checks this first, and the panel's hints use it, so the hint line
+    /// never offers a relaunch that this refuses.
+    pub fn relaunch_refusal(&self) -> Option<String> {
+        if self.origin == Origin::Found {
+            Some("this worktree has no record; a adopts it, then R can start an agent in it".into())
+        } else if self.origin == Origin::Composed {
+            Some(format!(
+                "{} is a composed result; no agent runs in it to start again",
+                self.name
+            ))
+        } else if self.is_running() {
+            Some(format!("{} is already running", self.name))
+        } else if self.archived {
+            Some("the agent's worktree was archived".into())
+        } else if self.base_status().is_decided() {
+            Some(format!(
+                "{} is {}; it is not relaunched",
+                self.name,
+                self.base_status().label()
+            ))
+        } else if let Some(what) = self.git_busy {
+            Some(format!(
+                "{} is busy ({what}); wait for it to finish",
+                self.name
+            ))
+        } else if self.tests_running() {
+            Some("tests are running for this agent; wait for them to finish".into())
+        } else if let Some(note) = &self.worktree_note {
+            Some(format!("not relaunched: {note}"))
+        } else if self.worktree.is_none() {
+            Some("the agent has no worktree".into())
+        } else {
+            None
+        }
     }
 
     /// The status to show: tests running take precedence over the agent's
-    /// own state until the user has decided.
+    /// own state until the user has decided, except a permission request,
+    /// which waits for the user whatever else runs.
     pub fn status(&self) -> Status {
-        if self.tests_running() && !self.status.is_decided() {
+        if self.tests_running()
+            && !self.status.is_decided()
+            && self.status != Status::AwaitingApproval
+        {
             Status::RunningTests
         } else {
             self.status
         }
+    }
+
+    /// The word for the agent's state, as every view shows it (see
+    /// [`state_word`]).
+    pub fn word(&self) -> &'static str {
+        state_word(self.status(), self.archived, self.origin)
+    }
+
+    /// The last verification run finished and did not pass: it exited
+    /// with an error, was killed, or could not start (code `None`).
+    pub fn tests_failed(&self) -> bool {
+        self.latest_test()
+            .and_then(|t| t.finished.as_ref())
+            .is_some_and(|f| f.code != Some(0))
     }
 
     /// The agent's own status, without the test overlay.

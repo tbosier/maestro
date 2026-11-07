@@ -266,3 +266,13 @@ crates = ["maestro-editor", "maestro-tui", "maestro-git", "maestro-config"]
 branch = "feat/file-tree"
 owner = "agent"
 status = "done"
+
+[[task]]
+id = "fix-status-words"
+title = "One word per agent state in the panel, sidebar, palette and notifications; archived agents say archived; hints only for keys that work; d forgets an archived agent's record"
+crates = ["maestro-editor", "maestro-tui"]
+branch = "fix/status-words"
+owner = "agent"
+status = "done"
+# Hints use the same refusal functions as the actions. The word table is in
+# docs/agent-model.md under State words. Saved status keys are unchanged.

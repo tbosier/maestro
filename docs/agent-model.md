@@ -1,6 +1,6 @@
 # Agent model
 
-This describes what is built as of November 1, 2026. Anything marked partial or not built is not there.
+This describes what is built as of November 6, 2026. Anything marked partial or not built is not there.
 
 ## Version-checked edits
 
@@ -159,11 +159,37 @@ Status comes only from these signals:
 | waiting for a prompt | a relaunched ACP agent's session is up and no turn runs |
 | stopped | no process runs and Maestro did not see the agent finish: a record that was still working when it was saved, an adopted found worktree, or a relaunched ACP agent that exited while waiting for a prompt |
 
-Once rejected or integrated, agent events no longer change the status. `maestro_agent::AgentStatus` has no state for "working" or for a running terminal program, so the editor has its own status type with those two added. Each status is drawn with its name next to its color.
+Once rejected or integrated, agent events no longer change the status. `maestro_agent::AgentStatus` has no state for "working" or for a running terminal program, so the editor has its own status type with those two added. A permission request is shown over running tests: the agent waits for you either way.
+
+### State words
+
+One word names each state, the same in the agent panel's list and summary, the review screen, the sidebar's agent rows and worktree rows, the jump palette and notifications (`agents::state_word`). Before the word every view draws a mark (`!` needs you, `~` working, `-` idle, `=` done), and both are drawn in the state's color, so color is never the only signal. The sidebar's group headings (needs you, working, idle, done) are groups of these states, not words for an agent.
+
+| State | Word | Mark | Sidebar group |
+|---|---|---|---|
+| starting | starting | `~` | working |
+| working | working | `~` | working |
+| planning | planning | `~` | working |
+| editing | editing | `~` | working |
+| running | running | `~` | working |
+| running tests | running tests | `~` | working |
+| awaiting approval | awaiting approval | `!` | needs you |
+| ready for review | ready for review | `!` | needs you |
+| blocked | blocked | `!` | needs you |
+| failed | failed | `!` | needs you |
+| waiting for a prompt | waiting for a prompt | `-` | idle |
+| stopped | stopped | `-` | idle |
+| finished, no changes | finished, no changes | `=` | done |
+| rejected | rejected | `=` | done |
+| integrated | integrated | `=` | done |
+| archived (the worktree was removed, whatever the status was) | archived | `=` | done |
+| found worktree (no record) | found worktree | `-` | idle |
+
+When the last verification run did not pass (a nonzero exit, killed, or it could not start) and the agent is not working, decided or archived, it goes to needs you with the mark `!` and keeps its word; the sidebar and the palette add `, tests failed` after it (`! stopped, tests failed`), the notification says `tests failed`, and the panel shows the result on the list's second line (`FAIL 3/40`, `exit 2`). Notifications use the word of the state that needs you: `alpha-1 needs you: awaiting approval`. An archived agent's list line says what its status was (`was ready for review`). Saved records keep the old status keys (`ready-for-review`, `idle`, ...), so records written before these words load unchanged.
 
 ## The panel and review screen
 
-`space a` or `:agents` opens the panel over the editor area. The keys are listed on its last line. The review screen (`Enter` on an agent) shows the diff of the worktree against the commit it started from: commits on its branch, staged, unstaged and untracked files. Diffs are computed on a background thread when the panel opens, when an ACP turn ends or the agent writes a file, when a process exits, after integration, every three seconds for running agents while the panel is open, and on `r`.
+`space a` or `:agents` opens the panel over the editor area. The keys are listed on its last line. A key is listed for the selected agent only when its action would not refuse, judged by the same function the action checks first (`review::blocker`, `actions::test_blocker`, `message_blocker`, `reject_blocker`, `archive_blocker`, `integrate_blocker`, `adopt_blocker`, `forget_blocker`, `compose::blocker`, `Agent::relaunch_refusal`), so the two cannot disagree. Some checks run only when the key is pressed, because they ask Git or read the worktree: the worktree's branch on disk (tests, relaunch), unsaved buffers and the main worktree (integrate), whether the worktree directory still exists (relaunch). Those can still refuse a listed key. The review screen's `m`, `t`, `I` and `X` are filtered the same way. An archived agent lists `v`, `N`, `d` and the panel's own keys; an agent whose program exited in this session does not list `m` or `i`. The review screen (`Enter` on an agent) shows the diff of the worktree against the commit it started from: commits on its branch, staged, unstaged and untracked files. Diffs are computed on a background thread when the panel opens, when an ACP turn ends or the agent writes a file, when a process exits, after integration, every three seconds for running agents while the panel is open, and on `r`.
 
 Terminal agents have no structured status. The panel says so ("terminal only") next to every terminal agent.
 
@@ -173,16 +199,17 @@ Terminal agents have no structured status. The panel says so ("terminal only") n
 - Drop a file (`D` in the review): discards the agent's change to the file under the cursor in its worktree, after a dialog that says what happens to it (restored to the starting commit's version, or deleted if the agent added it). Refused while that file has unsaved edits in a buffer, while other Git work for the agent runs, when the worktree no longer has the agent's branch checked out or no longer descends from its starting commit, and when the path (or a parent of it) is a directory or a symlink. A file the agent turned into a symlink, or the reverse, is restored whichever half of the change is dropped. This is how to keep stray files (build output, caches) out of an integration; to integrate only some hunks, mark them instead (see Integrating part of the work).
 - Message (`m`, formerly `f` for feedback, which still works): unsent comments plus typed text. An ACP agent gets them as a new prompt (refused while a turn is running). A terminal agent gets them typed into its terminal followed by Enter. To type into a running terminal agent directly, `i` or a click in its screen gives it the keys, and `C-\` or a click outside takes them back.
 - Permission (`p`): lists the choices of the oldest unanswered request (requests queue; the transcript says how many more wait). Choices that allow something ask for confirmation first; rejecting is sent at once.
-- Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree. Rejecting while the worktree is still being made means the agent is never launched.
+- Reject (`X`): stops the agent and its tests and marks it rejected. `a` in the dialog also archives the worktree. Rejecting while the worktree is still being made means the agent is never launched. It refuses for an agent already rejected, integrated or archived (nothing is left to reject once the worktree is gone).
 - Relaunch (`R`) and adopt (`a`): see Records across restarts.
 - Archive (`A`): removes the worktree with `remove_worktree`, keeping the branch, after the agent's program has exited. It refuses when Git lists the worktree on another branch than the record names. Ignored files in it are deleted without a second question, and the dialog says so. If the worktree has uncommitted or untracked files, or commits on no branch, the removal is refused and a second dialog lists what forcing would delete; only `F` there forces it.
+- Forget a record (`d`): removes an archived agent's record from the panel and, when records are saved, from the records file at the next save (within about a second, or on quit), so it does not come back after a restart. It asks y/n first; the dialog says nothing on disk is deleted (the worktree was removed when it was archived) and that the branch stays with its commits. It refuses for an agent that is not archived, since its worktree would be left with no record (it would come back as a found worktree), and while Git work for it runs. Records of that worktree that another Maestro saves into the file are not added back in this session. With sessions off, or a records file that cannot be used, it only removes the agent from the panel, and the dialog says so.
 - Integrate (`I`): checks first and refuses, changing nothing, if either worktree is gone or on another branch, the main worktree is detached or has uncommitted changes, the agent's starting commit is not on the main worktree's branch, or an open buffer in either worktree has unsaved edits. The dialog says what will be committed and how the branch will be integrated (`tab` cycles merge, fast-forward and cherry-pick). The dialog is computed from one snapshot of the agent's worktree: the commit its branch points at plus its uncommitted and untracked files. On `y`, the same checks run again; then uncommitted work in the agent's worktree is committed with the task's first line as the subject. What may be integrated is exactly the snapshot: the branch's commit from the dialog, or Maestro's commit of the same files whose only parent is that commit. If the agent committed, reset or rebased after the dialog was checked, or changed the files, nothing is integrated ("the agent's branch moved after the dialog was checked" or "the agent's files changed after the dialog was checked"; a commit Maestro made stays on the agent's branch), and `I` shows the new state. Then `maestro-git` integrates that commit only: it refuses if the branch no longer points at it, both when its checks start and again just before git runs, and gives git the commit id rather than the branch name, so a commit that lands on the branch after that last check is not taken in. It also refuses when the main worktree no longer has the dialog's target branch checked out, or when that branch no longer contains the agent's starting commit (a switch or reset while Maestro committed). Maestro's Git commands ignore replacement refs (`git replace`). `maestro-git` checks the rest again and refuses on its own. With a task contract, files outside it need `O` instead of `y`, and the dialog warns about the last verification and names agents that would conflict afterward (see Task contracts and Overlaps).
 - A dialog that does not fit the window cannot be accepted.
 - `:q` and `:qa` refuse while Git work for an agent runs (a worktree being made, an integration, an archive). With agents or tests running they ask first, and on `y` stop them and wait up to a second for terminal programs to exit. The automation API's `editor.quit` refuses the same way while Git work runs, and refuses while agents or tests run unless `force` is passed, which stops them first.
 
 ## Not built
 
-- Two Maestro instances in one repository: each keeps the other's new records when it saves, but a change both make to one record (an archive in one, a comment in the other) keeps only the last save's. A record whose agent still runs in the other editor loads here as not running, and Maestro cannot tell.
+- Two Maestro instances in one repository: each keeps the other's new records when it saves, but a change both make to one record (an archive in one, a comment in the other) keeps only the last save's. A record whose agent still runs in the other editor loads here as not running, and Maestro cannot tell. A record forgotten (`d`) in one stays in the other's memory, and that one's next save writes it back to the file; the session that forgot it does not load it again, but a later session does.
 - Relaunch does not send the task again, and a relaunched terminal agent gets no task at all.
 - Agents started from the panel cannot propose edits to open buffers. An automation client can (`proposal.create`, see `docs/automation.md`), and an agent that speaks the automation protocol could do so as a client, but the panel does not connect its agents to it.
 - No OS sandbox around agent processes (see `docs/security.md`).

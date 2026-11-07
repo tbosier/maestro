@@ -147,35 +147,47 @@ fn members(ed: &Editor, group: u64) -> Vec<AgentId> {
         .collect()
 }
 
-/// `C` in the panel: the compose view for the selected agent's task.
-pub fn open(ed: &mut Editor, id: AgentId) {
-    let Some(a) = ed.agents.get(id) else {
-        return;
-    };
+/// Why `C` refuses for agent `id`. [`open`] refuses with it and the
+/// panel's hints use it.
+pub(crate) fn blocker(ed: &Editor, id: AgentId) -> Option<String> {
+    let a = ed.agents.get(id)?;
     if a.origin == Origin::Found {
-        ed.error("a found worktree has no task to compose for; a adopts it first");
-        return;
+        return Some("a found worktree has no task to compose for; a adopts it first".into());
     }
-    let group = a.group;
-    let ids = members(ed, group);
+    let ids = members(ed, a.group);
     if ids.len() < 2 {
-        ed.error(
+        return Some(
             "composing needs two or more agents on this task that are not rejected, integrated \
-             or archived; N starts another agent on it",
+             or archived; N starts another agent on it"
+                .into(),
         );
-        return;
     }
-    let worktrees: Vec<WorktreeInfo> = ids
+    let worktrees: Vec<&WorktreeInfo> = ids
         .iter()
-        .filter_map(|i| ed.agents.get(*i).and_then(|a| a.worktree.clone()))
+        .filter_map(|i| ed.agents.get(*i).and_then(|a| a.worktree.as_ref()))
         .collect();
     if worktrees
         .iter()
         .any(|w| w.base != worktrees[0].base || w.main_root != worktrees[0].main_root)
     {
-        ed.error("these agents started from different commits; Maestro composes only on one");
+        return Some(
+            "these agents started from different commits; Maestro composes only on one".into(),
+        );
+    }
+    None
+}
+
+/// `C` in the panel: the compose view for the selected agent's task.
+pub fn open(ed: &mut Editor, id: AgentId) {
+    let Some(a) = ed.agents.get(id) else {
+        return;
+    };
+    if let Some(why) = blocker(ed, id) {
+        ed.error(why);
         return;
     }
+    let group = a.group;
+    let ids = members(ed, group);
     for i in &ids {
         super::review::request(ed, *i);
     }

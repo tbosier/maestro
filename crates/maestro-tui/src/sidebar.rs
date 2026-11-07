@@ -116,11 +116,11 @@ fn row_lines(ed: &Editor, row: &Row) -> Vec<Line> {
         Row::Heading(t) => vec![vec![(format!(" {t}"), ui.popup_title)]],
         Row::Note(t) => vec![vec![(format!("   {t}"), ui.text_muted)]],
         Row::Agent(a) => {
-            let style = crate::agents::status_style(&ed.theme, a.status);
+            let style = crate::agents::state_style(&ed.theme, a.status, a.archived);
             let mut line = vec![
                 (format!("  {} ", a.attention.symbol()), style),
                 (a.name.clone(), style),
-                (format!("  {}", a.attention.word()), style),
+                (format!("  {}", a.word_text()), style),
             ];
             if let Some(p) = a.project.as_deref().and_then(|p| p.file_name()) {
                 line.push((format!("  {}", p.to_string_lossy()), ui.text_muted));
@@ -208,10 +208,10 @@ fn worktree_lines(
     ];
     match agent {
         Some(a) => {
-            let style = crate::agents::status_style(&ed.theme, a.status);
+            let style = crate::agents::state_style(&ed.theme, a.status, a.archived);
             out.push(vec![
                 (format!("     {} ", a.attention.symbol()), style),
-                (format!("{} {}", a.name, a.attention.word()), style),
+                (format!("{} {}", a.name, a.word_text()), style),
             ]);
         }
         None if w.is_agent_branch() => out.push(vec![(

@@ -65,7 +65,7 @@ pub fn items(ed: &Editor) -> Vec<PickerItem> {
             } else {
                 format!("agent {}: {task}", a.name)
             },
-            detail: format!("{} {}", a.attention.symbol(), a.attention.word()),
+            detail: a.state_text(),
             action: PickerAction::Jump(Jump::Worktree(path)),
         });
     }

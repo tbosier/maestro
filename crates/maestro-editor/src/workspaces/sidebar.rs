@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use super::{AgentEntry, Attention, WorktreeRow};
+use super::{AgentEntry, WorktreeRow};
 use crate::editor::Editor;
 use crate::key::{KeyCode, KeyEvent};
 
@@ -293,7 +293,7 @@ fn set_expanded(ed: &mut Editor, root: &std::path::Path, on: bool) {
 }
 
 /// The mark and word for a row's agent, for front ends: `! ready for
-/// review`.
-pub fn attention_text(a: Attention) -> String {
-    format!("{} {}", a.symbol(), a.word())
+/// review` (see [`AgentEntry::state_text`]).
+pub fn attention_text(a: &AgentEntry) -> String {
+    a.state_text()
 }
