@@ -138,16 +138,23 @@ pub enum NeedsYou {
 }
 
 impl NeedsYou {
+    /// Why, in the panel's words: the status word for the four that are a
+    /// status, and `tests failed`, which the sidebar and the palette add
+    /// after the status word (see "State words" in `docs/agent-model.md`).
     pub fn label(self) -> &'static str {
         match self {
-            NeedsYou::Permission => "permission request",
-            NeedsYou::Review => "ready for review",
-            NeedsYou::TestsFailed => "tests failed",
-            NeedsYou::Failed => "failed",
-            NeedsYou::Blocked => "blocked",
+            NeedsYou::Permission => Status::AwaitingApproval.label(),
+            NeedsYou::Review => Status::ReadyForReview.label(),
+            NeedsYou::TestsFailed => TESTS_FAILED,
+            NeedsYou::Failed => Status::Failed.label(),
+            NeedsYou::Blocked => Status::Blocked.label(),
         }
     }
 }
+
+/// Added after an agent's state word in the sidebar and the palette when
+/// its last verification run did not pass.
+pub const TESTS_FAILED: &str = "tests failed";
 
 /// The herdr-style grouping of agents: what needs you first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,7 +192,8 @@ impl Attention {
         }
     }
 
-    /// The group heading.
+    /// The group heading. A row's own word is the agent's state word
+    /// ([`AgentEntry::word`]), the one the agent panel shows.
     pub fn group(self) -> &'static str {
         match self {
             Attention::NeedsYou(_) => "needs you",
@@ -194,16 +202,12 @@ impl Attention {
             Attention::Done => "done",
         }
     }
+}
 
-    /// The word for this agent's state.
-    pub fn word(self) -> &'static str {
-        match self {
-            Attention::NeedsYou(n) => n.label(),
-            Attention::Working => "working",
-            Attention::Idle => "idle",
-            Attention::Done => "done",
-        }
-    }
+/// The attention state of one of this editor's agents: what the sidebar
+/// groups it under and the mark the panel and the sidebar draw before it.
+pub fn attention_for(a: &crate::agents::Agent) -> Attention {
+    attention_of(a.status(), a.archived, a.tests_failed())
 }
 
 /// The attention state for an agent's status. `tests_failed`: the last
@@ -241,6 +245,11 @@ pub struct AgentEntry {
     pub task: String,
     pub status: Status,
     pub attention: Attention,
+    /// The state word, the same the agent panel shows for this agent
+    /// ([`crate::agents::state_word`]).
+    pub word: &'static str,
+    /// Its worktree was removed.
+    pub archived: bool,
     pub worktree: Option<PathBuf>,
     /// The main worktree of the agent's repository.
     pub project: Option<PathBuf>,
@@ -257,24 +266,14 @@ pub struct AgentEntry {
 pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
     let mut out: Vec<AgentEntry> = Vec::new();
     for a in &ed.agents.agents {
-        // A verification run that finished with an error, was killed or
-        // could not start (code `None`) did not pass.
-        let failed = a
-            .latest_test()
-            .and_then(|t| t.finished.as_ref())
-            .is_some_and(|f| f.code != Some(0));
-        // A permission request waits even while a verification run shows
-        // as the agent's status.
-        let status = match a.base_status() {
-            Status::AwaitingApproval => Status::AwaitingApproval,
-            _ => a.status(),
-        };
         out.push(AgentEntry {
             key: agent_key(a.worktree.as_ref().map(|w| w.path.as_path()), a.id.0),
             name: a.name.clone(),
             task: a.task.clone(),
-            status,
-            attention: attention_of(status, a.archived, failed),
+            status: a.status(),
+            attention: attention_for(a),
+            word: a.word(),
+            archived: a.archived,
             worktree: a.worktree.as_ref().map(|w| w.path.clone()),
             project: a.worktree.as_ref().map(|w| w.main_root.clone()),
             id: Some(a.id),
@@ -287,7 +286,9 @@ pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
             let loaded = out
                 .iter()
                 .any(|e| e.worktree.as_deref() == Some(r.worktree.as_path()));
-            if loaded {
+            // A record forgotten here may still be in the file the last
+            // scan read; it is not listed.
+            if loaded || ed.agents.persist.is_forgotten(&r.worktree) {
                 continue;
             }
             out.push(AgentEntry {
@@ -296,6 +297,8 @@ pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
                 task: r.task.clone(),
                 status: r.status,
                 attention: attention_of(r.status, r.archived, r.tests_failed),
+                word: crate::agents::state_word(r.status, r.archived, Origin::Loaded),
+                archived: r.archived,
                 worktree: Some(r.worktree.clone()),
                 project: Some(p.root.clone()),
                 id: None,
@@ -308,6 +311,24 @@ pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
         (a.attention.rank(), &a.name, &a.key).cmp(&(b.attention.rank(), &b.name, &b.key))
     });
     out
+}
+
+impl AgentEntry {
+    /// The mark, the state word, and `tests failed` when that is why the
+    /// agent needs you: `! ready for review, tests failed`. The word is
+    /// the one the agent panel shows for the same agent.
+    pub fn state_text(&self) -> String {
+        format!("{} {}", self.attention.symbol(), self.word_text())
+    }
+
+    /// The state word, with `tests failed` after it when that is why the
+    /// agent needs you: `ready for review, tests failed`.
+    pub fn word_text(&self) -> String {
+        match self.attention {
+            Attention::NeedsYou(NeedsYou::TestsFailed) => format!("{}, {TESTS_FAILED}", self.word),
+            _ => self.word.to_string(),
+        }
+    }
 }
 
 /// An agent's key: its worktree once it has one, so a saved record and the
@@ -548,6 +569,11 @@ mod tests {
         assert_eq!(attention_of(Running, false, true), Attention::Working);
         assert_eq!(attention_of(Rejected, false, true), Attention::Done);
         assert_eq!(attention_of(ReadyForReview, true, false), Attention::Done);
+        // Notifications say why in the panel's words.
+        assert_eq!(NeedsYou::Permission.label(), AwaitingApproval.label());
+        assert_eq!(NeedsYou::Review.label(), ReadyForReview.label());
+        assert_eq!(NeedsYou::Failed.label(), Failed.label());
+        assert_eq!(NeedsYou::Blocked.label(), Blocked.label());
         let mut ranks: Vec<u8> = [Integrated, Idle, Running, ReadyForReview]
             .into_iter()
             .map(|s| a(s).rank())

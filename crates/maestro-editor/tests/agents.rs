@@ -56,6 +56,14 @@ fn main() {
             integrate_refuses_a_base_that_is_not_on_the_target,
         ),
         (
+            "a_task_started_in_another_worktree_starts_from_main",
+            a_task_started_in_another_worktree_starts_from_main,
+        ),
+        (
+            "the_provider_list_warns_about_uncommitted_files_in_main",
+            the_provider_list_warns_about_uncommitted_files_in_main,
+        ),
+        (
             "integrate_refuses_when_the_worktree_is_gone",
             integrate_refuses_when_the_worktree_is_gone,
         ),
@@ -162,6 +170,18 @@ fn main() {
         (
             "compose_view_j_and_k_stay_in_the_agents_column",
             compose_view_j_and_k_stay_in_the_agents_column,
+        ),
+        (
+            "an_archived_agent_says_so_and_its_record_can_be_forgotten",
+            an_archived_agent_says_so_and_its_record_can_be_forgotten,
+        ),
+        (
+            "files_the_test_run_creates_are_listed_apart_and_left_behind",
+            files_the_test_run_creates_are_listed_apart_and_left_behind,
+        ),
+        (
+            "a_test_run_file_the_agent_changes_is_the_agents_and_records_survive",
+            a_test_run_file_the_agent_changes_is_the_agents_and_records_survive,
         ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
@@ -318,6 +338,27 @@ fn status_text(ed: &Editor) -> String {
 
 fn hint_keys(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     maestro_editor::agents::panel::hints(ed)
+}
+
+/// The keys the hint line offers, without what they do.
+fn hinted(ed: &Editor) -> Vec<&'static str> {
+    hint_keys(ed).into_iter().map(|(k, _)| k).collect()
+}
+
+/// Agent `i`'s mark and state word, checked to be the same in the agent
+/// panel's terms and the sidebar's row for it (and the jump palette, which
+/// uses the sidebar's text).
+fn same_word(ed: &Editor, i: usize) -> String {
+    use maestro_editor::workspaces::{agent_entries, attention_for};
+    let a = agent(ed, i);
+    let panel = format!("{} {}", attention_for(a).symbol(), a.word());
+    let entries = agent_entries(ed);
+    let row = entries
+        .iter()
+        .find(|e| e.id == Some(a.id))
+        .unwrap_or_else(|| panic!("no sidebar row for {}", a.name));
+    assert_eq!(row.state_text(), panel, "{}: sidebar vs panel", a.name);
+    panel
 }
 
 /// Moves the panel's selection to agent `i` with `j`/`k`.
@@ -495,6 +536,7 @@ fn acp_agent_permission_feedback_and_review() {
     poll_until(&mut ed, "the permission request", |ed| {
         status(ed, 0) == Status::AwaitingApproval
     });
+    assert_eq!(same_word(&ed, 0), "! awaiting approval");
     let a = agent(&ed, 0);
     assert_eq!(a.permissions.len(), 1);
     assert_eq!(a.kind(), maestro_editor::agents::ProviderKind::Acp);
@@ -1090,24 +1132,11 @@ fn rejecting_during_creation_never_launches_and_quit_waits_for_git() {
 
 fn integrate_refuses_a_base_that_is_not_on_the_target() {
     let f = Fixture::new();
-    // The editor runs in a linked worktree on a feature branch that is one
-    // commit ahead of main.
-    let feature = f.tmp.join("feature");
-    f.git(
-        &f.repo,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feature",
-            feature.to_str().unwrap(),
-        ],
-    );
-    std::fs::write(feature.join("feature.txt"), "unreviewed\n").unwrap();
-    f.git(&feature, &["add", "-A"]);
-    f.git(&feature, &["commit", "-q", "-m", "feature work"]);
-    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
+    // main gets a second commit, the agent starts from it, and then main
+    // is reset to the first: the agent's base is no longer on main.
+    std::fs::write(f.repo.join("second.txt"), "second\n").unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "second"]);
     let mut ed = f.editor(config(&[(
         "alpha",
         provider(
@@ -1116,12 +1145,13 @@ fn integrate_refuses_a_base_that_is_not_on_the_target() {
             &["-c", "printf a > a.txt", "sh", "{task}"],
         ),
     )]));
-    ed.cwd = feature.clone();
     run(&mut ed, " a");
     start_task(&mut ed, "add a", 0);
     poll_until(&mut ed, "the agent's exit", |ed| {
         ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
     });
+    f.git(&f.repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
     // The review shows only the agent's file.
     poll_until(&mut ed, "the review", |ed| review_paths(ed, 0) == ["a.txt"]);
     run(&mut ed, "I");
@@ -1138,6 +1168,206 @@ fn integrate_refuses_a_base_that_is_not_on_the_target() {
         f.git(&worktree(&ed, 0), &["status", "--porcelain"]),
         "?? a.txt\n"
     );
+}
+
+/// The reviewer's case: the editor switched into an agent's worktree,
+/// whose branch is a commit ahead of main, and a task started there. The
+/// new agent starts from main, the dialog says so, and `I` takes it.
+fn a_task_started_in_another_worktree_starts_from_main() {
+    let f = Fixture::new();
+    let mut ed = f.editor(config(&[
+        ("edit", sh_provider("printf 'pub fn two() {}\\n' > two.rs")),
+        ("mul", sh_provider("printf 'pub fn mul() {}\\n' > mul.rs")),
+    ]));
+    run(&mut ed, " a");
+    start_task(&mut ed, "add two", 0);
+    wait_files(&mut ed, 0, &["two.rs"]);
+    let first = worktree(&ed, 0);
+    let first_branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    f.git(&first, &["add", "-A"]);
+    f.git(&first, &["commit", "-q", "-m", "two"]);
+    let first_head = f.git(&first, &["rev-parse", "HEAD"]).trim().to_string();
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(first_head, main_head);
+
+    // Uncommitted work in main, which is warned about, and in the
+    // worktree the editor goes to, which is not where the agent starts.
+    std::fs::write(f.repo.join("src/lib.rs"), "pub fn wip() {}\n").unwrap();
+    std::fs::write(first.join("here.txt"), "here\n").unwrap();
+
+    // Into the agent's worktree, as the sidebar's worktree switch does.
+    run(&mut ed, &format!(":cd {}\n", first.display()));
+    assert_eq!(ed.cwd, first);
+    run(&mut ed, "n");
+    ed.paste_text("add mul");
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "where the agent starts", |ed| {
+        choice_notes(ed)
+            .iter()
+            .any(|l| l.starts_with("starts from"))
+    });
+    let notes = choice_notes(&ed);
+    assert!(
+        notes.contains(&format!(
+            "starts from main at {} (the branch I integrates into)",
+            &main_head[..8]
+        )),
+        "{notes:?}"
+    );
+    assert!(
+        notes.contains(&format!(
+            "you are in {first_branch}; the new agent starts from main, not from here"
+        )),
+        "{notes:?}"
+    );
+    let warnings: Vec<&String> = notes.iter().filter(|l| l.starts_with('!')).collect();
+    assert_eq!(
+        warnings,
+        [
+            &"! main has 1 uncommitted file (src/lib.rs): the agent will not see it; \
+            commit it first if it should"
+                .to_string()
+        ],
+        "{notes:?}"
+    );
+    run(&mut ed, "j\n");
+    wait_files(&mut ed, 1, &["mul.rs"]);
+    assert_eq!(agent(&ed, 1).worktree.as_ref().unwrap().base, main_head);
+    assert!(
+        agent(&ed, 1).history.iter().any(|h| h
+            .text
+            .contains(&format!("from main at {}", &main_head[..8]))),
+        "{:?}",
+        agent(&ed, 1).history
+    );
+
+    // `N` on it competes from the same commit and says so, and a check
+    // left running by a list closed just before does not change that.
+    run(&mut ed, "n");
+    ed.paste_text("closed at once");
+    run(&mut ed, "\n<esc>");
+    select(&mut ed, 1);
+    run(&mut ed, "N");
+    let compete = format!(
+        "starts from {}, the commit {} started from, so the competing agents work on the \
+         same code",
+        &main_head[..8],
+        agent(&ed, 1).name
+    );
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        ed.poll_background();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(choice_notes(&ed), [compete]);
+    run(&mut ed, "\n");
+    wait_files(&mut ed, 2, &["two.rs"]);
+    assert_eq!(agent(&ed, 2).worktree.as_ref().unwrap().base, main_head);
+
+    // It integrates into main with nothing of the first agent's.
+    f.git(&f.repo, &["checkout", "-q", "--", "src/lib.rs"]);
+    select(&mut ed, 1);
+    open_integrate(&mut ed);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 1) == Status::Integrated
+    });
+    assert!(f.repo.join("mul.rs").exists());
+    assert!(!f.repo.join("two.rs").exists());
+}
+
+/// The notes of the open provider list, or a panic.
+fn choice_notes(ed: &Editor) -> Vec<String> {
+    match &ed.agents.panel.overlay {
+        Some(Overlay::Choice { notes, .. }) => notes.clone(),
+        other => panic!(
+            "expected the provider list, got {other:?}; status {:?}",
+            ed.status
+        ),
+    }
+}
+
+/// `n` and a task, then waits for the provider list to say where the
+/// agent starts, and returns what it says.
+fn start_notes(ed: &mut Editor, task: &str) -> Vec<String> {
+    run(ed, "n");
+    ed.paste_text(task);
+    run(ed, "\n");
+    poll_until(ed, "where the agent starts", |ed| {
+        !choice_notes(ed).iter().any(|l| l.starts_with("checking"))
+    });
+    choice_notes(ed)
+}
+
+/// Uncommitted files in the main worktree, which a new agent's worktree
+/// does not get, are named in the provider list; ignored ones are not.
+/// A detached main worktree is said plainly.
+fn the_provider_list_warns_about_uncommitted_files_in_main() {
+    let f = Fixture::new();
+    std::fs::write(f.repo.join(".git/info/exclude"), "*.log\n").unwrap();
+    std::fs::write(f.repo.join("build.log"), "ignored\n").unwrap();
+    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let mut ed = f.editor(config(&[("writer", sh_provider("printf x > x.txt"))]));
+    run(&mut ed, " a");
+
+    // Clean (the ignored file does not count): where it starts, no warning.
+    let notes = start_notes(&mut ed, "clean");
+    assert_eq!(
+        notes,
+        [format!(
+            "starts from main at {} (the branch I integrates into)",
+            &main_head[..8]
+        )]
+    );
+    run(&mut ed, "<esc>");
+
+    // An unstaged change, a staged new file and an untracked file.
+    std::fs::write(f.repo.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+    std::fs::write(f.repo.join("staged.rs"), "staged\n").unwrap();
+    f.git(&f.repo, &["add", "staged.rs"]);
+    std::fs::write(f.repo.join("notes.md"), "draft\n").unwrap();
+    let notes = start_notes(&mut ed, "dirty");
+    let warning = notes
+        .iter()
+        .find(|l| l.starts_with("! main has 3 uncommitted files ("))
+        .unwrap_or_else(|| panic!("{notes:?}"));
+    for name in ["src/lib.rs", "staged.rs", "notes.md"] {
+        assert!(warning.contains(name), "{warning}");
+    }
+    assert!(!warning.contains("build.log"), "{warning}");
+    assert!(
+        warning.ends_with("): the agent will not see them; commit them first if it should"),
+        "{warning}"
+    );
+    // A warning, not a refusal: the agent starts.
+    run(&mut ed, "\n");
+    wait_files(&mut ed, 0, &["x.txt"]);
+    assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, main_head);
+
+    // A detached main worktree: the agent starts from the commit checked
+    // out where the editor is (here the first agent's worktree, a commit
+    // ahead of main), as before, and the list says so plainly.
+    f.git(&f.repo, &["stash", "-q", "--include-untracked"]);
+    f.git(&f.repo, &["checkout", "-q", "--detach"]);
+    let first = worktree(&ed, 0);
+    f.git(&first, &["add", "-A"]);
+    f.git(&first, &["commit", "-q", "-m", "x"]);
+    let first_head = f.git(&first, &["rev-parse", "HEAD"]).trim().to_string();
+    run(&mut ed, &format!(":cd {}\n", first.display()));
+    let notes = start_notes(&mut ed, "detached");
+    assert!(
+        notes.iter().any(|l| l.starts_with(&format!(
+            "! the main worktree has a detached HEAD, so the agent starts from the commit \
+             checked out here, {}",
+            &first_head[..8]
+        ))),
+        "{notes:?}"
+    );
+    run(&mut ed, "\n");
+    poll_until(&mut ed, "the worktree", |ed| {
+        ed.agents.agents.len() == 2 && agent(ed, 1).worktree.is_some()
+    });
+    assert_eq!(agent(&ed, 1).worktree.as_ref().unwrap().base, first_head);
 }
 
 fn integrate_refuses_when_the_worktree_is_gone() {
@@ -3452,4 +3682,402 @@ fn compose_view_j_and_k_stay_in_the_agents_column() {
     run(&mut ed, "h");
     run(&mut ed, "j");
     assert_eq!(at(&ed), (0, 1), "j goes down alpha's column");
+}
+
+/// An archived agent says "archived" wherever it is listed, offers only
+/// the keys that still work on it, and `d` forgets its record after a
+/// question: it leaves the panel and the saved records, and the branch
+/// stays. Along the way the panel and the sidebar use the same word for
+/// each state, and an agent whose program exited offers no message.
+fn an_archived_agent_says_so_and_its_record_can_be_forgotten() {
+    let f = Fixture::new();
+    let mut c = config(&[(
+        "quick",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &[
+                "-c",
+                "sleep 1; printf 'quick\\n' > notes.txt",
+                "sh",
+                "{task}",
+            ],
+        ),
+    )]);
+    c.agents.test_command = vec!["true".into()];
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write notes", 0);
+    poll_until(&mut ed, "the running program", |ed| {
+        ed.agents
+            .agents
+            .first()
+            .is_some_and(|a| a.status() == Status::Running)
+    });
+    // Running: typing in and a message both reach it.
+    assert_eq!(same_word(&ed, 0), "~ running");
+    let keys = hinted(&ed);
+    assert!(keys.contains(&"i") && keys.contains(&"m"), "{keys:?}");
+    // Forgetting refuses for an agent that is not archived.
+    run(&mut ed, "d");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(
+        status_text(&ed).contains("is not archived"),
+        "{}",
+        status_text(&ed)
+    );
+
+    poll_until(&mut ed, "the exit and its diff", |ed| {
+        let a = agent(ed, 0);
+        a.exited.is_some() && a.review.computed.is_some() && !a.review.files.is_empty()
+    });
+    // The program exited in this session: no message and no typing is
+    // offered, and m says why.
+    assert_eq!(same_word(&ed, 0), "! ready for review");
+    let keys = hinted(&ed);
+    assert!(!keys.contains(&"m") && !keys.contains(&"i"), "{keys:?}");
+    for key in ["ret", "t", "I", "X", "A", "R"] {
+        assert!(keys.contains(&key), "{key} missing from {keys:?}");
+    }
+    run(&mut ed, "m");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(
+        status_text(&ed).contains("program has exited"),
+        "{}",
+        status_text(&ed)
+    );
+    run(&mut ed, "i");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(ed.agents.panel.terminal_focus.is_none());
+
+    // Archive it: the change is uncommitted, so forcing asks again.
+    let wt = worktree(&ed, 0);
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    run(&mut ed, "Ay");
+    poll_until(&mut ed, "the force confirmation", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::ForceArchive(_)))
+    });
+    run(&mut ed, "F");
+    poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
+    assert!(!wt.exists());
+    assert_eq!(same_word(&ed, 0), "= archived");
+    // Only what works on an archived agent is offered, and every action
+    // left out refuses.
+    let keys = hinted(&ed);
+    for key in ["v", "N", "d", "n", "esc"] {
+        assert!(keys.contains(&key), "{key} missing from {keys:?}");
+    }
+    let refused = ["ret", "t", "m", "i", "I", "X", "A", "R", "a", "C", "p"];
+    for key in refused {
+        assert!(!keys.contains(&key), "{key} offered: {keys:?}");
+    }
+    for key in ["\n", "t", "m", "i", "I", "X", "A", "R", "a", "C", "p"] {
+        run(&mut ed, key);
+        assert!(
+            ed.agents.panel.overlay.is_none() && ed.agents.panel.review.is_none(),
+            "{key:?} opened {:?}",
+            ed.agents.panel.overlay
+        );
+        assert!(
+            matches!(ed.status, Some((maestro_editor::Severity::Error, _))),
+            "{key:?} did not refuse: {:?}",
+            ed.status
+        );
+    }
+    assert!(agent(&ed, 0).archived && agent(&ed, 0).base_status() == Status::ReadyForReview);
+    // The archived record is on disk, as another Maestro would have read it.
+    maestro_editor::agents::persist::save(&mut ed, true);
+    let before = std::fs::read_to_string(f.records()).unwrap();
+    assert!(before.contains(wt.to_str().unwrap()), "{before}");
+
+    // d asks first and says what it does and does not do; n keeps it.
+    run(&mut ed, "d");
+    let Some(Overlay::Confirm(dialog)) = &ed.agents.panel.overlay else {
+        panic!("no dialog: {:?}", ed.status);
+    };
+    assert!(matches!(dialog.action, ConfirmAction::Forget(_)));
+    let text = dialog.lines.join(" ");
+    for want in [
+        "saved agent records",
+        "nothing on disk is deleted",
+        &format!("The branch {branch} stays"),
+    ] {
+        assert!(text.contains(want), "{want:?} not in {text}");
+    }
+    run(&mut ed, "n");
+    assert_eq!(ed.agents.agents.len(), 1);
+    // y forgets it: the panel, the sidebar and the saved records lose it;
+    // the branch stays.
+    run(&mut ed, "dy");
+    assert!(ed.agents.agents.is_empty(), "{:?}", ed.status);
+    assert!(
+        status_text(&ed).contains(&format!("branch {branch} kept")),
+        "{}",
+        status_text(&ed)
+    );
+    assert!(maestro_editor::workspaces::agent_entries(&ed).is_empty());
+    let branches = f.git(&f.repo, &["branch", "--list", &branch]);
+    assert!(branches.contains(&branch), "{branches}");
+    // Another Maestro that still had the record saves it again: it is
+    // not added back here, and the next save leaves it out.
+    std::fs::write(f.records(), format!("{before}\n")).unwrap();
+    maestro_editor::agents::persist::save(&mut ed, true);
+    assert!(ed.agents.agents.is_empty(), "{:?}", ed.status);
+    quit(&mut ed);
+    drop(ed);
+    let saved = std::fs::read_to_string(f.records()).unwrap();
+    assert!(!saved.contains(wt.to_str().unwrap()), "{saved}");
+
+    // After a restart it does not come back.
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 0);
+    assert!(ed.agents.agents.is_empty());
+}
+
+// ----- files Maestro's own test run creates ----------------------------------
+
+/// A writer agent whose verification command creates files the agent never
+/// wrote, as `cargo test` creates `Cargo.lock`.
+fn test_run_config(test: &str) -> Config {
+    let mut c = config(&[("writer", sh_provider("printf 'notes\\n' > notes.txt"))]);
+    c.agents.test_command = vec!["sh".into(), "-c".into(), test.into()];
+    c
+}
+
+/// Waits until the review lists `made` as the test run's files.
+fn wait_test_made(ed: &mut Editor, i: usize, made: &[&str]) {
+    let want: Vec<PathBuf> = made.iter().map(PathBuf::from).collect();
+    poll_until(ed, "the review of the test run's files", |ed| {
+        let r = &agent(ed, i).review;
+        !r.running && r.computed.is_some() && r.test_made == want
+    });
+}
+
+fn head_files(f: &Fixture) -> Vec<String> {
+    f.git(&f.repo, &["ls-tree", "-r", "--name-only", "HEAD"])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `t` creates two files: the review lists them after the agent's file,
+/// labeled and not counted; they cannot be marked; `K` makes one the
+/// agent's; integrate names the other as left behind, commits everything
+/// else, and leaves it untracked in the worktree.
+fn files_the_test_run_creates_are_listed_apart_and_left_behind() {
+    let f = Fixture::new();
+    let test = "echo x > made-by-tests.txt; mkdir -p out; echo y > 'out/[x].log'";
+    let mut ed = f.editor(test_run_config(test));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt", "out/[x].log"]);
+    let a = agent(&ed, 0);
+    assert_eq!(
+        review_paths(&ed, 0),
+        ["notes.txt", "made-by-tests.txt", "out/[x].log"],
+        "the agent's files first, then the test run's"
+    );
+    assert_eq!(a.review.totals(), (1, 1, 0), "only notes.txt is counted");
+    assert_eq!(a.test_outputs.len(), 2);
+    assert_eq!(a.test_outputs[0].command, format!("sh -c {test}"));
+    assert!(
+        a.history.iter().any(|h| h
+            .text
+            .contains("the test run created 2 file(s) the agent did not write")),
+        "{:?}",
+        a.history
+    );
+    assert_eq!(status(&ed, 0), Status::ReadyForReview);
+
+    // The review labels the file and refuses to mark it.
+    run(&mut ed, "\n<tab>");
+    let rows = review_rows(&ed);
+    match &rows[0] {
+        Row::Note(n) => assert!(
+            n.starts_with(&format!(
+                "T created by Maestro's test run (`sh -c {test}`), not by the agent"
+            )),
+            "{n}"
+        ),
+        other => panic!("expected the test run note, got {other:?}"),
+    }
+    assert!(
+        matches!(&rows[1], Row::Note(n) if n.contains("K counts it as the agent's, D drops it")),
+        "{rows:?}"
+    );
+    run(&mut ed, "]");
+    run(&mut ed, " ");
+    assert!(agent(&ed, 0).marks.is_empty());
+    assert!(
+        status_text(&ed).contains("created by Maestro's test run, not by the agent"),
+        "{}",
+        status_text(&ed)
+    );
+    // K is offered on the test run's file, and not on the agent's.
+    let hinted_k = |ed: &Editor| {
+        maestro_editor::agents::panel::hints(ed)
+            .iter()
+            .any(|(k, _)| *k == "K")
+    };
+    assert!(hinted_k(&ed));
+    // K: made-by-tests.txt is the agent's from now on.
+    run(&mut ed, "K");
+    assert!(
+        status_text(&ed).contains("made-by-tests.txt counts as writer-1's work now (K)"),
+        "{}",
+        status_text(&ed)
+    );
+    wait_test_made(&mut ed, 0, &["out/[x].log"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (2, 2, 0));
+    // K on a file that is the agent's says so and changes nothing, and
+    // the hint line does not offer it there.
+    run(&mut ed, "<tab><tab>");
+    assert!(!hinted_k(&ed));
+    run(&mut ed, "K");
+    assert!(
+        status_text(&ed).contains("was not created by Maestro's test run"),
+        "{}",
+        status_text(&ed)
+    );
+
+    // Integrate names the file left behind and leaves it out.
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains(&format!(
+            "LEFT BEHIND: 1 file(s) created by Maestro's test run (`sh -c {test}`), not by the \
+             agent: out/[x].log. They stay untracked"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "When checked (2 in all; the review lists every one): made-by-tests.txt, notes.txt."
+        ),
+        "{text}"
+    );
+    // The verification did not run on made-by-tests.txt, which counts as
+    // the agent's now; the file left behind is not a change since it ran.
+    assert!(
+        text.contains("ran: made-by-tests.txt.\n"),
+        "only the kept file changed since the run: {text}"
+    );
+    // A test run that ends while the dialog is up records another file:
+    // the dialog no longer says what happens, so `y` refuses.
+    let checked = agent(&ed, 0).test_outputs.clone();
+    let mut late = checked[0].clone();
+    late.path = "late.txt".into();
+    ed.agents.agents[0].test_outputs.push(late);
+    run(&mut ed, "y");
+    assert!(
+        status_text(&ed).contains(
+            "not integrated, nothing changed: the files Maestro's test run created changed after \
+             the dialog was checked"
+        ),
+        "{}",
+        status_text(&ed)
+    );
+    assert_ne!(status(&ed, 0), Status::Integrated);
+    ed.agents.agents[0].test_outputs = checked;
+    open_integrate(&mut ed);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        head_files(&f),
+        ["README.md", "made-by-tests.txt", "notes.txt", "src/lib.rs"]
+    );
+    assert_eq!(
+        read(&wt.join("out/[x].log")),
+        "y\n",
+        "the file is not deleted"
+    );
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, "?? out/[x].log\n");
+}
+
+/// A file the agent wrote before the run stays the agent's even when the
+/// run changes it. The record survives a restart; a second run that
+/// leaves the test file as it was keeps it the run's; once the agent
+/// changes it, it is the agent's and integrate commits it.
+fn a_test_run_file_the_agent_changes_is_the_agents_and_records_survive() {
+    let f = Fixture::new();
+    let c = test_run_config("echo x > made-by-tests.txt; echo again >> notes.txt");
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt"]);
+    assert_eq!(review_paths(&ed, 0), ["notes.txt", "made-by-tests.txt"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (1, 2, 0));
+    let outputs = agent(&ed, 0).test_outputs.clone();
+    quit(&mut ed);
+    drop(ed);
+    let saved = read(&f.records());
+    assert!(saved.contains("\"test_outputs\""), "{saved}");
+
+    // Reloaded: the record is back and the review still labels the file.
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+    run(&mut ed, "\n");
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt"]);
+    // A second run writes the same file again and appends to notes.txt:
+    // the file is still the run's.
+    run(&mut ed, "<esc>");
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt"]);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+
+    // The agent changes the file while the integrate dialog that leaves
+    // it behind is open: integrating refuses, changing nothing.
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(text.contains("LEFT BEHIND: 1 file(s)"), "{text}");
+    std::fs::write(wt.join("made-by-tests.txt"), "x, then the agent's\n").unwrap();
+    run(&mut ed, "y");
+    wait_idle(&mut ed, 0);
+    assert!(
+        status_text(&ed).contains(
+            "files Maestro's test run created changed after the dialog was checked and count as \
+             the agent's now: made-by-tests.txt; nothing changed"
+        ),
+        "{}",
+        status_text(&ed)
+    );
+    assert_ne!(status(&ed, 0), Status::Integrated);
+    assert_eq!(
+        f.git(&wt, &["rev-list", "--count", "HEAD"]).trim(),
+        "1",
+        "nothing was committed on the agent's branch"
+    );
+
+    // It is the agent's now: the review counts it.
+    run(&mut ed, "\nr");
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(agent(&ed, 0).review.totals(), (2, 4, 0));
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        head_files(&f),
+        ["README.md", "made-by-tests.txt", "notes.txt", "src/lib.rs"]
+    );
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:made-by-tests.txt"]),
+        "x, then the agent's\n"
+    );
 }

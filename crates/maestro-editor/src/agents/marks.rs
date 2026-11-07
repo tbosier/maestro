@@ -222,13 +222,13 @@ pub fn describe(a: &Agent) -> Option<String> {
     })
 }
 
-/// Drops marks whose hunk the agent's refreshed review no longer has.
-/// Returns how many were dropped.
+/// Drops marks whose hunk the agent's refreshed review no longer has, or
+/// has only in a file the verification run made. Returns how many were
+/// dropped.
 pub fn prune(a: &mut Agent) -> usize {
     let keys: BTreeSet<HunkKey> = a
         .review
-        .files
-        .iter()
+        .agent_files()
         .flat_map(|f| f.hunks.iter().map(move |h| HunkKey::of(f, h)))
         .collect();
     let before = a.marks.len();
@@ -263,6 +263,13 @@ fn row_changed_lines(row: &Row) -> Vec<(usize, usize)> {
 fn refusal(a: &Agent, f: &DiffFile, index: usize) -> Option<String> {
     if let Some(why) = unmarkable(f) {
         return Some(why.to_string());
+    }
+    if a.review.is_test_made(f) {
+        return Some(format!(
+            "this file was {}, not by the agent, and is never integrated; K counts it as the \
+             agent's",
+            super::review::TEST_MADE
+        ));
     }
     match hunk_state(a, f, index) {
         HunkState::Integrated { part, whole: true } => Some(format!(

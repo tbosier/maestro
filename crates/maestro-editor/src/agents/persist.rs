@@ -121,6 +121,20 @@ pub struct AgentRecord {
     /// Parts of the work integrated on their own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<SavedPart>,
+    /// Files Maestro's verification runs created in the worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_outputs: Vec<SavedTestOutput>,
+}
+
+/// A [`super::TestOutput`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTestOutput {
+    /// Relative to the worktree root.
+    pub path: String,
+    pub blob: String,
+    pub command: String,
+    #[serde(default)]
+    pub agent_was_running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +209,7 @@ pub struct SavedTestRun {
     pub tail: Vec<String>,
     /// Output lines not kept.
     pub dropped: usize,
-    /// The tree of the worktree's files when the run finished.
+    /// The tree of the worktree's files when the run started.
     #[serde(default)]
     pub tree: Option<String>,
     /// The agent's process ran during the run.
@@ -348,6 +362,33 @@ fn check_record(r: &AgentRecord, main_root: &Path) -> Result<(), String> {
         && !is_object_id(&c.commit)
     {
         return Err(format!("composed commit {:?} is not a commit id", c.commit));
+    }
+    // Integrate leaves these paths out of its commit: each must name a file
+    // inside the worktree, and the list stays bounded.
+    if r.test_outputs.len() > super::test_outputs::MAX_TEST_OUTPUTS {
+        return Err(format!(
+            "{} files created by test runs; at most {} are kept",
+            r.test_outputs.len(),
+            super::test_outputs::MAX_TEST_OUTPUTS
+        ));
+    }
+    for o in &r.test_outputs {
+        let p = Path::new(&o.path);
+        let plain = p
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if o.path.is_empty() || !plain {
+            return Err(format!(
+                "test run file {:?} is not a path inside the worktree",
+                o.path
+            ));
+        }
+        if !is_object_id(&o.blob) {
+            return Err(format!(
+                "test run file blob {:?} is not an object id",
+                o.blob
+            ));
+        }
     }
     for p in &r.parts {
         if !p.branch.starts_with("maestro/") || !is_object_id(&p.commit) {
@@ -506,6 +547,18 @@ pub fn to_record(a: &Agent) -> Option<AgentRecord> {
                 .collect(),
         }),
         parts,
+        test_outputs: a
+            .test_outputs
+            .iter()
+            .filter_map(|o| {
+                Some(SavedTestOutput {
+                    path: o.path.to_str()?.to_string(),
+                    blob: o.blob.clone(),
+                    command: o.command.clone(),
+                    agent_was_running: o.agent_was_running,
+                })
+            })
+            .collect(),
     })
 }
 
@@ -557,6 +610,16 @@ pub fn from_record(r: &AgentRecord, providers: &[ProviderSpec]) -> Agent {
             })
             .collect(),
     });
+    a.test_outputs = r
+        .test_outputs
+        .iter()
+        .map(|o| super::TestOutput {
+            path: PathBuf::from(&o.path),
+            blob: o.blob.clone(),
+            command: o.command.clone(),
+            agent_was_running: o.agent_was_running,
+        })
+        .collect();
     a.parts = r
         .parts
         .iter()
@@ -684,6 +747,14 @@ pub struct PersistState {
     /// [`fingerprint`] at the last save, so an unchanged state is not
     /// even serialized.
     last_fingerprint: Option<u64>,
+    /// Worktrees (normalized paths) whose archived agent's record the user
+    /// forgot (`d`) in this session. Records for them in a file another
+    /// Maestro wrote are not added back, and the sidebar does not list them.
+    forgotten: HashSet<PathBuf>,
+    /// Repositories whose file must be written even when no agent of
+    /// theirs is left, because a record was forgotten. An entry stays
+    /// until a write synced to disk (on quit) holds the change.
+    rewrite: HashSet<PathBuf>,
 }
 
 /// A cheap summary of everything a record holds that changes on a
@@ -722,6 +793,9 @@ fn fingerprint(ed: &Editor) -> u64 {
         a.contract.as_ref().map(|c| c.brief()).hash(&mut h);
         a.composition.as_ref().map(|c| &c.commit).hash(&mut h);
         a.parts.len().hash(&mut h);
+        for o in &a.test_outputs {
+            (&o.path, &o.blob).hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -734,6 +808,22 @@ impl PersistState {
             _ => None,
         }
     }
+
+    /// The record of the agent in `worktree` was forgotten in this session.
+    pub fn is_forgotten(&self, worktree: &Path) -> bool {
+        !self.forgotten.is_empty() && self.forgotten.contains(&normalize_path(worktree))
+    }
+}
+
+/// Notes that the record of the agent in `w` was forgotten: the next save
+/// writes its repository's file without it, even when no agent of that
+/// repository is left, and records for that worktree that another Maestro
+/// saved are not added back in this session.
+pub(crate) fn forget(ed: &mut Editor, w: &WorktreeInfo) {
+    let p = &mut ed.agents.persist;
+    p.forgotten.insert(normalize_path(&w.path));
+    p.rewrite.insert(normalize_path(&w.main_root));
+    p.last_fingerprint = None;
 }
 
 /// The state directory, when agent records may be read and written: the
@@ -923,7 +1013,11 @@ fn take_file(ed: &mut Editor, root: &Path, file: ReadOutcome, seen: Seen) -> usi
 /// this session already has gets a new id, and its history says so.
 fn merge(ed: &mut Editor, records: &[AgentRecord]) -> usize {
     let providers = super::providers(ed);
-    let mut records: Vec<&AgentRecord> = records.iter().collect();
+    let forgotten = &ed.agents.persist;
+    let mut records: Vec<&AgentRecord> = records
+        .iter()
+        .filter(|r| !forgotten.is_forgotten(Path::new(&r.worktree.path)))
+        .collect();
     records.sort_by_key(|r| r.id);
     let taken: HashSet<u64> = ed.agents.agents.iter().map(|a| a.id.0).collect();
     let state = &mut ed.agents;
@@ -1136,10 +1230,12 @@ fn take_outside_changes(ed: &mut Editor, state: &Path, errors: &mut Vec<String>)
                     .filter(|a| a.origin != Origin::Found)
                     .filter_map(|a| a.worktree.as_ref().map(|w| normalize_path(&w.path)))
                     .collect();
+                // A record the user forgot here stays forgotten.
                 let new: Vec<AgentRecord> = f
                     .agents
                     .into_iter()
                     .filter(|r| !known.contains(&normalize_path(Path::new(&r.worktree.path))))
+                    .filter(|r| !ed.agents.persist.is_forgotten(Path::new(&r.worktree.path)))
                     .collect();
                 if !new.is_empty() {
                     let n = merge(ed, &new);
@@ -1164,7 +1260,7 @@ pub fn save(ed: &mut Editor, durable: bool) {
     let Some(state) = enabled(ed) else {
         return;
     };
-    if ed.agents.agents.is_empty() {
+    if ed.agents.agents.is_empty() && ed.agents.persist.rewrite.is_empty() {
         return;
     }
     let print = fingerprint(ed);
@@ -1204,10 +1300,15 @@ pub fn save(ed: &mut Editor, durable: bool) {
             unsaved.join(", ")
         ));
     }
+    // A repository whose last agent was forgotten is written with none.
+    for root in &ed.agents.persist.rewrite {
+        groups.entry(root.clone()).or_default();
+    }
     for (root, mut records) in groups {
         let Some(RepoState::Ready { written, seen }) = ed.agents.persist.repos.get_mut(&root)
         else {
             // Blocked, or never read: never written.
+            ed.agents.persist.rewrite.remove(&root);
             continue;
         };
         let Some(repository) = root.to_str() else {
@@ -1230,6 +1331,9 @@ pub fn save(ed: &mut Editor, durable: bool) {
             && *last == text
             && (*synced || !durable)
         {
+            if *synced {
+                ed.agents.persist.rewrite.remove(&root);
+            }
             continue;
         }
         let path = records_path(&state, &root);
@@ -1237,6 +1341,9 @@ pub fn save(ed: &mut Editor, durable: bool) {
             Ok(()) => {
                 *seen = Some(hash_bytes(text.as_bytes()));
                 *written = Some((text, durable));
+                if durable {
+                    ed.agents.persist.rewrite.remove(&root);
+                }
             }
             Err(e) => errors.push(format!(
                 "could not save agent records to {}: {e}",
@@ -1288,6 +1395,7 @@ mod tests {
             origin: None,
             composition: None,
             parts: vec![],
+            test_outputs: vec![],
         }
     }
 
@@ -1377,6 +1485,28 @@ mod tests {
         assert!(
             matches!(read(&bad, Path::new("/r")), ReadOutcome::Unusable(m) if m.contains("task contract"))
         );
+        // A test run's file is a path inside the worktree with a blob id;
+        // integrate leaves exactly these paths out of its commit.
+        for (path, blob, why) in [
+            ("../escape", "abc123", "not a path inside the worktree"),
+            ("/etc/passwd", "abc123", "not a path inside the worktree"),
+            ("", "abc123", "not a path inside the worktree"),
+            ("Cargo.lock", "--not-hex", "not an object id"),
+        ] {
+            let mut f = file.clone();
+            f.agents[0].test_outputs = vec![SavedTestOutput {
+                path: path.into(),
+                blob: blob.into(),
+                command: "cargo test".into(),
+                agent_was_running: false,
+            }];
+            let bad = write(&dir, "outputs.json", &serde_json::to_string(&f).unwrap());
+            assert!(
+                matches!(read(&bad, Path::new("/r")), ReadOutcome::Unusable(ref m) if m.contains(why)),
+                "{path:?} {blob:?}: {:?}",
+                read(&bad, Path::new("/r"))
+            );
+        }
         let mut f = file;
         f.agents[0].kind = "robot".into();
         let kind = write(&dir, "kind.json", &serde_json::to_string(&f).unwrap());

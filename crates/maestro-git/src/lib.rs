@@ -26,6 +26,7 @@ mod stage;
 mod stash;
 mod state;
 mod status;
+mod untracked;
 mod worktree;
 
 use std::ffi::{OsStr, OsString};

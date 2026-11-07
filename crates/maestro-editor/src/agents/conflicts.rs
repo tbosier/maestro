@@ -100,11 +100,11 @@ pub(crate) fn eligible(a: &Agent) -> bool {
         && a.review.error.is_none()
 }
 
-/// Every path the agent's last review diff names.
+/// Every path the agent's last review diff names, except files the
+/// verification run made.
 pub fn changed_paths(a: &Agent) -> BTreeSet<PathBuf> {
     a.review
-        .files
-        .iter()
+        .agent_files()
         .flat_map(super::file_paths)
         .cloned()
         .collect()
@@ -182,13 +182,17 @@ pub fn refresh(ed: &mut Editor) {
     if state.pairs.is_empty() {
         return;
     }
-    let mut involved: Vec<(AgentId, WorktreeInfo)> = Vec::new();
+    // Each with the records of files its verification runs made; those
+    // still as the runs left them are left out of its snapshot, as
+    // integrate leaves them out.
+    let mut involved: Vec<(AgentId, WorktreeInfo, Vec<super::TestOutput>)> = Vec::new();
     for p in &ed.agents.conflicts.pairs {
         for id in [p.a, p.b] {
-            if !involved.iter().any(|(x, _)| *x == id)
-                && let Some(w) = ed.agents.get(id).and_then(|a| a.worktree.clone())
+            if !involved.iter().any(|(x, _, _)| *x == id)
+                && let Some(a) = ed.agents.get(id)
+                && let Some(w) = a.worktree.clone()
             {
-                involved.push((id, w));
+                involved.push((id, w, a.test_outputs.clone()));
             }
         }
     }
@@ -225,7 +229,7 @@ struct DryRuns {
 /// dry run per pair whose snapshot ids are not cached.
 fn dry_runs(
     git: &maestro_git::Git,
-    involved: &[(AgentId, WorktreeInfo)],
+    involved: &[(AgentId, WorktreeInfo, Vec<super::TestOutput>)],
     pairs: &[(AgentId, AgentId)],
     cache: &HashMap<CacheKey, Merge>,
 ) -> DryRuns {
@@ -236,10 +240,11 @@ fn dry_runs(
         snapshots: 0,
     };
     let mut snaps: HashMap<AgentId, Result<(String, PathBuf), String>> = HashMap::new();
-    for (id, w) in involved {
+    for (id, w, outputs) in involved {
         out.snapshots += 1;
         let snap = super::actions::open_agent_worktree(git, w).and_then(|repo| {
-            repo.work_snapshot()
+            let made = super::test_outputs::still_made_by_tests(&repo, outputs)?;
+            repo.work_snapshot_leaving_out(&made)
                 .map(|s| (s.commit, w.main_root.clone()))
                 .map_err(|e| e.to_string())
         });

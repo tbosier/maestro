@@ -26,6 +26,7 @@ pub mod panel;
 pub mod parts;
 pub mod persist;
 pub mod review;
+pub mod test_outputs;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -102,6 +103,9 @@ pub enum Status {
 }
 
 impl Status {
+    /// The word for this status. Every view uses it through
+    /// [`state_word`]: the panel, the sidebar, the jump palette and
+    /// notifications (see "State words" in `docs/agent-model.md`).
     pub fn label(self) -> &'static str {
         match self {
             Status::Starting => "starting",
@@ -187,6 +191,25 @@ impl Status {
         matches!(self, Status::Rejected | Status::Integrated)
     }
 }
+
+/// The word shown for an agent's state, the same in the agent panel, the
+/// sidebar, the jump palette and notifications: `archived` once the
+/// worktree was removed (whatever the status was), `found worktree` for a
+/// worktree with no record, else [`Status::label`].
+pub fn state_word(status: Status, archived: bool, origin: Origin) -> &'static str {
+    if archived {
+        ARCHIVED
+    } else if origin == Origin::Found {
+        FOUND
+    } else {
+        status.label()
+    }
+}
+
+/// The state word of an archived agent.
+pub const ARCHIVED: &str = "archived";
+/// The state word of a found worktree.
+pub const FOUND: &str = "found worktree";
 
 /// Where an agent's record came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -276,9 +299,11 @@ pub struct TestRun {
     pub dropped: usize,
     pub finished: Option<TestFinish>,
     /// The tree of the worktree's files (tracked and untracked, not
-    /// ignored) as they were just after the run finished, from
-    /// `maestro_git::Repository::work_snapshot`. Integrate compares it
-    /// with the files then; `None` until computed, or when it could not be.
+    /// ignored) as they were just before the command started, without
+    /// files earlier runs created ([`TestOutput`]), from
+    /// `maestro_git::Repository::work_snapshot_leaving_out`. Integrate
+    /// compares it with the files then; `None` until computed, or when it
+    /// could not be.
     pub tree: Option<String>,
     /// The agent's process was running when the run started or finished,
     /// so it may have changed files the run did not see.
@@ -342,10 +367,32 @@ const MAX_STDERR_LINES: usize = 500;
 /// Transcript entries kept per ACP agent.
 const MAX_TRANSCRIPT: usize = 5_000;
 
+/// A file Maestro's own verification run (`t`) created in the agent's
+/// worktree, as the run left it. See [`test_outputs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestOutput {
+    /// Relative to the worktree root.
+    pub path: PathBuf,
+    /// Its blob id when the run ended. Once the file's contents differ
+    /// from this, it counts as the agent's again.
+    pub blob: String,
+    /// The command that created it, as the run showed it.
+    pub command: String,
+    /// The agent's process was running during that run, so it may have
+    /// written the file itself.
+    pub agent_was_running: bool,
+}
+
 /// The last review diff of an agent's worktree.
 #[derive(Debug, Default)]
 pub struct ReviewData {
+    /// Every changed file, the agent's first and then those in
+    /// `test_made`, each group in Git's order.
     pub files: Vec<DiffFile>,
+    /// Files of `files` that Maestro's verification run created and that
+    /// are still as it left them (untracked, same contents): shown apart,
+    /// left out of the counts, of overlaps, marks, compose and integrate.
+    pub test_made: Vec<PathBuf>,
     /// The worktree's `HEAD` commit when `files` was computed.
     pub head: Option<String>,
     /// When `files` was computed. `None` before the first diff.
@@ -357,15 +404,32 @@ pub struct ReviewData {
 }
 
 impl ReviewData {
-    /// Files changed, lines added, lines removed.
+    /// The agent's files changed, lines added, lines removed. Files the
+    /// verification run created ([`ReviewData::test_made`]) do not count.
     pub fn totals(&self) -> (usize, usize, usize) {
-        let (mut a, mut r) = (0, 0);
-        for f in &self.files {
+        let (mut n, mut a, mut r) = (0, 0, 0);
+        for f in self.agent_files() {
             let (fa, fr) = f.counts();
+            n += 1;
             a += fa;
             r += fr;
         }
-        (self.files.len(), a, r)
+        (n, a, r)
+    }
+
+    /// `f` is a file Maestro's verification run created, as it left it.
+    pub fn is_test_made(&self, f: &DiffFile) -> bool {
+        f.change == FileChange::Added
+            && f.old_path.is_none()
+            && f.new_path
+                .as_ref()
+                .is_some_and(|p| self.test_made.contains(p))
+    }
+
+    /// The files that count as the agent's work: every file but those
+    /// the verification run created.
+    pub fn agent_files(&self) -> impl Iterator<Item = &DiffFile> {
+        self.files.iter().filter(|f| !self.is_test_made(f))
     }
 }
 
@@ -380,7 +444,10 @@ pub fn file_paths(f: &DiffFile) -> Vec<&PathBuf> {
 /// Files of `files` that `contract` does not allow, with the reason, in
 /// diff order. A rename or deletion counts when either of its paths is
 /// outside the contract.
-pub fn out_of_scope(contract: &contract::Contract, files: &[DiffFile]) -> Vec<(PathBuf, String)> {
+pub fn out_of_scope<'a>(
+    contract: &contract::Contract,
+    files: impl IntoIterator<Item = &'a DiffFile>,
+) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     for f in files {
         for p in file_paths(f) {
@@ -460,6 +527,9 @@ pub struct Agent {
     pub parts: Vec<marks::Part>,
     /// For a composed result: where its hunks came from.
     pub composition: Option<compose::Composition>,
+    /// Files Maestro's verification runs created in the worktree, from
+    /// the last run that could tell. See [`test_outputs`].
+    pub test_outputs: Vec<TestOutput>,
 }
 
 impl Agent {
@@ -502,6 +572,7 @@ impl Agent {
             marks: Vec::new(),
             parts: Vec::new(),
             composition: None,
+            test_outputs: Vec::new(),
         }
     }
 
@@ -514,26 +585,74 @@ impl Agent {
 
     /// `R` would start the agent again: it has a record, no process, a
     /// worktree that is still its own, and no decision yet. (The provider
-    /// is checked when `R` is pressed.)
+    /// and the worktree on disk are checked when `R` is pressed.)
     pub fn can_relaunch(&self) -> bool {
-        !matches!(self.origin, Origin::Found | Origin::Composed)
-            && !self.is_running()
-            && !self.archived
-            && !self.base_status().is_decided()
-            && self.worktree.is_some()
-            && self.worktree_note.is_none()
-            && self.git_busy.is_none()
-            && !self.tests_running()
+        self.relaunch_refusal().is_none()
+    }
+
+    /// Why `R` refuses for this agent, judged from the record alone. `R`
+    /// checks this first, and the panel's hints use it, so the hint line
+    /// never offers a relaunch that this refuses.
+    pub fn relaunch_refusal(&self) -> Option<String> {
+        if self.origin == Origin::Found {
+            Some("this worktree has no record; a adopts it, then R can start an agent in it".into())
+        } else if self.origin == Origin::Composed {
+            Some(format!(
+                "{} is a composed result; no agent runs in it to start again",
+                self.name
+            ))
+        } else if self.is_running() {
+            Some(format!("{} is already running", self.name))
+        } else if self.archived {
+            Some("the agent's worktree was archived".into())
+        } else if self.base_status().is_decided() {
+            Some(format!(
+                "{} is {}; it is not relaunched",
+                self.name,
+                self.base_status().label()
+            ))
+        } else if let Some(what) = self.git_busy {
+            Some(format!(
+                "{} is busy ({what}); wait for it to finish",
+                self.name
+            ))
+        } else if self.tests_running() {
+            Some("tests are running for this agent; wait for them to finish".into())
+        } else if let Some(note) = &self.worktree_note {
+            Some(format!("not relaunched: {note}"))
+        } else if self.worktree.is_none() {
+            Some("the agent has no worktree".into())
+        } else {
+            None
+        }
     }
 
     /// The status to show: tests running take precedence over the agent's
-    /// own state until the user has decided.
+    /// own state until the user has decided, except a permission request,
+    /// which waits for the user whatever else runs.
     pub fn status(&self) -> Status {
-        if self.tests_running() && !self.status.is_decided() {
+        if self.tests_running()
+            && !self.status.is_decided()
+            && self.status != Status::AwaitingApproval
+        {
             Status::RunningTests
         } else {
             self.status
         }
+    }
+
+    /// The word for the agent's state, as every view shows it (see
+    /// [`state_word`]).
+    pub fn word(&self) -> &'static str {
+        state_word(self.status(), self.archived, self.origin)
+    }
+
+    /// The last verification run finished and did not pass: it exited
+    /// with an error, was killed, or could not start (code `None`).
+    pub fn tests_failed(&self) -> bool {
+        self.latest_test()
+            .and_then(|t| t.finished.as_ref())
+            .is_some_and(|f| f.code != Some(0))
     }
 
     /// The agent's own status, without the test overlay.
@@ -565,7 +684,7 @@ impl Agent {
     /// Files in the last review diff that the contract does not allow.
     pub fn out_of_scope(&self) -> Vec<(PathBuf, String)> {
         match &self.contract {
-            Some(c) => out_of_scope(c, &self.review.files),
+            Some(c) => out_of_scope(c, self.review.agent_files()),
             None => Vec::new(),
         }
     }

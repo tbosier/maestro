@@ -16,6 +16,17 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::render::{CursorShape, draw_box, wrap};
 use crate::surface::Surface;
 
+/// The color for an agent's state: its status's, or the decided color
+/// once its worktree is archived. The mark and the word are always drawn
+/// with it, so the color is never the only signal.
+pub fn state_style(theme: &Theme, s: Status, archived: bool) -> Style {
+    if archived {
+        theme.agent.completed
+    } else {
+        status_style(theme, s)
+    }
+}
+
 /// The theme color for a status. The name is always drawn with it.
 pub fn status_style(theme: &Theme, s: Status) -> Style {
     let a = &theme.agent;
@@ -203,13 +214,11 @@ fn accepts_typing(a: &Agent) -> bool {
     matches!(&a.runtime, Runtime::Terminal(t) if t.exit_status().is_none())
 }
 
-/// What the list shows after the name: the status, or for a found
-/// worktree that it has none.
-fn list_status(a: &Agent) -> &'static str {
-    match a.origin {
-        Origin::Found => "found worktree",
-        _ => a.status().label(),
-    }
+/// The mark the list and the summary draw before an agent's name: the
+/// sidebar's mark for the same agent (`!` needs you, `~` working, `-`
+/// idle, `=` done).
+fn mark(a: &Agent) -> &'static str {
+    maestro_editor::workspaces::attention_for(a).symbol()
 }
 
 /// The marker next to the status of an agent with no process from an
@@ -237,7 +246,7 @@ fn list_facts(a: &Agent) -> String {
     let mut d = match a.origin {
         Origin::Found => "no record".to_string(),
         Origin::Composed => format!("#{} composed", a.group),
-        _ if a.from_earlier_session() => format!(
+        _ if a.from_earlier_session() && !a.archived => format!(
             "not running, earlier session  #{} {}",
             a.group,
             maestro_editor::agents::kind_label(a.kind())
@@ -249,7 +258,8 @@ fn list_facts(a: &Agent) -> String {
         ),
     };
     if a.archived {
-        d.push_str("  archived");
+        // The state word says archived; this says what it was before.
+        d.push_str(&format!("  was {}", a.base_status().label()));
     } else if a.review.computed.is_some() {
         let (f, add, rem) = a.review.totals();
         d.push_str(&format!("  {f} files +{add} -{rem}"));
@@ -295,15 +305,10 @@ fn draw_list(ed: &Editor, s: &mut Surface, area: Rect) {
                 area.x + 1,
             );
         }
-        let x = s.print(area.x + 2, y, &a.name, bg.bold(), area.right());
-        let status = a.status();
-        s.print(
-            x + 2,
-            y,
-            list_status(a),
-            bg.patch(status_style(&ed.theme, status)),
-            area.right(),
-        );
+        let style = bg.patch(state_style(&ed.theme, a.status(), a.archived));
+        let x = s.print(area.x + 2, y, &format!("{} ", mark(a)), style, area.right());
+        let x = s.print(x, y, &a.name, bg.bold(), area.right());
+        s.print(x + 2, y, a.word(), style, area.right());
         let muted = if selected {
             ui.popup_muted
         } else {
@@ -318,17 +323,14 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     let r = area.right();
     let x0 = area.x + 1;
     let mut y = area.y;
-    // Row 1: name, status, provider.
-    let mut x = s.print(x0, y, &a.name, ui.text.bold(), r);
-    let st = a.status();
-    x = s.print(
-        x + 2,
-        y,
-        list_status(a),
-        ui.text.patch(status_style(&ed.theme, st)),
-        r,
-    );
-    if a.origin != Origin::Found && a.from_earlier_session() {
+    // Row 1: mark, name, state, provider.
+    let style = ui
+        .text
+        .patch(state_style(&ed.theme, a.status(), a.archived));
+    let mut x = s.print(x0, y, &format!("{} ", mark(a)), style, r);
+    x = s.print(x, y, &a.name, ui.text.bold(), r);
+    x = s.print(x + 2, y, a.word(), style, r);
+    if a.origin != Origin::Found && a.from_earlier_session() && !a.archived {
         x = s.print(x + 2, y, EARLIER, ui.text.bold(), r);
     }
     let mut tail = match a.origin {
@@ -354,21 +356,21 @@ fn draw_summary(ed: &Editor, s: &mut Surface, area: Rect, a: &Agent) {
     // Row 2: what the status can be based on, or why there is none.
     let changed;
     let note = match (a.origin, a.kind()) {
+        _ if a.archived => {
+            "archived: the worktree was removed and the branch kept; v shows the history, d forgets this record"
+        }
         (Origin::Found, _) => {
             "no record: task and provider unknown; ret reviews it, a adopts it, A archives it"
         }
         (Origin::Composed, _) => {
             "composed result: no agent runs here; ret reviews it, t tests it, I integrates it like an agent's work"
         }
-        _ if a.worktree_note.is_some() && !a.archived => {
+        _ if a.worktree_note.is_some() => {
             changed = format!(
                 "worktree changed: {}",
                 a.worktree_note.as_deref().unwrap_or_default()
             );
             changed.as_str()
-        }
-        (Origin::Loaded, _) if a.archived => {
-            "archived: the worktree was removed; the record stays for its history and decisions"
         }
         (Origin::Loaded, _) if a.from_earlier_session() && a.base_status().is_decided() => {
             "no process, and none is started again: the work was decided on"
@@ -836,17 +838,27 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
             );
         }
         let (add, rem) = f.counts();
-        let counts = format!(" +{add} -{rem}");
+        // A file Maestro's test run made is marked `T` and says so where
+        // the counts go: it is not counted, so it shows none.
+        let test_made = a.review.is_test_made(f);
+        let counts = if test_made {
+            " test run".to_string()
+        } else {
+            format!(" +{add} -{rem}")
+        };
         let cw = counts.chars().count() as u16;
         let name_r = list.right().saturating_sub(cw);
         // A file outside the task contract is marked with `!` before its
         // change letter; the summary says what the mark means.
-        let outside = a.contract.as_ref().is_some_and(|c| {
-            maestro_editor::agents::file_paths(f)
-                .iter()
-                .any(|p| c.violation(p).is_some())
-        });
-        let x = if outside {
+        let outside = !test_made
+            && a.contract.as_ref().is_some_and(|c| {
+                maestro_editor::agents::file_paths(f)
+                    .iter()
+                    .any(|p| c.violation(p).is_some())
+            });
+        let x = if test_made {
+            s.print(list.x + 1, y, "T", bg.patch(ui.text_muted).bold(), name_r)
+        } else if outside {
             s.print(
                 list.x + 1,
                 y,
@@ -863,6 +875,10 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         s.print(x + 1, y, &path, bg, name_r);
+        if test_made {
+            s.print(name_r, y, &counts, bg.patch(ui.text_muted), list.right());
+            continue;
+        }
         let x = s.print(
             name_r,
             y,
@@ -890,19 +906,27 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
     let sm = l.summary;
     let r = sm.right();
     let (n, add, rem) = a.review.totals();
-    let st = a.status();
-    let mut x = s.print(sm.x + 1, sm.y, &a.name, ui.text.bold(), r);
-    x = s.print(
-        x + 2,
-        sm.y,
-        st.label(),
-        ui.text.patch(status_style(&ed.theme, st)),
-        r,
-    );
+    let style = ui
+        .text
+        .patch(state_style(&ed.theme, a.status(), a.archived));
+    let mut x = s.print(sm.x + 1, sm.y, &format!("{} ", mark(a)), style, r);
+    x = s.print(x, sm.y, &a.name, ui.text.bold(), r);
+    x = s.print(x + 2, sm.y, a.word(), style, r);
+    let made = a
+        .review
+        .files
+        .iter()
+        .filter(|f| a.review.is_test_made(f))
+        .count();
+    let extra = if made > 0 {
+        format!("  and {made} created by the test run (T, not counted)")
+    } else {
+        String::new()
+    };
     s.print(
         x + 2,
         sm.y,
-        &format!("{n} files +{add} -{rem}"),
+        &format!("{n} files +{add} -{rem}{extra}"),
         ui.text_muted,
         r,
     );
@@ -913,7 +937,11 @@ fn draw_review(ed: &Editor, s: &mut Surface, l: &PanelLayout) {
                 f.path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
-                review::change_label(f),
+                if a.review.is_test_made(f) {
+                    format!("T {}, {}", review::change_label(f), review::TEST_MADE)
+                } else {
+                    review::change_label(f)
+                },
                 if v.side_by_side {
                     "side-by-side"
                 } else {
@@ -1464,24 +1492,54 @@ fn draw_overlay(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorShape>
         }
         Overlay::Choice {
             title,
+            notes,
             items,
             selected,
             ..
         } => {
-            let h = (items.len() as u16 + 2)
+            // Notes go above the items, with a blank line after them.
+            let wrap_notes = |notes: &mut dyn Iterator<Item = &String>| -> Vec<String> {
+                notes
+                    .flat_map(|n| panel::wrap_words(n, inner.max(1)))
+                    .collect()
+            };
+            let mut note_lines = wrap_notes(&mut notes.iter());
+            if !note_lines.is_empty() {
+                note_lines.push(String::new());
+            }
+            let h = (note_lines.len() as u16 + items.len() as u16 + 2)
                 .min(area.height.saturating_sub(2))
                 .max(3);
             let y = area.y + (area.height.saturating_sub(h)) / 3;
             let b = Rect::new(x, y, w, h);
             draw_box(s, b, title, ui.popup, ui.popup_border, ui.popup_title);
-            let rows = (h - 2) as usize;
+            // At least one row stays for the items.
+            let inside = (h - 2) as usize;
+            let room = inside.saturating_sub(1);
+            if note_lines.len() > room {
+                // Too short for every note: warnings first, and the last
+                // row says that some were left out.
+                let (warn, rest): (Vec<&String>, Vec<&String>) =
+                    notes.iter().partition(|n| n.starts_with('!'));
+                note_lines = wrap_notes(&mut warn.into_iter().chain(rest));
+                note_lines.truncate(room.saturating_sub(1));
+                if room > 0 {
+                    note_lines.push("! window too short for every note".into());
+                }
+            }
+            let shown = note_lines.len().min(room);
+            for (i, line) in note_lines.iter().take(shown).enumerate() {
+                s.print(x + 2, y + 1 + i as u16, line, ui.popup, b.right() - 1);
+            }
+            let top = y + 1 + shown as u16;
+            let rows = inside - shown;
             let first = if *selected >= rows {
                 selected + 1 - rows
             } else {
                 0
             };
             for (i, (label, detail)) in items.iter().enumerate().skip(first).take(rows) {
-                let ry = y + 1 + (i - first) as u16;
+                let ry = top + (i - first) as u16;
                 let style = if i == *selected {
                     ui.popup_selected
                 } else {

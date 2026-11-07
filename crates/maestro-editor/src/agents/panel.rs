@@ -5,6 +5,7 @@
 
 use maestro_git::Integration;
 
+use super::actions;
 use super::contract::Contract;
 use super::create::NewAgent;
 use super::review::ReviewView;
@@ -97,6 +98,9 @@ pub enum ConfirmAction {
     Archive(AgentId),
     /// `F` force-removes the worktree, deleting what `lines` lists.
     ForceArchive(AgentId),
+    /// `y` forgets an archived agent's record: it leaves the panel and the
+    /// saved records. Nothing on disk but the records file changes.
+    Forget(AgentId),
     /// `y` discards the agent's change to one file in its worktree.
     DropFile {
         agent: AgentId,
@@ -136,6 +140,9 @@ pub enum Overlay {
     Choice {
         purpose: ChoicePurpose,
         title: String,
+        /// Lines shown above the items: facts about the choice, and
+        /// warnings, which start with `!`.
+        notes: Vec<String>,
         /// Label and detail per item.
         items: Vec<(String, String)>,
         selected: usize,
@@ -158,6 +165,9 @@ pub struct Panel {
     pub overlay: Option<Overlay>,
     /// Lines scrolled back from the bottom of a transcript or log.
     pub scroll: usize,
+    /// Counts provider lists that check where a new task starts, so a
+    /// check that finishes after its list closed changes nothing.
+    start_check: u64,
 }
 
 /// Where the panel's parts go inside the editor area.
@@ -458,6 +468,11 @@ fn list_key(ed: &mut Editor, key: KeyEvent) {
                 super::compose::open(ed, id);
             }
         }
+        (KeyCode::Char('d'), false) => {
+            if let Some(id) = selected_id(ed) {
+                super::actions::confirm_forget(ed, id);
+            }
+        }
         _ => {}
     }
 }
@@ -634,7 +649,15 @@ fn compete(ed: &mut Editor) {
     }
     // A competing implementation works under the same contract.
     let contract = a.contract.clone();
-    choose_provider(ed, task, group, base, contract, providers);
+    let notes = match &base {
+        Some(b) => vec![format!(
+            "starts from {}, the commit {} started from, so the competing agents work on the same code",
+            super::create::short(b),
+            a.name
+        )],
+        None => Vec::new(),
+    };
+    choose_provider(ed, task, group, base, contract, providers, notes);
 }
 
 pub(crate) fn choose_provider(
@@ -644,6 +667,7 @@ pub(crate) fn choose_provider(
     base: Option<String>,
     contract: Option<Contract>,
     providers: Vec<ProviderSpec>,
+    mut notes: Vec<String>,
 ) {
     if providers.is_empty() {
         ed.error(
@@ -666,6 +690,24 @@ pub(crate) fn choose_provider(
         Some(_) => "provider (task with a contract)",
         None => "provider (no task contract)",
     };
+    // Every provider list counts, so a check started for an earlier list
+    // never lands on this one.
+    ed.agents.panel.start_check += 1;
+    let check = ed.agents.panel.start_check;
+    if base.is_none() {
+        // Where the agent will start, and what it will not get, takes Git:
+        // checked on a background thread while the list is up.
+        let git = ed.git.git().clone();
+        let cwd = ed.cwd.clone();
+        let spawned = ed.spawn_background("agent-start-point", move |tx| {
+            let found = super::create::start_notes(&git, &cwd);
+            tx.send(move |ed| start_checked(ed, check, found));
+        });
+        notes.push(match spawned {
+            Ok(()) => "checking where the agent starts...".into(),
+            Err(e) => format!("! could not check where the agent starts: {e}"),
+        });
+    }
     ed.agents.panel.overlay = Some(Overlay::Choice {
         purpose: ChoicePurpose::Provider {
             task,
@@ -675,9 +717,26 @@ pub(crate) fn choose_provider(
             providers,
         },
         title: title.into(),
+        notes,
         items,
         selected: 0,
     });
+}
+
+/// The check started by [`choose_provider`] finished: its notes replace
+/// "checking" if that provider list is still up.
+fn start_checked(ed: &mut Editor, check: u64, found: Vec<String>) {
+    if ed.agents.panel.start_check != check {
+        return;
+    }
+    if let Some(Overlay::Choice {
+        purpose: ChoicePurpose::Provider { .. },
+        notes,
+        ..
+    }) = &mut ed.agents.panel.overlay
+    {
+        *notes = found;
+    }
 }
 
 fn overlay_key(ed: &mut Editor, key: KeyEvent) {
@@ -723,6 +782,7 @@ fn overlay_key(ed: &mut Editor, key: KeyEvent) {
         Overlay::Choice {
             purpose,
             title,
+            notes,
             items,
             mut selected,
         } => {
@@ -743,6 +803,7 @@ fn overlay_key(ed: &mut Editor, key: KeyEvent) {
             ed.agents.panel.overlay = Some(Overlay::Choice {
                 purpose,
                 title,
+                notes,
                 items,
                 selected,
             });
@@ -798,7 +859,7 @@ fn submit_input(ed: &mut Editor, purpose: InputPurpose, text: String) {
                 }
                 None => {
                     let providers = super::providers(ed);
-                    choose_provider(ed, parsed.task, None, None, None, providers);
+                    choose_provider(ed, parsed.task, None, None, None, providers, Vec::new());
                 }
             }
         }
@@ -1033,10 +1094,12 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
                 None,
                 Some((**contract).clone()),
                 providers,
+                Vec::new(),
             );
         }
         (ConfirmAction::Archive(id), Some('y'), _) => super::actions::archive(ed, *id, false),
         (ConfirmAction::ForceArchive(id), Some('F'), _) => super::actions::archive(ed, *id, true),
+        (ConfirmAction::Forget(id), Some('y'), _) => super::actions::forget(ed, *id),
         (ConfirmAction::DropFile { agent, old, new }, Some('y'), _) => {
             super::actions::drop_file(ed, *agent, old.clone(), new.clone())
         }
@@ -1124,27 +1187,50 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     if p.compose.is_some() {
         return super::compose::hints();
     }
-    if p.review.is_some() {
-        return super::review::hints();
+    if let Some(v) = &p.review {
+        // Moving, viewing and refreshing always work; the actions are left
+        // out when they would refuse, judged as the actions judge (a found
+        // worktree takes no comments).
+        let a = ed.agents.get(v.agent);
+        return super::review::hints()
+            .into_iter()
+            .filter(|(k, _)| match (*k, a) {
+                ("m", Some(a)) => actions::message_blocker(a).is_none(),
+                ("t", Some(a)) => actions::test_blocker(ed, a).is_none(),
+                ("I", Some(a)) => actions::integrate_blocker(a).is_none(),
+                ("X", Some(a)) => actions::reject_blocker(a).is_none(),
+                ("D", Some(a)) => actions::drop_blocker(a).is_none(),
+                ("c", Some(a)) => actions::found_refusal(a).is_none(),
+                // K applies to a file the test run created, between runs.
+                ("K", Some(a)) => {
+                    !a.tests_running()
+                        && a.review
+                            .files
+                            .get(v.file)
+                            .is_some_and(|f| a.review.is_test_made(f))
+                }
+                _ => true,
+            })
+            .collect();
     }
     let mut out = vec![("n", "new task"), ("j/k", "select")];
     let Some(a) = ed.agents.selected() else {
         out.push(("esc", "close"));
         return out;
     };
-    if a.origin == super::Origin::Found {
-        out.extend([
-            ("ret", "review"),
-            ("a", "adopt"),
-            ("A", "archive"),
-            ("v", "view"),
-            ("esc", "close"),
-        ]);
-        return out;
-    }
+    // Every key below is offered only when its action would not refuse,
+    // judged by the same function the action calls first. A few checks
+    // run only when the key is pressed, because they read Git, the
+    // worktree or PATH (the worktree's branch, unsaved buffers, the main
+    // worktree, which providers are available for N and R); those can
+    // still refuse.
+    let ok = |why: Option<String>| why.is_none();
     // First, so it is the last hint a narrow panel cuts: the way into the
     // agent.
-    if a.kind() == ProviderKind::Terminal && a.is_running() {
+    if a.runtime
+        .terminal()
+        .is_some_and(|t| t.exit_status().is_none())
+    {
         out.insert(0, ("i", "type into agent"));
     }
     if !a.permissions.is_empty() {
@@ -1156,30 +1242,37 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
     if relaunchable && a.from_earlier_session() {
         out.push(("R", "relaunch"));
     }
-    out.extend([("ret", "review"), ("t", "test")]);
-    // A message cannot reach an agent with no process; R comes first
-    // instead. A composed result has no agent at all.
-    if !a.from_earlier_session() && a.origin != super::Origin::Composed {
+    if ok(super::review::blocker(a)) {
+        out.push(("ret", "review"));
+    }
+    if ok(actions::test_blocker(ed, a)) {
+        out.push(("t", "test"));
+    }
+    if ok(actions::message_blocker(a)) {
         out.push(("m", "message"));
     }
-    out.push(("N", "compete"));
-    let group = a.group;
-    if ed
-        .agents
-        .agents
-        .iter()
-        .filter(|x| x.group == group && !matches!(x.origin, super::Origin::Composed))
-        .count()
-        >= 2
-    {
+    if ok(actions::adopt_blocker(a)) {
+        out.push(("a", "adopt"));
+    }
+    if ok(actions::found_refusal(a)) {
+        out.push(("N", "compete"));
+    }
+    if ok(super::compose::blocker(ed, a.id)) {
         out.push(("C", "compose"));
     }
-    out.extend([
-        ("v", "view"),
-        ("I", "integrate"),
-        ("X", "reject"),
-        ("A", "archive"),
-    ]);
+    out.push(("v", "view"));
+    if ok(actions::integrate_blocker(a)) {
+        out.push(("I", "integrate"));
+    }
+    if ok(actions::reject_blocker(a)) {
+        out.push(("X", "reject"));
+    }
+    if ok(actions::archive_blocker(a)) {
+        out.push(("A", "archive"));
+    }
+    if ok(actions::forget_blocker(a)) {
+        out.push(("d", "forget record"));
+    }
     if relaunchable && !a.from_earlier_session() {
         out.push(("R", "relaunch"));
     }
