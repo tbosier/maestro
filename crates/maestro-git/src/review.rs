@@ -235,7 +235,7 @@ impl Drop for TempFile {
 
 impl Repository {
     /// Runs commands that create commits: never opens an editor.
-    fn writer(&self) -> Repository {
+    pub(crate) fn writer(&self) -> Repository {
         self.with_git(
             self.git()
                 .clone()
@@ -245,7 +245,7 @@ impl Repository {
         )
     }
 
-    fn rev_list(&self, args: &[&str]) -> Result<Vec<String>> {
+    pub(crate) fn rev_list(&self, args: &[&str]) -> Result<Vec<String>> {
         let mut all = vec!["rev-list"];
         all.extend_from_slice(args);
         let out = self.run(&all, Access::ReadOnly)?;
@@ -1109,6 +1109,16 @@ impl Repository {
         onto: &str,
         commits: &[String],
     ) -> Result<Vec<String>, IntegrateError> {
+        self.cherry_pick_trees(onto, commits).map(|(kept, _)| kept)
+    }
+
+    /// [`Repository::cherry_pick_check`], also returning the tree the last
+    /// commit leaves.
+    pub(crate) fn cherry_pick_trees(
+        &self,
+        onto: &str,
+        commits: &[String],
+    ) -> Result<(Vec<String>, String), IntegrateError> {
         let have = self.git().version()?;
         if have < MERGE_TREE_TREES {
             return Err(GitError::Unsupported {
@@ -1167,7 +1177,7 @@ impl Repository {
                 current = tree;
             }
         }
-        Ok(kept)
+        Ok((kept, current))
     }
 
     /// After a failed merge or cherry-pick (of `source`, or of `commits`
