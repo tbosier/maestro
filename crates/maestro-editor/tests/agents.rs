@@ -176,6 +176,15 @@ fn main() {
             an_archived_agent_says_so_and_its_record_can_be_forgotten,
         ),
         (
+            "a_forget_sticks_when_another_maestro_saves_after_it",
+            a_forget_sticks_when_another_maestro_saves_after_it,
+        ),
+        (
+            "a_forget_sticks_when_another_maestro_saved_before_it",
+            a_forget_sticks_when_another_maestro_saved_before_it,
+        ),
+        ("a_forget_survives_a_restart", a_forget_survives_a_restart),
+        (
             "files_the_test_run_creates_are_listed_apart_and_left_behind",
             files_the_test_run_creates_are_listed_apart_and_left_behind,
         ),
@@ -3846,13 +3855,252 @@ fn an_archived_agent_says_so_and_its_record_can_be_forgotten() {
     assert!(ed.agents.agents.is_empty(), "{:?}", ed.status);
     quit(&mut ed);
     drop(ed);
-    let saved = std::fs::read_to_string(f.records()).unwrap();
-    assert!(!saved.contains(wt.to_str().unwrap()), "{saved}");
+    let saved = raw_records(&f);
+    assert!(saved.agents.is_empty(), "{saved:?}");
+    assert_eq!(forgotten_paths(&saved), std::slice::from_ref(&wt));
 
     // After a restart it does not come back.
     let mut ed = f.session_editor(c);
     open_and_load(&mut ed, 0);
     assert!(ed.agents.agents.is_empty());
+}
+
+/// The records file as written, parsed without the filtering a read does.
+fn raw_records(f: &Fixture) -> maestro_editor::agents::persist::RecordsFile {
+    let text = std::fs::read_to_string(f.records()).unwrap();
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+fn forgotten_paths(file: &maestro_editor::agents::persist::RecordsFile) -> Vec<PathBuf> {
+    file.forgotten
+        .iter()
+        .map(|x| PathBuf::from(&x.worktree))
+        .collect()
+}
+
+fn saved_paths(file: &maestro_editor::agents::persist::RecordsFile) -> Vec<PathBuf> {
+    file.agents
+        .iter()
+        .map(|r| PathBuf::from(&r.worktree.path))
+        .collect()
+}
+
+/// A provider whose program exits at once and writes nothing, so the
+/// worktree archives without forcing.
+fn quiet_config() -> Config {
+    config(&[("quiet", sh_provider("true"))])
+}
+
+/// Starts a task in `ed` and waits for its program to exit.
+fn finished_agent(ed: &mut Editor, task: &str) -> usize {
+    let i = ed.agents.agents.len();
+    start_task(ed, task, 0);
+    poll_until(ed, "the program's exit", |ed| {
+        ed.agents.agents.len() > i && agent(ed, i).exited.is_some() && !agent(ed, i).review.running
+    });
+    i
+}
+
+/// Archives agent `i` of `ed` (its worktree is clean) and waits for it.
+fn archive_agent(ed: &mut Editor, i: usize) {
+    select(ed, i);
+    run(ed, "Ay");
+    poll_until(ed, "the archive", |ed| agent(ed, i).archived);
+}
+
+/// Two Maestros on one project. A forgets an archived record and saves;
+/// B, which loaded that record before, saves after it. B drops the record
+/// from its own panel instead of writing it back, keeps its selection on
+/// the agent it was on, and a later session does not load the record.
+fn a_forget_sticks_when_another_maestro_saves_after_it() {
+    let f = Fixture::new();
+    let mut a = f.session_editor(quiet_config());
+    open_and_load(&mut a, 0);
+    let i = finished_agent(&mut a, "write notes");
+    let wt = worktree(&a, i);
+    archive_agent(&mut a, i);
+    maestro_editor::agents::persist::save(&mut a, true);
+
+    let mut b = f.session_editor(quiet_config());
+    open_and_load(&mut b, 1);
+    assert!(agent(&b, 0).archived);
+    // B has agents of its own below it, and the middle one selected.
+    finished_agent(&mut b, "other notes");
+    finished_agent(&mut b, "more notes");
+    select(&mut b, 1);
+    let selected = agent(&b, 1).name.clone();
+
+    // A forgets it and saves, as its tick does within a second.
+    select(&mut a, 0);
+    run(&mut a, "dy");
+    assert!(a.agents.agents.is_empty(), "{:?}", a.status);
+    maestro_editor::agents::persist::save(&mut a, false);
+    let file = raw_records(&f);
+    assert!(file.agents.is_empty(), "{file:?}");
+    assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+
+    // B saves with its stale copy: the copy leaves B's panel, the
+    // selection stays on the same agent, and the file keeps the forget.
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(b.agents.agents.len(), 2, "{:?}", b.status);
+    assert!(!b.agents.agents.iter().any(|x| x.archived));
+    assert_eq!(b.agents.selected().unwrap().name, selected);
+    assert!(
+        status_text(&b).contains("was forgotten in another Maestro"),
+        "{}",
+        status_text(&b)
+    );
+    let file = raw_records(&f);
+    assert_eq!(file.agents.len(), 2, "{file:?}");
+    assert!(!saved_paths(&file).contains(&wt), "{file:?}");
+    assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+    quit(&mut b);
+    quit(&mut a);
+    drop((a, b));
+
+    let mut c = f.session_editor(quiet_config());
+    open_and_load(&mut c, 2);
+    assert!(c.agents.agents.iter().all(|x| !x.archived));
+}
+
+/// The other order: B writes its copy of the record (here not archived:
+/// B loaded it before A archived it) after A forgot it but before A saved.
+/// A's save leaves it out again; B keeps showing its copy until it quits
+/// but no longer saves it; a later session does not load it.
+fn a_forget_sticks_when_another_maestro_saved_before_it() {
+    let f = Fixture::new();
+    let mut a = f.session_editor(quiet_config());
+    open_and_load(&mut a, 0);
+    let i = finished_agent(&mut a, "write notes");
+    let wt = worktree(&a, i);
+    maestro_editor::agents::persist::save(&mut a, true);
+
+    let mut b = f.session_editor(quiet_config());
+    open_and_load(&mut b, 1);
+    assert!(!agent(&b, 0).archived);
+
+    archive_agent(&mut a, i);
+    run(&mut a, "dy");
+    assert!(a.agents.agents.is_empty(), "{:?}", a.status);
+
+    // B saves first: its copy is in the file again.
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(saved_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+    // A saves: the record is not added back to A, and the file loses it.
+    maestro_editor::agents::persist::save(&mut a, false);
+    assert!(a.agents.agents.is_empty(), "{:?}", a.status);
+    let file = raw_records(&f);
+    assert!(file.agents.is_empty(), "{file:?}");
+    assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+
+    // B saves again: its copy is not archived there, so it stays listed,
+    // says why, and is not written.
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(b.agents.agents.len(), 1);
+    assert!(
+        status_text(&b).contains("forgotten in another Maestro; it is no longer saved"),
+        "{}",
+        status_text(&b)
+    );
+    assert!(
+        agent(&b, 0)
+            .history
+            .iter()
+            .any(|h| h.text.contains("forgotten in another Maestro")),
+        "{:?}",
+        agent(&b, 0).history
+    );
+
+    // Someone makes a new worktree at the same path, and a third session
+    // adopts it: another record, with another creation time. B, which
+    // still lists its forgotten copy at that path, keeps the new record
+    // when it saves.
+    f.git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "maestro/again",
+            wt.to_str().unwrap(),
+        ],
+    );
+    let mut c = f.session_editor(quiet_config());
+    open_and_load(&mut c, 1);
+    assert_eq!(worktree(&c, 0), wt);
+    run(&mut c, "a");
+    poll_until(&mut c, "the provider list", |ed| {
+        matches!(ed.agents.panel.overlay, Some(Overlay::Choice { .. }))
+    });
+    run(&mut c, "\n");
+    quit(&mut c);
+    drop(c);
+    assert_eq!(saved_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+    maestro_editor::agents::persist::save(&mut b, true);
+    assert_eq!(saved_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+    quit(&mut b);
+    quit(&mut a);
+    drop((a, b));
+    let file = raw_records(&f);
+    assert_eq!(saved_paths(&file), std::slice::from_ref(&wt));
+    assert_eq!(file.agents[0].worktree.branch, "maestro/again");
+
+    // A later session loads the adopted record, not the forgotten one, and
+    // the sidebar lists it.
+    let mut d = f.session_editor(quiet_config());
+    open_and_load(&mut d, 1);
+    assert_eq!(
+        agent(&d, 0).worktree.as_ref().unwrap().branch,
+        "maestro/again"
+    );
+}
+
+/// The forget is in the file, so it outlives the session that made it: a
+/// restarted session refuses the record when an older Maestro (which drops
+/// the forgotten list) writes it back, and a new agent never takes the
+/// forgotten one's id.
+fn a_forget_survives_a_restart() {
+    let f = Fixture::new();
+    let mut a = f.session_editor(quiet_config());
+    open_and_load(&mut a, 0);
+    let i = finished_agent(&mut a, "write notes");
+    let wt = worktree(&a, i);
+    let forgotten = agent(&a, i).name.clone();
+    archive_agent(&mut a, i);
+    maestro_editor::agents::persist::save(&mut a, true);
+    let before = std::fs::read_to_string(f.records()).unwrap();
+    run(&mut a, "dy");
+    quit(&mut a);
+    drop(a);
+    assert_eq!(forgotten_paths(&raw_records(&f)), std::slice::from_ref(&wt));
+
+    // A restarted session: nothing loads, and the forget is remembered.
+    let mut d = f.session_editor(quiet_config());
+    open_and_load(&mut d, 0);
+    // An older Maestro writes the record back without the list, twice:
+    // the second time D's text is the same as what it last wrote, and it
+    // still writes, because the file is not that text any more.
+    for _ in 0..2 {
+        std::fs::write(f.records(), &before).unwrap();
+        maestro_editor::agents::persist::save(&mut d, true);
+        assert!(d.agents.agents.is_empty(), "{:?}", d.status);
+        let file = raw_records(&f);
+        assert!(file.agents.is_empty(), "{file:?}");
+        assert_eq!(forgotten_paths(&file), std::slice::from_ref(&wt));
+    }
+    // A new agent takes an id above the forgotten one's.
+    let j = finished_agent(&mut d, "write more notes");
+    let name = agent(&d, j).name.clone();
+    assert_ne!(name, forgotten);
+    assert!(agent(&d, j).id.0 > 1, "{name}");
+    quit(&mut d);
+    drop(d);
+
+    let mut e = f.session_editor(quiet_config());
+    open_and_load(&mut e, 1);
+    assert_eq!(agent(&e, 0).name, name);
+    assert_eq!(forgotten_paths(&raw_records(&f)), [wt]);
 }
 
 // ----- files Maestro's own test run creates ----------------------------------
