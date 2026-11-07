@@ -94,6 +94,12 @@ pub enum ConfirmAction {
         how: Integration,
         facts: Box<super::actions::IntegrateFacts>,
     },
+    /// `y` rebases the agent's work onto the branch `I` integrates into;
+    /// offered when `I` refused because its base is not on that branch.
+    Rebase {
+        agent: AgentId,
+        facts: Box<super::rebase::RebaseFacts>,
+    },
     /// `y` removes the worktree (refused if it has work in it).
     Archive(AgentId),
     /// `F` force-removes the worktree, deleting what `lines` lists.
@@ -1096,6 +1102,9 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
                 providers,
                 Vec::new(),
             );
+        }
+        (ConfirmAction::Rebase { agent, facts }, Some('y'), _) => {
+            super::rebase::rebase(ed, *agent, (**facts).clone())
         }
         (ConfirmAction::Archive(id), Some('y'), _) => super::actions::archive(ed, *id, false),
         (ConfirmAction::ForceArchive(id), Some('F'), _) => super::actions::archive(ed, *id, true),

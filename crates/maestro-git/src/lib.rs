@@ -19,6 +19,7 @@ mod linediff;
 mod log;
 mod merge;
 mod patch;
+mod rebase;
 mod remote;
 mod repo;
 mod review;
@@ -42,6 +43,7 @@ pub use linediff::{LineHunk, LineHunkKind, Sign, SignMap, diff_lines};
 pub use log::{CommitDetail, LogCommit, LogEntry};
 pub use merge::MergeCheck;
 pub use patch::{FilePatch, PatchError, Picks, Side, TextPatch, parse_patches};
+pub use rebase::{CommitLine, Commits, RebaseCheck, RebaseError, RebaseOnto, RebaseOutcome};
 pub use remote::{Branch, RemoteCommand, RemoteOp};
 pub use repo::{Base, Head, Repository};
 pub use review::{

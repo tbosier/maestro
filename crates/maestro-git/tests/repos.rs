@@ -1911,3 +1911,179 @@ fn work_snapshots_hold_uncommitted_work_and_change_nothing() {
     assert_eq!(rev(&f, &f.repo, "HEAD"), head);
     assert!(main.commit_tree("-x", &[], "x").is_err());
 }
+
+/// main gets `pre.txt`, an agent branch starts there and commits
+/// `one.txt`, then main is moved back to the first commit: the agent's
+/// base is no longer on main. Returns the worktree, the base and main.
+fn base_off_main(f: &Fixture) -> (PathBuf, String, String) {
+    f.write("pre.txt", "pre\n");
+    f.commit_all("pre");
+    let base = rev(f, &f.repo, "HEAD");
+    let wt = agent_branch(f, "agent/r", "one.txt", "1\n");
+    f.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    f.write("main.txt", "main\n");
+    f.commit_all("main moves on");
+    let main = rev(f, &f.repo, "HEAD");
+    (wt, base, main)
+}
+
+#[test]
+fn commits_between_names_what_the_base_has_and_main_lacks() {
+    let f = Fixture::new();
+    let (_wt, base, main) = base_off_main(&f);
+    let c = f.repo().commits_between(&main, &base, 5).unwrap();
+    assert_eq!(c.total, 1);
+    assert_eq!(c.shown.len(), 1);
+    assert_eq!(c.shown[0].id, base);
+    assert_eq!(c.shown[0].subject, "pre");
+    assert!(base.starts_with(&c.shown[0].short));
+    let none = f.repo().commits_between(&base, &main, 0).unwrap();
+    assert_eq!(none.total, 1);
+    assert!(none.shown.is_empty());
+}
+
+#[test]
+fn rebase_onto_moves_only_the_branchs_commits_and_keeps_the_old_tip() {
+    let f = Fixture::new();
+    let (wt, base, main) = base_off_main(&f);
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let old_tip = rev(&f, &wt, "HEAD");
+    // An untracked file stays where it is.
+    write_in(&wt, "stray.txt", "stray\n");
+    match repo.rebase_check(&main, &base, &old_tip, None).unwrap() {
+        maestro_git::RebaseCheck::Clean { kept } => {
+            assert_eq!(kept, std::slice::from_ref(&old_tip))
+        }
+        other => panic!("{other:?}"),
+    }
+    let out = repo
+        .rebase_onto(maestro_git::RebaseOnto {
+            branch: "agent/r",
+            upstream: &base,
+            onto: &main,
+            tip: &old_tip,
+            keep_old_tip_as: "agent/r-before-rebase",
+            undo_to: None,
+        })
+        .unwrap();
+    assert_eq!(out.commits.len(), 1);
+    assert_eq!(rev(&f, &wt, "HEAD"), out.new_tip);
+    assert_eq!(rev(&f, &wt, "HEAD~1"), main);
+    assert_eq!(rev(&f, &f.repo, "agent/r-before-rebase"), old_tip);
+    assert!(
+        !wt.join("pre.txt").exists(),
+        "pre.txt came from the old base"
+    );
+    assert!(wt.join("one.txt").exists());
+    assert!(wt.join("stray.txt").exists());
+    // A second rebase may not reuse the old-tip name.
+    let again = repo.rebase_onto(maestro_git::RebaseOnto {
+        branch: "agent/r",
+        upstream: &main,
+        onto: &main,
+        tip: &out.new_tip,
+        keep_old_tip_as: "agent/r-before-rebase",
+        undo_to: None,
+    });
+    assert!(
+        matches!(again, Err(maestro_git::RebaseError::Refused(_))),
+        "{again:?}"
+    );
+    assert_eq!(rev(&f, &wt, "HEAD"), out.new_tip);
+}
+
+#[test]
+fn a_conflicting_rebase_is_aborted_and_the_branch_put_back() {
+    let f = Fixture::new();
+    let (wt, base, _) = base_off_main(&f);
+    // main changes the line the agent changes.
+    f.write("one.txt", "main's one\n");
+    f.commit_all("main's one");
+    let main = rev(&f, &f.repo, "HEAD");
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let before_commit = rev(&f, &wt, "HEAD");
+    // The caller's commit of uncommitted work, which a failure undoes.
+    write_in(&wt, "two.txt", "2\n");
+    f.git_ok(&wt, &["add", "-A"]);
+    f.git_ok(&wt, &["commit", "-q", "-m", "work"]);
+    let tip = rev(&f, &wt, "HEAD");
+    match repo.rebase_check(&main, &base, &tip, None).unwrap() {
+        maestro_git::RebaseCheck::Conflicts(files) => {
+            assert_eq!(files, [PathBuf::from("one.txt")])
+        }
+        other => panic!("{other:?}"),
+    }
+    let r = repo.rebase_onto(maestro_git::RebaseOnto {
+        branch: "agent/r",
+        upstream: &base,
+        onto: &main,
+        tip: &tip,
+        keep_old_tip_as: "agent/r-before-rebase",
+        undo_to: Some(&before_commit),
+    });
+    match r {
+        Err(maestro_git::RebaseError::Conflicts(files)) => {
+            assert_eq!(files, [PathBuf::from("one.txt")])
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rev(&f, &wt, "HEAD"), before_commit);
+    assert_eq!(repo.head().unwrap(), Head::Branch("agent/r".into()));
+    assert_eq!(repo.operation().unwrap(), None);
+    assert_eq!(std::fs::read_to_string(wt.join("one.txt")).unwrap(), "1\n");
+    assert_eq!(std::fs::read_to_string(wt.join("two.txt")).unwrap(), "2\n");
+    // The undone commit's file is staged, as before it.
+    assert_eq!(f.git_ok(&wt, &["status", "--porcelain"]), "A  two.txt\n");
+    assert!(
+        !f.git_in(
+            &f.repo,
+            &["rev-parse", "--verify", "--quiet", "agent/r-before-rebase"]
+        )
+        .status
+        .success(),
+        "the old-tip branch is deleted again"
+    );
+}
+
+#[test]
+fn rebase_onto_refuses_a_dirty_worktree_or_a_moved_branch() {
+    let f = Fixture::new();
+    let (wt, base, main) = base_off_main(&f);
+    let repo = f.api().discover(&wt).unwrap().unwrap();
+    let tip = rev(&f, &wt, "HEAD");
+    write_in(&wt, "one.txt", "changed\n");
+    let r = repo.rebase_onto(maestro_git::RebaseOnto {
+        branch: "agent/r",
+        upstream: &base,
+        onto: &main,
+        tip: &tip,
+        keep_old_tip_as: "agent/r-before-rebase",
+        undo_to: None,
+    });
+    assert!(
+        matches!(r, Err(maestro_git::RebaseError::Refused(ref m)) if m.contains("uncommitted")),
+        "{r:?}"
+    );
+    f.git_ok(&wt, &["checkout", "-q", "--", "one.txt"]);
+    let r = repo.rebase_onto(maestro_git::RebaseOnto {
+        branch: "agent/r",
+        upstream: &base,
+        onto: &main,
+        tip: &base,
+        keep_old_tip_as: "agent/r-before-rebase",
+        undo_to: None,
+    });
+    assert!(
+        matches!(r, Err(maestro_git::RebaseError::Refused(_))),
+        "{r:?}"
+    );
+    assert_eq!(rev(&f, &wt, "HEAD"), tip);
+    assert!(
+        !f.git_in(
+            &f.repo,
+            &["rev-parse", "--verify", "--quiet", "agent/r-before-rebase"]
+        )
+        .status
+        .success()
+    );
+}

@@ -56,6 +56,18 @@ fn main() {
             integrate_refuses_a_base_that_is_not_on_the_target,
         ),
         (
+            "rebasing_an_agent_off_main_lets_i_integrate_only_its_work",
+            rebasing_an_agent_off_main_lets_i_integrate_only_its_work,
+        ),
+        (
+            "a_rebase_that_would_conflict_is_not_offered",
+            a_rebase_that_would_conflict_is_not_offered,
+        ),
+        (
+            "a_running_agent_is_not_rebased",
+            a_running_agent_is_not_rebased,
+        ),
+        (
             "a_task_started_in_another_worktree_starts_from_main",
             a_task_started_in_another_worktree_starts_from_main,
         ),
@@ -1130,44 +1142,212 @@ fn rejecting_during_creation_never_launches_and_quit_waits_for_git() {
     assert!(ed.should_quit);
 }
 
-fn integrate_refuses_a_base_that_is_not_on_the_target() {
-    let f = Fixture::new();
-    // main gets a second commit, the agent starts from it, and then main
-    // is reset to the first: the agent's base is no longer on main.
+/// main gets the commit "second", an agent starts from it and runs
+/// `script`, and once the program exits (unless `wait_exit` is false)
+/// main is reset to "initial" and gets "main moves on": the agent's base
+/// is no longer on main. Returns the editor, the old base and main's
+/// `HEAD`.
+fn off_main_agent(f: &Fixture, script: &str, wait_exit: bool) -> (Editor, String, String) {
     std::fs::write(f.repo.join("second.txt"), "second\n").unwrap();
     f.git(&f.repo, &["add", "-A"]);
     f.git(&f.repo, &["commit", "-q", "-m", "second"]);
-    let mut ed = f.editor(config(&[(
-        "alpha",
-        provider(
-            AgentProviderKind::Terminal,
-            "sh",
-            &["-c", "printf a > a.txt", "sh", "{task}"],
-        ),
-    )]));
+    let base = f.git(&f.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let mut ed = f.editor(config(&[("alpha", sh_provider(script))]));
     run(&mut ed, " a");
     start_task(&mut ed, "add a", 0);
-    poll_until(&mut ed, "the agent's exit", |ed| {
-        ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
-    });
+    if wait_exit {
+        poll_until(&mut ed, "the agent's exit", |ed| {
+            ed.agents.agents.first().is_some_and(|a| a.exited.is_some())
+        });
+    } else {
+        poll_until(&mut ed, "the agent's worktree", |ed| {
+            ed.agents
+                .agents
+                .first()
+                .is_some_and(|a| a.worktree.is_some() && a.is_running())
+        });
+    }
     f.git(&f.repo, &["reset", "-q", "--hard", "HEAD~1"]);
-    let main_head = f.git(&f.repo, &["rev-parse", "HEAD"]);
-    // The review shows only the agent's file.
-    poll_until(&mut ed, "the review", |ed| review_paths(ed, 0) == ["a.txt"]);
-    run(&mut ed, "I");
-    poll_until(&mut ed, "the refusal", |ed| {
+    std::fs::write(f.repo.join("main.txt"), "main\n").unwrap();
+    f.git(&f.repo, &["add", "-A"]);
+    f.git(&f.repo, &["commit", "-q", "-m", "main moves on"]);
+    let main = f.git(&f.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    (ed, base, main)
+}
+
+/// `I` and the refusal it ends with.
+fn refused(ed: &mut Editor) -> String {
+    run(ed, "I");
+    poll_until(ed, "the refusal", |ed| {
         ed.status
             .as_ref()
             .is_some_and(|(_, m)| m.contains("not integrated"))
     });
-    let msg = ed.status.clone().unwrap().1;
+    status_text(ed)
+}
+
+fn branch_exists(f: &Fixture, branch: &str) -> bool {
+    f.cmd(
+        &f.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .status
+    .success()
+}
+
+fn integrate_refuses_a_base_that_is_not_on_the_target() {
+    let f = Fixture::new();
+    let (mut ed, base, main_head) = off_main_agent(&f, "printf a > a.txt", true);
+    // The review shows only the agent's file.
+    poll_until(&mut ed, "the review", |ed| review_paths(ed, 0) == ["a.txt"]);
+    let msg = refused(&mut ed);
+    // The refusal names the commit main lacks: short id and subject.
     assert!(msg.contains("which is not on main"), "{msg}");
-    assert!(ed.agents.panel.overlay.is_none());
-    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]), main_head);
-    assert_eq!(
-        f.git(&worktree(&ed, 0), &["status", "--porcelain"]),
-        "?? a.txt\n"
+    assert!(msg.contains("1 commit(s) that main does not have"), "{msg}");
+    assert!(msg.contains(&format!("{} second", &base[..7])), "{msg}");
+    let wt = worktree(&ed, 0);
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    let tip = f.git(&wt, &["rev-parse", "HEAD"]);
+    assert!(
+        agent(&ed, 0)
+            .history
+            .iter()
+            .any(|h| h.text.contains("integrate refused") && h.text.contains("second")),
+        "{:?}",
+        agent(&ed, 0).history
     );
+    // The rebase is offered, and says what it does.
+    let (text, keys) = dialog(&ed);
+    assert!(
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::Rebase { .. })),
+        "{text}"
+    );
+    assert_eq!(keys[0].0, "y");
+    assert!(text.contains(&format!("{} second", &base[..7])), "{text}");
+    assert!(
+        text.contains("Commits the uncommitted work in a.txt"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("git rebase --onto main {} {branch}", &base[..8])),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("kept as the branch {branch}-before-rebase")),
+        "{text}"
+    );
+    // n leaves everything as it was.
+    run(&mut ed, "n");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert_eq!(f.git(&f.repo, &["rev-parse", "HEAD"]).trim(), main_head);
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "?? a.txt\n");
+    assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, base);
+    assert!(!branch_exists(&f, &format!("{branch}-before-rebase")));
+}
+
+/// `y` moves the agent's commit and its uncommitted file onto main, and
+/// `I` then integrates only those.
+fn rebasing_an_agent_off_main_lets_i_integrate_only_its_work() {
+    let f = Fixture::new();
+    let (mut ed, base, main_head) = off_main_agent(&f, "printf a > a.txt", true);
+    // The agent committed a.txt and left b.txt uncommitted.
+    let wt = worktree(&ed, 0);
+    f.git(&wt, &["add", "a.txt"]);
+    f.git(&wt, &["commit", "-q", "-m", "agent adds a"]);
+    std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+    let old_tip = f.git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+    let branch = agent(&ed, 0).worktree.as_ref().unwrap().branch.clone();
+    refused(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(text.contains("agent adds a"), "{text}");
+    assert!(text.contains("in b.txt"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the rebase", |ed| {
+        agent(ed, 0).git_busy.is_none() && status_text(ed).contains("rebased")
+    });
+    let msg = status_text(&ed);
+    assert!(msg.contains("2 commit(s) moved"), "{msg}");
+    assert!(msg.contains(&format!("{branch}-before-rebase")), "{msg}");
+    // The agent now starts from main, its branch is two commits on top,
+    // and the old tip is kept under a name.
+    assert_eq!(agent(&ed, 0).worktree.as_ref().unwrap().base, main_head);
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD~2"]).trim(), main_head);
+    assert_eq!(
+        f.git(
+            &f.repo,
+            &["rev-parse", &format!("{branch}-before-rebase~1")]
+        )
+        .trim(),
+        old_tip
+    );
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "");
+    assert!(!wt.join("second.txt").exists());
+    poll_until(&mut ed, "the review against the new base", |ed| {
+        let mut p = review_paths(ed, 0);
+        p.sort();
+        !ed.agents.agents[0].review.running && p == ["a.txt", "b.txt"]
+    });
+    // I now integrates, and main gets the agent's two files and nothing
+    // from the old base.
+    open_integrate(&mut ed);
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    let log = f.git(&f.repo, &["log", "--format=%s", "main"]);
+    assert!(!log.contains("second"), "{log}");
+    assert!(log.contains("agent adds a"), "{log}");
+    assert!(f.repo.join("a.txt").exists() && f.repo.join("b.txt").exists());
+    assert!(!f.repo.join("second.txt").exists());
+    assert!(
+        agent(&ed, 0)
+            .history
+            .iter()
+            .any(|h| h.text.starts_with("rebased")),
+        "{:?}",
+        agent(&ed, 0).history
+    );
+    let _ = base;
+}
+
+/// main changes the agent's file: the dry run finds the conflict, the
+/// rebase is not offered and the branch stays where it was.
+fn a_rebase_that_would_conflict_is_not_offered() {
+    let f = Fixture::new();
+    let (mut ed, _base, _) = off_main_agent(&f, "printf 'agent\\n' > README.md", true);
+    let wt = worktree(&ed, 0);
+    f.git(&wt, &["commit", "-q", "-am", "agent edits the readme"]);
+    let tip = f.git(&wt, &["rev-parse", "HEAD"]);
+    std::fs::write(f.repo.join("README.md"), "main\n").unwrap();
+    f.git(&f.repo, &["commit", "-q", "-am", "main edits the readme"]);
+    let msg = refused(&mut ed);
+    assert!(msg.contains("is not offered"), "{msg}");
+    assert!(msg.contains("would conflict in README.md"), "{msg}");
+    assert!(ed.agents.panel.overlay.is_none(), "{msg}");
+    assert_eq!(f.git(&wt, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(f.git(&wt, &["status", "--porcelain"]), "");
+}
+
+/// A running agent could commit while its branch is rewritten: the
+/// rebase is not offered.
+fn a_running_agent_is_not_rebased() {
+    let f = Fixture::new();
+    let (mut ed, _base, _) = off_main_agent(&f, "printf a > a.txt; sleep 30", false);
+    let wt = worktree(&ed, 0);
+    poll_until(&mut ed, "the agent's file", |_| wt.join("a.txt").exists());
+    let msg = refused(&mut ed);
+    assert!(msg.contains("1 commit(s) that main does not have"), "{msg}");
+    assert!(msg.contains("is not offered"), "{msg}");
+    assert!(msg.contains("is still running"), "{msg}");
+    assert!(ed.agents.panel.overlay.is_none(), "{msg}");
+    quit(&mut ed);
 }
 
 /// The reviewer's case: the editor switched into an agent's worktree,

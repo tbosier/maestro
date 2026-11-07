@@ -230,7 +230,7 @@ impl Drop for TempFile {
 
 impl Repository {
     /// Runs commands that create commits: never opens an editor.
-    fn writer(&self) -> Repository {
+    pub(crate) fn writer(&self) -> Repository {
         self.with_git(
             self.git()
                 .clone()
@@ -240,7 +240,7 @@ impl Repository {
         )
     }
 
-    fn rev_list(&self, args: &[&str]) -> Result<Vec<String>> {
+    pub(crate) fn rev_list(&self, args: &[&str]) -> Result<Vec<String>> {
         let mut all = vec!["rev-list"];
         all.extend_from_slice(args);
         let out = self.run(&all, Access::ReadOnly)?;
@@ -996,7 +996,7 @@ impl Repository {
     /// `cherry-pick` would, and returns the ones that change something.
     /// Writes objects (merged trees and blobs) to the object store, never
     /// refs, the index or files.
-    fn cherry_pick_check(
+    pub(crate) fn cherry_pick_check(
         &self,
         onto: &str,
         commits: &[String],
