@@ -180,6 +180,18 @@ fn main() {
             files_the_test_run_creates_are_listed_apart_and_left_behind,
         ),
         (
+            "a_tracked_file_the_test_run_rewrites_is_marked_and_integrated_as_it_was",
+            a_tracked_file_the_test_run_rewrites_is_marked_and_integrated_as_it_was,
+        ),
+        (
+            "a_file_the_agent_edited_before_the_run_integrates_the_agents_version",
+            a_file_the_agent_edited_before_the_run_integrates_the_agents_version,
+        ),
+        (
+            "a_test_run_change_carries_over_until_edited_and_k_keeps_it",
+            a_test_run_change_carries_over_until_edited_and_k_keeps_it,
+        ),
+        (
             "a_test_run_file_the_agent_changes_is_the_agents_and_records_survive",
             a_test_run_file_the_agent_changes_is_the_agents_and_records_survive,
         ),
@@ -3939,7 +3951,7 @@ fn files_the_test_run_creates_are_listed_apart_and_left_behind() {
     assert!(!hinted_k(&ed));
     run(&mut ed, "K");
     assert!(
-        status_text(&ed).contains("was not created by Maestro's test run"),
+        status_text(&ed).contains("was not created or changed by Maestro's test run"),
         "{}",
         status_text(&ed)
     );
@@ -3976,7 +3988,7 @@ fn files_the_test_run_creates_are_listed_apart_and_left_behind() {
     run(&mut ed, "y");
     assert!(
         status_text(&ed).contains(
-            "not integrated, nothing changed: the files Maestro's test run created changed after \
+            "not integrated, nothing changed: the files Maestro's test run wrote changed after \
              the dialog was checked"
         ),
         "{}",
@@ -4047,7 +4059,7 @@ fn a_test_run_file_the_agent_changes_is_the_agents_and_records_survive() {
     wait_idle(&mut ed, 0);
     assert!(
         status_text(&ed).contains(
-            "files Maestro's test run created changed after the dialog was checked and count as \
+            "files Maestro's test run wrote changed after the dialog was checked and count as \
              the agent's now: made-by-tests.txt; nothing changed"
         ),
         "{}",
@@ -4080,4 +4092,284 @@ fn a_test_run_file_the_agent_changes_is_the_agents_and_records_survive() {
         f.git(&f.repo, &["show", "HEAD:made-by-tests.txt"]),
         "x, then the agent's\n"
     );
+}
+
+// ----- tracked files Maestro's own test run changes ----------------------------
+
+/// The blob id of `rel` in the worktree's `HEAD`.
+fn head_blob(f: &Fixture, dir: &Path, rel: &str) -> String {
+    f.git(dir, &["rev-parse", &format!("HEAD:{rel}")])
+        .trim()
+        .to_string()
+}
+
+/// `t` rewrites the tracked README.md (and creates a file): the review
+/// marks the rewrite `T` after the agent's files and does not count it,
+/// mark it or drop it; integrate names it as left behind, commits the
+/// agent's work without it, and leaves the rewrite on disk. The created
+/// file is handled as before.
+fn a_tracked_file_the_test_run_rewrites_is_marked_and_integrated_as_it_was() {
+    let f = Fixture::new();
+    let test = "printf 'rewritten by the tests\\n' > README.md; echo x > made-by-tests.txt";
+    let mut ed = f.editor(test_run_config(test));
+    run(&mut ed, " a");
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    let original = head_blob(&f, &wt, "README.md");
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["made-by-tests.txt", "README.md"]);
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+    let a = agent(&ed, 0);
+    assert_eq!(
+        review_paths(&ed, 0),
+        ["notes.txt", "made-by-tests.txt", "README.md"],
+        "the agent's files first, then the test run's"
+    );
+    assert_eq!(a.review.totals(), (1, 1, 0), "only notes.txt is counted");
+    let readme = a
+        .test_outputs
+        .iter()
+        .find(|o| o.path == Path::new("README.md"))
+        .expect("a record of README.md");
+    assert_eq!(readme.before.as_deref(), Some(original.as_str()));
+    assert!(
+        a.test_outputs
+            .iter()
+            .any(|o| o.path == Path::new("made-by-tests.txt") && o.before.is_none())
+    );
+    assert!(
+        a.history.iter().any(|h| h
+            .text
+            .contains("the test run changed 1 tracked file(s): README.md")),
+        "{:?}",
+        a.history
+    );
+
+    // The review labels the change; it cannot be marked or dropped.
+    run(&mut ed, "\n<tab><tab>");
+    let rows = review_rows(&ed);
+    match &rows[0] {
+        Row::Note(n) => assert!(
+            n.starts_with(&format!(
+                "T changed by Maestro's test run (`sh -c {test}`), not by the agent"
+            )),
+            "{n}"
+        ),
+        other => panic!("expected the test run note, got {other:?}"),
+    }
+    assert!(
+        matches!(&rows[1], Row::Note(n) if n.contains("integrate commits the file as it was before the run")),
+        "{rows:?}"
+    );
+    let hinted_now = hinted(&ed);
+    assert!(
+        hinted_now.contains(&"K") && !hinted_now.contains(&"D"),
+        "{hinted_now:?}"
+    );
+    run(&mut ed, "]");
+    run(&mut ed, " ");
+    assert!(agent(&ed, 0).marks.is_empty());
+    assert!(
+        status_text(&ed).contains("this change was made by Maestro's test run, not by the agent"),
+        "{}",
+        status_text(&ed)
+    );
+    run(&mut ed, "D");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(
+        status_text(&ed).contains("D does not drop the test run's change to a tracked file"),
+        "{}",
+        status_text(&ed)
+    );
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    for want in [
+        "LEFT BEHIND: 1 file(s) created by Maestro's test run".to_string(),
+        format!(
+            "LEFT BEHIND: the changes Maestro's test run (`sh -c {test}`) made to 1 tracked \
+             file(s): README.md. Step 1 commits each as it was before the run"
+        ),
+        "When checked (1 in all; the review lists every one): notes.txt.".to_string(),
+    ] {
+        assert!(text.contains(&want), "{want:?} not in {text}");
+    }
+    assert!(
+        !text.contains("changed after the last verification"),
+        "{text}"
+    );
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(head_files(&f), ["README.md", "notes.txt", "src/lib.rs"]);
+    assert_eq!(f.git(&f.repo, &["show", "HEAD:README.md"]), "# demo\n");
+    assert_eq!(read(&f.repo.join("README.md")), "# demo\n");
+    // The worktree keeps the run's rewrite and file, uncommitted.
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, " M README.md\n?? made-by-tests.txt\n");
+}
+
+/// The agent changed README.md and committed nothing; the run then
+/// rewrote it. The review shows the agent's part (counted) and the run's
+/// part (T); integrate commits the agent's version from before the run.
+fn a_file_the_agent_edited_before_the_run_integrates_the_agents_version() {
+    let f = Fixture::new();
+    let mut c = config(&[(
+        "writer",
+        sh_provider("printf 'the agent was here\\n' >> README.md"),
+    )]);
+    c.agents.test_command = vec![
+        "sh".into(),
+        "-c".into(),
+        "printf 'rewritten by the tests\\n' > README.md".into(),
+    ];
+    let mut ed = f.editor(c);
+    run(&mut ed, " a");
+    start_task(&mut ed, "edit the readme", 0);
+    wait_files(&mut ed, 0, &["README.md"]);
+    let wt = worktree(&ed, 0);
+    let agents = f.git(&wt, &["hash-object", "README.md"]).trim().to_string();
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    let a = agent(&ed, 0);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "README.md"]);
+    assert_eq!(a.test_outputs[0].before.as_deref(), Some(agents.as_str()));
+    // The agent's part: one line added to the original.
+    assert_eq!(a.review.totals(), (1, 1, 0));
+    let added: Vec<&str> = a.review.files[0]
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind == maestro_git::DiffLineKind::Added)
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(added, ["the agent was here"]);
+    // The run's part: from the agent's version to the rewrite.
+    let run_part: Vec<&str> = a.review.files[1]
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind == maestro_git::DiffLineKind::Added)
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(run_part, ["rewritten by the tests"]);
+    run(&mut ed, "\n");
+    let rows = review_rows(&ed);
+    assert!(
+        rows.iter().any(
+            |r| matches!(r, Row::Note(n) if n.starts_with("changed by Maestro's test run too"))
+        ),
+        "{rows:?}"
+    );
+    run(&mut ed, "<esc>");
+
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(
+        text.contains("When checked (1 in all; the review lists every one): README.md."),
+        "{text}"
+    );
+    assert!(
+        text.contains("made to 1 tracked file(s): README.md"),
+        "{text}"
+    );
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "# demo\nthe agent was here\n"
+    );
+    assert_eq!(read(&wt.join("README.md")), "rewritten by the tests\n");
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, " M README.md\n");
+}
+
+/// A run's change to a tracked file survives a restart and a second run
+/// that writes the same; an edit after the run makes the whole file the
+/// agent's; the next run records its change against that edit; `K` keeps
+/// the run's version, and integrate commits it.
+fn a_test_run_change_carries_over_until_edited_and_k_keeps_it() {
+    let f = Fixture::new();
+    let c = test_run_config("printf 'rewritten by the tests\\n' > README.md");
+    let mut ed = f.session_editor(c.clone());
+    open_and_load(&mut ed, 0);
+    start_task(&mut ed, "write notes", 0);
+    wait_files(&mut ed, 0, &["notes.txt"]);
+    let wt = worktree(&ed, 0);
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    let outputs = agent(&ed, 0).test_outputs.clone();
+    assert!(outputs[0].before.is_some());
+    quit(&mut ed);
+    drop(ed);
+    let saved = read(&f.records());
+    assert!(saved.contains("\"before\""), "{saved}");
+
+    // Reloaded: the record is back, and a second run that writes the same
+    // keeps it as it was.
+    let mut ed = f.session_editor(c);
+    open_and_load(&mut ed, 1);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+    run(&mut ed, "\n");
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    run(&mut ed, "<esc>");
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    assert_eq!(agent(&ed, 0).test_outputs, outputs);
+
+    // Edited after the run: the whole file is the agent's, as it is now.
+    std::fs::write(wt.join("README.md"), "edited after the run\n").unwrap();
+    run(&mut ed, "\nr");
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "notes.txt"]);
+    assert_eq!(agent(&ed, 0).review.totals(), (2, 2, 1));
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "n");
+
+    // The next run's change is recorded against that edit.
+    let edited = f.git(&wt, &["hash-object", "README.md"]).trim().to_string();
+    verify(&mut ed, 0);
+    wait_test_made(&mut ed, 0, &["README.md"]);
+    assert_eq!(
+        agent(&ed, 0).test_outputs[0].before.as_deref(),
+        Some(edited.as_str())
+    );
+    // K: the run's version is the agent's.
+    run(&mut ed, "\n<tab><tab>");
+    run(&mut ed, "K");
+    assert!(
+        status_text(&ed).contains(
+            "README.md counts as writer-1's work now (K); integrate commits it with the test \
+             run's change"
+        ),
+        "{}",
+        status_text(&ed)
+    );
+    assert!(agent(&ed, 0).test_outputs.is_empty());
+    wait_test_made(&mut ed, 0, &[]);
+    assert_eq!(review_paths(&ed, 0), ["README.md", "notes.txt"]);
+    run(&mut ed, "<esc>");
+    open_integrate(&mut ed);
+    let (text, _) = dialog(&ed);
+    assert!(!text.contains("LEFT BEHIND"), "{text}");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the integration", |ed| {
+        status(ed, 0) == Status::Integrated
+    });
+    assert_eq!(
+        f.git(&f.repo, &["show", "HEAD:README.md"]),
+        "rewritten by the tests\n"
+    );
+    let left = f.git(&wt, &["status", "--porcelain", "--untracked-files=all"]);
+    assert_eq!(left, "");
 }

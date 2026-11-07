@@ -290,6 +290,7 @@ fn test_run_files_are_marked_and_not_counted() {
     a.test_outputs = vec![TestOutput {
         path: "Cargo.lock".into(),
         blob: "0123abcd".into(),
+        before: None,
         command: "cargo test".into(),
         agent_was_running: false,
     }];
@@ -311,7 +312,7 @@ fn test_run_files_are_marked_and_not_counted() {
         "{text}"
     );
     assert!(
-        text.contains("1 files +0 -0  and 1 created by the test run (T, not counted)"),
+        text.contains("1 files +0 -0  and 1 by the test run (T, not counted)"),
         "{text}"
     );
     assert!(

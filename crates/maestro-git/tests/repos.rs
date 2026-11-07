@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use maestro_git::{
     Base, ChangeKind, ConflictKind, DiffLineKind, DiffSpec, EntryState, FileChange, Git, Head,
-    IntegrateError, IntegrateOutcome, Integration, MergeCheck, RemoveError, RemoveRefusal,
+    IntegrateError, IntegrateOutcome, Integration, LeftOut, MergeCheck, RemoveError, RemoveRefusal,
     Reviewed, Sign, SignMap,
 };
 
@@ -115,6 +115,10 @@ impl Fixture {
         self.git(&["add", "-A"]);
         self.git(&["commit", "-q", "-m", msg]);
     }
+}
+
+fn read_in(dir: &Path, rel: &str) -> String {
+    std::fs::read_to_string(dir.join(rel)).unwrap()
 }
 
 fn write_in(dir: &Path, rel: &str, text: &str) {
@@ -841,7 +845,8 @@ fn commit_all_leaving_out_keeps_named_untracked_files_out() {
     f.write("out/[1].txt", "also made by the tests\n");
     f.write("out/1.txt", "the agent's\n");
     f.write("keep.txt", "the agent's too\n");
-    let leave: Vec<PathBuf> = vec!["Cargo.lock".into(), "out/[1].txt".into()];
+    let left: Vec<PathBuf> = vec!["Cargo.lock".into(), "out/[1].txt".into()];
+    let leave: Vec<LeftOut> = left.iter().cloned().map(LeftOut::untracked).collect();
     let snap = repo.work_snapshot_leaving_out(&leave).unwrap();
     let full = repo.work_snapshot().unwrap();
     assert_ne!(snap.tree, full.tree);
@@ -855,13 +860,105 @@ fn commit_all_leaving_out_keeps_named_untracked_files_out() {
     assert_eq!(names, ["a.txt", "keep.txt", "out/1.txt"], "{tree}");
     assert_eq!(repo.commit_shape(&id).unwrap().tree, snap.tree);
     let untracked = repo.untracked_files().unwrap();
-    assert_eq!(untracked, leave);
+    assert_eq!(untracked, left);
     // Only left-out files remain: nothing to commit.
     assert_eq!(repo.commit_all_leaving_out("again", &leave).unwrap(), None);
     // A path that escapes the worktree is refused before anything runs.
     assert!(
-        repo.commit_all_leaving_out("bad", &["../x".into()])
+        repo.commit_all_leaving_out("bad", &[LeftOut::untracked("../x")])
             .is_err()
+    );
+}
+
+/// A tracked file left out with other contents is committed with those
+/// contents, keeps its mode, and stays as it is on disk; the snapshot with
+/// the same list has the commit's tree. A blob id that is not one is
+/// refused before anything is staged.
+#[test]
+fn commit_all_leaving_out_commits_other_contents_for_a_tracked_file() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    f.write("run.sh", "echo 1\n");
+    f.git(&["add", "run.sh"]);
+    f.git(&["update-index", "--chmod=+x", "run.sh"]);
+    f.git(&["commit", "-q", "-m", "script"]);
+    // The agent's version, then a test run's rewrite of both files.
+    f.write("a.txt", "the agent's\n");
+    f.write("run.sh", "echo 2\n");
+    let agents = f.git(&["hash-object", "-w", "a.txt"]).trim().to_string();
+    let script = f.git(&["hash-object", "-w", "run.sh"]).trim().to_string();
+    f.write("a.txt", "rewritten by the tests\n");
+    f.write("run.sh", "echo 3\n");
+    f.write("new.txt", "the agent's new file\n");
+    let leave = [
+        LeftOut::instead("a.txt", agents.clone()),
+        LeftOut::instead("run.sh", script.clone()),
+    ];
+    assert!(
+        repo.commit_all_leaving_out("bad", &[LeftOut::instead("a.txt", "HEAD")])
+            .is_err()
+    );
+    let missing = "1".repeat(agents.len());
+    assert!(
+        repo.commit_all_leaving_out("bad", &[LeftOut::instead("a.txt", missing)])
+            .is_err()
+    );
+    assert!(f.git(&["diff", "--cached", "--name-only"]).is_empty());
+    let snap = repo.work_snapshot_leaving_out(&leave).unwrap();
+    let id = repo
+        .commit_all_leaving_out("agent work", &leave)
+        .unwrap()
+        .expect("a commit");
+    assert_eq!(repo.commit_shape(&id).unwrap().tree, snap.tree);
+    assert_eq!(f.git(&["show", &format!("{id}:a.txt")]), "the agent's\n");
+    assert_eq!(f.git(&["show", &format!("{id}:run.sh")]), "echo 2\n");
+    assert_eq!(
+        f.git(&["show", &format!("{id}:new.txt")]),
+        "the agent's new file\n"
+    );
+    let mode = f.git(&["ls-tree", &id, "run.sh"]);
+    assert!(mode.starts_with("100755 "), "{mode}");
+    // The files on disk are untouched and differ from the commit.
+    assert_eq!(read_in(&f.repo, "a.txt"), "rewritten by the tests\n");
+    assert_eq!(f.git(&["status", "--porcelain"]), " M a.txt\n M run.sh\n");
+    // Nothing else to commit.
+    assert_eq!(repo.commit_all_leaving_out("again", &leave).unwrap(), None);
+}
+
+/// `tracked_blobs` gives the index entry's and the file's blob ids of
+/// tracked files only; `changed_blobs` lists files whose contents differ
+/// between two trees; `objects_present` says which ids the store has.
+#[test]
+fn tracked_and_changed_blobs() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let before = repo.work_snapshot().unwrap();
+    f.write("a.txt", "changed\n");
+    f.write("new.txt", "x\n");
+    let after = repo.work_snapshot().unwrap();
+    let ask: Vec<PathBuf> = ["a.txt", "new.txt", "missing"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let got = repo.tracked_blobs(&ask).unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].path, PathBuf::from("a.txt"));
+    assert_eq!(got[0].index, rev(&f, &f.repo, "HEAD:a.txt"));
+    let disk = f.git(&["hash-object", "a.txt"]).trim().to_string();
+    assert_eq!(got[0].file.as_deref(), Some(disk.as_str()));
+    std::fs::remove_file(f.repo.join("a.txt")).unwrap();
+    assert_eq!(repo.tracked_blobs(&ask).unwrap()[0].file, None);
+
+    let changed = repo.changed_blobs(&before.tree, &after.tree).unwrap();
+    assert_eq!(changed.len(), 1, "added files are not listed: {changed:?}");
+    assert_eq!(changed[0].path, PathBuf::from("a.txt"));
+    assert_eq!(changed[0].from, rev(&f, &f.repo, "HEAD:a.txt"));
+    assert_eq!(changed[0].to, disk);
+
+    let missing = "0".repeat(disk.len());
+    assert_eq!(
+        repo.objects_present(&[disk.clone(), missing]).unwrap(),
+        [disk]
     );
 }
 
@@ -928,6 +1025,7 @@ fn integrate_reviewed_lets_named_untracked_files_stay_behind() {
                 target: "main",
                 base: &base,
                 leave_untracked: &leave,
+                leave_modified: &[],
             },
             Integration::Merge,
         )
@@ -945,6 +1043,7 @@ fn integrate_reviewed_lets_named_untracked_files_stay_behind() {
                 target: "main",
                 base: &base,
                 leave_untracked: &leave,
+                leave_modified: &[],
             },
             Integration::Merge,
         )
@@ -954,6 +1053,51 @@ fn integrate_reviewed_lets_named_untracked_files_stay_behind() {
     assert!(tree.lines().any(|l| l == "one.txt"), "{tree}");
     assert!(!tree.lines().any(|l| l == "Cargo.lock"), "{tree}");
     assert!(wt.join("Cargo.lock").exists());
+}
+
+/// `leave_modified` lets exactly those tracked files stay changed and
+/// unstaged in the source worktree; staged, or another file, still
+/// refuses.
+#[test]
+fn integrate_reviewed_lets_named_modified_files_stay_behind() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let base = rev(&f, &f.repo, "HEAD");
+    let wt = agent_branch(&f, "agent/modified", "one.txt", "1\n");
+    let reviewed = rev(&f, &wt, "HEAD");
+    write_in(&wt, "a.txt", "rewritten by the tests\n");
+    let leave = [PathBuf::from("a.txt")];
+    let try_it = || {
+        repo.integrate_reviewed(
+            "agent/modified",
+            Reviewed {
+                commit: &reviewed,
+                target: "main",
+                base: &base,
+                leave_untracked: &[],
+                leave_modified: &leave,
+            },
+            Integration::Merge,
+        )
+    };
+    f.git_ok(&wt, &["add", "a.txt"]);
+    let err = try_it().unwrap_err();
+    assert!(
+        matches!(&err, IntegrateError::SourceDirty(p) if p == &[PathBuf::from("a.txt")]),
+        "staged is refused: {err:?}"
+    );
+    f.git_ok(&wt, &["reset", "-q"]);
+    write_in(&wt, "one.txt", "changed too\n");
+    let err = try_it().unwrap_err();
+    assert!(
+        matches!(&err, IntegrateError::SourceDirty(p) if p == &[PathBuf::from("one.txt")]),
+        "{err:?}"
+    );
+    f.git_ok(&wt, &["checkout", "--", "one.txt"]);
+    let out = try_it().unwrap();
+    assert_eq!(out.new_head, rev(&f, &f.repo, "HEAD"));
+    assert_eq!(f.git(&["show", "HEAD:a.txt"]), read_in(&f.repo, "a.txt"));
+    assert_eq!(read_in(&wt, "a.txt"), "rewritten by the tests\n");
 }
 
 #[test]
@@ -1219,6 +1363,7 @@ fn on_main<'a>(commit: &'a str, base: &'a str) -> Reviewed<'a> {
         target: "main",
         base,
         leave_untracked: &[],
+        leave_modified: &[],
     }
 }
 

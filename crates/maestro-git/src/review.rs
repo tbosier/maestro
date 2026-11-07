@@ -9,8 +9,8 @@ use crate::diff::diff_args;
 use crate::repo::check_rev;
 use crate::worktree::check_branch_name;
 use crate::{
-    Access, DiffFile, DiffSpec, GitError, GitVersion, Head, MergeCheck, Repository, Result,
-    bytes_to_path, command_error, split_nul,
+    Access, DiffFile, DiffSpec, GitError, GitVersion, Head, LeftOut, MergeCheck, Repository,
+    Result, bytes_to_path, command_error, split_nul,
 };
 
 /// How [`Repository::integrate`] brings a branch in.
@@ -118,6 +118,10 @@ pub struct Reviewed<'a> {
     /// review left them out on purpose. Any other uncommitted or untracked
     /// file there still refuses the integration.
     pub leave_untracked: &'a [PathBuf],
+    /// Tracked files whose unstaged change (and nothing staged) may stay
+    /// behind there, for the same reason: the commit holds other contents
+    /// for them ([`crate::LeftOut::instead`]).
+    pub leave_modified: &'a [PathBuf],
 }
 
 /// [`Reviewed`] with the source resolved to a full id.
@@ -126,6 +130,7 @@ struct Pinned<'a> {
     target: &'a str,
     base: &'a str,
     leave_untracked: &'a [PathBuf],
+    leave_modified: &'a [PathBuf],
 }
 
 /// A worktree's files as an unreferenced commit, from
@@ -364,11 +369,13 @@ impl Repository {
         self.work_snapshot_leaving_out(&[])
     }
 
-    /// [`Repository::work_snapshot`] without the untracked files named in
-    /// `leave_out` (relative to the root, matched by exact name): what
+    /// [`Repository::work_snapshot`] with the files named in `leave_out`
+    /// left out (relative to the root, matched by exact name): what
     /// [`Repository::commit_all_leaving_out`] with the same list would
-    /// commit. A path in `leave_out` that is already in the index stays.
-    pub fn work_snapshot_leaving_out(&self, leave_out: &[PathBuf]) -> Result<WorkSnapshot> {
+    /// commit. An untracked path in it is not added (one already in the
+    /// index stays); a tracked path given contents to commit instead has
+    /// those.
+    pub fn work_snapshot_leaving_out(&self, leave_out: &[LeftOut]) -> Result<WorkSnapshot> {
         let head = self.resolve("HEAD")?;
         let index = TempFile::index_copy("snapshot-index", &self.git_dir().join("index"))?;
         // As in `review_diff`: a whole index, never new shared index files.
@@ -493,27 +500,102 @@ impl Repository {
     }
 
     /// `git add --all`, or with `leave_out`, every path but those (each
-    /// matched by its exact name, relative to the root).
-    fn add_all(&self, leave_out: &[PathBuf]) -> Result<()> {
+    /// matched by its exact name, relative to the root), and then the index
+    /// entries of those given contents to commit instead set to them, with
+    /// the mode their entry has (a regular file's when they have none).
+    fn add_all(&self, leave_out: &[LeftOut]) -> Result<()> {
         if leave_out.is_empty() {
             self.run(&["add", "--all", "--", "."], Access::Write)?;
-        } else {
-            let mut args: Vec<OsString> = vec!["add".into(), "--all".into(), "--".into()];
-            args.extend(crate::untracked::all_but(leave_out)?);
-            self.with_magic_pathspecs().run(&args, Access::Write)?;
+            return Ok(());
         }
+        // Checked before anything is staged.
+        let instead: Vec<(&PathBuf, &str)> = leave_out
+            .iter()
+            .filter_map(|l| l.instead.as_deref().map(|b| (&l.path, b)))
+            .collect();
+        for (p, blob) in &instead {
+            if !crate::untracked::is_object_id(blob) {
+                return Err(GitError::InvalidArgument(format!(
+                    "{blob:?} is not an object id (for {})",
+                    p.display()
+                )));
+            }
+        }
+        // `update-index` takes an id it does not have, and the index would
+        // then name a missing object.
+        let ids: Vec<String> = instead.iter().map(|(_, b)| b.to_string()).collect();
+        let present = self.objects_present(&ids)?;
+        if let Some((p, blob)) = instead
+            .iter()
+            .find(|(_, b)| !present.iter().any(|q| q == b))
+        {
+            return Err(GitError::InvalidArgument(format!(
+                "the contents to commit for {} ({blob}) are not in the object store",
+                p.display()
+            )));
+        }
+        let paths: Vec<PathBuf> = leave_out.iter().map(|l| l.path.clone()).collect();
+        let mut args: Vec<OsString> = vec!["add".into(), "--all".into(), "--".into()];
+        args.extend(crate::untracked::all_but(&paths)?);
+        self.with_magic_pathspecs().run(&args, Access::Write)?;
+        if instead.is_empty() {
+            return Ok(());
+        }
+        let wanted: Vec<PathBuf> = instead.iter().map(|(p, _)| (*p).clone()).collect();
+        let modes = self.tracked_modes(&wanted)?;
+        let mut input = Vec::new();
+        for (p, blob) in &instead {
+            let mode = modes
+                .iter()
+                .find(|(q, _)| q == *p)
+                .map_or("100644", |(_, m)| m.as_str());
+            input.extend_from_slice(format!("{mode} {blob}\t").as_bytes());
+            input.extend_from_slice(p.as_os_str().as_encoded_bytes());
+            input.push(0);
+        }
+        self.run_input(
+            &["update-index", "-z", "--index-info"],
+            &input,
+            Access::Write,
+        )?;
         Ok(())
     }
 
-    /// [`Repository::commit_all`], leaving the untracked files named in
-    /// `leave_out` (relative to the root, matched by exact name) untracked
-    /// and out of the commit. A path in `leave_out` that is already staged
-    /// is committed: this only keeps `git add` from picking it up. Returns
+    /// The modes of the stage 0 index entries of `paths` that are regular
+    /// files.
+    fn tracked_modes(&self, paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
+        let mut args: Vec<OsString> = ["ls-files", "-z", "--stage", "--"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        args.extend(paths.iter().map(|p| p.as_os_str().to_os_string()));
+        let out = self.run(&args, Access::ReadOnly)?;
+        let mut modes = Vec::new();
+        for entry in split_nul(&out) {
+            let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&entry[..tab]);
+            let fields: Vec<&str> = head.split(' ').collect();
+            if let [mode @ ("100644" | "100755"), _, "0"] = fields.as_slice() {
+                modes.push((bytes_to_path(&entry[tab + 1..]), mode.to_string()));
+            }
+        }
+        Ok(modes)
+    }
+
+    /// [`Repository::commit_all`], leaving out the files named in
+    /// `leave_out` (relative to the root, matched by exact name). An
+    /// untracked one stays untracked and out of the commit; one that is
+    /// already staged is committed, as this only keeps `git add` from
+    /// picking it up. A tracked one given contents to commit instead
+    /// ([`LeftOut::instead`]) is committed with them, and the file on disk
+    /// is left as it is (so it then differs from the commit). Returns
     /// `None` when nothing else was there to commit.
     pub fn commit_all_leaving_out(
         &self,
         message: &str,
-        leave_out: &[PathBuf],
+        leave_out: &[LeftOut],
     ) -> Result<Option<String>> {
         let status = self.status()?;
         let conflicted: Vec<PathBuf> = status.conflicted().map(|e| e.path.clone()).collect();
@@ -783,6 +865,7 @@ impl Repository {
             target: reviewed.target,
             base: reviewed.base,
             leave_untracked: reviewed.leave_untracked,
+            leave_modified: reviewed.leave_modified,
         };
         self.integrate_inner(branch, Some(&pinned), how)
     }
@@ -839,7 +922,11 @@ impl Repository {
         if !dirty.is_empty() {
             return Err(IntegrateError::Dirty(dirty));
         }
-        self.check_source_worktree(branch, pinned.map_or(&[], |p| p.leave_untracked))?;
+        self.check_source_worktree(
+            branch,
+            pinned.map_or(&[], |p| p.leave_untracked),
+            pinned.map_or(&[], |p| p.leave_modified),
+        )?;
 
         let range = format!("{old_head}..{source}");
         let mut commits = self.rev_list(&["--reverse", &range])?;
@@ -956,11 +1043,13 @@ impl Repository {
 
     /// Refuses when the worktree that has `branch` checked out (if any,
     /// other than this one) has uncommitted or untracked files, other than
-    /// the untracked files named in `leave_untracked`.
+    /// the untracked files named in `leave_untracked` and the files named in
+    /// `leave_modified` with only an unstaged modification.
     fn check_source_worktree(
         &self,
         branch: &str,
         leave_untracked: &[PathBuf],
+        leave_modified: &[PathBuf],
     ) -> Result<(), IntegrateError> {
         let here = std::fs::canonicalize(self.root()).unwrap_or_else(|_| self.root().into());
         for wt in self.worktrees()? {
@@ -977,6 +1066,15 @@ impl Repository {
             let status = repo.status()?;
             let files: Vec<PathBuf> = status
                 .uncommitted()
+                .filter(|e| {
+                    let only_unstaged = e.orig_path.is_none()
+                        && e.state
+                            == crate::EntryState::Changed {
+                                staged: None,
+                                unstaged: Some(crate::ChangeKind::Modified),
+                            };
+                    !(only_unstaged && leave_modified.contains(&e.path))
+                })
                 .map(|e| e.path.clone())
                 .chain(
                     status

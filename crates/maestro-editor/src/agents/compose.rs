@@ -238,7 +238,7 @@ pub fn items(ed: &Editor, v: &ComposeView) -> Vec<Item> {
         // Every entry of the path: a file whose type changed is a deletion
         // and an addition of one path.
         for (fi, f) in a.review.files.iter().enumerate() {
-            if f.path() != Some(&path) || unmarkable(f).is_some() || a.review.is_test_made(f) {
+            if f.path() != Some(&path) || unmarkable(f).is_some() || a.review.is_test_made(fi) {
                 continue;
             }
             for (hi, h) in f.hunks.iter().enumerate() {
