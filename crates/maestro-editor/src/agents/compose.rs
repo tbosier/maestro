@@ -287,6 +287,12 @@ fn key_of(ed: &Editor, it: &Item) -> Option<(HunkKey, DiffFile)> {
     Some((HunkKey::of(f, h), f.clone()))
 }
 
+/// The item's hunk, without copying its file as [`key_of`] does.
+fn hunk_key(ed: &Editor, it: &Item) -> Option<HunkKey> {
+    let f = ed.agents.get(it.agent)?.review.files.get(it.file)?;
+    Some(HunkKey::of(f, f.hunks.get(it.hunk)?))
+}
+
 /// Where the item's hunk starts in the base file.
 fn old_start(ed: &Editor, it: &Item) -> usize {
     ed.agents
@@ -301,16 +307,25 @@ fn remember(ed: &Editor, v: &mut ComposeView) {
     v.path = files(ed, v).get(v.file).cloned();
     v.at = items(ed, v)
         .get(v.cursor)
-        .and_then(|it| key_of(ed, it).map(|(key, _)| (it.agent, key)));
+        .and_then(|it| hunk_key(ed, it).map(|key| (it.agent, key)));
+}
+
+/// [`follow`] for the open compose view, after an agent's review changed.
+pub(crate) fn refollow(ed: &mut Editor) {
+    if let Some(mut v) = ed.agents.panel.compose.take() {
+        follow(ed, &mut v);
+        ed.agents.panel.compose = Some(v);
+    }
 }
 
 /// Puts the view back on the file and hunk it showed after the agents'
 /// reviews changed: every refresh recomputes the files and hunks, and the
 /// same index can then name another file or another agent's hunk. When
 /// the hunk is gone (its agent changed it), the cursor goes to the hunk
-/// of the same agent in the file nearest to where it started, else to
-/// the nearest hunk of any agent; when the file is gone, to the first
-/// hunk of the file now in its place.
+/// of the same agent in the file nearest to where it started; when that
+/// agent has no hunk left in the file, to the nearest hunk of any agent,
+/// which is then the one remembered. When the file is gone, the cursor
+/// goes to the first hunk of the file now in its place.
 pub(crate) fn follow(ed: &Editor, v: &mut ComposeView) {
     let files = files(ed, v);
     let same_file = match v
@@ -331,7 +346,7 @@ pub(crate) fn follow(ed: &Editor, v: &mut ComposeView) {
     let found = match (&v.at, same_file) {
         (Some((agent, key)), true) => {
             let here = |n: usize| {
-                items[n].agent == *agent && key_of(ed, &items[n]).is_some_and(|(k, _)| k == *key)
+                items[n].agent == *agent && hunk_key(ed, &items[n]).as_ref() == Some(key)
             };
             // The current index first, in case two items look the same.
             (v.cursor < items.len() && here(v.cursor))
@@ -358,16 +373,16 @@ pub(crate) fn follow(ed: &Editor, v: &mut ComposeView) {
     keep_visible(ed, v);
 }
 
-/// Scrolls the grid so the cursor's hunk is on screen.
+/// Scrolls the grid so the cursor's hunk is on screen, or to the top
+/// when there is none (the notes say why).
 fn keep_visible(ed: &Editor, v: &mut ComposeView) {
     let g = grid(ed, v);
     let height = grid_height(ed.area);
-    if let Some(&row) = g.item_rows.get(v.cursor) {
-        if row < v.top {
-            v.top = row;
-        } else if row >= v.top + height {
-            v.top = row + 1 - height;
-        }
+    match g.item_rows.get(v.cursor) {
+        Some(&row) if row < v.top => v.top = row,
+        Some(&row) if row >= v.top + height => v.top = row + 1 - height,
+        Some(_) => {}
+        None => v.top = 0,
     }
 }
 
@@ -462,6 +477,7 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             return;
         }
         KeyCode::Char('?') => {
+            ed.agents.panel.compose = Some(v);
             super::panel::show_keys(ed);
             return;
         }

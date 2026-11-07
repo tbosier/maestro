@@ -176,6 +176,10 @@ fn main() {
             compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes,
         ),
         (
+            "compose_view_cursor_stays_on_its_hunk_when_an_agent_is_archived",
+            compose_view_cursor_stays_on_its_hunk_when_an_agent_is_archived,
+        ),
+        (
             "an_archived_agent_says_so_and_its_record_can_be_forgotten",
             an_archived_agent_says_so_and_its_record_can_be_forgotten,
         ),
@@ -3727,13 +3731,10 @@ fn compose_view_j_and_k_stay_in_the_agents_column() {
     assert_eq!(at(&ed), (0, 1), "j goes down alpha's column");
 }
 
-/// A refreshed diff reorders the compose view's hunks. The cursor stays
-/// on its hunk (same agent, same hunk), or on that agent's nearest hunk
-/// when its hunk is gone, and on its file when another file joins the
-/// list before it. Each refresh is waited for, so nothing here depends on
-/// timing.
-fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
-    use maestro_editor::agents::compose;
+/// alpha (lines 2 and 28) and beta (lines 3 and 15) on one task, both
+/// finished, and the compose view open on alpha's first hunk once the
+/// refreshes `C` asked for are in.
+fn compose_two_agents() -> (Fixture, Editor) {
     let f = calc_fixture();
     let sed = |s: &str| {
         sh_provider(&format!(
@@ -3753,14 +3754,38 @@ fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
     wait_files(&mut ed, 1, &["calc.txt"]);
     select(&mut ed, 0);
     run(&mut ed, "C");
-    // Agent, old start and length of the hunk under the cursor.
-    let at = |ed: &Editor| {
-        let v = ed.agents.panel.compose.as_ref().expect("the compose view");
-        let it = &compose::items(ed, v)[v.cursor];
-        let a = ed.agents.get(it.agent).expect("the item's agent");
-        let h = &a.review.files[it.file].hunks[it.hunk];
-        (a.name.clone(), h.old_start, h.old_len)
-    };
+    poll_until(&mut ed, "the refreshes C asked for", |ed| {
+        review_settled(ed, 0) && review_settled(ed, 1)
+    });
+    (f, ed)
+}
+
+/// A refresh the test asked for, and any one queued behind it, applied.
+fn review_settled(ed: &Editor, i: usize) -> bool {
+    !agent(ed, i).review.running && !agent(ed, i).review.again
+}
+
+/// Agent, old start and length of the compose view's hunk under the
+/// cursor.
+fn compose_at(ed: &Editor) -> (String, usize, usize) {
+    use maestro_editor::agents::compose;
+    let v = ed.agents.panel.compose.as_ref().expect("the compose view");
+    let it = &compose::items(ed, v)[v.cursor];
+    let a = ed.agents.get(it.agent).expect("the item's agent");
+    let h = &a.review.files[it.file].hunks[it.hunk];
+    (a.name.clone(), h.old_start, h.old_len)
+}
+
+/// A refreshed diff reorders the compose view's hunks. The cursor stays
+/// on its hunk (same agent, same hunk), or on that agent's nearest hunk
+/// when its hunk is gone, and on its file when another file joins the
+/// list before it. Each refresh is waited for, so nothing here depends on
+/// timing.
+fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
+    use maestro_editor::agents::compose;
+    let (_f, mut ed) = compose_two_agents();
+    let at = compose_at;
+    let settled = review_settled;
     let shape = |ed: &Editor| {
         let v = ed.agents.panel.compose.as_ref().expect("the compose view");
         compose::items(ed, v)
@@ -3768,12 +3793,6 @@ fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
             .map(|i| (i.col, i.hunk))
             .collect::<Vec<_>>()
     };
-    // A refresh the test asked for, and any one queued behind it, applied.
-    let settled =
-        |ed: &Editor, i: usize| !agent(ed, i).review.running && !agent(ed, i).review.again;
-    poll_until(&mut ed, "the refreshes C asked for", |ed| {
-        settled(ed, 0) && settled(ed, 1)
-    });
     // Written whole, as an agent's `sed > tmp && mv` does: a refresh never
     // reads it half written.
     let write = |path: PathBuf, text: String| {
@@ -3815,11 +3834,29 @@ fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
         .collect();
     assert_eq!(marked, [(id(&ed, 1), 1, 6)]);
 
-    // beta empties the file: its hunk is gone, and the cursor goes to
-    // beta's nearest hunk, the deletion, not to the item now in its place.
+    // beta changes its line-15 hunk under the cursor: the cursor goes to
+    // beta's hunk nearest to where it was, the new line-15 hunk, not to
+    // beta's first.
+    run(&mut ed, "j");
+    assert_eq!(at(&ed), ("beta-2".into(), 12, 7));
     let beta_wt = worktree(&ed, 1);
-    write(beta_wt.join("calc.txt"), String::new());
+    let text = read(&beta_wt.join("calc.txt")).replace("beta 15", "beta fifteen");
+    write(beta_wt.join("calc.txt"), text);
     let beta = id(&ed, 1);
+    maestro_editor::agents::review::request(&mut ed, beta);
+    poll_until(&mut ed, "beta's refresh with beta fifteen", |ed| {
+        settled(ed, 1)
+            && agent(ed, 1).review.files[0]
+                .hunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.text == "beta fifteen"))
+    });
+    assert_eq!(at(&ed), ("beta-2".into(), 12, 7), "beta's nearest hunk");
+    assert_eq!(ed.agents.panel.compose.as_ref().unwrap().marks.len(), 1);
+
+    // beta empties the file: its hunks are gone, and the cursor goes to
+    // beta's nearest hunk, the deletion, not to the item now in its place.
+    write(beta_wt.join("calc.txt"), String::new());
     maestro_editor::agents::review::request(&mut ed, beta);
     poll_until(&mut ed, "beta's refresh of the empty file", |ed| {
         settled(ed, 1) && agent(ed, 1).review.files[0].hunks[0].new_len == 0
@@ -3842,6 +3879,43 @@ fn compose_view_cursor_stays_on_its_hunk_when_a_diff_refreshes() {
     );
     assert_eq!(v.file, 1, "the view stays on calc.txt");
     assert_eq!(at(&ed), ("beta-2".into(), 1, 30));
+}
+
+/// Archiving empties the agent's review, and its hunks leave the compose
+/// view: the cursor stays on beta's hunk. The view is opened while the
+/// force question is up and its refreshes are waited for, so the archive's
+/// result is the only one left to apply; the order does not depend on
+/// timing.
+fn compose_view_cursor_stays_on_its_hunk_when_an_agent_is_archived() {
+    use maestro_editor::agents::compose;
+    let (_f, mut ed) = compose_two_agents();
+    run(&mut ed, "<esc>");
+    // alpha's worktree has uncommitted changes: archiving asks to force.
+    select(&mut ed, 0);
+    run(&mut ed, "A");
+    run(&mut ed, "y");
+    poll_until(&mut ed, "the force confirmation", |ed| {
+        matches!(&ed.agents.panel.overlay,
+            Some(Overlay::Confirm(c)) if matches!(c.action, ConfirmAction::ForceArchive(_)))
+    });
+    // C under the question: the keys go to the question.
+    let beta = id(&ed, 1);
+    compose::open(&mut ed, beta);
+    poll_until(&mut ed, "the refreshes the view asked for", |ed| {
+        review_settled(ed, 0) && review_settled(ed, 1)
+    });
+    run(&mut ed, "F");
+    assert!(ed.agents.panel.overlay.is_none());
+    assert!(!agent(&ed, 0).archived);
+    run(&mut ed, "l");
+    assert_eq!(compose_at(&ed), ("beta-2".into(), 1, 6));
+    poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
+    assert!(review_settled(&ed, 0) && review_settled(&ed, 1));
+    assert_eq!(
+        compose_at(&ed),
+        ("beta-2".into(), 1, 6),
+        "the cursor stays on beta's first hunk"
+    );
 }
 
 /// An archived agent says "archived" wherever it is listed, offers only

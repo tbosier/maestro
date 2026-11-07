@@ -1073,6 +1073,9 @@ pub fn archive(ed: &mut Editor, id: AgentId, force: bool) {
 
 fn archived(ed: &mut Editor, id: AgentId, forced: bool, removal: Removal) {
     archived_inner(ed, id, forced, removal);
+    // An archived agent's review is emptied and its hunks leave the
+    // compose view; the cursor stays on the hunk it was on.
+    super::compose::refollow(ed);
     super::conflicts::refresh(ed);
 }
 
