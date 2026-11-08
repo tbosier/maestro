@@ -22,6 +22,7 @@ maestro-agent.workspace = true
 maestro-term.workspace = true
 maestro-tasks.workspace = true
 maestro-forge.workspace = true
+jiff.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

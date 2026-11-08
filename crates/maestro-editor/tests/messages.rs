@@ -311,6 +311,88 @@ fn save_refusals_name_the_file_relative_to_the_working_directory() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Set in a child copy of this test binary that runs with its own TZ.
+const TZ_CHILD: &str = "MAESTRO_TEST_TZ_CHILD";
+
+/// A TZif file (RFC 8536, version 2) with no transitions, one local time
+/// type and `rule` as its footer, the way zones are stored on disk.
+fn tzif(utoff: i32, abbr: &str, rule: &str) -> Vec<u8> {
+    let chars = format!("{abbr}\0");
+    let header = |out: &mut Vec<u8>| {
+        out.extend_from_slice(b"TZif2");
+        out.extend_from_slice(&[0; 15]);
+        // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+        for n in [0u32, 0, 0, 0, 1, chars.len() as u32] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+    };
+    let block = |out: &mut Vec<u8>| {
+        out.extend_from_slice(&utoff.to_be_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(chars.as_bytes());
+    };
+    let mut out = Vec::new();
+    header(&mut out);
+    block(&mut out);
+    header(&mut out);
+    block(&mut out);
+    out.extend_from_slice(format!("\n{rule}\n").as_bytes());
+    out
+}
+
+/// Runs the test `name` again in a child copy of this binary with TZ set
+/// to `tz` and TZDIR to a zone database written here, which holds only
+/// America/New_York, so the result does not depend on the machine's own
+/// zone or zoneinfo files. The environment of this process is never
+/// changed, so no other test can see the zone change.
+fn rerun_with_tz(name: &str, tz: &str) {
+    let db = temp_dir("zoneinfo");
+    std::fs::create_dir_all(db.join("America")).unwrap();
+    std::fs::write(
+        db.join("America/New_York"),
+        tzif(-5 * 3600, "EST", "EST5EDT,M3.2.0,M11.1.0"),
+    )
+    .unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1"])
+        .env("TZ", tz)
+        .env("TZDIR", &db)
+        .env(TZ_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "child run with TZ={tz} failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_dir_all(&db).unwrap();
+}
+
+#[test]
+fn messages_shows_local_times_and_names_the_zone() {
+    let name = "messages_shows_local_times_and_names_the_zone";
+    if std::env::var_os(TZ_CHILD).is_none() {
+        rerun_with_tz(name, "America/New_York");
+        rerun_with_tz(name, "Not/A_Zone");
+        return;
+    }
+    let tz = std::env::var("TZ").unwrap();
+    let mut ed = editor();
+    // 2026-09-08T23:21:26Z: 19:21:26 daylight saving time in New York.
+    ed.messages.push_at(Severity::Info, "hello", 1_788_909_686);
+    run(&mut ed, ":messages\n");
+    let text = ed.doc().text().to_string();
+    // The header wraps at spaces in a narrow view; join it back.
+    let flat = text.replace('\n', " ");
+    let (zone, time) = match tz.as_str() {
+        "America/New_York" => ("America/New_York", "19:21:26"),
+        _ => ("UTC (the local time zone could not be read)", "23:21:26"),
+    };
+    assert!(flat.contains(&format!("Times are {zone}.")), "{text}");
+    assert!(text.contains(&format!("{time}  info     hello")), "{text}");
+}
+
 /// Set in a child copy of this test binary that runs with its own HOME.
 const HOME_CHILD: &str = "MAESTRO_TEST_HOME_CHILD";
 
