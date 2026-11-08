@@ -96,6 +96,10 @@ fn main() {
             an_agent_that_changes_nothing_says_so,
         ),
         (
+            "worktree_messages_name_the_worktree_from_home",
+            worktree_messages_name_the_worktree_from_home,
+        ),
+        (
             "dropping_refuses_when_the_worktree_changed_branch",
             dropping_refuses_when_the_worktree_changed_branch,
         ),
@@ -1839,6 +1843,79 @@ fn an_agent_that_changes_nothing_says_so() {
     poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
     assert_eq!(status(&ed, 0), Status::Rejected);
     assert!(!worktree(&ed, 0).exists());
+}
+
+/// The worktree sits inside the working directory here, so the two forms
+/// differ: the history line names it as `~/...` (history is saved and read
+/// back later, when the working directory may be another one) and the
+/// archive status line relative to the working directory. Runs again in a
+/// child copy of this binary with HOME set to the temporary directory the
+/// fixtures live in; this process's environment is never changed.
+fn worktree_messages_name_the_worktree_from_home() {
+    const CHILD: &str = "MAESTRO_TEST_HOME_CHILD";
+    let name = "worktree_messages_name_the_worktree_from_home";
+    if std::env::var_os(CHILD).is_none() {
+        let home = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .arg(name)
+            .env("HOME", &home)
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "child run failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let f = Fixture::new();
+    let mut c = config(&[(
+        "idle",
+        provider(
+            AgentProviderKind::Terminal,
+            "sh",
+            &["-c", "true", "sh", "{task}"],
+        ),
+    )]);
+    c.agents.worktree_dir = Some(".agents".into());
+    let mut ed = f.editor(c);
+    run(&mut ed, " a");
+    start_task(&mut ed, "do nothing", 0);
+    poll_until(&mut ed, "the empty review", |ed| {
+        status(ed, 0) == Status::Completed
+    });
+    let wt = worktree(&ed, 0);
+    assert_eq!(ed.cwd, f.repo);
+    assert!(wt.starts_with(f.repo.join(".agents")), "{wt:?}");
+    let from_home = format!("~/{}", wt.strip_prefix(&home).unwrap().display());
+    let created = format!("worktree {from_home} on branch ");
+    assert!(
+        agent(&ed, 0)
+            .history
+            .iter()
+            .any(|h| h.text.starts_with(&created)),
+        "{:?}",
+        agent(&ed, 0).history
+    );
+    std::fs::write(wt.join("later.txt"), "x\n").unwrap();
+    run(&mut ed, "\nr");
+    poll_until(&mut ed, "the changed review", |ed| {
+        status(ed, 0) == Status::ReadyForReview
+    });
+    std::fs::remove_file(wt.join("later.txt")).unwrap();
+    run(&mut ed, "<esc>X");
+    run(&mut ed, "a");
+    poll_until(&mut ed, "the archive", |ed| agent(ed, 0).archived);
+    let relative = wt.strip_prefix(&f.repo).unwrap().display().to_string();
+    let archived = format!("archived {relative}: worktree removed, branch ");
+    assert!(
+        status_text(&ed).starts_with(&archived),
+        "{}",
+        status_text(&ed)
+    );
 }
 
 /// A drop is refused, changing nothing, when the worktree no longer has

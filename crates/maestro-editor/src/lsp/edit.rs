@@ -111,10 +111,7 @@ pub(crate) fn apply_document_edits(
 }
 
 fn display(ed: &Editor, path: &std::path::Path) -> String {
-    path.strip_prefix(&ed.cwd)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    ed.show_path(path)
 }
 
 /// Checks everything and computes each document's change set, without
@@ -339,7 +336,7 @@ fn execute(ed: &mut Editor, plan: Vec<Planned>) -> Result<Applied, String> {
             }
         };
         if let Err(e) = crate::proposals::apply_versioned(ed, id, p.version, &p.changes) {
-            let name = ed.buffers[&id].doc.display_name();
+            let name = ed.doc_name(&ed.buffers[&id].doc);
             return Err(format!(
                 "{name}: {e}; {} already changed",
                 plural(applied.changed.len(), "other file")

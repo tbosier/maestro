@@ -333,12 +333,14 @@ pub fn resolve(editor: &mut Editor, outcome: Outcome) {
                 PickerAction::Jump(j) => crate::workspaces::jump::go(editor, j),
                 PickerAction::ChangeDir(path) => match std::fs::canonicalize(&path) {
                     Ok(dir) if dir.is_dir() => {
-                        let msg = format!("cwd: {}", dir.display());
+                        let msg = format!("cwd: {}", crate::navigation::home_path(&dir));
                         editor.cwd = dir;
                         editor.info(msg);
                     }
-                    Ok(dir) => editor.error(format!("{} is not a directory", dir.display())),
-                    Err(e) => editor.error(format!("{}: {e}", path.display())),
+                    Ok(dir) => {
+                        editor.error(format!("{} is not a directory", editor.show_path(&dir)))
+                    }
+                    Err(e) => editor.error(format!("{}: {e}", editor.show_path(&path))),
                 },
                 PickerAction::Goto { path, line, column } => {
                     if let Err(e) = editor.open(&path) {

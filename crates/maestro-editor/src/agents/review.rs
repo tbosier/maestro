@@ -332,7 +332,10 @@ pub fn request(ed: &mut Editor, id: AgentId) {
                 )),
                 Err(e) => Err(e.to_string()),
             },
-            Ok(_) => Err(format!("{} is no longer a worktree", w.path.display())),
+            Ok(_) => Err(format!(
+                "{} is no longer a worktree",
+                crate::navigation::home_path(&w.path)
+            )),
             Err(e) => Err(e.to_string()),
         };
         tx.send(move |ed| applied(ed, id, result));
@@ -884,12 +887,12 @@ fn open_at_cursor(ed: &mut Editor, v: &ReviewView, rows: &[Row]) {
         Ok(_) => {
             ed.error(format!(
                 "{} is not a regular file; not opened",
-                path.display()
+                ed.show_path(&path)
             ));
             return;
         }
         Err(e) => {
-            ed.error(format!("{}: {e}", path.display()));
+            ed.error(format!("{}: {e}", ed.show_path(&path)));
             return;
         }
     }

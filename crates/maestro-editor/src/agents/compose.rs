@@ -827,8 +827,10 @@ pub fn create(ed: &mut Editor, plan: ComposePlan) {
                 .commit_on(&tree, &plan.base, &message)
                 .map_err(|e| format!("committing the composed hunks failed: {e}"))?;
             let dir = super::create::worktree_root(&plan.main_root, setting.as_deref());
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                let shown = crate::navigation::home_path(&dir);
+                format!("could not create {shown}: {e}")
+            })?;
             for n in 0..100 {
                 let leaf = if n == 0 {
                     format!("compose-{}", id.0)
@@ -863,6 +865,12 @@ pub fn create(ed: &mut Editor, plan: ComposePlan) {
 }
 
 fn created(ed: &mut Editor, id: AgentId, result: Result<(WorktreeInfo, String), String>) {
+    // Kept in the agent's history, so not relative to today's working
+    // directory.
+    let shown = result
+        .as_ref()
+        .ok()
+        .map(|(info, _)| crate::navigation::home_path(&info.path));
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
@@ -873,7 +881,7 @@ fn created(ed: &mut Editor, id: AgentId, result: Result<(WorktreeInfo, String), 
                 "composed as {} on branch {} in {}",
                 super::create::short(&commit),
                 info.branch,
-                info.path.display()
+                shown.unwrap_or_default()
             ));
             if let Some(c) = &mut a.composition {
                 c.commit = commit;

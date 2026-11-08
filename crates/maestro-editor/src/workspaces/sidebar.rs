@@ -246,7 +246,7 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) -> bool {
             Some(Row::Project { root, expanded, .. }) => set_expanded(ed, root, !expanded),
             Some(Row::Worktree { row, .. }) => {
                 if row.missing {
-                    ed.error(format!("{} is gone", row.path.display()));
+                    ed.error(format!("{} is gone", ed.show_path(&row.path)));
                 } else if super::switch::switch(ed, &row.path) {
                     ed.workspaces.sidebar.focused = false;
                 }

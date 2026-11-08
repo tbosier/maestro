@@ -1077,7 +1077,7 @@ fn goto_location(ed: &mut Editor, uri: &str, range: &Value, files: &Preloaded) {
     // Only open what is already a buffer or was read as a regular file in
     // the background, so a location cannot make the editor block on a FIFO.
     if ed.find_buffer_by_path(&path).is_none() && !files.contains_key(&path) {
-        ed.error(format!("cannot open {}", path.display()));
+        ed.error(format!("cannot open {}", ed.show_path(&path)));
         return;
     }
     // Re-check right before the synchronous open: the background read saw a
@@ -1087,7 +1087,7 @@ fn goto_location(ed: &mut Editor, uri: &str, range: &Value, files: &Preloaded) {
     {
         ed.error(format!(
             "cannot open {}: not a regular file",
-            path.display()
+            ed.show_path(&path)
         ));
         return;
     }
@@ -1448,7 +1448,7 @@ fn retire_server(ed: &mut Editor, id: ServerId, why: &str) {
     let msg = format!(
         "stopped {} for {}: {why}",
         server.name,
-        server.root.display()
+        ed.show_path(&server.root)
     );
     if ed.status.is_none() {
         ed.info(msg.clone());

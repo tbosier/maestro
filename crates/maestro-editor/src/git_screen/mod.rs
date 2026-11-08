@@ -804,7 +804,7 @@ fn open_file(ed: &mut Editor, path: &Path, line: usize) {
     if !path.exists() {
         ed.error(format!(
             "{} does not exist in the working tree",
-            path.display()
+            ed.show_path(path)
         ));
         return;
     }

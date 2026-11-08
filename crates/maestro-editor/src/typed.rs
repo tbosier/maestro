@@ -1053,7 +1053,7 @@ fn goto(ed: &mut Editor, args: &[&str], _: bool) -> Result<(), String> {
 }
 
 fn pwd(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
-    let msg = ed.cwd.display().to_string();
+    let msg = crate::navigation::home_path(&ed.cwd);
     ed.info(msg);
     Ok(())
 }
@@ -1061,12 +1061,14 @@ fn pwd(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
 fn cd(ed: &mut Editor, args: &[&str], _: bool) -> Result<(), String> {
     let target = ed.resolve_path(Path::new(args.first().copied().unwrap_or("~")));
     let target =
-        std::fs::canonicalize(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+        std::fs::canonicalize(&target).map_err(|e| format!("{}: {e}", ed.show_path(&target)))?;
     if !target.is_dir() {
-        return Err(format!("{} is not a directory", target.display()));
+        return Err(format!("{} is not a directory", ed.show_path(&target)));
     }
     ed.cwd = target;
-    let msg = format!("cwd: {}", ed.cwd.display());
+    // Relative to the new directory it would be empty, and relative to the
+    // old one (`../x`) it says where you came from, not where you are.
+    let msg = format!("cwd: {}", crate::navigation::home_path(&ed.cwd));
     ed.info(msg);
     Ok(())
 }
