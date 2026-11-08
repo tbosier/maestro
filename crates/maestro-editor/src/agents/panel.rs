@@ -281,11 +281,7 @@ pub fn close(ed: &mut Editor) {
     p.overlay = None;
 }
 
-/// True when `key` is `C-\`. Terminals send it as the byte 0x1c, which
-/// crossterm reports as `C-4`, so both count.
-pub fn is_toggle(key: KeyEvent) -> bool {
-    key.mods.ctrl && !key.mods.alt && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4'))
-}
+pub use crate::term_input::is_toggle;
 
 /// Handles a key while the panel is open.
 pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
@@ -317,11 +313,10 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
 /// keys, else into an open input line. Dropped otherwise.
 pub fn paste(ed: &mut Editor, text: &str) {
     if let Some(id) = ed.agents.panel.terminal_focus {
-        if let Some(t) = ed.agents.get(id).and_then(|a| a.runtime.terminal()) {
-            let bytes = maestro_term::encode_paste(text, t.bracketed_paste());
-            if let Err(e) = t.write(&bytes) {
-                ed.error(format!("could not paste into the terminal: {e}"));
-            }
+        if let Some(t) = ed.agents.get(id).and_then(|a| a.runtime.terminal())
+            && let Err(e) = crate::term_input::send_paste(t, text)
+        {
+            ed.error(format!("could not paste into the terminal: {e}"));
         }
         return;
     }
@@ -340,46 +335,12 @@ fn send_key_to_terminal(ed: &mut Editor, id: AgentId, key: KeyEvent) {
         ed.agents.panel.terminal_focus = None;
         return;
     };
-    let Some(tk) = term_key(key.code) else {
-        return;
-    };
-    // As in a terminal emulator, typing returns to the live screen.
-    t.scroll(0);
-    let mods = maestro_term::TermMods {
-        ctrl: key.mods.ctrl,
-        alt: key.mods.alt,
-        shift: key.mods.shift,
-    };
-    let bytes = maestro_term::encode_key(tk, mods, t.application_cursor());
-    if let Err(e) = t.write(&bytes) {
+    if let Err(e) = crate::term_input::send_key(&t, key) {
         ed.agents.panel.terminal_focus = None;
         ed.error(format!(
             "the agent's terminal does not take input ({e}); keys are back with the panel"
         ));
     }
-}
-
-fn term_key(code: KeyCode) -> Option<maestro_term::TermKey> {
-    use maestro_term::TermKey as T;
-    Some(match code {
-        KeyCode::Char(c) => T::Char(c),
-        KeyCode::Enter => T::Enter,
-        KeyCode::Esc => T::Esc,
-        KeyCode::Backspace => T::Backspace,
-        KeyCode::Delete => T::Delete,
-        KeyCode::Tab => T::Tab,
-        KeyCode::BackTab => T::BackTab,
-        KeyCode::Left => T::Left,
-        KeyCode::Right => T::Right,
-        KeyCode::Up => T::Up,
-        KeyCode::Down => T::Down,
-        KeyCode::Home => T::Home,
-        KeyCode::End => T::End,
-        KeyCode::PageUp => T::PageUp,
-        KeyCode::PageDown => T::PageDown,
-        KeyCode::Insert => T::Insert,
-        KeyCode::F(n) => T::F(n),
-    })
 }
 
 fn selected_id(ed: &Editor) -> Option<AgentId> {
@@ -617,6 +578,8 @@ pub(crate) fn focus_terminal(ed: &mut Editor, id: AgentId) {
     if let Some(t) = ed.agents.get(id).and_then(|a| a.runtime.terminal()) {
         t.scroll(0);
     }
+    // One terminal has the keys at a time.
+    ed.shell.focused = false;
     let p = &mut ed.agents.panel;
     p.terminal_focus = Some(id);
     p.view = DetailView::Live;

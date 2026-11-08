@@ -275,6 +275,54 @@ fn kill_ends_descendants_that_ignore_hangup() {
     }
 }
 
+/// The process group and session of `pid`, from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn group_and_session(pid: u32) -> (u32, u32) {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // After the command name in parentheses: state, ppid, pgrp, session.
+    let rest = &stat[stat.rfind(')').unwrap() + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    (fields[2].parse().unwrap(), fields[3].parse().unwrap())
+}
+
+/// A shell with job control (an interactive one, or `set -m`) puts each job
+/// in a process group of its own. A job that ignores SIGHUP used to outlive
+/// the kill; kill signals the whole session too.
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_ends_jobs_in_process_groups_of_their_own() {
+    let h = sh(
+        "set -m; sh -c 'trap \"\" HUP; echo job=$$; while :; do sleep 1; done' & wait",
+        SIZE,
+    );
+    h.wait_for("the job's pid", |t| {
+        t.snapshot().row_text(0).starts_with("job=")
+    });
+    let pid: u32 = h.term.snapshot().row_text(0)["job=".len()..]
+        .trim()
+        .parse()
+        .unwrap();
+    let (group, session) = group_and_session(pid);
+    assert_ne!(group, session, "the job should lead a group of its own");
+    h.term.kill().unwrap();
+    h.wait_for_exit();
+    // Gone, or a zombie waiting for whoever adopted it to reap it: either
+    // way it no longer runs.
+    let running = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            let state = stat[stat.rfind(')').unwrap() + 1..]
+                .split_whitespace()
+                .next();
+            state != Some("Z")
+        })
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    while running() {
+        assert!(Instant::now() < deadline, "job {pid} survived the kill");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn input_echoes_through_cat() {
     let h = start_spec(&spec("cat", &[]), SIZE);

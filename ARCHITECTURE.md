@@ -30,7 +30,7 @@ maestro-cli ──► maestro-tui ──► maestro-editor ──► maestro-cor
 
 `maestro-editor` runs `maestro-forge` only on background threads (`forge/`); `maestro-tui` draws the inbox (`src/inbox.rs`) and reuses the agent review's diff rows for pull request diffs.
 
-`maestro-editor` uses the agent crates (`maestro-agent`, `maestro-term`, `maestro-tasks`) for the agent panel in `src/agents/`; `maestro-tui` draws it (`src/agents.rs`). ADR 0006 records how they fit together and `docs/agent-model.md` what the panel does. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
+`maestro-editor` uses the agent crates (`maestro-agent`, `maestro-term`, `maestro-tasks`) for the agent panel in `src/agents/`; `maestro-tui` draws it (`src/agents.rs`). The shell pane (`src/shell.rs` in both crates) runs the user's shell in a `maestro-term` terminal, and shares key and paste encoding with agent terminals (`maestro-editor/src/term_input.rs`). ADR 0006 records how they fit together and `docs/agent-model.md` what the panel does. ADR 0001 explains why the spec's `vesper-command` became `maestro-editor`.
 
 ## Rules
 

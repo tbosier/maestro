@@ -63,6 +63,7 @@ cargo build --release
 | `space g` | Git status |
 | `space s` | projects and worktrees (`a` adds a project) |
 | `space t` | file tree, with the files your branch changed marked (`c` only those, `d` diff) |
+| `space o` | a shell under the views (`C-\` moves the keys between it and the editor) |
 | `space j` | jump to a project, worktree, agent or buffer |
 | `space i` | GitHub inbox |
 

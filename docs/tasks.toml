@@ -311,3 +311,13 @@ status = "done"
 # 200, repeats counted). The status line ends a cut message with
 # "… (:messages)". Reload, :w, :wa, :q, :bd and the integrate unsaved-edits
 # refusal name files relative to the working directory.
+
+[[task]]
+id = "feat-shell-pane"
+title = "One shell in a pane under the views: space o or :term, C-\\ moves the keys, the exit is reported, quitting ends it"
+crates = ["maestro-editor", "maestro-tui", "maestro-term"]
+branch = "feat/shell-pane"
+owner = "agent"
+status = "done"
+# Several shells and a shell per worktree are not started (ROADMAP.md, Shell
+# pane). maestro-term now signals the program's session too, through pkill.

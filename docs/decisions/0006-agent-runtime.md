@@ -64,7 +64,7 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8>;
 
 Each terminal runs three threads: a reader (PTY to parser), a writer (input queue to PTY) and a waiter that owns the child. The emulator answers cursor position (`CSI 6 n`), device status (`CSI 5 n`) and device attribute (`CSI c`, `CSI > c`) queries itself, because some programs wait seconds for those answers before they draw anything.
 
-Kill and drop signal the program's process group through kill(1): SIGHUP, 200 ms, then SIGKILL. Known gaps: a descendant that left the group (a daemon, `setsid`) is not reached. portable-pty starts the program in `$HOME` if the working directory vanishes between the check and the spawn. The cursor position reply ignores origin mode (DECOM), because vt100 does not expose the scroll region.
+Kill and drop signal the program's process group through kill(1): SIGHUP, 200 ms, then SIGKILL. Known gaps: a descendant that left the group (a daemon, `setsid`) is not reached. Amended (feat/shell-pane): the program's session is signaled too, through pkill(1), with the same signals at the same times, because an interactive shell puts each job in a process group of its own; only a descendant that started a session of its own is not reached, and without pkill only the group is signaled. portable-pty starts the program in `$HOME` if the working directory vanishes between the check and the spawn. The cursor position reply ignores origin mode (DECOM), because vt100 does not expose the scroll region.
 
 ## `maestro-agent`
 

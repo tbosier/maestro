@@ -242,6 +242,8 @@ pub struct Editor {
     pub workspaces: crate::workspaces::Workspaces,
     /// The GitHub inbox (see [`crate::forge`]).
     pub forge: crate::forge::Forge,
+    /// The shell pane under the views (see [`crate::shell`]).
+    pub shell: crate::shell::ShellPane,
     jobs_tx: std::sync::mpsc::Sender<Job>,
     jobs_rx: std::sync::mpsc::Receiver<Job>,
     active_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -297,6 +299,7 @@ impl Editor {
             proposals: Default::default(),
             workspaces: Default::default(),
             forge: Default::default(),
+            shell: Default::default(),
             jobs_tx,
             jobs_rx,
             active_jobs: Default::default(),
@@ -307,7 +310,7 @@ impl Editor {
         let view = editor.new_view(doc);
         editor.layout = Layout::new(view);
         editor.focus = view;
-        editor.relayout();
+        editor.resize(area);
         editor
     }
 
@@ -821,9 +824,43 @@ impl Editor {
 
     // ----- geometry -------------------------------------------------------
 
-    pub fn resize(&mut self, area: Rect) {
-        self.area = area;
+    /// Gives the editor `region`: the rows and columns the views share with
+    /// the shell pane under them (see [`crate::shell`]). The views get what
+    /// the pane leaves, as [`Editor::area`]; the sidebar and the file tree
+    /// are as tall as the region.
+    pub fn resize(&mut self, region: Rect) {
+        self.shell.region = region;
+        let pane = self.shell.area();
+        if pane.is_none() {
+            // A pane with no room takes the keys back for good, so they do
+            // not jump to it when the window grows again.
+            self.shell.focused = false;
+        }
+        self.area = crate::shell::views_area(region, pane);
         self.relayout();
+        crate::shell::fit(self);
+    }
+
+    /// Readies the editor for a terminal taking the keys: closes the
+    /// completion popup, ends insert mode as Escape would (so the insert
+    /// session is one change for `.`), and drops a half-typed key sequence
+    /// so it cannot complete when the keys come back.
+    pub(crate) fn hand_keys_to_terminal(&mut self) {
+        crate::lsp::completion::close(self);
+        if self.mode == Mode::Insert {
+            self.handle_key(KeyEvent::plain(KeyCode::Esc));
+        }
+        self.pending_char = None;
+        self.awaiting_register = false;
+        self.pending.clear();
+        self.count = None;
+        self.selected_register = None;
+    }
+
+    /// The region last given to [`Editor::resize`]: the views' area plus
+    /// the shell pane's rows when it is shown.
+    pub fn region(&self) -> Rect {
+        self.shell.region
     }
 
     pub fn relayout(&mut self) {
@@ -922,6 +959,24 @@ impl Editor {
 
     /// Handles one key press.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Keys for the shell pane skip the editor's bookkeeping: they are
+        // not part of a change `.` repeats, a macro or an insert session.
+        // While the shell has the keys every key goes to it (C-\ gives
+        // them back); from the editor, C-\ gives them to the shown shell.
+        if self.shell.has_focus() {
+            crate::shell::handle_key(self, key);
+            return;
+        }
+        if self.pending.is_empty()
+            && self.pending_char.is_none()
+            && !self.awaiting_register
+            && self.prompt.is_none()
+            && self.picker.is_none()
+            && crate::shell::takes_keys_on(self, key)
+        {
+            crate::shell::focus(self);
+            return;
+        }
         if let Some((_, keys)) = &mut self.recording {
             keys.push(key);
         }
@@ -1276,6 +1331,14 @@ impl Editor {
 
     /// Handles a mouse event at screen cell (x, y).
     pub fn handle_mouse(&mut self, kind: MouseKind, x: u16, y: u16) {
+        // The shell pane under the views. A click outside it takes the
+        // keys back from the shell and goes on to what is there.
+        if self.picker.is_none()
+            && self.prompt.is_none()
+            && crate::shell::handle_mouse(self, kind, x, y)
+        {
+            return;
+        }
         // The file tree's column, and its diff over the views.
         if self.picker.is_none()
             && self.prompt.is_none()
@@ -1385,6 +1448,10 @@ impl Editor {
         }
         if self.prompt.is_some() {
             crate::prompt::insert_text(self, text);
+            return;
+        }
+        if self.shell.has_focus() {
+            crate::shell::paste(self, text);
             return;
         }
         if self.workspaces.sidebar.has_focus() {
@@ -1523,7 +1590,7 @@ impl Editor {
             self.ensure_cursor_visible();
         }
         // Terminal output only wakes the loop; this notices it.
-        let changed = crate::agents::poll(self) || ran;
+        let changed = crate::agents::poll(self) | crate::shell::poll(self) || ran;
         crate::workspaces::check_attention(self) || changed
     }
 

@@ -385,6 +385,7 @@ impl Keymaps {
             .chain(crate::workspaces::DEFAULT_KEYS)
             .chain(crate::forge::DEFAULT_KEYS)
             .chain(crate::git_screen::DEFAULT_KEYS)
+            .chain(crate::shell::DEFAULT_KEYS)
         {
             g(&mut normal, k, "space", c);
         }

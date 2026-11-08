@@ -17,10 +17,15 @@
 //! `CSI 65535 b` (repeat) asks the parser for about four million characters.
 //!
 //! Known gaps, all on Unix:
-//! - Kill and drop signal the program's process group (SIGHUP, 200 ms, then
-//!   SIGKILL) through kill(1). A descendant that moved itself to another
-//!   process group or session (a daemon, `setsid`) is not reached, and keeps
-//!   the PTY and the reader thread alive if it holds the terminal open.
+//! - Kill and drop signal the program's process group through kill(1), and
+//!   every process in its session through pkill(1) (SIGHUP, 200 ms, then
+//!   SIGKILL), so the jobs an interactive shell puts in process groups of
+//!   their own end too. A descendant that started a session of its own (a
+//!   daemon, `setsid`) is not reached, and keeps the PTY and the reader
+//!   thread alive if it holds the terminal open. Without pkill only the
+//!   process group is signaled. pkill lists the session's processes and then
+//!   signals them by pid, so a member that exits and has its pid reused in
+//!   that moment could be signaled instead.
 //! - portable-pty starts the program in `$HOME` when the working directory is
 //!   missing. `spawn` checks the directory just before spawning, which narrows
 //!   but does not close that window.
@@ -547,16 +552,20 @@ fn wait_for_child(
             drop(control);
             kill_sent = true;
             // The child leads its own session (portable-pty calls setsid),
-            // so its process group id is its pid. Signal the whole group:
-            // SIGHUP, a grace period, then SIGKILL, so descendants that
-            // ignore SIGHUP end too. The child has not been reaped yet (no
+            // so its process group id and its session id are its pid.
+            // Signal the whole group, and the whole session for the jobs a
+            // shell with job control moves to groups of their own: SIGHUP,
+            // a grace period, then SIGKILL, so descendants that ignore
+            // SIGHUP end too. The child has not been reaped yet (no
             // try_wait since the check above), so its pid, and with it the
-            // group id, cannot have been reused. This blocks only this
-            // thread.
+            // group and session ids, cannot have been reused. This blocks
+            // only this thread.
             if let Some(pid) = child.process_id() {
                 signal_group("HUP", pid);
+                signal_session("HUP", pid);
                 thread::sleep(KILL_GRACE);
                 signal_group("KILL", pid);
+                signal_session("KILL", pid);
             }
             // Then portable-pty's own kill for the child, which also reaps.
             let _ = child.kill();
@@ -594,6 +603,22 @@ fn signal_group(signal: &str, pgid: u32) {
     }
     #[cfg(not(unix))]
     let _ = (signal, pgid);
+}
+
+/// Sends `signal` to every process in session `sid` through pkill(1), for
+/// the same reason as [`signal_group`]. Does nothing when pkill is missing.
+fn signal_session(signal: &str, sid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args([format!("-{signal}"), "-s".into(), sid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    let _ = (signal, sid);
 }
 
 fn exit_info(status: &portable_pty::ExitStatus) -> ExitInfo {
