@@ -1,6 +1,6 @@
 //! `:` commands.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use maestro_core::document::SaveError;
 use maestro_core::{Change, ChangeSet, Transaction};
@@ -527,6 +527,8 @@ pub fn execute_line(editor: &mut Editor, line: &str) {
 }
 
 fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<(), String> {
+    // A new name is taken only once the write succeeds.
+    let mut new_name = None;
     if let Some(p) = path {
         let target = editor.resolve_path(Path::new(p));
         let same = editor.doc().path().is_some_and(|cur| {
@@ -545,29 +547,31 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
                     editor.show_path(&target)
                 ));
             }
-            editor.buffer_mut().doc.set_path(target);
-            editor.refresh_syntax(editor.view().doc);
+            new_name = Some(target);
         }
     }
-    let cwd = editor.cwd.clone();
     let (view, buf) = editor.current();
     let sel = view.selection.clone();
-    let old_path: Option<PathBuf> = buf.doc.path().map(Path::to_path_buf);
-    match buf.doc.save(&sel, force) {
+    let result = match new_name.clone() {
+        Some(p) => buf.doc.save_as(p, &sel, force),
+        None => buf.doc.save(&sel, force),
+    };
+    match result {
         Ok(()) => {
+            let id = editor.view().doc;
+            if new_name.is_some() {
+                editor.refresh_syntax(id);
+            }
+            let name = editor.doc_name(editor.doc());
+            let (_, buf) = editor.current();
             buf.disk_change_reported = false;
             buf.recovery_version = None;
-            let name = buf
-                .doc
-                .path()
-                .map(|p| crate::navigation::display_path(p, &cwd))
-                .unwrap_or_else(|| buf.doc.display_name());
+            let written = buf.doc.path().map(Path::to_path_buf);
             let lines = crate::motion::last_line(buf.doc.text().slice(..)) + 1;
             let bytes = buf.doc.text().len_bytes();
-            if let (Some(dir), Some(p)) = (editor.recovery_dir.clone(), old_path) {
+            if let (Some(dir), Some(p)) = (editor.recovery_dir.clone(), written) {
                 crate::recovery::remove(&dir, &p, &editor.session_id);
             }
-            let id = editor.view().doc;
             // A new name means a new document for the server.
             crate::lsp::reconcile(editor);
             crate::lsp::document_saved(editor, id);
@@ -576,11 +580,12 @@ fn save_current(editor: &mut Editor, path: Option<&str>, force: bool) -> Result<
         }
         Err(SaveError::NoPath) => Err("no file name; use :w <path>".into()),
         Err(e) => {
-            let name = buf
-                .doc
-                .path()
-                .map(|p| crate::navigation::display_path(p, &cwd))
-                .unwrap_or_else(|| buf.doc.display_name());
+            // Name the file the write was aimed at, which after a failed
+            // `:w <path>` is not the buffer's own name.
+            let name = match &new_name {
+                Some(p) => editor.show_path(p),
+                None => editor.doc_name(editor.doc()),
+            };
             Err(save_error(&name, &e))
         }
     }
@@ -593,7 +598,7 @@ fn save_error(name: &str, e: &SaveError) -> String {
         SaveError::ExternallyModified(_) => {
             format!("{name} changed on disk since it was opened; use :w! to overwrite or :reload")
         }
-        e => e.to_string(),
+        e => format!("{name}: {e}"),
     }
 }
 
@@ -638,12 +643,7 @@ fn write_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
                     .path()
                     .map(|p| crate::navigation::display_path(p, &ed.cwd))
                     .unwrap_or_else(|| buf.doc.display_name());
-                let why = match e {
-                    // Already names the file.
-                    SaveError::ExternallyModified(_) => save_error(&name, &e),
-                    e => format!("{name}: {e}"),
-                };
-                errors.push(why);
+                errors.push(save_error(&name, &e));
             }
         }
     }
