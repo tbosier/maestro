@@ -505,7 +505,10 @@ pub(crate) fn start_dir(ed: &Editor) -> PathBuf {
 pub(crate) fn find_repo(git: &Git, start: &Path) -> Result<Repository, String> {
     match git.discover(start) {
         Ok(Some(r)) => Ok(r),
-        Ok(None) => Err(format!("{} is not in a Git repository", start.display())),
+        Ok(None) => Err(format!(
+            "{} is not in a Git repository",
+            crate::navigation::home_path(start)
+        )),
         Err(e) => Err(e.to_string()),
     }
 }

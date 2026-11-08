@@ -481,7 +481,7 @@ pub fn load_file(path: &str, cwd: &Path) -> Result<Contract, String> {
         let p = crate::editor::expand_tilde(Path::new(path));
         if p.is_absolute() { p } else { cwd.join(p) }
     };
-    let shown = full.display();
+    let shown = crate::navigation::display_path(&full, cwd);
     match std::fs::metadata(&full) {
         Ok(m) if !m.is_file() => return Err(format!("{shown} is not a regular file")),
         Ok(m) if m.len() > MAX_FILE_BYTES => {

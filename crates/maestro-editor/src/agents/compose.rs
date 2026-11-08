@@ -57,6 +57,11 @@ pub struct ComposeView {
     pub file: usize,
     /// Index into [`items`] of the current file.
     pub cursor: usize,
+    /// The file shown and the hunk under the cursor, by identity. A
+    /// refreshed review can add files and hunks before them, so after one
+    /// `follow` finds them again instead of trusting the indexes.
+    pub path: Option<PathBuf>,
+    pub at: Option<(AgentId, HunkKey)>,
     /// First row of the grid shown.
     pub top: usize,
     pub marks: Vec<(AgentId, Mark)>,
@@ -191,16 +196,20 @@ pub fn open(ed: &mut Editor, id: AgentId) {
     for i in &ids {
         super::review::request(ed, *i);
     }
-    ed.agents.panel.compose = Some(ComposeView {
+    let mut v = ComposeView {
         group,
         agents: ids,
         file: 0,
         cursor: 0,
+        path: None,
+        at: None,
         top: 0,
         marks: Vec::new(),
         problems: Vec::new(),
         checking: false,
-    });
+    };
+    remember(ed, &mut v);
+    ed.agents.panel.compose = Some(v);
 }
 
 /// Every path any column's agent changed, sorted.
@@ -238,7 +247,7 @@ pub fn items(ed: &Editor, v: &ComposeView) -> Vec<Item> {
         // Every entry of the path: a file whose type changed is a deletion
         // and an addition of one path.
         for (fi, f) in a.review.files.iter().enumerate() {
-            if f.path() != Some(&path) || unmarkable(f).is_some() || a.review.is_test_made(f) {
+            if f.path() != Some(&path) || unmarkable(f).is_some() || a.review.is_test_made(fi) {
                 continue;
             }
             for (hi, h) in f.hunks.iter().enumerate() {
@@ -276,6 +285,105 @@ fn key_of(ed: &Editor, it: &Item) -> Option<(HunkKey, DiffFile)> {
     let f = a.review.files.get(it.file)?;
     let h = f.hunks.get(it.hunk)?;
     Some((HunkKey::of(f, h), f.clone()))
+}
+
+/// The item's hunk, without copying its file as [`key_of`] does.
+fn hunk_key(ed: &Editor, it: &Item) -> Option<HunkKey> {
+    let f = ed.agents.get(it.agent)?.review.files.get(it.file)?;
+    Some(HunkKey::of(f, f.hunks.get(it.hunk)?))
+}
+
+/// Where the item's hunk starts in the base file.
+fn old_start(ed: &Editor, it: &Item) -> usize {
+    ed.agents
+        .get(it.agent)
+        .and_then(|a| a.review.files.get(it.file))
+        .and_then(|f| f.hunks.get(it.hunk))
+        .map_or(0, |h| h.old_start)
+}
+
+/// Notes the file shown and the hunk under the cursor, for [`follow`].
+fn remember(ed: &Editor, v: &mut ComposeView) {
+    v.path = files(ed, v).get(v.file).cloned();
+    v.at = items(ed, v)
+        .get(v.cursor)
+        .and_then(|it| hunk_key(ed, it).map(|key| (it.agent, key)));
+}
+
+/// [`follow`] for the open compose view, after an agent's review changed.
+pub(crate) fn refollow(ed: &mut Editor) {
+    if let Some(mut v) = ed.agents.panel.compose.take() {
+        follow(ed, &mut v);
+        ed.agents.panel.compose = Some(v);
+    }
+}
+
+/// Puts the view back on the file and hunk it showed after the agents'
+/// reviews changed: every refresh recomputes the files and hunks, and the
+/// same index can then name another file or another agent's hunk. When
+/// the hunk is gone (its agent changed it), the cursor goes to the hunk
+/// of the same agent in the file nearest to where it started; when that
+/// agent has no hunk left in the file, to the nearest hunk of any agent,
+/// which is then the one remembered. When the file is gone, the cursor
+/// goes to the first hunk of the file now in its place.
+pub(crate) fn follow(ed: &Editor, v: &mut ComposeView) {
+    let files = files(ed, v);
+    let same_file = match v
+        .path
+        .as_ref()
+        .and_then(|p| files.iter().position(|f| f == p))
+    {
+        Some(i) => {
+            v.file = i;
+            true
+        }
+        None => {
+            v.file = v.file.min(files.len().saturating_sub(1));
+            false
+        }
+    };
+    let items = items(ed, v);
+    let found = match (&v.at, same_file) {
+        (Some((agent, key)), true) => {
+            let here = |n: usize| {
+                items[n].agent == *agent && hunk_key(ed, &items[n]).as_ref() == Some(key)
+            };
+            // The current index first, in case two items look the same.
+            (v.cursor < items.len() && here(v.cursor))
+                .then_some(v.cursor)
+                .or_else(|| (0..items.len()).find(|&n| here(n)))
+                .or_else(|| {
+                    let col = v.agents.iter().position(|a| a == agent).unwrap_or(0);
+                    (0..items.len()).min_by_key(|&n| {
+                        (
+                            items[n].agent != *agent,
+                            old_start(ed, &items[n]).abs_diff(key.old_start),
+                            items[n].col.abs_diff(col),
+                        )
+                    })
+                })
+        }
+        _ => None,
+    };
+    if !same_file {
+        v.top = 0;
+    }
+    v.cursor = found.unwrap_or(0);
+    remember(ed, v);
+    keep_visible(ed, v);
+}
+
+/// Scrolls the grid so the cursor's hunk is on screen, or to the top
+/// when there is none (the notes say why).
+fn keep_visible(ed: &Editor, v: &mut ComposeView) {
+    let g = grid(ed, v);
+    let height = grid_height(ed.area);
+    match g.item_rows.get(v.cursor) {
+        Some(&row) if row < v.top => v.top = row,
+        Some(&row) if row >= v.top + height => v.top = row + 1 - height,
+        Some(_) => {}
+        None => v.top = 0,
+    }
 }
 
 /// The side-by-side grid of the current file.
@@ -358,6 +466,8 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
     let Some(mut v) = ed.agents.panel.compose.clone() else {
         return;
     };
+    // Keys act on the hunk the cursor was left on, whatever changed since.
+    follow(ed, &mut v);
     let items = items(ed, &v);
     let nfiles = files(ed, &v).len();
     let ctrl = key.mods.ctrl;
@@ -367,6 +477,7 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
             return;
         }
         KeyCode::Char('?') => {
+            ed.agents.panel.compose = Some(v);
             super::panel::show_keys(ed);
             return;
         }
@@ -434,16 +545,8 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) {
         KeyCode::Char(':') if !ctrl => crate::prompt::open(ed, crate::prompt::PromptKind::Command),
         _ => {}
     }
-    // Keep the cursor's hunk on screen.
-    let g = grid(ed, &v);
-    let height = grid_height(ed.area);
-    if let Some(&row) = g.item_rows.get(v.cursor) {
-        if row < v.top {
-            v.top = row;
-        } else if row >= v.top + height {
-            v.top = row + 1 - height;
-        }
-    }
+    remember(ed, &mut v);
+    keep_visible(ed, &mut v);
     if ed.agents.panel.compose.is_some() {
         ed.agents.panel.compose = Some(v);
     }
@@ -724,8 +827,10 @@ pub fn create(ed: &mut Editor, plan: ComposePlan) {
                 .commit_on(&tree, &plan.base, &message)
                 .map_err(|e| format!("committing the composed hunks failed: {e}"))?;
             let dir = super::create::worktree_root(&plan.main_root, setting.as_deref());
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                let shown = crate::navigation::home_path(&dir);
+                format!("could not create {shown}: {e}")
+            })?;
             for n in 0..100 {
                 let leaf = if n == 0 {
                     format!("compose-{}", id.0)
@@ -760,6 +865,12 @@ pub fn create(ed: &mut Editor, plan: ComposePlan) {
 }
 
 fn created(ed: &mut Editor, id: AgentId, result: Result<(WorktreeInfo, String), String>) {
+    // Kept in the agent's history, so not relative to today's working
+    // directory.
+    let shown = result
+        .as_ref()
+        .ok()
+        .map(|(info, _)| crate::navigation::home_path(&info.path));
     let Some(a) = ed.agents.get_mut(id) else {
         return;
     };
@@ -770,7 +881,7 @@ fn created(ed: &mut Editor, id: AgentId, result: Result<(WorktreeInfo, String), 
                 "composed as {} on branch {} in {}",
                 super::create::short(&commit),
                 info.branch,
-                info.path.display()
+                shown.unwrap_or_default()
             ));
             if let Some(c) = &mut a.composition {
                 c.commit = commit;

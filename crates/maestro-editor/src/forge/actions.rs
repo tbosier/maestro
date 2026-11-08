@@ -738,7 +738,10 @@ fn worktree_job(
     let repo = git
         .discover(cwd)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("{} is not in a Git repository", cwd.display()))?;
+        .ok_or_else(|| {
+            let shown = crate::navigation::home_path(cwd);
+            format!("{shown} is not in a Git repository")
+        })?;
     let trees = repo.worktrees().map_err(|e| e.to_string())?;
     let main = trees
         .first()
@@ -751,14 +754,14 @@ fn worktree_job(
         Ok(name) => {
             return Err(format!(
                 "{} is a clone of {name}, not of {}; nothing was checked out",
-                main.display(),
+                crate::navigation::display_path(&main, cwd),
                 pr.repo
             ));
         }
         Err(why) => {
             return Err(format!(
                 "{} is not a GitHub repository ({why}); nothing was checked out",
-                main.display()
+                crate::navigation::display_path(&main, cwd)
             ));
         }
     }
@@ -771,13 +774,13 @@ fn worktree_job(
         Some(_) => {
             return Err(format!(
                 "{} is already a worktree on another branch; not touched",
-                path.display()
+                crate::navigation::display_path(&path, cwd)
             ));
         }
         None if path.exists() => {
             return Err(format!(
                 "{} already exists and is not a worktree of this repository; not touched",
-                path.display()
+                crate::navigation::display_path(&path, cwd)
             ));
         }
         None => {
@@ -788,7 +791,9 @@ fn worktree_job(
                 ));
             }
             let cmd = maestro_forge::checkout_command(pr, &branch, &path, &main);
-            gh.run(&cmd).map_err(|e| e.to_string())?;
+            // gh adds a worktree; agents may be adding theirs at once.
+            repo.with_worktree_lock(|| gh.run(&cmd))
+                .map_err(|e| e.to_string())?;
             false
         }
     };
@@ -811,14 +816,17 @@ fn worktree_done(ed: &mut Editor, pr: PrRef, r: WorktreeResult) {
             let msg = format!(
                 "{pr} {how} on branch {} in {}",
                 pr_branch(&pr),
-                path.display()
+                ed.show_path(&path)
             );
             match file {
                 Some(f) => {
                     super::screen::close(ed);
                     match ed.open(&f) {
                         Ok(_) => ed.info(msg),
-                        Err(e) => ed.error(format!("{msg}; could not open {}: {e}", f.display())),
+                        Err(e) => {
+                            let shown = ed.show_path(&f);
+                            ed.error(format!("{msg}; could not open {shown}: {e}"))
+                        }
                     }
                 }
                 None => ed.info(format!("{msg}; no file to open there")),

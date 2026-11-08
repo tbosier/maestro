@@ -94,6 +94,12 @@ pub enum ConfirmAction {
         how: Integration,
         facts: Box<super::actions::IntegrateFacts>,
     },
+    /// `y` rebases the agent's work onto the branch `I` integrates into;
+    /// offered when `I` refused because its base is not on that branch.
+    Rebase {
+        agent: AgentId,
+        facts: Box<super::rebase::RebaseFacts>,
+    },
     /// `y` removes the worktree (refused if it has work in it).
     Archive(AgentId),
     /// `F` force-removes the worktree, deleting what `lines` lists.
@@ -1097,6 +1103,9 @@ fn confirm_key(ed: &mut Editor, c: Confirm, key: KeyEvent) {
                 Vec::new(),
             );
         }
+        (ConfirmAction::Rebase { agent, facts }, Some('y'), _) => {
+            super::rebase::rebase(ed, *agent, (**facts).clone())
+        }
         (ConfirmAction::Archive(id), Some('y'), _) => super::actions::archive(ed, *id, false),
         (ConfirmAction::ForceArchive(id), Some('F'), _) => super::actions::archive(ed, *id, true),
         (ConfirmAction::Forget(id), Some('y'), _) => super::actions::forget(ed, *id),
@@ -1199,16 +1208,19 @@ pub fn hints(ed: &Editor) -> Vec<(&'static str, &'static str)> {
                 ("t", Some(a)) => actions::test_blocker(ed, a).is_none(),
                 ("I", Some(a)) => actions::integrate_blocker(a).is_none(),
                 ("X", Some(a)) => actions::reject_blocker(a).is_none(),
-                ("D", Some(a)) => actions::drop_blocker(a).is_none(),
-                ("c", Some(a)) => actions::found_refusal(a).is_none(),
-                // K applies to a file the test run created, between runs.
-                ("K", Some(a)) => {
-                    !a.tests_running()
-                        && a.review
-                            .files
-                            .get(v.file)
-                            .is_some_and(|f| a.review.is_test_made(f))
+                // Not on the test run's change to a tracked file.
+                ("D", Some(a)) => {
+                    actions::drop_blocker(a).is_none()
+                        && !(a.review.is_test_made(v.file)
+                            && a.review
+                                .files
+                                .get(v.file)
+                                .is_some_and(|f| f.change != maestro_git::FileChange::Added))
                 }
+                ("c", Some(a)) => actions::found_refusal(a).is_none(),
+                // K applies to a file the test run created or changed,
+                // between runs.
+                ("K", Some(a)) => !a.tests_running() && a.review.is_test_made(v.file),
                 _ => true,
             })
             .collect();

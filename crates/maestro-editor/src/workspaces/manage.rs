@@ -174,13 +174,13 @@ pub(crate) fn load(ed: &mut Editor) {
     match read(&file) {
         Ok(Some(list)) => ed.workspaces.saved = list,
         Ok(None) => {}
-        Err(why) => ed.set_status(
-            Severity::Warning,
-            format!(
-                "ignored {}: {why}; adding or forgetting a project replaces it",
-                file.display()
-            ),
-        ),
+        Err(why) => {
+            let shown = ed.show_path(&file);
+            ed.set_status(
+                Severity::Warning,
+                format!("ignored {shown}: {why}; adding or forgetting a project replaces it"),
+            )
+        }
     }
 }
 
@@ -227,7 +227,7 @@ fn save(ed: &mut Editor, root: &Path, change: impl Fn(&mut ProjectList)) -> Save
     let written = match toml::to_string(&body) {
         Ok(t) if t.len() as u64 > MAX_BYTES => Err("the list would be larger than 1 MiB".into()),
         Ok(t) => crate::navigation::session::write_private(&file, t.as_bytes(), true)
-            .map_err(|e| format!("could not write {}: {e}", file.display())),
+            .map_err(|e| format!("could not write {}: {e}", ed.show_path(&file))),
         Err(e) => Err(e.to_string()),
     };
     ed.workspaces.saved_unwritten = written.is_err();
@@ -312,8 +312,8 @@ pub fn add(ed: &mut Editor, input: &str) {
         tx.send(move |ed| finish_add(ed, &checked, generation, found));
     });
     match spawned {
-        Ok(()) => ed.info(format!("checking {}…", dir.display())),
-        Err(e) => ed.error(format!("could not check {}: {e}", dir.display())),
+        Ok(()) => ed.info(format!("checking {}…", ed.show_path(&dir))),
+        Err(e) => ed.error(format!("could not check {}: {e}", ed.show_path(&dir))),
     }
 }
 
@@ -326,7 +326,7 @@ fn finish_add(
     let (project, canonical) = match found {
         Ok(p) => p,
         Err(why) => {
-            let shown = dir.display();
+            let shown = ed.show_path(dir);
             ed.error(match why {
                 Unusable::Missing => format!("no such directory: {shown}"),
                 Unusable::NotDirectory => format!("not a directory: {shown}"),
@@ -347,7 +347,7 @@ fn finish_add(
     if root.to_str().is_none() {
         ed.error(format!(
             "cannot keep a project whose path is not valid UTF-8: {}",
-            root.display()
+            ed.show_path(&root)
         ));
         return;
     }
@@ -411,7 +411,7 @@ fn finish_add(
 /// forgotten.
 pub fn forget(ed: &mut Editor, root: &Path) {
     let Some(p) = ed.workspaces.projects.iter().find(|p| p.root == root) else {
-        ed.error(format!("{} is not in the list", root.display()));
+        ed.error(format!("{} is not in the list", ed.show_path(root)));
         return;
     };
     let name = p.name.clone();
@@ -424,7 +424,7 @@ pub fn forget(ed: &mut Editor, root: &Path) {
         .any(|a| a.worktree.as_ref().is_some_and(|w| w.main_root == root));
     if ed.workspaces.configured.iter().any(|c| c == root) {
         let file = match &ed.workspaces.config_path {
-            Some(f) => f.display().to_string(),
+            Some(f) => ed.show_path(f),
             None => "the config file".into(),
         };
         ed.error(format!(
@@ -544,7 +544,7 @@ fn find(ed: &Editor, want: &str) -> Result<PathBuf, String> {
         [one] => return Ok(one.root.clone()),
         [] => {}
         many => {
-            let paths: Vec<String> = many.iter().map(|p| p.root.display().to_string()).collect();
+            let paths: Vec<String> = many.iter().map(|p| ed.show_path(&p.root)).collect();
             return Err(format!(
                 "{} projects are named {want}: {}; give the path instead",
                 many.len(),

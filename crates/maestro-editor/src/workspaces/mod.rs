@@ -288,7 +288,7 @@ pub fn agent_entries(ed: &Editor) -> Vec<AgentEntry> {
                 .any(|e| e.worktree.as_deref() == Some(r.worktree.as_path()));
             // A record forgotten here may still be in the file the last
             // scan read; it is not listed.
-            if loaded || ed.agents.persist.is_forgotten(&r.worktree) {
+            if loaded || ed.agents.persist.is_forgotten(&r.worktree, r.created) {
                 continue;
             }
             out.push(AgentEntry {

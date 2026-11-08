@@ -787,7 +787,7 @@ pub fn approval_blocker(ed: &Editor, id: ProposalId) -> Option<String> {
         return Some(format!(
             "not approved: {} changed on disk since it was read, so it cannot be saved \
              for the verification command; :reload or :w! first",
-            buf.doc.display_name()
+            ed.doc_name(&buf.doc)
         ));
     }
     None
@@ -812,8 +812,10 @@ pub fn stale_reason(ed: &Editor, p: &Proposal) -> Option<String> {
         {
             Some(format!(
                 "the document was saved as {} since the proposal was made for {}",
-                b.doc.display_name(),
-                p.file_label()
+                ed.doc_name(&b.doc),
+                p.path
+                    .as_deref()
+                    .map_or_else(|| "[scratch]".into(), |f| ed.show_path(f))
             ))
         }
         Some(b) => {

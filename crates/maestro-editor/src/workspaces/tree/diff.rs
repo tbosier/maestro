@@ -160,7 +160,10 @@ fn read(
         .ok_or_else(|| "no longer a Git repository".to_string())?;
     let rel = abs
         .strip_prefix(&cmp.repo_root)
-        .map_err(|_| format!("{} is outside the repository", abs.display()))?
+        .map_err(|_| {
+            let shown = crate::navigation::home_path(abs);
+            format!("{shown} is outside the repository")
+        })?
         .to_path_buf();
     let rev = match (kind, cmp.rev()) {
         (PathChangeKind::Untracked, _) | (_, None) => {

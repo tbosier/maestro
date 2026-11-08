@@ -392,3 +392,60 @@ fn messages_shows_local_times_and_names_the_zone() {
     assert!(flat.contains(&format!("Times are {zone}.")), "{text}");
     assert!(text.contains(&format!("{time}  info     hello")), "{text}");
 }
+
+/// Set in a child copy of this test binary that runs with its own HOME.
+const HOME_CHILD: &str = "MAESTRO_TEST_HOME_CHILD";
+
+/// Runs the test `name` again in a child copy of this binary with HOME set
+/// to `home`. The environment of this process is never changed, so tests
+/// running alongside cannot see a different HOME.
+fn rerun_with_home(name: &str, home: &std::path::Path) {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1"])
+        .env("HOME", home)
+        .env(HOME_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "child run failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cd_pwd_and_open_name_directories_from_home_and_the_working_directory() {
+    let name = "cd_pwd_and_open_name_directories_from_home_and_the_working_directory";
+    if std::env::var_os(HOME_CHILD).is_none() {
+        let home = temp_dir("home");
+        rerun_with_home(name, &home);
+        std::fs::remove_dir_all(&home).unwrap();
+        return;
+    }
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    std::fs::create_dir_all(home.join("proj/sub")).unwrap();
+    let mut ed = editor();
+    ed.cwd = home.join("proj");
+    let last = |ed: &Editor| logged(ed).last().cloned().unwrap();
+
+    // After :cd the working directory is the new one, so the message names
+    // it from home: relative to itself it would be empty.
+    run(&mut ed, ":cd sub\n");
+    assert_eq!(last(&ed), (Severity::Info, "cwd: ~/proj/sub".to_string()));
+    run(&mut ed, ":pwd\n");
+    assert_eq!(last(&ed), (Severity::Info, "~/proj/sub".to_string()));
+    run(&mut ed, ":cd ~\n");
+    assert_eq!(last(&ed), (Severity::Info, "cwd: ~".to_string()));
+
+    // Errors name the path as typed relative to where you are.
+    run(&mut ed, ":cd nope\n");
+    let (sev, text) = last(&ed);
+    assert_eq!(sev, Severity::Error);
+    assert!(text.starts_with("nope: "), "{text}");
+    run(&mut ed, ":open proj\n");
+    assert_eq!(
+        last(&ed),
+        (Severity::Error, "proj is a directory".to_string())
+    );
+}

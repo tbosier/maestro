@@ -243,8 +243,8 @@ fn dry_runs(
     for (id, w, outputs) in involved {
         out.snapshots += 1;
         let snap = super::actions::open_agent_worktree(git, w).and_then(|repo| {
-            let made = super::test_outputs::still_made_by_tests(&repo, outputs)?;
-            repo.work_snapshot_leaving_out(&made)
+            let leave = super::test_outputs::still_left_out(&repo, outputs)?;
+            repo.work_snapshot_leaving_out(&leave)
                 .map(|s| (s.commit, w.main_root.clone()))
                 .map_err(|e| e.to_string())
         });
@@ -294,7 +294,10 @@ pub(crate) fn check(
 ) -> Merge {
     let repo = match git.discover(root) {
         Ok(Some(r)) => r,
-        Ok(None) => return Merge::Failed(format!("{} is not a repository", root.display())),
+        Ok(None) => {
+            let shown = crate::navigation::home_path(root);
+            return Merge::Failed(format!("{shown} is not a repository"));
+        }
         Err(e) => return Merge::Failed(e.to_string()),
     };
     match repo.merge_check(ours, theirs) {
