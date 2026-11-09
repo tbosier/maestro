@@ -1060,15 +1060,26 @@ fn open_line(ed: &mut Editor, below: bool) {
         .map(|r| s.char_to_line(if below { r.last() } else { r.from() }))
         .collect();
     lines.dedup();
-    for line in lines {
+    let python = if below {
+        let ends: Vec<usize> = lines
+            .iter()
+            .map(|&l| line_end_excluding_terminator(s, l))
+            .collect();
+        python_block_indents(ed, &text, &ends)
+    } else {
+        vec![None; lines.len()]
+    };
+    for (line, python) in lines.into_iter().zip(python) {
         let indent = line_indent(s, line);
-        let ind_len = indent.chars().count();
         if below {
             let at = line_end_excluding_terminator(s, line);
+            let indent = python.unwrap_or(indent);
+            let ind_len = indent.chars().count();
             let piece = format!("{le}{indent}");
             changes.push(Change::insert(at, piece.repeat(count)));
             cursor_offsets.push((at, le.chars().count() + ind_len));
         } else {
+            let ind_len = indent.chars().count();
             let at = s.line_to_char(line);
             let piece = format!("{indent}{le}");
             changes.push(Change::insert(at, piece.repeat(count)));
@@ -1130,8 +1141,9 @@ fn insert_newline(ed: &mut Editor) {
     let unit = ed.config.editor.indent_unit();
     let mut changes = Vec::new();
     let mut offsets = Vec::new();
-    for r in ed.view().selection.iter() {
-        let p = r.head;
+    let heads: Vec<usize> = ed.view().selection.iter().map(|r| r.head).collect();
+    let pythons = python_block_indents(ed, &text, &heads);
+    for (&p, python) in heads.iter().zip(pythons) {
         let line = s.char_to_line(p);
         let line_start = s.line_to_char(line);
         let indent = line_indent(s, line);
@@ -1153,7 +1165,10 @@ fn insert_newline(ed: &mut Editor) {
         while ws_start > line_start && matches!(s.char(ws_start - 1), ' ' | '\t') {
             ws_start -= 1;
         }
-        let inner = if opens {
+        let python_header = python.is_some();
+        let inner = if let Some(python) = python {
+            python
+        } else if opens {
             format!("{indent}{unit}")
         } else {
             indent.clone()
@@ -1166,7 +1181,16 @@ fn insert_newline(ed: &mut Editor) {
         }
         // Only drop it when the line has content before it.
         let from = if ws_start > line_start { ws_start } else { p };
-        changes.push(Change::replace(from, p, ins));
+        // After a Python header the rest of the line moves into the block:
+        // drop the whitespace that separated it from the colon, or it would
+        // add to the new indentation.
+        let mut to = p;
+        if python_header {
+            while to < s.len_chars() && matches!(s.char(to), ' ' | '\t') {
+                to += 1;
+            }
+        }
+        changes.push(Change::replace(from, to, ins));
         offsets.push((from, cursor));
     }
     let cs = changes_from(&text, changes);
@@ -1176,6 +1200,23 @@ fn insert_newline(ed: &mut Editor) {
         .map(|&(at, off)| Range::point(cs.map_pos(at, maestro_core::Assoc::Before) + off))
         .collect();
     ed.apply_or_report(Transaction::new(cs).with_selection(Selection::new(ranges, primary)));
+}
+
+/// For each position in `positions`, the indentation for a new line there
+/// when the buffer is Python and the text before it ends a block header
+/// (`def f(x):`, `if x:`, `else:`): one level deeper than the line where
+/// the header's statement starts. See [`crate::python_indent`] for what
+/// counts. The text is read once for all positions.
+fn python_block_indents(ed: &Editor, text: &Rope, positions: &[usize]) -> Vec<Option<String>> {
+    if ed.buffer().syntax.language() != Some(maestro_syntax::Language::Python) {
+        return vec![None; positions.len()];
+    }
+    let s = text.slice(..);
+    let unit = ed.config.editor.indent_unit();
+    crate::python_indent::header_start_lines(s, positions)
+        .into_iter()
+        .map(|line| line.map(|l| format!("{}{unit}", line_indent(s, l))))
+        .collect()
 }
 
 fn insert_tab(ed: &mut Editor) {
