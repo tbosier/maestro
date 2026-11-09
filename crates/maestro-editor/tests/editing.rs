@@ -203,6 +203,161 @@ fn indent_newline_and_brackets() {
     assert_eq!(text(&ed), "fn f() {\n    x\n}\n");
 }
 
+/// Opens `text` as a file named `name` in a fresh directory, so the
+/// language comes from the extension the way it does for a real file.
+fn editor_on_file(name: &str, text: &str) -> (Editor, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "maestro-indent-{}-{}",
+        name.replace('.', "-"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    let mut ed = editor("");
+    ed.cwd = dir.clone();
+    ed.open(&path).unwrap();
+    (ed, dir)
+}
+
+#[test]
+fn enter_after_a_python_block_header_indents_one_level() {
+    let (mut ed, dir) = editor_on_file("a.py", "");
+    assert_eq!(
+        ed.buffer().syntax.language(),
+        Some(maestro_syntax::Language::Python)
+    );
+    run(&mut ed, "idef blah(x):\nif x:  # positive\nreturn x<esc>");
+    assert_eq!(
+        text(&ed),
+        "def blah(x):\n    if x:  # positive\n        return x"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn o_after_a_python_block_header_indents_one_level() {
+    let (mut ed, dir) = editor_on_file("b.py", "if a:\n    pass\nelse:\n");
+    run(&mut ed, "jjob<esc>");
+    assert_eq!(text(&ed), "if a:\n    pass\nelse:\n    b\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_colon_in_a_string_comment_or_open_bracket_does_not_indent() {
+    // `A` puts the cursor at the end of the line, after the colon; each
+    // colon there is inside something.
+    // Each starts with `if`, so only the string, comment or bracket keeps
+    // its colon from ending a header.
+    for line in ["if x == {\"a\":", "if s[1:", "# if todo:", "if z  # note:"] {
+        let (mut ed, dir) = editor_on_file("c.py", &format!("{line}\n"));
+        run(&mut ed, "A\nq<esc>");
+        assert_eq!(text(&ed), format!("{line}\nq\n"), "{line}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    // Enter after the colon of a lambda or an annotation, mid-line.
+    for (line, keys, want) in [
+        ("f = lambda x: x + 1", "f:a\n<esc>", "f = lambda x:\n x + 1"),
+        ("value: int = 1", "f:a\n<esc>", "value:\n int = 1"),
+    ] {
+        let (mut ed, dir) = editor_on_file("l.py", &format!("{line}\n"));
+        run(&mut ed, keys);
+        assert_eq!(text(&ed), format!("{want}\n"), "{line}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    // Enter right after a colon inside a closed string.
+    let (mut ed, dir) = editor_on_file("c.py", "if s == \"a:b\":\n");
+    run(&mut ed, "f:a\nq<esc>");
+    assert_eq!(text(&ed), "if s == \"a:\nqb\":\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_colon_typed_inside_an_unclosed_docstring_does_not_indent() {
+    let (mut ed, dir) = editor_on_file("u.py", "");
+    // `if x:` inside the string would be a header in code.
+    run(&mut ed, "is = \"\"\"Summary\nif x:\nq<esc>");
+    assert_eq!(text(&ed), "s = \"\"\"Summary\nif x:\nq");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_header_continued_over_lines_indents_from_its_first_line() {
+    // The continuation line is indented 8, so copying its indentation (or
+    // adding a level to it) would put the body in the wrong place.
+    let src = "if (ready\n        and enabled):\n    existing()\n";
+    let (mut ed, dir) = editor_on_file("h.py", src);
+    run(&mut ed, "jonew()<esc>");
+    assert_eq!(
+        text(&ed),
+        "if (ready\n        and enabled):\n    new()\n    existing()\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn headers_with_tricky_strings_still_indent() {
+    for line in [
+        "if message == '''It's ready''':",
+        "if f\"{mapping[\"a#b\"]}\":",
+        "if s == f\"{x:>10}\":",
+    ] {
+        let (mut ed, dir) = editor_on_file("t.py", &format!("{line}\n"));
+        run(&mut ed, "A\nq<esc>");
+        assert_eq!(text(&ed), format!("{line}\n    q\n"), "{line}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[test]
+fn enter_between_a_header_and_its_inline_body_moves_the_body_one_level_in() {
+    for (src, keys) in [
+        ("if ready: print(1)\n", "f:a\n<esc>"),
+        ("if ready:\tprint(1)\n", "f:a\n<esc>"),
+    ] {
+        let (mut ed, dir) = editor_on_file("i.py", src);
+        run(&mut ed, keys);
+        assert_eq!(text(&ed), "if ready:\n    print(1)\n", "{src:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[test]
+fn every_cursor_gets_its_own_python_indent() {
+    let (mut ed, dir) = editor_on_file("m.py", "if a:\nx = 1\n    while b:\n");
+    // A cursor at the end of each of the three lines.
+    run(&mut ed, "%<A-s>A\nq<esc>");
+    assert_eq!(
+        text(&ed),
+        "if a:\n    q\nx = 1\nq\n    while b:\n        q\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_slice_colon_inside_a_bracket_from_an_earlier_line_does_not_indent() {
+    // The statement starts with `if`, so only the bracket opened on the
+    // line before keeps `1:` from being its header colon.
+    let src = "if values[\n    1:\n]:\n    pass\n";
+    let (mut ed, dir) = editor_on_file("s.py", src);
+    run(&mut ed, "jA\n2<esc>");
+    assert_eq!(text(&ed), "if values[\n    1:\n    2\n]:\n    pass\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_trailing_colon_outside_python_keeps_the_indent() {
+    // Python headers, in buffers that are not Python.
+    let (mut ed, dir) = editor_on_file("e.yaml", "  if x:\n");
+    run(&mut ed, "A\nq<esc>");
+    assert_eq!(text(&ed), "  if x:\n  q\n");
+    let mut ed = editor("def f(x):\n");
+    run(&mut ed, "A\nq<esc>");
+    assert_eq!(text(&ed), "def f(x):\nq\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn open_lines_and_backspace_to_indent_stop() {
     let mut ed = editor("    a\n");
