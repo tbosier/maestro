@@ -412,6 +412,9 @@ impl Keymaps {
         }
 
         bind_syntax(&mut normal);
+        for (k, c) in crate::comment::DEFAULT_KEYS {
+            b(&mut normal, k, c);
+        }
 
         let mut select = normal.clone();
         b(&mut select, "v", "normal_mode");

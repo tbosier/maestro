@@ -13,6 +13,7 @@
 
 pub mod agents;
 pub mod commands;
+pub mod comment;
 pub mod editor;
 pub mod forge;
 pub mod git;

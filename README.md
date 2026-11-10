@@ -58,6 +58,7 @@ cargo build --release
 |---|---|
 | `:w` / `:q` | save / quit |
 | `space ?` | every command, with its key |
+| `C-c` or `C-/` | comment or uncomment the selected lines |
 | `space f` / `space /` | find a file / search the workspace |
 | `space a` | agents: `n` new task, `i` or a click to type into one, `m` message it, `ret` review, `I` integrate (or rebase an agent that started off your branch first) |
 | `space g` | Git status |
