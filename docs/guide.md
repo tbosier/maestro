@@ -9,6 +9,7 @@ Everything Maestro does today, the keys, and the config file. The [README](../RE
 - Open, edit and save files. Saves are atomic (write to a temp file, fsync, rename) and keep permissions and symlinks.
 - Selection-first modal editing in the Kakoune and Helix style, with Vim-familiar motions. Multiple selections everywhere: select by regex, split on regex, add cursors on the lines below, and edit them all at once.
 - New lines keep the indentation of the line above, and Enter after `{`, `(` or `[` indents one level deeper. In Python, Enter and `o` after a block header indent one level deeper than the line where the header starts. A block header is a statement that starts with `if`, `elif`, `else`, `for`, `while`, `try`, `except`, `finally`, `with`, `def`, `class`, `async`, `match` or `case` and ends with `:`, so the colons of `lambda x:` and `value: int` don't count. A header continued over several lines (`if (a` then `and b):`) indents from its first line, and a trailing `# comment` is ignored. A colon inside a string, a comment, an f-string field or an open bracket doesn't count, even when the string or bracket began on an earlier line. To know that, Maestro reads the file from the top, and past about four million characters it stops and keeps the line's indentation. The indent unit comes from `indent` and `indent-width` in the config.
+- `C-c` (or Ctrl+/) comments out the lines each selection touches, or uncomments them when every non-blank line is already a comment. Comments go in at the smallest indentation of those lines, so a block stays aligned, and blank lines are left alone. Uncommenting removes the comment marker and one space after it. Each cursor or selection is toggled on its own; one press is one undo step, and `.` repeats it. The marker is `#` for Python, TOML, shell, YAML and Makefiles, `//` for Rust, JavaScript, TypeScript, C, C++, Go and Java, and `--` for Lua and SQL. JSON, Markdown and other files get no change and a note in the status line. Most terminals send Ctrl+/ as the same key as Ctrl+7, so both are bound. `:toggle-comment` does the same.
 - Undo and redo as a revision tree: editing after an undo starts a branch instead of discarding the old one, and `g-`/`g+` step through every state across branches. A whole insert session is one undo step.
 - Registers (one value per selection), the system clipboard, macros (`Q` records, `q` replays), dot repeat, counts, marks and a jump list.
 - Search with live preview, `n`/`N`, and `:s/pat/rep/g` or `:%s` substitution with capture groups.
@@ -95,6 +96,7 @@ More than one shell, and a shell per worktree that follows you when you switch. 
 | `v` | select mode (motions extend) |
 | `/ ? n N *` | search |
 | `.` | repeat the last change |
+| `C-c` or `C-/` | comment or uncomment the selected lines |
 | `gg G` / `3G` / `:42` | go to the start, end, or a line |
 | `:messages` | earlier status messages, including ones cut off or replaced |
 | `space f` / `space /` / `space r` | find a file / search the workspace / recent files |
