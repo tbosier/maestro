@@ -457,7 +457,7 @@ pub fn selected_index(ed: &Editor, rows: &[Row]) -> Option<usize> {
 /// List rows that fit under the header (and the key line, when there is
 /// room for one).
 pub fn body_height(ed: &Editor) -> usize {
-    let h = ed.area.height;
+    let h = ed.region().height;
     usize::from(h.saturating_sub(HEADER_ROWS + u16::from(has_footer(h))))
 }
 
@@ -748,13 +748,13 @@ pub fn handle_mouse(ed: &mut Editor, kind: MouseKind, x: u16, y: u16) -> bool {
     if !t.open || t.too_narrow {
         return false;
     }
-    let area = ed.area;
-    if t.diff_shown() && area.contains(x, y) {
+    if t.diff_shown() && ed.area.contains(x, y) {
         diff::handle_mouse(ed, kind, y);
         return true;
     }
     // The tree is the column right of the views; its divider is the first
-    // column past them.
+    // column past them. It is as tall as the views and the shell pane.
+    let area = ed.region();
     let inside = x >= area.right() && y >= area.y && y < area.bottom();
     if !inside {
         if kind == MouseKind::Down && t.focused {

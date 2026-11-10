@@ -15,7 +15,9 @@ pub enum CursorShape {
     Bar(u16, u16),
 }
 
-/// The screen regions the front end gives the editor.
+/// The screen regions the front end gives the editor: the tabline, the
+/// region for the views and the shell pane under them (see
+/// [`Editor::resize`]), and the command line.
 pub fn split_screen(width: u16, height: u16, ed: &Editor) -> (Option<Rect>, Rect, Rect) {
     let tabline = ed.presentation != Presentation::Focus && height > 3;
     let top = u16::from(tabline);
@@ -108,6 +110,11 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
     if let Some(area) = tree_area(surface.width, surface.height, ed) {
         crate::tree::draw(ed, surface, area);
     }
+    // The shell pane under the views (crate::shell).
+    let shell_cursor = ed
+        .shell
+        .area()
+        .and_then(|area| crate::shell::draw(ed, surface, area));
     draw_hover(ed, surface);
     draw_signature(ed, surface);
     draw_completion(ed, surface);
@@ -130,6 +137,9 @@ pub fn render(ed: &Editor, surface: &mut Surface) -> CursorShape {
         cursor = crate::agents::draw(ed, surface);
     } else if ed.mode == Mode::Insert && ed.prompt.is_none() && ed.picker.is_none() {
         cursor = insert_cursor(ed, ed.view());
+    }
+    if ed.shell.has_focus() {
+        cursor = shell_cursor.unwrap_or(CursorShape::Hidden);
     }
     if let Some(c) = draw_cmdline(ed, surface, cmdline) {
         cursor = c;

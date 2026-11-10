@@ -73,6 +73,12 @@ static TYPED: &[TypedCommand] = &[
         fun: tree,
     },
     TypedCommand {
+        name: "term",
+        aliases: &["terminal"],
+        doc: "Show the shell pane and type into it, or hide it (also space o)",
+        fun: term,
+    },
+    TypedCommand {
         name: "project-add",
         aliases: &[],
         doc: "Add a project to the sidebar and the jump palette (no path: asks for one)",
@@ -427,6 +433,11 @@ fn tree(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn term(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
+    crate::shell::toggle(ed);
+    Ok(())
+}
+
 fn format(ed: &mut Editor, _: &[&str], _: bool) -> Result<(), String> {
     crate::lsp::actions::format(ed, false);
     Ok(())
@@ -716,6 +727,7 @@ fn quit_all(ed: &mut Editor, _: &[&str], force: bool) -> Result<(), String> {
 
 fn finish_quit(ed: &mut Editor) {
     crate::proposals::stop_all(ed);
+    crate::shell::stop(ed);
     // Best effort: a session that cannot be written must not block quitting.
     let _ = crate::navigation::session::save(ed);
     crate::agents::persist::save(ed, true);

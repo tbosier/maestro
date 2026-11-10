@@ -17,10 +17,17 @@
 //! `CSI 65535 b` (repeat) asks the parser for about four million characters.
 //!
 //! Known gaps, all on Unix:
-//! - Kill and drop signal the program's process group (SIGHUP, 200 ms, then
-//!   SIGKILL) through kill(1). A descendant that moved itself to another
-//!   process group or session (a daemon, `setsid`) is not reached, and keeps
-//!   the PTY and the reader thread alive if it holds the terminal open.
+//! - Kill and drop signal the program's process group through kill(1), every
+//!   process in its session through pkill(1), and every descendant listed by
+//!   ps(1) just before the first signal (SIGHUP, 200 ms, then SIGKILL), so
+//!   the jobs an interactive shell puts in process groups of their own end
+//!   too. (pkill's session match alone did not find them on macOS.) A
+//!   process that started a session of its own and left the program's
+//!   descendants (a daemon that forked twice) is not reached, and keeps the
+//!   PTY and the reader thread alive if it holds the terminal open. Without
+//!   pkill or ps those parts are skipped. pkill and the descendant list
+//!   signal by pid, so a process that exits and has its pid reused in that
+//!   moment (up to 200 ms for the SIGKILL) could be signaled instead.
 //! - portable-pty starts the program in `$HOME` when the working directory is
 //!   missing. `spawn` checks the directory just before spawning, which narrows
 //!   but does not close that window.
@@ -547,16 +554,27 @@ fn wait_for_child(
             drop(control);
             kill_sent = true;
             // The child leads its own session (portable-pty calls setsid),
-            // so its process group id is its pid. Signal the whole group:
-            // SIGHUP, a grace period, then SIGKILL, so descendants that
-            // ignore SIGHUP end too. The child has not been reaped yet (no
+            // so its process group id and its session id are its pid.
+            // Signal the whole group, and the whole session for the jobs a
+            // shell with job control moves to groups of their own: SIGHUP,
+            // a grace period, then SIGKILL, so descendants that ignore
+            // SIGHUP end too. The child has not been reaped yet (no
             // try_wait since the check above), so its pid, and with it the
-            // group id, cannot have been reused. This blocks only this
+            // group and session ids, cannot have been reused. The child's
+            // descendants are listed first, while they are still its
+            // descendants (SIGHUP ends the shell and they move to init),
+            // and signaled by pid too: pkill's session match does not find
+            // them everywhere (it did not on macOS). This blocks only this
             // thread.
             if let Some(pid) = child.process_id() {
+                let family = descendants(pid);
                 signal_group("HUP", pid);
+                signal_session("HUP", pid);
+                signal_pids("HUP", &family);
                 thread::sleep(KILL_GRACE);
                 signal_group("KILL", pid);
+                signal_session("KILL", pid);
+                signal_pids("KILL", &family);
             }
             // Then portable-pty's own kill for the child, which also reaps.
             let _ = child.kill();
@@ -594,6 +612,85 @@ fn signal_group(signal: &str, pgid: u32) {
     }
     #[cfg(not(unix))]
     let _ = (signal, pgid);
+}
+
+/// The pids of `root`'s descendants, from `ps -A -o pid= -o ppid=`, which
+/// Linux and macOS both read. Empty when ps is missing or fails.
+fn descendants(root: u32) -> Vec<u32> {
+    #[cfg(unix)]
+    {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=", "-o", "ppid="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return Vec::new();
+        };
+        let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace().map(|n| n.parse::<u32>().ok());
+                Some((it.next()??, it.next()??))
+            })
+            .collect();
+        let mut found = vec![root];
+        let mut k = 0;
+        while k < found.len() {
+            let parent = found[k];
+            for &(pid, ppid) in &pairs {
+                if ppid == parent && !found.contains(&pid) {
+                    found.push(pid);
+                }
+            }
+            k += 1;
+        }
+        found.remove(0);
+        found
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Vec::new()
+    }
+}
+
+/// Sends `signal` to each of `pids` through kill(1). A pid that exited
+/// after it was listed could have been reused in between; the window is
+/// the time from listing to signaling, 200 ms for SIGKILL.
+fn signal_pids(signal: &str, pids: &[u32]) {
+    #[cfg(unix)]
+    {
+        if pids.is_empty() {
+            return;
+        }
+        let mut args = vec![format!("-{signal}"), "--".into()];
+        args.extend(pids.iter().map(|p| p.to_string()));
+        let _ = std::process::Command::new("kill")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    let _ = (signal, pids);
+}
+
+/// Sends `signal` to every process in session `sid` through pkill(1), for
+/// the same reason as [`signal_group`]. Does nothing when pkill is missing.
+fn signal_session(signal: &str, sid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args([format!("-{signal}"), "-s".into(), sid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    let _ = (signal, sid);
 }
 
 fn exit_info(status: &portable_pty::ExitStatus) -> ExitInfo {

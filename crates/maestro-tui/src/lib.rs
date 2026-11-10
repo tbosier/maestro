@@ -8,6 +8,7 @@ mod inbox;
 mod preview;
 mod proposals;
 pub mod render;
+mod shell;
 mod sidebar;
 pub mod surface;
 pub mod terminal;
@@ -213,7 +214,9 @@ pub fn run(mut editor: Editor, opts: RunOptions) -> io::Result<()> {
             editor.workspaces.tree.too_narrow = narrow;
             dirty = true;
         }
-        if editor.area != views {
+        // The views and the shell pane share this region; the editor
+        // splits it.
+        if editor.region() != views {
             editor.resize(views);
             dirty = true;
         }

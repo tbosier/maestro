@@ -8,7 +8,8 @@
 //! (see [`syntax`]). Coding agents, their terminals, tests and review run
 //! through `maestro-agent`, `maestro-term`, `maestro-tasks` and
 //! `maestro-git` (see [`agents`]). The GitHub inbox runs the GitHub CLI
-//! through `maestro-forge` on background threads (see [`forge`]).
+//! through `maestro-forge` on background threads (see [`forge`]). The shell
+//! pane runs the user's shell in a `maestro-term` terminal (see [`shell`]).
 
 pub mod agents;
 pub mod commands;
@@ -32,9 +33,11 @@ pub mod python_indent;
 pub mod recovery;
 pub mod registers;
 pub mod search;
+pub mod shell;
 pub mod structural;
 pub mod syntax;
 pub mod syntax_commands;
+pub mod term_input;
 pub mod typed;
 pub mod workspaces;
 

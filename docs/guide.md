@@ -67,9 +67,15 @@ Everything Maestro does today, the keys, and the config file. The [README](../RE
 - When an agent starts needing you, the status line says so once, and the terminal gets a bell or an OSC 9 desktop notification (`[notify] method`).
 - Language servers start for the worktree you switch into when its files open. Servers of roots you left stop after five unused minutes, or when more than three roots have servers; a server with an open buffer is never stopped.
 
+### Shell
+
+- A shell pane (`space o` or `:term`, also `:terminal`) under the views and above the status line, between the sidebar and the file tree. The first `space o` starts your `$SHELL` (`/bin/sh` when it is unset) in the working directory, which is the worktree you are in, and gives it the keys: everything you type or paste goes to the shell, and the header says `KEYS: TYPING INTO SHELL`. `C-\` or a click outside the pane gives the keys back with the pane still shown; `C-\` or a click in the pane gives them to the shell again (with the agent panel open, `C-\` belongs to the panel, so only the click works). Giving the shell the keys ends insert mode, as Escape would, and keys typed into the shell are not part of what `.` repeats. `space o` from the editor hides the pane and the shell keeps running; the next `space o` shows it again with the keys. The wheel scrolls the shell's scrollback. The pane takes the bottom third of the rows the views had, at least 6; when the window is too short for that and 8 rows of views, the pane is not drawn and the keys go back to the editor, where they stay when the window grows again. When the shell exits, the header says how (`exited with code 0`), the keys come back, and the next `space o` starts a new shell in the worktree you are in then. Switching worktrees leaves a running shell where it is, and the header keeps naming the directory it started in. Quitting ends a running shell and what it started, background jobs included; a program that started a session of its own (a daemon) keeps running. A job still running after you `exit` the shell yourself keeps running too: once the shell has ended, Maestro signals nothing it left.
+
 ## Not built yet
 
 An OS sandbox for agents. A worktree keeps their files apart, not their permissions; see [docs/security.md](security.md). The [roadmap](../ROADMAP.md) tracks it.
+
+More than one shell, and a shell per worktree that follows you when you switch. Maestro does not see the shell's working directory and cannot open file paths it prints. The [roadmap](../ROADMAP.md) lists them.
 
 ## Keys
 
@@ -110,6 +116,7 @@ An OS sandbox for agents. A worktree keeps their files apart, not their permissi
 | `space s` | the sidebar: opens and focuses it, focuses it, or hides it. In it: `j`/`k` move, `ret` switch to a worktree or agent (on a project: fold or unfold), `l`/`h` unfold or fold, `a` add a project, `d` forget the selected project (asks first; deletes no files), `r` rescan, `q` hide, `esc` back to the editor with the sidebar still shown, `space ...` the usual space keys |
 | `space j` | jump to a project, worktree, agent or open buffer |
 | `space t` / `:tree` | the file tree: opens and focuses it, focuses it, or hides it. In it: `j`/`k` move, `g`/`G` first and last, `ret` open a file (on a directory: fold or unfold), `l`/`h` unfold or fold, `c` only changed files, `d` the file's diff against the base, `r` read again, `q` hide, `esc` back to the editor with the tree still shown, `space ...` the usual space keys |
+| `space o` / `:term` | the shell pane: shows it and gives the shell the keys (starting one when none runs), or hides it with the shell still running. While the shell has the keys every key goes to it; `C-\` or a click outside the pane gives them back, and `C-\` or a click in it gives them to the shell again |
 | in the tree's diff (`d`) | `j`/`k` lines, `C-d`/`C-u` half a page, `g`/`G` first and last, `s` side by side, `ret` open the file at that line, `q` or `esc` back to the tree |
 
 The full model is in [docs/editor-model.md](editor-model.md).
