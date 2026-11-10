@@ -77,6 +77,11 @@ fn the_pane_draws_its_header_and_the_shell_under_the_views() {
     let (w, h) = (220, 30);
     let dir = crate_dir();
     let mut ed = editor_with_shell(w, h, dir.clone());
+    // Typed before the first prompt, the command's echo and its output
+    // land after the prompt (`$ hi-from-shell`), so wait for it first.
+    poll_until(&mut ed, "the prompt", |ed| {
+        !shell_text(ed).trim().is_empty()
+    });
     type_text(&mut ed, "printf 'hi-from-%s\\n' shell\n");
     poll_until(&mut ed, "the shell's output", |ed| {
         shell_text(ed).contains("hi-from-shell")
