@@ -170,6 +170,20 @@ fn a_blank_line_alone_is_left_alone() {
 }
 
 #[test]
+fn a_script_known_by_its_shebang_toggles_back_and_keeps_the_shebang() {
+    let src = "#!/usr/bin/env python3\nimport sys\nprint(sys.argv)\n";
+    let (mut ed, dir) = on_file("tool", src);
+    run(&mut ed, "%<C-c>");
+    assert_eq!(
+        text(&ed),
+        "#!/usr/bin/env python3\n# import sys\n# print(sys.argv)\n"
+    );
+    run(&mut ed, "<C-c>");
+    assert_eq!(text(&ed), src);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn the_typed_command_toggles_too() {
     let (mut ed, dir) = on_file("l.py", "x = 1\n");
     run(&mut ed, ":toggle-comment<ret>");

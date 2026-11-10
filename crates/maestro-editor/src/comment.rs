@@ -86,8 +86,10 @@ fn token_from_shebang(first_line: &str) -> Option<&'static str> {
 /// non-blank line already starts (after its indentation) with the token,
 /// each loses it and one space after it; otherwise each non-blank line gets
 /// `token` and a space after the indentation the lines share, so the block
-/// stays aligned. Blank lines are never touched. `None` when every line in
-/// the block is blank.
+/// stays aligned. Blank lines are never touched, and neither is a `#!`
+/// line at the top of the file: commenting it would stop the file from
+/// running (and from being recognized by it), and uncommenting it would
+/// turn it into `!/usr/bin/...`. `None` when no line in the block is left.
 fn toggle_block(s: RopeSlice, first: usize, last: usize, token: &str) -> Option<Vec<Change>> {
     // (line start, leading whitespace) of each non-blank line.
     let lines: Vec<(usize, String)> = (first..=last)
@@ -100,7 +102,8 @@ fn toggle_block(s: RopeSlice, first: usize, last: usize, token: &str) -> Option<
                 .take_while(|c| *c == ' ' || *c == '\t')
                 .collect();
             let blank = indent.chars().count() == end - start;
-            (!blank).then_some((start, indent))
+            let shebang = l == 0 && s.slice(start..end).chars().take(2).eq("#!".chars());
+            (!blank && !shebang).then_some((start, indent))
         })
         .collect();
     if lines.is_empty() {
@@ -185,7 +188,7 @@ fn toggle_comment(ed: &mut Editor) {
         .flatten()
         .collect();
     if changes.is_empty() {
-        ed.info("toggle comment: the selected lines are blank");
+        ed.info("toggle comment: nothing to toggle on the selected lines");
         return;
     }
     let cs = ChangeSet::from_changes_clipped(text.len_chars(), changes);
@@ -261,6 +264,17 @@ mod tests {
         assert_eq!(toggle(src, 0, 1, "//"), "// \tx\n//     y\n");
         let src = "\t\tx\n\ty\n";
         assert_eq!(toggle(src, 0, 1, "//"), "\t// \tx\n\t// y\n");
+    }
+
+    #[test]
+    fn a_shebang_line_is_left_alone() {
+        let src = "#!/usr/bin/env python3\n# a\n# b\n";
+        assert_eq!(toggle(src, 0, 2, "#"), "#!/usr/bin/env python3\na\nb\n");
+        let src = "#!/bin/sh\necho hi\n";
+        assert_eq!(toggle(src, 0, 1, "#"), "#!/bin/sh\n# echo hi\n");
+        assert_eq!(toggle("#!/bin/sh\n", 0, 0, "#"), "#!/bin/sh\n");
+        // Only the first line can be one.
+        assert_eq!(toggle("x\n#!y\n", 1, 1, "#"), "x\n!y\n");
     }
 
     #[test]
