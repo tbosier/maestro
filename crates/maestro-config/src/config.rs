@@ -223,6 +223,7 @@ pub struct Config {
     pub agents: AgentsConfig,
     pub sidebar: SidebarConfig,
     pub tree: TreeConfig,
+    pub shell: ShellConfig,
     pub projects: ProjectsConfig,
     pub notify: NotifyConfig,
     pub lsp: LspConfig,
@@ -240,6 +241,7 @@ impl Default for Config {
             agents: AgentsConfig::default(),
             sidebar: SidebarConfig::default(),
             tree: TreeConfig::default(),
+            shell: ShellConfig::default(),
             projects: ProjectsConfig::default(),
             notify: NotifyConfig::default(),
             lsp: LspConfig::default(),
@@ -277,6 +279,25 @@ impl Default for TreeConfig {
     fn default() -> Self {
         Self { width: 32 }
     }
+}
+
+/// Where the shell pane (`space o`) goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShellPosition {
+    /// Under the views, taking the bottom third of their rows.
+    #[default]
+    Bottom,
+    /// Right of the views, taking half their columns at full height, so a
+    /// program in the shell (a coding agent, say) sits next to the code.
+    Right,
+}
+
+/// `[shell]`: the shell pane (`space o`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ShellConfig {
+    pub position: ShellPosition,
 }
 
 /// `[projects]`: Git repositories the sidebar and the jump palette list,
@@ -497,6 +518,8 @@ line-numbers = "relative"
 width = 40
 [tree]
 width = 28
+[shell]
+position = "right"
 [projects]
 paths = ["~/src/a", "/work/b"]
 [notify]
@@ -510,6 +533,7 @@ max-live-roots = 2
         .unwrap();
         assert_eq!(c.sidebar.width, 40);
         assert_eq!(c.tree.width, 28);
+        assert_eq!(c.shell.position, ShellPosition::Right);
         assert_eq!(c.projects.paths, ["~/src/a", "/work/b"]);
         assert_eq!(c.notify.method, NotifyMethod::Osc);
         assert_eq!(c.lsp.stop_unused_after_secs, 60);
@@ -519,6 +543,8 @@ max-live-roots = 2
         assert_eq!(d.lsp.stop_unused_after_secs, 300);
         assert_eq!(d.sidebar.width, 36);
         assert_eq!(d.tree.width, 32);
+        assert_eq!(d.shell.position, ShellPosition::Bottom);
+        assert!(Config::parse("[shell]\nposition = \"left\"\n", Path::new("x")).is_err());
         assert!(Config::parse("[notify]\nmethod = \"loud\"\n", Path::new("x")).is_err());
         assert!(Config::parse("[sidebar]\nwidht = 3\n", Path::new("x")).is_err());
         assert!(Config::parse("[tree]\nwidht = 3\n", Path::new("x")).is_err());

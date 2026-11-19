@@ -321,3 +321,13 @@ owner = "agent"
 status = "done"
 # Several shells and a shell per worktree are not started (ROADMAP.md, Shell
 # pane). maestro-term now signals the program's session too, through pkill.
+
+[[task]]
+id = "feat-shell-pane-right"
+title = "The shell pane beside the views: [shell] position = \"right\""
+crates = ["maestro-config", "maestro-editor", "maestro-tui"]
+branch = "feat/shell-pane-right"
+owner = "agent"
+status = "done"
+# Read at start only; no command moves a shown pane between the bottom and
+# the right.

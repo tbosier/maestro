@@ -543,3 +543,121 @@ fn a_pane_that_loses_its_room_gives_the_keys_back_for_good() {
     run(&mut ed, "X");
     assert_eq!(ed.doc().text().to_string(), "Xirst\nsecond\n");
 }
+
+/// An editor like [`Fixture::editor`] with `[shell] position = "right"`.
+fn editor_with_pane_right(f: &Fixture) -> Editor {
+    let mut config = Config::default();
+    config.shell.position = maestro_config::ShellPosition::Right;
+    let mut ed = Editor::new(config, Rect::new(0, 1, 120, 40));
+    ed.cwd = f.one.clone();
+    ed.shell.program = Some("sh".into());
+    let doc = ed.add_document(Document::from_text("first\nsecond\n"));
+    ed.switch_to(doc);
+    ed
+}
+
+#[test]
+fn a_pane_on_the_right_sits_beside_the_views_at_full_height() {
+    let f = Fixture::new();
+    let mut ed = editor_with_pane_right(&f);
+    let region = ed.region();
+    run(&mut ed, " o");
+    assert!(ed.shell.has_focus(), "status {:?}", ed.status);
+    let pane = ed.shell.area().expect("the pane is shown");
+    // Right half, full height; the views keep the left half less the
+    // divider column and all their rows.
+    assert_eq!(pane, Rect::new(60, 1, 60, 40));
+    assert_eq!(ed.area, Rect::new(0, 1, 59, 40));
+    assert_eq!(ed.view().area.height, region.height);
+    let divider = maestro_editor::shell::divider(pane, ed.shell.position).unwrap();
+    assert_eq!(divider, Rect::new(59, 1, 1, 40));
+
+    // The shell's terminal is the pane less its header row.
+    wait_for_prompt(&mut ed);
+    type_text(&mut ed, "stty size > size.txt\n");
+    let size = wait_for_file(&mut ed, &f.one.join("size.txt"));
+    assert_eq!(size.trim_end(), "39 60");
+
+    // A click in the views takes the keys back with the shell still
+    // shown, so the buffer can be edited next to it.
+    ed.handle_mouse(MouseKind::Down, 10, 2);
+    assert!(!ed.shell.has_focus());
+    assert!(ed.shell.area().is_some());
+    run(&mut ed, "j");
+    assert_eq!(cursor_line(&ed), 1);
+    // A click on the divider is outside the pane: from the editor it gives
+    // the shell nothing.
+    ed.handle_mouse(MouseKind::Down, divider.x, 5);
+    assert!(!ed.shell.has_focus());
+    // A click in the pane gives them to the shell again.
+    ed.handle_mouse(MouseKind::Down, pane.x + 3, pane.y + 2);
+    assert!(ed.shell.has_focus());
+    // With the shell typing, a click on the divider takes the keys back.
+    ed.handle_mouse(MouseKind::Down, divider.x, 5);
+    assert!(!ed.shell.has_focus());
+    ed.handle_mouse(MouseKind::Down, pane.x + 3, pane.y + 2);
+    assert!(ed.shell.has_focus());
+    type_text(&mut ed, "printf 'right-%s\\n' side\n");
+    poll_until(&mut ed, "the output after the click", |ed| {
+        shows_line(ed, "right-side")
+    });
+    assert_eq!(ed.doc().text().to_string(), "first\nsecond\n");
+
+    // A narrower window resizes the shell's terminal with the pane.
+    ed.resize(Rect::new(0, 1, 81, 30));
+    assert_eq!(ed.shell.area(), Some(Rect::new(41, 1, 40, 30)));
+    assert_eq!(ed.area, Rect::new(0, 1, 40, 30));
+    type_text(&mut ed, "stty size > size2.txt\n");
+    let size = wait_for_file(&mut ed, &f.one.join("size2.txt"));
+    assert_eq!(size.trim_end(), "29 40");
+}
+
+#[test]
+fn a_pane_on_the_right_needs_columns_for_the_views_and_the_pane() {
+    let f = Fixture::new();
+    let mut ed = editor_with_pane_right(&f);
+    // 40 columns: the views would keep 20 and the divider one, leaving
+    // the pane 19, under its 20.
+    ed.resize(Rect::new(0, 1, 40, 40));
+    run(&mut ed, " o");
+    assert!(!ed.shell.open && ed.shell.session().is_none());
+    let msg = ed.status.clone().unwrap().1;
+    assert!(msg.contains("41 columns"), "{msg}");
+    // At 41 there is room: views 20, divider, pane 20.
+    ed.resize(Rect::new(0, 1, 41, 40));
+    run(&mut ed, " o");
+    assert_eq!(ed.shell.area(), Some(Rect::new(21, 1, 20, 40)));
+    assert_eq!(ed.area, Rect::new(0, 1, 20, 40));
+    // A short window is fine on the right: the pane keeps full height.
+    ed.resize(Rect::new(0, 1, 120, 10));
+    assert_eq!(ed.shell.area(), Some(Rect::new(60, 1, 60, 10)));
+
+    // Too short even on the right: the warning names rows, not columns.
+    let mut ed = editor_with_pane_right(&f);
+    ed.resize(Rect::new(0, 1, 120, 5));
+    run(&mut ed, " o");
+    assert!(!ed.shell.open);
+    let msg = ed.status.clone().unwrap().1;
+    assert!(msg.contains("needs 6 rows"), "{msg}");
+}
+
+#[test]
+fn the_agent_panel_gets_the_views_half_and_its_width_back_with_the_shell_hidden() {
+    let f = Fixture::new();
+    let mut ed = editor_with_pane_right(&f);
+    run(&mut ed, " o");
+    wait_for_prompt(&mut ed);
+    ed.handle_key(KeyEvent::ctrl('\\'));
+    run(&mut ed, " a");
+    assert!(ed.agents.panel_open(), "status {:?}", ed.status);
+    // The panel covers the views, left of the shell.
+    assert_eq!(ed.area, Rect::new(0, 1, 59, 40));
+    // q closes it, space o hides the shell, space a opens it full width.
+    run(&mut ed, "q");
+    assert!(!ed.agents.panel_open());
+    run(&mut ed, " o");
+    assert!(!ed.shell.open && ed.shell.running());
+    run(&mut ed, " a");
+    assert!(ed.agents.panel_open());
+    assert_eq!(ed.area, ed.region());
+}

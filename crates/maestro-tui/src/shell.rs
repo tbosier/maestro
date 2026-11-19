@@ -2,7 +2,7 @@
 //! naming the directory the shell started in and who has the keys, and the
 //! shell's screen under it.
 
-use maestro_editor::shell::{header, screen_area};
+use maestro_editor::shell::{divider, header, screen_area};
 use maestro_editor::{Editor, Rect};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -22,6 +22,17 @@ pub(crate) fn draw(ed: &Editor, s: &mut Surface, area: Rect) -> Option<CursorSha
         return None;
     }
     s.fill(area, ui.text);
+    // On the right, a divider column like the one between split views.
+    if let Some(d) = divider(area, ed.shell.position) {
+        let style = if ed.shell.has_focus() {
+            ui.border_active
+        } else {
+            ui.border
+        };
+        for y in d.y..d.bottom() {
+            s.put(d.x, y, "│", style, d.x + 1);
+        }
+    }
     let h = Rect::new(area.x, area.y, area.width, 1);
     s.fill(h, ui.statusline);
     let header = header(ed);
