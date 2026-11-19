@@ -306,6 +306,7 @@ impl Editor {
             wake: WakeHandle::default(),
             next_id: 1,
         };
+        editor.shell.position = editor.config.shell.position;
         let doc = editor.add_document(Document::default());
         let view = editor.new_view(doc);
         editor.layout = Layout::new(view);
@@ -825,7 +826,7 @@ impl Editor {
     // ----- geometry -------------------------------------------------------
 
     /// Gives the editor `region`: the rows and columns the views share with
-    /// the shell pane under them (see [`crate::shell`]). The views get what
+    /// the shell pane under or beside them (see [`crate::shell`]). The views get what
     /// the pane leaves, as [`Editor::area`]; the sidebar and the file tree
     /// are as tall as the region.
     pub fn resize(&mut self, region: Rect) {
@@ -836,7 +837,7 @@ impl Editor {
             // not jump to it when the window grows again.
             self.shell.focused = false;
         }
-        self.area = crate::shell::views_area(region, pane);
+        self.area = crate::shell::views_area(region, pane, self.shell.position);
         self.relayout();
         crate::shell::fit(self);
     }
@@ -858,7 +859,8 @@ impl Editor {
     }
 
     /// The region last given to [`Editor::resize`]: the views' area plus
-    /// the shell pane's rows when it is shown.
+    /// the shell pane's rows (or, on the right, its columns and divider)
+    /// when it is shown.
     pub fn region(&self) -> Rect {
         self.shell.region
     }

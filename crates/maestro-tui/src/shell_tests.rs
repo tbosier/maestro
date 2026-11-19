@@ -297,3 +297,62 @@ fn the_scrolled_back_notice_stays_inside_a_narrow_pane() {
     assert!(left.trim().is_empty(), "drawn left of the pane: {body:?}");
     assert!(body.contains(" scrolled back"), "{body:?}");
 }
+
+#[test]
+fn a_pane_on_the_right_draws_beside_the_text_with_a_divider() {
+    let (w, h) = (100, 24);
+    let mut config = Config::default();
+    config.shell.position = maestro_config::ShellPosition::Right;
+    let mut ed = Editor::new(config, Rect::new(0, 1, w, h - 2));
+    let (_, region, _) = split_screen(w, h, &ed);
+    ed.resize(region);
+    ed.cwd = crate_dir();
+    ed.shell.program = Some("sh".into());
+    let doc = ed.add_document(maestro_core::Document::from_text("def two_sum(nums):\n"));
+    ed.switch_to(doc);
+    type_text(&mut ed, " o");
+    assert!(ed.shell.has_focus(), "status {:?}", ed.status);
+    poll_until(&mut ed, "the prompt", |ed| {
+        !shell_text(ed).trim().is_empty()
+    });
+    type_text(&mut ed, "printf 'beside-%s\\n' code\n");
+    poll_until(&mut ed, "the output", |ed| {
+        shell_text(ed).contains("beside-code")
+    });
+    let pane = ed.shell.area().unwrap();
+    assert_eq!((pane.y, pane.height), (region.y, region.height));
+    assert_eq!(pane.right(), region.right());
+
+    let mut s = Surface::new(w, h, ed.theme.ui.text);
+    render(&ed, &mut s);
+    // The header is the pane's first row, starting at the pane.
+    let header: String = row(&s, pane.y).chars().skip(usize::from(pane.x)).collect();
+    assert!(header.starts_with(" shell  "), "{header:?}");
+    // The buffer's text is still drawn left of the pane.
+    let text_row: String = row(&s, ed.view().area.y)
+        .chars()
+        .take(usize::from(pane.x - 1))
+        .collect();
+    assert!(text_row.contains("def two_sum(nums):"), "{text_row:?}");
+    // A divider runs the pane's height, active while the shell has the
+    // keys.
+    let x = pane.x - 1;
+    for y in pane.y..pane.bottom() {
+        let c = s.cell(x, y).unwrap();
+        assert_eq!(c.symbol, "│", "row {y}");
+        assert_eq!(c.style, ed.theme.ui.border_active, "row {y}");
+    }
+    // The shell's output is drawn inside the pane.
+    let shown = (pane.y + 1..pane.bottom()).any(|y| {
+        let r: String = row(&s, y).chars().skip(usize::from(pane.x)).collect();
+        r.trim_end() == "beside-code"
+    });
+    assert!(shown, "the shell's output is not in the pane");
+
+    // With the keys back in the editor, the divider is the plain border.
+    ed.handle_key(KeyEvent::ctrl('\\'));
+    assert!(!ed.shell.has_focus());
+    let mut s = Surface::new(w, h, ed.theme.ui.text);
+    render(&ed, &mut s);
+    assert_eq!(s.cell(x, pane.y + 3).unwrap().style, ed.theme.ui.border);
+}

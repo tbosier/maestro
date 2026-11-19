@@ -1,6 +1,7 @@
 //! The shell pane (`space o`, `:term`): one shell in a terminal, docked
-//! under the views, above the status line. The sidebar and the file tree
-//! keep their columns; the pane takes rows from the views between them.
+//! under the views, above the status line, or right of them with
+//! `[shell] position = "right"`. The sidebar and the file tree keep their
+//! columns; the pane takes rows (or columns) from the views between them.
 //!
 //! * `space o` shows the pane and gives the shell the keys, starting
 //!   `$SHELL` (else `/bin/sh`) in the editor's working directory when no
@@ -26,14 +27,15 @@
 //!
 //! The editor owns the split: [`Editor::resize`] takes the rows and
 //! columns the views and the pane share (its *region*) and gives the views
-//! what the pane leaves. When the region is too short for both, the pane
-//! is not drawn and takes no keys.
+//! what the pane leaves. When the region is too short (or, on the right,
+//! too narrow) for both, the pane is not drawn and takes no keys.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use maestro_config::ShellPosition;
 use maestro_term::{CommandSpec, ExitInfo, TermSize, Terminal};
 
 use crate::editor::{Editor, MouseKind, Severity};
@@ -42,7 +44,7 @@ use crate::layout::Rect;
 use crate::term_input::{is_toggle, send_key, send_paste};
 
 crate::commands! {
-    toggle_shell => "Show the shell pane under the views and type into it, or hide it",
+    toggle_shell => "Show the shell pane (under or beside the views) and type into it, or hide it",
 }
 
 /// Default key bindings, added to the `space` group.
@@ -53,6 +55,11 @@ pub const MIN_ROWS: u16 = 6;
 /// Rows the views keep under the pane's rule: with fewer, the pane is not
 /// drawn.
 pub const VIEWS_MIN_ROWS: u16 = 8;
+/// The pane's fewest columns on the right.
+pub const MIN_COLS: u16 = 20;
+/// Columns the views keep left of the pane's divider when the pane is on
+/// the right, as they do next to the file tree.
+pub const VIEWS_MIN_COLS: u16 = 20;
 /// The shell when `$SHELL` is unset or empty.
 const FALLBACK_SHELL: &str = "/bin/sh";
 /// How long quitting waits for the shell's process group to end: its
@@ -70,6 +77,8 @@ pub struct ShellPane {
     /// The program to run instead of `$SHELL`, with no arguments. Tests set
     /// it so they do not depend on the user's shell.
     pub program: Option<String>,
+    /// Under the views or right of them, from `[shell] position`.
+    pub position: ShellPosition,
     /// The rows and columns the views and the pane share; see
     /// [`Editor::resize`].
     pub(crate) region: Rect,
@@ -104,7 +113,11 @@ impl ShellPane {
 
     /// The pane's rows, when it is open and the region has room for it.
     pub fn area(&self) -> Option<Rect> {
-        if self.open { room(self.region) } else { None }
+        if self.open {
+            room(self.region, self.position)
+        } else {
+            None
+        }
     }
 
     /// True when keys go to the shell: it has them, it runs, and the pane
@@ -122,25 +135,59 @@ impl Drop for ShellPane {
     }
 }
 
-/// Where the pane goes in `region`, open or not: the bottom third, at
-/// least [`MIN_ROWS`], leaving the views [`VIEWS_MIN_ROWS`]. `None` when
-/// the region is too short for both or too narrow for a terminal.
-pub fn room(region: Rect) -> Option<Rect> {
-    if region.height < MIN_ROWS + VIEWS_MIN_ROWS || region.width < 10 {
-        return None;
+/// Where the pane goes in `region`, open or not.
+///
+/// * At the bottom: the bottom third, at least [`MIN_ROWS`], leaving the
+///   views [`VIEWS_MIN_ROWS`]. `None` when the region is too short for
+///   both or too narrow for a terminal.
+/// * On the right: the right half at full height, at least [`MIN_COLS`],
+///   after a divider column, leaving the views [`VIEWS_MIN_COLS`]. `None`
+///   when the region is too narrow for both or shorter than [`MIN_ROWS`].
+pub fn room(region: Rect, position: ShellPosition) -> Option<Rect> {
+    match position {
+        ShellPosition::Bottom => {
+            if region.height < MIN_ROWS + VIEWS_MIN_ROWS || region.width < 10 {
+                return None;
+            }
+            let h = (region.height / 3)
+                .max(MIN_ROWS)
+                .min(region.height - VIEWS_MIN_ROWS);
+            Some(Rect::new(region.x, region.bottom() - h, region.width, h))
+        }
+        ShellPosition::Right => {
+            if region.width < VIEWS_MIN_COLS + 1 + MIN_COLS || region.height < MIN_ROWS {
+                return None;
+            }
+            let w = (region.width / 2)
+                .max(MIN_COLS)
+                .min(region.width - VIEWS_MIN_COLS - 1);
+            Some(Rect::new(region.right() - w, region.y, w, region.height))
+        }
     }
-    let h = (region.height / 3)
-        .max(MIN_ROWS)
-        .min(region.height - VIEWS_MIN_ROWS);
-    Some(Rect::new(region.x, region.bottom() - h, region.width, h))
 }
 
-/// The views' part of `region` when the pane takes `pane`.
-pub(crate) fn views_area(region: Rect, pane: Option<Rect>) -> Rect {
-    match pane {
-        Some(p) => Rect::new(region.x, region.y, region.width, p.y - region.y),
-        None => region,
+/// The views' part of `region` when the pane takes `pane`: the rows above
+/// it, or the columns left of its divider.
+pub(crate) fn views_area(region: Rect, pane: Option<Rect>, position: ShellPosition) -> Rect {
+    match (pane, position) {
+        (None, _) => region,
+        (Some(p), ShellPosition::Bottom) => {
+            Rect::new(region.x, region.y, region.width, p.y - region.y)
+        }
+        (Some(p), ShellPosition::Right) => Rect::new(
+            region.x,
+            region.y,
+            p.x.saturating_sub(region.x + 1),
+            region.height,
+        ),
     }
+}
+
+/// The divider column left of the pane when it is on the right. At the
+/// bottom there is none: the pane's header is the rule.
+pub fn divider(pane: Rect, position: ShellPosition) -> Option<Rect> {
+    (position == ShellPosition::Right && pane.x > 0)
+        .then(|| Rect::new(pane.x - 1, pane.y, 1, pane.height))
 }
 
 /// The terminal's part of the pane: everything under the header.
@@ -235,13 +282,17 @@ pub fn toggle(ed: &mut Editor) {
         ed.info("the shell pane is hidden; the shell keeps running (space o shows it)");
         return;
     }
-    if room(ed.region()).is_none() {
+    if room(ed.region(), ed.shell.position).is_none() {
+        let need = match ed.shell.position {
+            ShellPosition::Bottom => format!("{} rows", MIN_ROWS + VIEWS_MIN_ROWS),
+            ShellPosition::Right if ed.region().height < MIN_ROWS => {
+                format!("{MIN_ROWS} rows")
+            }
+            ShellPosition::Right => format!("{} columns", VIEWS_MIN_COLS + 1 + MIN_COLS),
+        };
         ed.set_status(
             Severity::Warning,
-            format!(
-                "the window is too small for the shell pane: it needs {} rows for the views and the pane",
-                MIN_ROWS + VIEWS_MIN_ROWS
-            ),
+            format!("the window is too small for the shell pane: it needs {need} for the views and the pane"),
         );
         return;
     }
